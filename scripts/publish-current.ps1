@@ -50,13 +50,31 @@ $baseTree = (& $Gh api "repos/$Repository/git/commits/$parentCommit" --jq '.tree
 if ($LASTEXITCODE -ne 0 -or -not $baseTree) { throw 'Could not read the repository base tree.' }
 
 $entries = [System.Collections.Generic.List[object]]::new()
-foreach ($relative in @(Get-WorkspaceFiles)) {
+$workspaceFiles = @(Get-WorkspaceFiles)
+$workspacePaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+foreach ($relative in $workspaceFiles) {
+  [void]$workspacePaths.Add($relative)
   $entries.Add([ordered]@{
       path = $relative
       mode = '100644'
       type = 'blob'
       sha = Get-BlobSha $relative
     })
+}
+
+$remoteTreeJson = & $Gh api "repos/$Repository/git/trees/${baseTree}?recursive=1"
+if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate the repository base tree.' }
+$remoteTree = $remoteTreeJson | ConvertFrom-Json
+if ($remoteTree.truncated) { throw 'The repository tree is too large to publish safely.' }
+foreach ($item in $remoteTree.tree) {
+  if ($item.type -eq 'blob' -and -not $workspacePaths.Contains([string]$item.path)) {
+    $entries.Add([ordered]@{
+        path = [string]$item.path
+        mode = '100644'
+        type = 'blob'
+        sha = $null
+      })
+  }
 }
 
 $tree = Invoke-GhJson "repos/$Repository/git/trees" 'POST' @{ base_tree = $baseTree; tree = @($entries) }
