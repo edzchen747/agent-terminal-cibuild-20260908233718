@@ -4,25 +4,25 @@ Agent Terminal exposes command execution, so the desktop is deliberately authori
 
 ## Current controls
 
-- One-time, 192-bit QR pairing secrets expire after five minutes.
+- Single-use, 192-bit QR authorization grants expire after five minutes; they authorize a device binding rather than ordinary reconnects.
 - Successful pairing rotates into a separate 256-bit device credential.
 - The desktop stores only SHA-256 credential hashes.
 - Credential comparisons use a timing-safe comparison.
+- A production relay can require a shared host-registration secret (`RELAY_SHARED_SECRET` / `AGENT_TERMINAL_RELAY_SECRET`) so an offline host ID cannot be impersonated by another desktop.
 - Every command requires an authenticated socket.
 - Device revocation closes currently connected sockets immediately.
 - Remote project paths must resolve to existing desktop directories.
 - Terminal dimensions and WebSocket payload sizes are bounded.
 - Electron renderers use context isolation, no Node integration, and a narrow preload API.
 
-## Local-network transport limitation
+## Transport and relay boundary
 
-Version 0.1 uses plain `ws://` on the local network so Android can connect to a desktop without certificate provisioning. Authorization prevents an unpaired client from using the terminal, but traffic and credentials are not encrypted against an attacker who can observe the local network.
+For cross-network use, configure a production `wss://` relay. The desktop and phone make outbound connections, and the relay only forwards protocol payloads; project state, terminal state, and device authorization remain on the desktop. The desktop still verifies the saved device credential after the relay routes the connection. Configure the relay registration secret in production; an unset secret is intended only for local development.
 
-Do not expose port `47831` to the public internet. Use only on a trusted private network.
+The direct `ws://` transport on port `47831` is a development fallback only. Do not expose it to the public internet. It is suitable only for a trusted private network while testing without a relay.
 
-Before an internet-facing release, replace the transport with authenticated encryption (for example, TLS with pinned host identity or a Noise-style application handshake), add origin/rate controls, and complete an external security review. Remote access across networks should be provided through a trusted VPN rather than router port forwarding.
+Before an internet-facing release, add relay admission/rate controls, relay abuse protection, device-credential rotation, and an external security review. TLS termination must be configured for the relay, and the relay must avoid logging terminal payloads or credentials. A VPN remains a valid alternative for deployments that do not want a public relay.
 
 ## Desktop data
 
 The installed app stores project metadata, device records, and settings in Electron's per-user application data directory. Terminal output is retained only in memory and is discarded when the desktop app exits. The mobile app stores one host connection record through Capacitor Preferences and no project/session state.
-

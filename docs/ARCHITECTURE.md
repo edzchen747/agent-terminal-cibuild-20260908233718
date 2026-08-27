@@ -4,7 +4,10 @@
 
 ```text
 Android / future iOS client
-        │ local WebSocket
+        │ outbound WebSocket
+        ▼
+Relay service (cross-network routing only)
+        │ outbound WebSocket
         ▼
 Electron main process (desktop authority)
         ├── pairing and device authorization
@@ -19,6 +22,8 @@ Electron renderer
         └── xterm.js views over typed IPC
 ```
 
+When `AGENT_TERMINAL_RELAY_URL` is configured, both the desktop and phone initiate outbound WebSocket connections to the relay. The relay matches the desktop's host ID to the phone's temporary connection ID and forwards opaque protocol payloads. It has no project, device, or terminal state. If the variable is absent, the QR payload uses the desktop's direct LAN WebSocket as a development fallback.
+
 The Electron main process is the only authority. Renderers and mobile clients request operations; they never access the file system or spawn processes directly.
 
 ## State ownership
@@ -29,7 +34,7 @@ The Electron main process is the only authority. Renderers and mobile clients re
 | Authorized devices | Persistent | Desktop JSON store |
 | Default shell | Persistent | Desktop JSON store |
 | Terminal processes and scrollback | Desktop process lifetime | Desktop session manager |
-| Paired host endpoint and credential | Persistent | Mobile Capacitor Preferences |
+| Paired host endpoint, transport, and credential | Persistent | Mobile Capacitor Preferences |
 | Current mobile screen, project snapshots, terminal output | In memory | Mobile app |
 
 Temporary projects are derived from live desktop sessions. They disappear when their final session closes unless the folder is explicitly saved as a project.
@@ -44,12 +49,14 @@ Temporary projects are derived from live desktop sessions. They disappear when t
 
 ## Pairing lifecycle
 
-1. The desktop creates a cryptographically random, one-use token with a five-minute expiry.
-2. The QR payload includes protocol version, host identity, LAN endpoint, token, and expiry.
+1. The desktop creates a cryptographically random pairing grant with a five-minute expiry.
+2. The QR payload includes protocol version, host identity, relay endpoint (or direct development endpoint), transport, grant, and expiry.
 3. The phone submits its generated device ID, display name, platform, and token.
-4. The desktop consumes the token and returns a 256-bit device credential.
+4. The desktop consumes the grant once and returns a 256-bit device credential.
 5. The phone stores the host record. The desktop stores only a SHA-256 hash of the credential.
-6. Later connections authenticate with the device ID and credential. Revocation removes the hash and disconnects active sockets for that device.
+6. Later connections authenticate with the device ID and credential through a new relay connection. No new QR scan is needed. Revocation removes the hash and disconnects active sockets for that device.
+
+The relay connection is deliberately separate from authorization: the relay routes by host ID, while the desktop remains the authority that accepts or rejects the device credential.
 
 ## Protocol
 
@@ -66,4 +73,3 @@ An attached mobile terminal receives a bounded 512 KB scrollback snapshot follow
 ## iOS path
 
 The mobile UI and connection layer use browser APIs plus Capacitor abstractions. Adding iOS consists of installing `@capacitor/ios`, running `cap add ios`, adding the camera usage description, and validating local-network permission behavior. No protocol or desktop changes are required.
-

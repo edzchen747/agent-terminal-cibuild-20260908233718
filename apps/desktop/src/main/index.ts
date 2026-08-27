@@ -19,12 +19,14 @@ import { DesktopStore } from "./store";
 import { detectShells } from "./shells";
 import { SessionManager } from "./sessions";
 import { RemoteServer } from "./remote-server";
+import { RelayClient } from "./relay-client";
 
 interface PairingGrant { expiresAt: number; }
 
 let store: DesktopStore;
 let sessions: SessionManager;
 let remote: RemoteServer;
+let relayClient: RelayClient | undefined;
 let shells: ShellProfile[] = [];
 const projectWindows = new Map<string, BrowserWindow>();
 const windowProjects = new Map<number, string>();
@@ -48,7 +50,7 @@ function publicProjects(): Project[] {
 
 function snapshot(): HostSnapshot {
   return {
-    host: { ...store.host, version: app.getVersion() },
+    host: { id: store.host.id, name: store.host.name, version: app.getVersion() },
     projects: publicProjects(),
     sessions: sessions.list(),
     devices: store.devices.map(({ tokenHash: _tokenHash, ...device }) => device),
@@ -197,15 +199,23 @@ function localAddress(): string {
   return "127.0.0.1";
 }
 
+function configuredRelayEndpoint(): string | undefined {
+  const value = process.env.AGENT_TERMINAL_RELAY_URL?.trim();
+  if (!value) return undefined;
+  return value.replace(/^http:/i, "ws:").replace(/^https:/i, "wss:").replace(/\/$/, "");
+}
+
 function startPairing(): PairingPayload {
   const pairingToken = randomBytes(24).toString("base64url");
   const expiresAtMs = Date.now() + 5 * 60_000;
   pairingGrants.set(pairingToken, { expiresAt: expiresAtMs });
+  const relayEndpoint = configuredRelayEndpoint();
   return {
     version: PROTOCOL_VERSION,
     hostId: store.host.id,
     hostName: store.host.name,
-    endpoint: `ws://${localAddress()}:${remote.port}`,
+    endpoint: relayEndpoint ?? `ws://${localAddress()}:${remote.port}`,
+    transport: relayEndpoint ? "relay" : "direct",
     pairingToken,
     expiresAt: new Date(expiresAtMs).toISOString()
   };
@@ -266,6 +276,12 @@ app.whenReady().then(() => {
     onAuthenticated: (deviceId) => { store.touchDevice(deviceId); broadcastState(); },
     execute: executeRemote
   });
+  const relayEndpoint = configuredRelayEndpoint();
+  if (relayEndpoint) {
+    const relaySecret = process.env.AGENT_TERMINAL_RELAY_SECRET?.trim() || store.host.relayToken;
+    relayClient = new RelayClient(relayEndpoint, store.host.id, relaySecret, remote);
+    relayClient.connect();
+  }
   registerIpc();
 
   const startFolder = app.getPath("home");
@@ -281,6 +297,7 @@ app.whenReady().then(() => {
 
 app.on("before-quit", () => {
   isQuitting = true;
+  relayClient?.close();
   remote?.close();
   sessions?.dispose();
 });

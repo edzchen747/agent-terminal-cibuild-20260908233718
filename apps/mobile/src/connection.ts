@@ -1,5 +1,5 @@
 import { Preferences } from "@capacitor/preferences";
-import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage } from "@agentterminal/protocol";
+import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, RelayMessage, ServerMessage } from "@agentterminal/protocol";
 import { createRequestId, decodeServerMessage, encodeMessage } from "@agentterminal/protocol";
 
 const HOST_KEY = "agent-terminal-host";
@@ -8,6 +8,7 @@ export interface SavedHost {
   id: string;
   name: string;
   endpoint: string;
+  transport?: "relay" | "direct";
   deviceId: string;
   deviceToken: string;
 }
@@ -20,6 +21,7 @@ type EventMap = {
 
 export class HostConnection {
   private socket?: WebSocket;
+  private readonly connectionId = crypto.randomUUID();
   private pending = new Map<string, { resolve: (message: ServerMessage) => void; reject: (error: Error) => void }>();
   private listeners = new Map<keyof EventMap, Set<(value: never) => void>>();
   snapshot?: HostSnapshot;
@@ -37,7 +39,7 @@ export class HostConnection {
   }
 
   static async pair(payload: PairingPayload, device: DeviceIdentity): Promise<HostConnection> {
-    const temporary = new HostConnection({ id: payload.hostId, name: payload.hostName, endpoint: payload.endpoint, deviceId: device.id, deviceToken: "" });
+    const temporary = new HostConnection({ id: payload.hostId, name: payload.hostName, endpoint: payload.endpoint, transport: payload.transport, deviceId: device.id, deviceToken: "" });
     await temporary.open();
     const response = await temporary.request({ type: "pair", requestId: createRequestId(), token: payload.pairingToken, device });
     if (response.type !== "pair.accepted") throw new Error("The desktop rejected the pairing request.");
@@ -58,7 +60,7 @@ export class HostConnection {
   async request(message: ClientMessage): Promise<ServerMessage> {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) throw new Error("The desktop is not connected.");
     if (!("requestId" in message)) {
-      this.socket.send(encodeMessage(message));
+      this.sendPayload(encodeMessage(message));
       return { type: "ok", requestId: "" };
     }
     return new Promise((resolve, reject) => {
@@ -67,12 +69,12 @@ export class HostConnection {
         resolve: (response) => { window.clearTimeout(timeout); resolve(response); },
         reject: (error) => { window.clearTimeout(timeout); reject(error); }
       });
-      this.socket!.send(encodeMessage(message));
+      this.sendPayload(encodeMessage(message));
     });
   }
 
   send(message: ClientMessage): void {
-    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(encodeMessage(message));
+    if (this.socket?.readyState === WebSocket.OPEN) this.sendPayload(encodeMessage(message));
   }
 
   on<K extends keyof EventMap>(event: K, callback: (value: EventMap[K]) => void): () => void {
@@ -87,8 +89,15 @@ export class HostConnection {
   private open(): Promise<void> {
     return new Promise((resolve, reject) => {
       const socket = new WebSocket(this.host.endpoint);
-      const timeout = window.setTimeout(() => { socket.close(); reject(new Error("Could not reach the desktop. Check that both devices are on the same network.")); }, 8_000);
-      socket.onopen = () => { window.clearTimeout(timeout); this.socket = socket; resolve(); };
+      const timeout = window.setTimeout(() => { socket.close(); reject(new Error("Could not reach the desktop. Check the relay or desktop connection.")); }, 8_000);
+      socket.onopen = () => {
+        window.clearTimeout(timeout);
+        this.socket = socket;
+        if (this.host.transport === "relay") {
+          socket.send(JSON.stringify({ type: "relay.connect", hostId: this.host.id, connectionId: this.connectionId } satisfies RelayMessage));
+        }
+        resolve();
+      };
       socket.onerror = () => { window.clearTimeout(timeout); reject(new Error("Could not reach the desktop host.")); };
       socket.onclose = () => { this.rejectAll(new Error("Desktop disconnected.")); this.emit("disconnected", undefined); };
       socket.onmessage = (event) => this.receive(String(event.data));
@@ -96,6 +105,13 @@ export class HostConnection {
   }
 
   private receive(raw: string): void {
+    if (this.host.transport === "relay") {
+      let relay: RelayMessage;
+      try { relay = JSON.parse(raw) as RelayMessage; } catch { return; }
+      if (relay.type === "relay.message") raw = relay.payload;
+      else if (relay.type === "relay.disconnect") { this.emit("disconnected", undefined); return; }
+      else return;
+    }
     let message: ServerMessage;
     try { message = decodeServerMessage(raw); } catch { return; }
     if (message.type === "session.output") { this.emit("output", { sessionId: message.sessionId, data: message.data }); return; }
@@ -119,5 +135,13 @@ export class HostConnection {
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
   }
-}
 
+  private sendPayload(payload: string): void {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+    if (this.host.transport === "relay") {
+      this.socket.send(JSON.stringify({ type: "relay.message", connectionId: this.connectionId, payload } satisfies RelayMessage));
+    } else {
+      this.socket.send(payload);
+    }
+  }
+}

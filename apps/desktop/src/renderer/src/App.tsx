@@ -109,9 +109,9 @@ export function App() {
         <button className="modal-close icon-button" onClick={() => setModal(null)}><CloseIcon /></button>
         <div className="modal-kicker"><PhoneIcon /> Pair mobile</div>
         <h1>Bring this terminal with you.</h1>
-        <p>Open Agent Terminal on your phone and scan this code. Both devices must be on the same network.</p>
+        <p>Scan this code once to authorize your phone. After pairing, it can reconnect to this desktop from anywhere.</p>
         <div className="qr-frame">{qr ? <img src={qr} alt="Mobile pairing QR code" /> : <div className="qr-loading">Generating secure code…</div>}</div>
-        <div className="pair-details"><span><i /> One-time code</span><span>Expires {pairing ? new Date(pairing.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "soon"}</span></div>
+        <div className="pair-details"><span><i /> One-time device binding</span><span>Expires {pairing ? new Date(pairing.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "soon"}</span></div>
       </section></div>}
 
       {modal === "settings" && <div className="modal-backdrop" onMouseDown={() => setModal(null)}><section className="modal settings-modal" onMouseDown={(event) => event.stopPropagation()}>
@@ -128,4 +128,3 @@ export function App() {
     </main>
   );
 }
-

@@ -57,9 +57,19 @@ export interface PairingPayload {
   hostId: string;
   hostName: string;
   endpoint: string;
+  transport?: "relay" | "direct";
   pairingToken: string;
   expiresAt: string;
 }
+
+export type RelayMessage =
+  | { type: "relay.register"; hostId: string; hostToken: string }
+  | { type: "relay.registered"; hostId: string }
+  | { type: "relay.connect"; hostId: string; connectionId: string }
+  | { type: "relay.connected"; connectionId: string }
+  | { type: "relay.message"; connectionId: string; payload: string }
+  | { type: "relay.disconnect"; connectionId: string }
+  | { type: "relay.error"; message: string };
 
 export type ClientMessage =
   | { type: "pair"; requestId: string; token: string; device: DeviceIdentity }
@@ -124,4 +134,3 @@ export function parsePairingPayload(raw: string): PairingPayload {
 export function createRequestId(): string {
   return globalThis.crypto.randomUUID();
 }
-

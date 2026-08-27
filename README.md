@@ -1,6 +1,6 @@
 # Agent Terminal
 
-Agent Terminal is a Windows terminal host with an Android-first companion app. It runs real interactive shells through Windows ConPTY, renders them with xterm.js, and lets an authorized phone create projects, open terminal sessions, and interact with those sessions over the local network.
+Agent Terminal is a Windows terminal host with an Android-first companion app. It runs real interactive shells through Windows ConPTY, renders them with xterm.js, and lets an authorized phone create projects, open terminal sessions, and interact with those sessions remotely.
 
 This repository is an end-to-end MVP, not a UI-only prototype.
 
@@ -12,15 +12,16 @@ This repository is an end-to-end MVP, not a UI-only prototype.
 - A collapsible project sidebar. Opening a different project creates/focuses a dedicated desktop window.
 - Multiple terminal tabs per project.
 - Native folder picker for saved projects.
-- QR pairing codes that expire after five minutes and can only be used once.
+- QR pairing that authorizes a phone once; ordinary reconnects use the saved device credential.
 - Persistent authorized-device registry with token hashing, last-seen timestamps, and immediate revocation.
-- Local WebSocket host on port `47831`.
+- Outbound relay support for connections across Wi-Fi, mobile data, NAT, and firewall boundaries.
+- Direct local WebSocket fallback on port `47831` for development without a relay.
 - Desktop-owned persistence for projects, devices, and the default shell.
 
 ### Android-first mobile app
 
 - Native QR scanning with a manual pairing-code fallback.
-- Automatic reconnect to the one saved desktop host.
+- Automatic reconnect to the one saved desktop host through the configured relay or direct fallback.
 - Live project/session discovery whenever the app connects.
 - Saved-project marker and automatic temporary projects for open desktop folders that were not saved.
 - Project creation against an existing absolute folder path on the desktop.
@@ -48,9 +49,33 @@ docs/            Architecture and security notes
 - Windows 10 1809 or newer (Windows 11 recommended).
 - Node.js 22 or newer.
 - Android Studio with Java 21 and Android SDK 36 to build the Android APK.
-- Phone and desktop on the same local network for the current transport.
+- A deployed WebSocket relay for cross-network use. The desktop connects to it with `AGENT_TERMINAL_RELAY_URL`.
 
 No Visual Studio C++ workload is required: the desktop uses a prebuilt ConPTY binding.
+
+## Run a relay
+
+The relay is stateless with respect to projects and terminal sessions. It only forwards WebSocket messages between an online desktop and an already authorized phone. For local development:
+
+```powershell
+$env:AGENT_TERMINAL_RELAY_URL = "ws://127.0.0.1:8787"
+$env:AGENT_TERMINAL_RELAY_SECRET = "local-development-secret"
+$env:RELAY_SHARED_SECRET = "local-development-secret"
+npm run build -w @agentterminal/relay
+npm run start -w @agentterminal/relay
+```
+
+For production, deploy `apps/relay/Dockerfile` behind a TLS reverse proxy and configure the desktop with the resulting `wss://` URL:
+
+```powershell
+$env:AGENT_TERMINAL_RELAY_URL = "wss://relay.example.com"
+$env:AGENT_TERMINAL_RELAY_SECRET = "use-a-long-random-secret"
+npm run dev
+```
+
+Set `RELAY_SHARED_SECRET` to the same value in the relay deployment. The relay uses it only to authenticate the desktop's host registration; the desktop still authenticates every phone with its paired device credential.
+
+The desktop must be able to make an outbound connection to the relay. The phone does not need to discover or expose the desktop's LAN address.
 
 ## Start the desktop app
 
@@ -92,8 +117,8 @@ Then build/run from Android Studio. The QR scanner requires a physical device or
 
 1. Start Agent Terminal on Windows.
 2. Select the phone button in the title bar.
-3. Open the mobile app and scan the QR code.
-4. The phone saves only that host connection. Future launches authenticate automatically until the desktop revokes the phone.
+3. Open the mobile app and scan the QR code once.
+4. The phone saves only that host connection. Future launches authenticate automatically from any network until the desktop revokes the phone.
 5. Open a project to see its live sessions, or create a terminal. A project without a current desktop window opens in a new window; another session in that project appears as a new tab.
 
 See [Architecture](docs/ARCHITECTURE.md) and [Security](docs/SECURITY.md) for implementation details and production-hardening guidance.
@@ -109,4 +134,3 @@ npm run build
 ## Current product boundary
 
 The terminal path is real ConPTY + xterm.js and supports normal interactive shell programs, ANSI/VT output, resizing, and scrollback. Some Windows Terminal-specific features such as pane splitting, profile JSON import, GPU text rendering, and command palette parity are not yet implemented.
-

@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,7 +9,7 @@ export interface StoredDevice extends AuthorizedDevice {
 }
 
 interface StoredState {
-  host: { id: string; name: string };
+  host: { id: string; name: string; relayToken: string };
   projects: Project[];
   devices: StoredDevice[];
   settings: { defaultShellId: string; port: number };
@@ -24,7 +24,7 @@ export class DesktopStore {
 
   private defaults(): StoredState {
     return {
-      host: { id: crypto.randomUUID(), name: os.hostname() },
+      host: { id: crypto.randomUUID(), name: os.hostname(), relayToken: randomBytes(32).toString("base64url") },
       projects: [],
       devices: [],
       settings: { defaultShellId: "powershell", port: 47831 }
@@ -33,7 +33,14 @@ export class DesktopStore {
 
   private read(): StoredState {
     try {
-      return { ...this.defaults(), ...JSON.parse(fs.readFileSync(this.filePath, "utf8")) } as StoredState;
+      const parsed = JSON.parse(fs.readFileSync(this.filePath, "utf8")) as Partial<StoredState>;
+      const initial = this.defaults();
+      return {
+        ...initial,
+        ...parsed,
+        host: { ...initial.host, ...parsed.host, relayToken: parsed.host?.relayToken ?? initial.host.relayToken },
+        settings: { ...initial.settings, ...parsed.settings }
+      };
     } catch {
       const initial = this.defaults();
       this.write(initial);
@@ -98,4 +105,3 @@ export class DesktopStore {
 function hashToken(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
 }
-

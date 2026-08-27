@@ -32,6 +32,9 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
+      - name: Build shared protocol
+        run: npm run build -w @agentterminal/protocol
+
       - name: Build and sync Capacitor Android project
         run: npm run android:sync
 
@@ -62,6 +65,9 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
+      - name: Build shared protocol
+        run: npm run build -w @agentterminal/protocol
+
       - name: Typecheck
         run: npm run typecheck
 
@@ -77,4 +83,3 @@ jobs:
           name: agent-terminal-windows-installer
           path: apps/desktop/release/Agent Terminal Setup 0.1.0.exe
           if-no-files-found: error
-

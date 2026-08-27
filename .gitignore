@@ -1,6 +1,7 @@
 node_modules/
 .tools/
 .gh-config/
+.gh-cache/
 .npm-cache/
 .electron-cache/
 .electron-gyp/
