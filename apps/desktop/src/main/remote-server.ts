@@ -95,7 +95,7 @@ export class RemoteServer {
     if (message.type === "pair") {
       const deviceToken = this.options.pair(message.token, message.device);
       if (!deviceToken) {
-        client.send({ type: "error", requestId: message.requestId, code: "PAIRING_DENIED", message: "Pairing code is invalid or expired." });
+        client.send({ type: "error", requestId: message.requestId, code: "PAIRING_DENIED", message: "This pairing QR is no longer valid. Reopen the desktop pairing window and scan the new QR." });
         return;
       }
       client.deviceId = message.device.id;

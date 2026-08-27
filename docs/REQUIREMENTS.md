@@ -18,6 +18,8 @@
 - The relay must use wss:// in a production deployment.
 - Direct LAN WebSocket remains available only as a local-development fallback when no relay URL is configured.
 - The desktop QR modal and mobile onboarding must describe pairing as a one-time device binding, not a one-time reconnect code.
+- Pairing UI must not label the QR as a one-time code or present its setup-grant expiry as the lifetime of the device pairing.
+- The confirmation language must state that the phone remains authorized until explicitly revoked.
 
 ## Session behavior
 

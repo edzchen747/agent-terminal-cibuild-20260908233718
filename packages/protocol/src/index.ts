@@ -126,7 +126,7 @@ export function parsePairingPayload(raw: string): PairingPayload {
     !payload.pairingToken ||
     !payload.expiresAt
   ) {
-    throw new Error("This is not a valid Agent Terminal pairing code.");
+    throw new Error("This is not valid Agent Terminal pairing QR data.");
   }
   return payload as PairingPayload;
 }

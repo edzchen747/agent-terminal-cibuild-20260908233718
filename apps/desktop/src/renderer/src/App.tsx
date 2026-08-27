@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
 import QRCode from "qrcode";
-import type { PairingPayload } from "@agentterminal/protocol";
 import type { DesktopState } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, FolderIcon, MenuIcon, PhoneIcon, PlusIcon, SettingsIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { TerminalPane } from "./TerminalPane";
@@ -12,7 +11,6 @@ export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [modal, setModal] = useState<Modal>(null);
-  const [pairing, setPairing] = useState<PairingPayload | null>(null);
   const [qr, setQr] = useState("");
 
   useEffect(() => {
@@ -35,7 +33,6 @@ export function App() {
   async function showPairing() {
     setModal("pair");
     const payload = await window.agentTerminal.startPairing();
-    setPairing(payload);
     setQr(await QRCode.toDataURL(JSON.stringify(payload), { width: 320, margin: 2, color: { dark: "#0a1015", light: "#ffffff" } }));
   }
 
@@ -107,11 +104,11 @@ export function App() {
 
       {modal === "pair" && <div className="modal-backdrop" onMouseDown={() => setModal(null)}><section className="modal pair-modal" onMouseDown={(event) => event.stopPropagation()}>
         <button className="modal-close icon-button" onClick={() => setModal(null)}><CloseIcon /></button>
-        <div className="modal-kicker"><PhoneIcon /> Pair mobile</div>
-        <h1>Bring this terminal with you.</h1>
-        <p>Scan this code once to authorize your phone. After pairing, it can reconnect to this desktop from anywhere.</p>
-        <div className="qr-frame">{qr ? <img src={qr} alt="Mobile pairing QR code" /> : <div className="qr-loading">Generating secure code…</div>}</div>
-        <div className="pair-details"><span><i /> One-time device binding</span><span>Expires {pairing ? new Date(pairing.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "soon"}</span></div>
+        <div className="modal-kicker"><PhoneIcon /> Connect your phone</div>
+        <h1>Pair once. Reconnect anytime.</h1>
+        <p>Scan this QR once to add your phone as an authorized device. It stays paired across every network until you revoke it in Settings.</p>
+        <div className="qr-frame">{qr ? <img src={qr} alt="Mobile pairing QR" /> : <div className="qr-loading">Preparing secure pairing…</div>}</div>
+        <div className="pair-details"><span><i /> This phone stays authorized</span><span>Reconnect from anywhere</span></div>
       </section></div>}
 
       {modal === "settings" && <div className="modal-backdrop" onMouseDown={() => setModal(null)}><section className="modal settings-modal" onMouseDown={(event) => event.stopPropagation()}>
