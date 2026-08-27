@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { App as CapacitorApp } from "@capacitor/app";
-import { Capacitor } from "@capacitor/core";
+import { Capacitor, type PluginListenerHandle } from "@capacitor/core";
 import {
   CapacitorBarcodeScanner,
   CapacitorBarcodeScannerCameraDirection,
@@ -10,6 +10,7 @@ import {
 import type { HostSnapshot, PairingPayload, Platform, Project, TerminalSession } from "@agentterminal/protocol";
 import { createRequestId, parsePairingPayload } from "@agentterminal/protocol";
 import { HostConnection } from "./connection";
+import { ConnectionNotification } from "./connection-notification";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, TerminalIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
 
@@ -25,6 +26,8 @@ export function App() {
   const [view, setView] = useState<View>({ type: "home" });
   const [showCreateProject, setShowCreateProject] = useState(false);
   const [sessionToClose, setSessionToClose] = useState<TerminalSession | null>(null);
+  const connectionRef = useRef<HostConnection | null>(null);
+  connectionRef.current = connection;
   const navigationRef = useRef({ view, status, showCreateProject, sessionToClose });
   navigationRef.current = { view, status, showCreateProject, sessionToClose };
 
@@ -55,16 +58,39 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (Capacitor.getPlatform() !== "android") return;
+    let disposed = false;
+    let listener: PluginListenerHandle | undefined;
+    void ConnectionNotification.addListener("disconnectRequested", () => {
+      connectionRef.current?.close();
+      void stopConnectionNotification();
+      setSnapshot(null);
+      setError("Disconnected from the desktop by the notification.");
+      setStatus("error");
+    }).then((handle) => {
+      if (disposed) void handle.remove();
+      else listener = handle;
+    });
+    return () => {
+      disposed = true;
+      void listener?.remove();
+    };
+  }, []);
+
+  useEffect(() => {
     let current: HostConnection | null = null;
     void HostConnection.saved().then(async (host) => {
       if (!host) { setStatus("pairing"); return; }
       setStatus("connecting");
       current = new HostConnection(host);
       try {
-        setSnapshot(await current.connect());
+        const nextSnapshot = await current.connect();
+        setSnapshot(nextSnapshot);
         setConnection(current);
+        await startConnectionNotification(current.host.name);
         setStatus("connected");
       } catch (cause) {
+        await stopConnectionNotification();
         setError(cause instanceof Error ? cause.message : "Could not connect to the saved desktop.");
         setStatus("error");
       }
@@ -87,6 +113,7 @@ export function App() {
       const next = await HostConnection.pair(payload, { id: crypto.randomUUID(), name: mobileName(), platform });
       connection?.close();
       setConnection(next); setSnapshot(next.snapshot ?? null); setStatus("connected"); setView({ type: "home" });
+      await startConnectionNotification(next.host.name);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Pairing failed."); setStatus("pairing");
     }
@@ -109,7 +136,7 @@ export function App() {
   }
 
   async function forgetHost() {
-    connection?.close(); await HostConnection.forget();
+    connection?.close(); await stopConnectionNotification(); await HostConnection.forget();
     setConnection(null); setSnapshot(null); setError(""); setStatus("pairing"); setView({ type: "home" });
   }
 
@@ -153,6 +180,16 @@ export function App() {
     <nav className="bottom-nav"><button className="active"><FolderIcon /><span>Projects</span></button><button onClick={() => void scan()}><ScanIcon /><span>Pair</span></button><button onClick={() => void forgetHost()}><WifiIcon /><span>Host</span></button></nav>
     {showCreateProject && <CreateProjectSheet connection={connection} onClose={() => setShowCreateProject(false)} />}
   </div>;
+}
+
+async function startConnectionNotification(hostName: string) {
+  if (Capacitor.getPlatform() !== "android") return;
+  try { await ConnectionNotification.start({ hostName }); } catch { /* The connection still works if notifications are denied. */ }
+}
+
+async function stopConnectionNotification() {
+  if (Capacitor.getPlatform() !== "android") return;
+  try { await ConnectionNotification.stop(); } catch { /* Native plugin is unavailable on non-release web shells. */ }
 }
 
 function ProjectScreen({ project, snapshot, connection, onBack, onOpen }: { project: Project; snapshot: HostSnapshot; connection: HostConnection; onBack: () => void; onOpen: (session: TerminalSession) => void }) {

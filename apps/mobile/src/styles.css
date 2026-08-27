@@ -93,7 +93,7 @@ button { color: inherit; }
 .mobile-terminal .xterm { height: 100%; }
 .mobile-terminal .xterm-viewport, .mobile-terminal .xterm-screen { touch-action: none; }
 .mobile-terminal .xterm .xterm-accessibility:not(.debug) { pointer-events: auto; }
-.mobile-terminal .xterm .xterm-accessibility-tree { -webkit-user-select: text; user-select: text; -webkit-touch-callout: default; touch-action: manipulation; }
+.mobile-terminal .xterm .xterm-accessibility-tree { -webkit-user-select: text !important; user-select: text !important; -webkit-touch-callout: default; touch-action: auto; }
 .mobile-terminal .xterm-viewport, .mobile-terminal .xterm-scrollable-element > .scrollbar { scrollbar-width: none; }
 .mobile-terminal .xterm-scrollable-element > .scrollbar.vertical { touch-action: none; }
 .mobile-terminal .xterm-scrollable-element > .scrollbar.vertical > .slider { background: transparent !important; }

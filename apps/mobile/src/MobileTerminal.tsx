@@ -169,6 +169,7 @@ export function MobileTerminal({ connection, session }: Props) {
     let scrollbarGesture = false;
     let suppressTap = false;
     let tapTimer: number | undefined;
+    let longPressTimer: number | undefined;
     const findTouch = (touches: TouchList, identifier: number) => {
       for (let index = 0; index < touches.length; index += 1) {
         const touch = touches.item(index);
@@ -185,6 +186,42 @@ export function MobileTerminal({ connection, session }: Props) {
       selectionGesture = false;
       scrollbarGesture = false;
       suppressTap = false;
+    };
+    const clearLongPressTimer = () => {
+      if (longPressTimer !== undefined) window.clearTimeout(longPressTimer);
+      longPressTimer = undefined;
+    };
+    const selectWordAtTouch = (clientX: number, clientY: number) => {
+      const target = document.elementFromPoint(clientX, clientY);
+      if (!(target instanceof Element) || !target.closest(".xterm-accessibility-tree")) return false;
+
+      const documentWithCaret = document as Document & {
+        caretRangeFromPoint?: (x: number, y: number) => Range | null;
+      };
+      const caret = documentWithCaret.caretRangeFromPoint?.(clientX, clientY);
+      if (!caret || !(caret.startContainer instanceof Text)) return false;
+
+      const text = caret.startContainer.textContent ?? "";
+      if (!text.length) return false;
+      let offset = Math.max(0, Math.min(caret.startOffset, text.length - 1));
+      const isWordCharacter = (character: string) => /\S/.test(character);
+      if (!isWordCharacter(text[offset] ?? "") && offset > 0) offset -= 1;
+      let start = offset;
+      let end = Math.min(text.length, offset + 1);
+      if (isWordCharacter(text[offset] ?? "")) {
+        while (start > 0 && isWordCharacter(text[start - 1] ?? "")) start -= 1;
+        while (end < text.length && isWordCharacter(text[end] ?? "")) end += 1;
+      }
+      if (end <= start) return false;
+
+      const selection = document.getSelection();
+      if (!selection) return false;
+      const range = document.createRange();
+      range.setStart(caret.startContainer, start);
+      range.setEnd(caret.startContainer, end);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return true;
     };
     const moveCursorToTouch = (clientX: number, clientY: number) => {
       terminal.focus();
@@ -232,13 +269,25 @@ export function MobileTerminal({ connection, session }: Props) {
       touchMoved = false;
       selectionGesture = terminal.hasSelection();
       scrollbarGesture = event.target instanceof Element && Boolean(event.target.closest(".scrollbar.vertical"));
+      clearLongPressTimer();
+      if (!selectionGesture && !scrollbarGesture && !suppressTap) {
+        longPressTimer = window.setTimeout(() => {
+          longPressTimer = undefined;
+          if (activeTouchId === touch.identifier && !touchMoved && !terminal.hasSelection() && selectWordAtTouch(touch.clientX, touch.clientY)) {
+            selectionGesture = true;
+          }
+        }, 500);
+      }
     };
     const handleTouchMove = (event: TouchEvent) => {
       if (activeTouchId === undefined || previousTouchY === undefined) return;
       const touch = findTouch(event.touches, activeTouchId);
       if (!touch) return;
       if (scrollbarGesture) return;
-      if (touchStartX !== undefined && touchStartY !== undefined && Math.hypot(touch.clientX - touchStartX, touch.clientY - touchStartY) > 7) touchMoved = true;
+      if (touchStartX !== undefined && touchStartY !== undefined && Math.hypot(touch.clientX - touchStartX, touch.clientY - touchStartY) > 7) {
+        touchMoved = true;
+        clearLongPressTimer();
+      }
       if (selectionGesture || terminal.hasSelection()) return;
       const deltaY = touch.clientY - previousTouchY;
       previousTouchY = touch.clientY;
@@ -254,6 +303,7 @@ export function MobileTerminal({ connection, session }: Props) {
     };
     const handleTouchEnd = (event: TouchEvent) => {
       if (activeTouchId === undefined) return resetTouch();
+      clearLongPressTimer();
       const touch = findTouch(event.changedTouches, activeTouchId);
       const isQuickTap = performance.now() - touchStartedAt < 420;
       if (touch && isQuickTap && !touchMoved && !selectionGesture && !scrollbarGesture && !suppressTap) {
@@ -291,6 +341,7 @@ export function MobileTerminal({ connection, session }: Props) {
       hostElement.removeEventListener("touchmove", handleTouchMove);
       hostElement.removeEventListener("touchend", handleTouchEnd);
       hostElement.removeEventListener("touchcancel", resetTouch);
+      clearLongPressTimer();
       if (tapTimer !== undefined) window.clearTimeout(tapTimer);
       if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
       input.dispose(); output(); terminal.dispose(); terminalRef.current = null;
