@@ -129,6 +129,13 @@ function configureShellIntegration(shell: ShellProfile, environment: { [key: str
     const reportCwd = 'printf "\\033]9;9;%s\\007" "$(cygpath -w "$PWD" -C ANSI)"';
     environment.PROMPT_COMMAND = environment.PROMPT_COMMAND ? `${environment.PROMPT_COMMAND};${reportCwd}` : reportCwd;
   }
+  if (shell.id === "wsl") {
+    const reportCwd = 'printf "\\033]9;9;%s\\007" "$(wslpath -w "$PWD")"';
+    environment.PROMPT_COMMAND = environment.PROMPT_COMMAND ? `${environment.PROMPT_COMMAND};${reportCwd}` : reportCwd;
+    const wslEnvironment = new Set((environment.WSLENV ?? "").split(":").filter(Boolean));
+    wslEnvironment.add("PROMPT_COMMAND/w");
+    environment.WSLENV = [...wslEnvironment].join(":");
+  }
   return shell.args;
 }
 

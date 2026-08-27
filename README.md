@@ -11,7 +11,7 @@ This repository is an end-to-end MVP, not a UI-only prototype.
 - Interactive ConPTY terminal sessions with Command Prompt, Windows PowerShell, PowerShell 7, WSL, and Git Bash detection.
 - A collapsible project sidebar. Opening a different project creates/focuses a dedicated desktop window.
 - Multiple terminal tabs per project.
-- Automatic session regrouping when shell integration reports a changed working directory.
+- Automatic session regrouping when PowerShell, Command Prompt, Git Bash, or WSL shell integration reports a changed working directory.
 - Context-aware Ctrl+C: copies selected terminal text and otherwise sends the normal interrupt signal to the shell.
 - Native folder picker for saved projects.
 - QR pairing that authorizes a phone once; ordinary reconnects use the saved device credential.

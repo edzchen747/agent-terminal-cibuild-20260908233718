@@ -189,7 +189,7 @@ function samePath(left: string, right: string): boolean {
 }
 
 function isWithinProject(candidate: string, projectPath: string): boolean {
-  const relative = path.relative(path.resolve(projectPath), candidate);
+  const relative = path.relative(path.resolve(projectPath).toLowerCase(), path.resolve(candidate).toLowerCase());
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
