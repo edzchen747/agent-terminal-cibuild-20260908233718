@@ -28,7 +28,7 @@ When `AGENT_TERMINAL_RELAY_URL` is configured, both the desktop and phone initia
 
 The desktop is single-instance. A second launch delegates focus to the existing tray host and exits before starting another runtime. In direct mode, the desktop refuses to issue a QR unless its process successfully owns the configured WebSocket port.
 
-The Rust process is the only authority. Tauri webviews and mobile clients request operations; they never access the file system or spawn processes directly. The same process owns the tray and connections, so hiding every terminal window does not disconnect paired phones or terminate PTYs.
+The Rust tray process is the only authority. Tauri webviews and mobile clients request operations; they never access the file system or spawn processes directly. Terminal windows are disposable clients: closing every window does not disconnect paired phones or terminate PTYs, and the tray can create a fresh client later.
 
 ## State ownership
 
@@ -49,7 +49,9 @@ Temporary projects are derived from live desktop sessions. They disappear when t
 - A session belongs to exactly one project.
 - Creating the first live session for a project opens its window.
 - Creating another session in that project adds a tab to the existing window.
-- Closing a project window hides it; its sessions and remote connections remain owned by the tray process.
+- A terminal webview explicitly attaches to each rendered session. Attachment atomically returns the current scrollback and registers the window for subsequent live bytes, preventing gaps or duplicate output during tab/window transitions.
+- Closing a project window destroys that client and its subscriptions; its sessions and remote connections remain owned by the tray process.
+- If a shell changes directory into another project, the active window is reassigned to the destination project. Remaining tabs from the previous project are rendered by a replacement window shown behind the active window.
 - Left-clicking the tray restores the most recently focused terminal window.
 - Right-clicking the tray exposes the explicit Exit action that terminates sessions and the connection host.
 
@@ -74,7 +76,7 @@ The relay connection is deliberately separate from authorization: the relay rout
 - session create/close/attach/detach;
 - terminal input, output, and resize events.
 
-An attached mobile terminal receives a bounded 512 KB scrollback snapshot followed by live output. Desktop xterm views maintain their own larger visual scrollback.
+An attached mobile or desktop terminal receives a bounded 512 KB scrollback snapshot followed by live output. Desktop xterm views maintain their own larger visual scrollback.
 
 ## iOS path
 

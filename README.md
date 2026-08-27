@@ -9,12 +9,12 @@ This repository is an end-to-end MVP, not a UI-only prototype.
 ### Windows desktop
 
 - One portable `agent-terminal.exe`; there is no installer, Electron runtime, Node sidecar, or separate connection process.
-- A native tray host owns terminal sessions and all direct/relay connections even when terminal windows are hidden.
+- A single native tray host owns every PTY and direct/relay connection. Terminal windows are disposable clients that attach to tray-owned sessions and may all be closed without interrupting the host.
 - Left-clicking the tray icon restores the terminal. Right-clicking opens a menu with Exit.
 - Interactive ConPTY terminal sessions with Command Prompt, Windows PowerShell, PowerShell 7, WSL, and Git Bash detection.
 - A collapsible project sidebar. Opening a different project creates/focuses a dedicated desktop window.
 - Multiple terminal tabs per project.
-- Automatic session regrouping when PowerShell, Command Prompt, Git Bash, or WSL shell integration reports a changed working directory.
+- Automatic session regrouping when shell integration reports a changed working directory: the active window follows the moved tab, while remaining old-project tabs reopen together in a background window.
 - Context-aware Ctrl+C: copies selected terminal text and otherwise sends the normal interrupt signal to the shell.
 - Native folder picker for saved projects.
 - QR pairing that authorizes a phone once; ordinary reconnects use the saved device credential.

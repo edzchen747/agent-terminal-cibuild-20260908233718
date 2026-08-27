@@ -85,17 +85,33 @@ export function TerminalPane({ sessionId, active }: Props) {
     };
     window.addEventListener("pointerdown", handlePointerActivity, true);
     const dataSubscription = terminal.onData((data) => window.agentTerminal.write(sessionId, data));
-    const offData = window.agentTerminal.onData((id, data) => { if (id === sessionId) terminal.write(data); });
-    void window.agentTerminal.getBuffer(sessionId).then((buffer) => {
+    let initialized = false;
+    let disposed = false;
+    const pendingData: string[] = [];
+    const offData = window.agentTerminal.onData((id, data) => {
+      if (id !== sessionId) return;
+      if (initialized) terminal.write(data);
+      else pendingData.push(data);
+    });
+    const attachment = window.agentTerminal.attachSession(sessionId).then((buffer) => {
+      if (disposed) {
+        window.agentTerminal.detachSession(sessionId);
+        return;
+      }
       if (buffer) terminal.write(buffer);
+      for (const data of pendingData) terminal.write(data);
+      pendingData.length = 0;
+      initialized = true;
       resize();
       if (active) terminal.focus();
-    });
+    }).catch(() => undefined);
     return () => {
+      disposed = true;
       observer.disconnect();
       window.removeEventListener("pointerdown", handlePointerActivity, true);
       dataSubscription.dispose();
       offData();
+      void attachment.then(() => window.agentTerminal.detachSession(sessionId));
       if (copyToastTimer) window.clearTimeout(copyToastTimer);
       terminal.dispose();
       resizeRef.current = () => undefined;

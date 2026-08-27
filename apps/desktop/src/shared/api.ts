@@ -14,7 +14,8 @@ export interface DesktopApi {
   closeSession(sessionId: string): Promise<void>;
   write(sessionId: string, data: string): void;
   resize(sessionId: string, cols: number, rows: number, force?: boolean): void;
-  getBuffer(sessionId: string): Promise<string>;
+  attachSession(sessionId: string): Promise<string>;
+  detachSession(sessionId: string): void;
   copyText(text: string): Promise<void>;
   startPairing(): Promise<PairingPayload>;
   revokeDevice(deviceId: string): Promise<void>;

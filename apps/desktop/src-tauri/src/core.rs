@@ -28,6 +28,7 @@ use crate::{
     },
     shells::{command_for, detect_shells},
     store::{DesktopStore, random_token},
+    window_clients::WindowClients,
 };
 
 const MAX_SCROLLBACK_BYTES: usize = 512_000;
@@ -68,9 +69,7 @@ struct Inner {
     shells: Vec<ShellProfile>,
     temporary_projects: HashMap<String, Project>,
     sessions: HashMap<String, ManagedSession>,
-    project_windows: HashMap<String, String>,
-    window_projects: HashMap<String, String>,
-    last_window: Option<String>,
+    windows: WindowClients,
     pairing_grants: HashMap<String, PairingGrant>,
 }
 
@@ -81,6 +80,7 @@ pub struct Core {
     relay_sender: Mutex<Option<mpsc::UnboundedSender<RelayMessage>>>,
     remote_port: AtomicU16,
     direct_server_ready: AtomicBool,
+    exit_requested: AtomicBool,
 }
 
 impl Core {
@@ -93,15 +93,14 @@ impl Core {
                 shells: detect_shells(),
                 temporary_projects: HashMap::new(),
                 sessions: HashMap::new(),
-                project_windows: HashMap::new(),
-                window_projects: HashMap::new(),
-                last_window: None,
+                windows: WindowClients::default(),
                 pairing_grants: HashMap::new(),
             }),
             clients: Mutex::new(HashMap::new()),
             relay_sender: Mutex::new(None),
             remote_port: AtomicU16::new(remote_port),
             direct_server_ready: AtomicBool::new(false),
+            exit_requested: AtomicBool::new(false),
         })
     }
 
@@ -182,6 +181,14 @@ impl Core {
         self.direct_server_ready.store(ready, Ordering::Release);
     }
 
+    pub fn request_exit(&self) {
+        self.exit_requested.store(true, Ordering::Release);
+    }
+
+    pub fn exit_requested(&self) -> bool {
+        self.exit_requested.load(Ordering::Acquire)
+    }
+
     pub fn relay_endpoint(&self) -> Option<String> {
         let value = std::env::var("AGENT_TERMINAL_RELAY_URL")
             .ok()?
@@ -215,9 +222,9 @@ impl Core {
             .inner
             .lock()
             .expect("desktop state poisoned")
-            .window_projects
-            .get(label)
-            .cloned()
+            .windows
+            .project_for_window(label)
+            .map(str::to_owned)
             .or_else(|| snapshot.projects.first().map(|project| project.id.clone()))
             .unwrap_or_default();
         DesktopState {
@@ -256,8 +263,18 @@ impl Core {
 
     pub fn mark_window_focused(&self, label: &str) {
         let mut inner = self.inner.lock().expect("desktop state poisoned");
-        if inner.window_projects.contains_key(label) {
-            inner.last_window = Some(label.to_string());
+        inner.windows.mark_focused(label);
+    }
+
+    pub fn unregister_window(&self, label: &str) {
+        let project_id = self
+            .inner
+            .lock()
+            .expect("desktop state poisoned")
+            .windows
+            .remove_window(label);
+        if let Some(project_id) = project_id {
+            self.cleanup_empty_temporary_project(&project_id);
         }
     }
 
@@ -265,10 +282,7 @@ impl Core {
         let (label, fallback_project) = {
             let inner = self.inner.lock().expect("desktop state poisoned");
             (
-                inner
-                    .last_window
-                    .clone()
-                    .or_else(|| inner.window_projects.keys().next().cloned()),
+                inner.windows.last_or_any(),
                 public_projects(&inner)
                     .first()
                     .map(|project| project.id.clone()),
@@ -288,46 +302,69 @@ impl Core {
     }
 
     pub fn ensure_project_window(self: &Arc<Self>, project_id: &str) -> Result<()> {
+        self.ensure_project_window_with_focus(project_id, true)
+    }
+
+    fn ensure_project_window_in_background(self: &Arc<Self>, project_id: &str) -> Result<()> {
+        self.ensure_project_window_with_focus(project_id, false)
+    }
+
+    fn ensure_project_window_with_focus(
+        self: &Arc<Self>,
+        project_id: &str,
+        focus: bool,
+    ) -> Result<()> {
         let existing = self
             .inner
             .lock()
             .expect("desktop state poisoned")
-            .project_windows
-            .get(project_id)
-            .cloned();
+            .windows
+            .window_for_project(project_id)
+            .map(str::to_owned);
         if let Some(label) = existing
             && let Some(window) = self.app.get_webview_window(&label)
         {
             let _ = window.unminimize();
             window.show()?;
-            window.set_focus()?;
-            self.mark_window_focused(&label);
+            if focus {
+                window.set_focus()?;
+                self.mark_window_focused(&label);
+            }
             return Ok(());
         }
 
         let project = self.project_by_id(project_id)?;
-        let label = format!("project-{}", project.id);
+        let label = format!("terminal-{}", Uuid::new_v4());
         {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
-            inner
-                .project_windows
-                .insert(project.id.clone(), label.clone());
-            inner
-                .window_projects
-                .insert(label.clone(), project.id.clone());
-            inner.last_window = Some(label.clone());
+            inner.windows.assign(&label, &project.id);
+            if focus {
+                inner.windows.mark_focused(&label);
+            }
         }
         let built =
             WebviewWindowBuilder::new(&self.app, &label, WebviewUrl::App("index.html".into()))
                 .title(format!("{} — Agent Terminal", project.name))
                 .inner_size(1320.0, 820.0)
                 .min_inner_size(840.0, 560.0)
+                .visible(focus)
                 .build();
-        if let Err(error) = built {
-            let mut inner = self.inner.lock().expect("desktop state poisoned");
-            inner.project_windows.remove(&project.id);
-            inner.window_projects.remove(&label);
-            return Err(error.into());
+        let window = match built {
+            Ok(window) => window,
+            Err(error) => {
+                self.inner
+                    .lock()
+                    .expect("desktop state poisoned")
+                    .windows
+                    .remove_window(&label);
+                return Err(error.into());
+            }
+        };
+        if !focus {
+            window.show()?;
+        }
+        if focus {
+            window.set_focus()?;
         }
         Ok(())
     }
@@ -564,7 +601,30 @@ impl Core {
         });
     }
 
-    pub fn session_buffer(&self, session_id: &str) -> String {
+    pub fn attach_window_session(&self, label: &str, session_id: &str) -> Result<String> {
+        let mut inner = self.inner.lock().expect("desktop state poisoned");
+        let buffer = inner
+            .sessions
+            .get(session_id)
+            .map(|session| session.buffer.clone())
+            .ok_or_else(|| anyhow!("Terminal session not found."))?;
+        if !inner.windows.attach(label, session_id) {
+            return Err(anyhow!(
+                "Terminal window is no longer registered with the tray host."
+            ));
+        }
+        Ok(buffer)
+    }
+
+    pub fn detach_window_session(&self, label: &str, session_id: &str) {
+        self.inner
+            .lock()
+            .expect("desktop state poisoned")
+            .windows
+            .detach(label, session_id);
+    }
+
+    fn session_buffer(&self, session_id: &str) -> String {
         self.inner
             .lock()
             .expect("desktop state poisoned")
@@ -1035,7 +1095,7 @@ impl Core {
     }
 
     fn on_terminal_data(self: &Arc<Self>, session_id: &str, data: String) {
-        let reported_cwd = {
+        let (reported_cwd, window_clients) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
@@ -1044,20 +1104,23 @@ impl Core {
             truncate_front(&mut session.buffer, MAX_SCROLLBACK_BYTES);
             session.control_tail.push_str(&data);
             truncate_front(&mut session.control_tail, MAX_CONTROL_BYTES);
-            parse_working_directories(&session.control_tail)
+            let reported = parse_working_directories(&session.control_tail)
                 .into_iter()
                 .last()
                 .filter(|cwd| {
                     normalize_text_path(cwd) != normalize_text_path(&session.metadata.cwd)
-                })
+                });
+            (reported, inner.windows.subscribers(session_id))
         };
-        let _ = self.app.emit(
-            "desktop-data",
-            TerminalDataEvent {
-                session_id: session_id.to_string(),
-                data: data.clone(),
-            },
-        );
+        let event = TerminalDataEvent {
+            session_id: session_id.to_string(),
+            data: data.clone(),
+        };
+        for label in window_clients {
+            if let Some(window) = self.app.get_webview_window(&label) {
+                let _ = window.emit("desktop-data", event.clone());
+            }
+        }
         self.send_terminal_output(session_id, &data);
         if let Some(cwd) = reported_cwd {
             self.handle_session_working_directory(session_id, &cwd);
@@ -1091,7 +1154,7 @@ impl Core {
         let Ok(cwd) = canonical_directory(&cleaned) else {
             return;
         };
-        let (project, previous_project_id) = {
+        let (project, previous_project_id, active_window, displaced_window, old_has_sessions) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let Some(current) = inner
                 .sessions
@@ -1139,11 +1202,59 @@ impl Core {
                 session.metadata.cwd = cwd.to_string_lossy().into_owned();
                 session.metadata.project_id = project.id.clone();
             }
-            (project, current.project_id)
+            let project_changed = project.id != current.project_id;
+            let active_window = project_changed
+                .then(|| {
+                    inner
+                        .windows
+                        .window_for_project(&current.project_id)
+                        .map(str::to_owned)
+                })
+                .flatten();
+            let displaced_window = active_window
+                .as_ref()
+                .and_then(|label| inner.windows.assign(label, &project.id).displaced_window);
+            let old_has_sessions = project_changed
+                && inner
+                    .sessions
+                    .values()
+                    .any(|session| session.metadata.project_id == current.project_id);
+            (
+                project,
+                current.project_id,
+                active_window,
+                displaced_window,
+                old_has_sessions,
+            )
         };
         if project.id != previous_project_id {
-            let _ = self.ensure_project_window(&project.id);
-            self.cleanup_empty_temporary_project(&previous_project_id);
+            if let Some(label) = displaced_window
+                && let Some(window) = self.app.get_webview_window(&label)
+            {
+                let _ = window.destroy();
+            }
+
+            if let Some(label) = active_window {
+                if let Some(window) = self.app.get_webview_window(&label) {
+                    let _ = window.set_title(&format!("{} — Agent Terminal", project.name));
+                    if old_has_sessions {
+                        let _ = self.ensure_project_window_in_background(&previous_project_id);
+                    } else {
+                        self.cleanup_empty_temporary_project(&previous_project_id);
+                    }
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                    self.mark_window_focused(&label);
+                }
+            } else {
+                let _ = self.ensure_project_window(&project.id);
+                if old_has_sessions {
+                    let _ = self.ensure_project_window_in_background(&previous_project_id);
+                } else {
+                    self.cleanup_empty_temporary_project(&previous_project_id);
+                }
+            }
         }
         self.broadcast();
     }
@@ -1160,9 +1271,12 @@ impl Core {
                 return;
             }
             inner.temporary_projects.remove(project_id);
-            let label = inner.project_windows.remove(project_id);
+            let label = inner
+                .windows
+                .window_for_project(project_id)
+                .map(str::to_owned);
             if let Some(label) = &label {
-                inner.window_projects.remove(label);
+                inner.windows.remove_window(label);
             }
             label
         };
@@ -1231,8 +1345,7 @@ fn public_projects(inner: &Inner) -> Vec<Project> {
             .temporary_projects
             .values()
             .filter(|project| {
-                active.contains(project.id.as_str())
-                    || inner.project_windows.contains_key(&project.id)
+                active.contains(project.id.as_str()) || inner.windows.has_project(&project.id)
             })
             .cloned(),
     );

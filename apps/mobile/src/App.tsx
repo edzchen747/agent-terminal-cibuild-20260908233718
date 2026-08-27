@@ -85,6 +85,7 @@ export function App() {
       const payload: PairingPayload = parsePairingPayload(raw.trim());
       const platform = (Capacitor.getPlatform() === "ios" ? "ios" : Capacitor.getPlatform() === "android" ? "android" : "web") as Platform;
       const next = await HostConnection.pair(payload, { id: crypto.randomUUID(), name: mobileName(), platform });
+      connection?.close();
       setConnection(next); setSnapshot(next.snapshot ?? null); setStatus("connected"); setView({ type: "home" });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Pairing failed."); setStatus("pairing");

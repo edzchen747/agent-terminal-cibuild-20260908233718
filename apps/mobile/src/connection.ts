@@ -21,6 +21,7 @@ type EventMap = {
 
 export class HostConnection {
   private socket?: WebSocket;
+  private intentionalClose = false;
   private readonly connectionId = crypto.randomUUID();
   private pending = new Map<string, { resolve: (message: ServerMessage) => void; reject: (error: Error) => void }>();
   private listeners = new Map<keyof EventMap, Set<(value: never) => void>>();
@@ -40,13 +41,18 @@ export class HostConnection {
 
   static async pair(payload: PairingPayload, device: DeviceIdentity): Promise<HostConnection> {
     const temporary = new HostConnection({ id: payload.hostId, name: payload.hostName, endpoint: payload.endpoint, transport: payload.transport, deviceId: device.id, deviceToken: "" });
-    await temporary.open();
-    const response = await temporary.request({ type: "pair", requestId: createRequestId(), token: payload.pairingToken, device });
-    if (response.type !== "pair.accepted") throw new Error("The desktop rejected the pairing request.");
-    temporary.host.deviceToken = response.deviceToken;
-    temporary.snapshot = response.snapshot;
-    await Preferences.set({ key: HOST_KEY, value: JSON.stringify(temporary.host) });
-    return temporary;
+    try {
+      await temporary.open();
+      const response = await temporary.request({ type: "pair", requestId: createRequestId(), token: payload.pairingToken, device });
+      if (response.type !== "pair.accepted") throw new Error("The desktop rejected the pairing request.");
+      temporary.host.deviceToken = response.deviceToken;
+      temporary.snapshot = response.snapshot;
+      await Preferences.set({ key: HOST_KEY, value: JSON.stringify(temporary.host) });
+      return temporary;
+    } catch (error) {
+      temporary.close();
+      throw error;
+    }
   }
 
   async connect(): Promise<HostSnapshot> {
@@ -84,10 +90,17 @@ export class HostConnection {
     return () => callbacks.delete(callback as (value: never) => void);
   }
 
-  close(): void { this.socket?.close(); }
+  close(): void {
+    this.intentionalClose = true;
+    const socket = this.socket;
+    this.socket = undefined;
+    socket?.close();
+    this.rejectAll(new Error("Connection closed."));
+  }
 
   private open(): Promise<void> {
     return new Promise((resolve, reject) => {
+      this.intentionalClose = false;
       const socket = new WebSocket(this.host.endpoint);
       const timeout = window.setTimeout(() => { socket.close(); reject(new Error("Could not reach the desktop. Check the relay or desktop connection.")); }, 8_000);
       socket.onopen = () => {
@@ -99,7 +112,11 @@ export class HostConnection {
         resolve();
       };
       socket.onerror = () => { window.clearTimeout(timeout); reject(new Error("Could not reach the desktop host.")); };
-      socket.onclose = () => { this.rejectAll(new Error("Desktop disconnected.")); this.emit("disconnected", undefined); };
+      socket.onclose = () => {
+        if (this.socket === socket) this.socket = undefined;
+        this.rejectAll(new Error("Desktop disconnected."));
+        if (!this.intentionalClose) this.emit("disconnected", undefined);
+      };
       socket.onmessage = (event) => this.receive(String(event.data));
     });
   }

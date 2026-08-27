@@ -3,6 +3,7 @@ mod models;
 mod remote;
 mod shells;
 mod store;
+mod window_clients;
 
 use std::sync::Arc;
 
@@ -115,8 +116,19 @@ fn resize_session(
 }
 
 #[tauri::command]
-fn get_buffer(state: State<'_, Arc<Core>>, session_id: String) -> String {
-    state.session_buffer(&session_id)
+fn attach_session(
+    window: WebviewWindow,
+    state: State<'_, Arc<Core>>,
+    session_id: String,
+) -> Result<String, String> {
+    state
+        .attach_window_session(window.label(), &session_id)
+        .map_err(error_string)
+}
+
+#[tauri::command]
+fn detach_session(window: WebviewWindow, state: State<'_, Arc<Core>>, session_id: String) {
+    state.detach_window_session(window.label(), &session_id);
 }
 
 #[tauri::command]
@@ -162,14 +174,15 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| match event {
-            tauri::WindowEvent::CloseRequested { api, .. } => {
-                api.prevent_close();
-                let _ = window.hide();
-            }
             tauri::WindowEvent::Focused(true) => {
                 window
                     .state::<Arc<Core>>()
                     .mark_window_focused(window.label());
+            }
+            tauri::WindowEvent::Destroyed => {
+                window
+                    .state::<Arc<Core>>()
+                    .unregister_window(window.label());
             }
             _ => {}
         })
@@ -183,7 +196,8 @@ pub fn run() {
             close_session,
             write_session,
             resize_session,
-            get_buffer,
+            attach_session,
+            detach_session,
             copy_text,
             start_pairing,
             revoke_device,
@@ -192,10 +206,14 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Agent Terminal");
 
-    app.run(|handle, event| {
-        if let tauri::RunEvent::Exit = event {
-            handle.state::<Arc<Core>>().shutdown();
+    app.run(|handle, event| match event {
+        tauri::RunEvent::ExitRequested { api, .. }
+            if !handle.state::<Arc<Core>>().exit_requested() =>
+        {
+            api.prevent_exit();
         }
+        tauri::RunEvent::Exit => handle.state::<Arc<Core>>().shutdown(),
+        _ => {}
     });
 }
 
@@ -209,6 +227,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| {
             if event.id.as_ref() == "exit" {
+                app.state::<Arc<Core>>().request_exit();
                 app.state::<Arc<Core>>().shutdown();
                 app.exit(0);
             }

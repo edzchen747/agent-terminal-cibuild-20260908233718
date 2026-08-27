@@ -5,11 +5,12 @@
 - The Windows desktop runtime uses Tauri 2 with a Rust authority process; Electron, Electron Builder, Node PTY, and a Node desktop WebSocket process are not shipped.
 - The desktop web UI, Rust backend, ConPTY integration, connection host, and tray behavior compile into one portable `agent-terminal.exe` with no installation step or sidecar process.
 - The portable executable uses the WebView2 runtime provided by supported Windows 10 and Windows 11 systems.
-- The Tauri process creates a system-tray icon and remains the owner of terminal sessions, pairing, direct WebSockets, relay connections, authorization, and desktop state while terminal windows are hidden.
+- The Tauri process creates a system-tray icon and remains the sole owner of terminal sessions, pairing, direct WebSockets, relay connections, authorization, and desktop state independently of terminal-window lifetimes.
 - Only one desktop host process may run at a time. Launching the executable again focuses the existing terminal window so every QR grant is issued by the process that owns the connection port.
+- Every terminal window is a disposable client of the tray host. It explicitly attaches to visible sessions, receives an atomic scrollback-plus-live-output stream, and sends all terminal input and resize operations back to the tray authority.
 - Left-clicking the tray icon opens or restores the terminal application.
 - Right-clicking the tray icon opens a native menu containing an Exit action.
-- Closing a terminal window hides that window without stopping the tray host or active mobile connections. Exit from the tray is the explicit full-process shutdown path.
+- Closing a terminal window destroys only that window client without stopping PTYs, the tray host, or active mobile connections. Exit from the tray is the explicit full-process shutdown path.
 - The tray host is the extension point for additional connection methods added later.
 
 ## Pairing
@@ -43,6 +44,7 @@
 - Terminal bytes travel over the live paired connection with resize and scrollback support.
 - Desktop clicks and mobile taps force a PTY resize notification even when the cell dimensions are unchanged.
 - Shell working-directory reports move sessions to the longest matching saved project, or to a temporary project for an unknown folder.
+- When an active session changes to another project, its current window switches to the new project and removes the old project's tabs. Any remaining old-project tabs move into a replacement window opened behind the current window.
 - Mobile accessibility keys form animated three-second chords; mobile keyboard input consumes armed modifiers immediately.
 - Desktop Ctrl+C copies when terminal text is selected; with no selection it must continue to send the shell interrupt signal.
 - A successful selection copy displays a brief toast positioned above the selected terminal text.

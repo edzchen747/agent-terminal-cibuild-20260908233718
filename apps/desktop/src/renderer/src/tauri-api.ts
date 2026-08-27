@@ -10,13 +10,15 @@ interface TerminalDataEvent {
 const stateListeners = new Set<(state: DesktopState) => void>();
 const dataListeners = new Set<(sessionId: string, data: string) => void>();
 
-void listen<DesktopState>("desktop-state", ({ payload }) => {
+const stateBridgeReady = listen<DesktopState>("desktop-state", ({ payload }) => {
   for (const listener of stateListeners) listener(payload);
 });
 
-void listen<TerminalDataEvent>("desktop-data", ({ payload }) => {
+const dataBridgeReady = listen<TerminalDataEvent>("desktop-data", ({ payload }) => {
   for (const listener of dataListeners) listener(payload.sessionId, payload.data);
 });
+
+void stateBridgeReady;
 
 const api: DesktopApi = {
   getState: () => invoke("get_state"),
@@ -28,7 +30,11 @@ const api: DesktopApi = {
   closeSession: (sessionId) => invoke("close_session", { sessionId }),
   write: (sessionId, data) => { void invoke("write_session", { sessionId, data }); },
   resize: (sessionId, cols, rows, force) => { void invoke("resize_session", { sessionId, cols, rows, force }); },
-  getBuffer: (sessionId) => invoke("get_buffer", { sessionId }),
+  attachSession: async (sessionId) => {
+    await dataBridgeReady;
+    return invoke("attach_session", { sessionId });
+  },
+  detachSession: (sessionId) => { void invoke("detach_session", { sessionId }); },
   copyText: (text) => invoke("copy_text", { text }),
   startPairing: () => invoke("start_pairing"),
   revokeDevice: (deviceId) => invoke("revoke_device", { deviceId }),
