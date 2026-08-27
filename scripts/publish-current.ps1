@@ -1,5 +1,6 @@
 param(
-  [string]$Repository = 'edzchen747/agent-terminal'
+  [string]$Repository = 'edzchen747/agent-terminal',
+  [string]$CommitMessage = 'chore: publish workspace'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -59,6 +60,6 @@ foreach ($relative in @(Get-WorkspaceFiles)) {
 }
 
 $tree = Invoke-GhJson "repos/$Repository/git/trees" 'POST' @{ base_tree = $baseTree; tree = @($entries) }
-$commit = Invoke-GhJson "repos/$Repository/git/commits" 'POST' @{ message = 'feat: make pairing persistent across networks'; tree = $tree.sha; parents = @($parentCommit) }
+$commit = Invoke-GhJson "repos/$Repository/git/commits" 'POST' @{ message = $CommitMessage; tree = $tree.sha; parents = @($parentCommit) }
 Invoke-GhJson "repos/$Repository/git/refs/heads/main" 'PATCH' @{ ref = 'refs/heads/main'; sha = $commit.sha } | Out-Null
 Write-Host "Published $Repository at $($commit.sha)"

@@ -1,6 +1,34 @@
 export const PROTOCOL_VERSION = 1 as const;
 
 export type Platform = "android" | "ios" | "web";
+export type TerminalModifier = "ctrl" | "alt" | "shift";
+
+export function applyTerminalModifiers(value: string, modifiers: ReadonlySet<TerminalModifier>): string {
+  let output = value;
+
+  if (modifiers.has("shift") && Array.from(output).length === 1) {
+    output = output.toUpperCase();
+  }
+
+  if (modifiers.has("ctrl") && Array.from(output).length === 1) {
+    const character = output.toUpperCase();
+    const code = character.charCodeAt(0);
+
+    if (code >= 0x40 && code <= 0x5f) {
+      output = String.fromCharCode(code & 0x1f);
+    } else if (character === " ") {
+      output = "\x00";
+    } else if (character === "?") {
+      output = "\x7f";
+    }
+  }
+
+  if (modifiers.has("alt")) {
+    output = `\x1b${output}`;
+  }
+
+  return output;
+}
 
 export interface DeviceIdentity {
   id: string;

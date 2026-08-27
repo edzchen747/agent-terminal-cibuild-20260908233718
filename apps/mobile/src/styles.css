@@ -81,7 +81,8 @@ button { color: inherit; }
 .mobile-terminal-shell { flex: 1; min-height: 0; display: grid; grid-template-rows: 1fr auto; }
 .mobile-terminal { min-height: 0; padding: 8px 5px 4px 8px; overflow: hidden; }
 .mobile-terminal .xterm { height: 100%; }
-.mobile-terminal .xterm-viewport { scrollbar-width: none; }
+.mobile-terminal .xterm-viewport, .mobile-terminal .xterm-screen { touch-action: none; }
+.mobile-terminal .xterm-viewport, .mobile-terminal .xterm-scrollable-element > .scrollbar { scrollbar-width: none; }
 .extra-keys { padding: 6px 5px calc(7px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: 5px; border-top: 1px solid #222832; background: #0e1218; overflow: hidden; }
 .key-row { display: flex; gap: 5px; overflow-x: auto; scrollbar-width: none; }
 .key-row button { min-width: 43px; height: 36px; flex: 1 0 auto; padding: 0 8px; border: 1px solid #2a303a; border-radius: 7px; background: linear-gradient(#1a1f27,#131820); color: #9ba3af; font-family: "Roboto Mono", monospace; font-size: 10px; box-shadow: 0 2px 0 #05070a; }
@@ -129,4 +130,3 @@ button { color: inherit; }
 .offline-icon svg { width: 31px; height: 31px; }
 .error-screen h1 { margin: 20px 0 7px; color: #e9ecf2; font-size: 23px; }.error-screen p { max-width: 320px; margin: 0 0 25px; color: #737d8c; font-size: 11px; line-height: 1.55; }
 @media (min-width: 700px) { .mobile-app,.onboarding,.splash,.error-screen { max-width: 520px; margin: auto; border-left: 1px solid #20252e; border-right: 1px solid #20252e; } }
-

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PROTOCOL_VERSION, encodeMessage, parsePairingPayload } from "./index.js";
+import { PROTOCOL_VERSION, applyTerminalModifiers, encodeMessage, parsePairingPayload } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -16,4 +16,16 @@ test("pairing payloads round-trip", () => {
 
 test("messages encode as JSON", () => {
   assert.equal(encodeMessage({ type: "snapshot.request", requestId: "r1" }), '{"type":"snapshot.request","requestId":"r1"}');
+});
+
+test("mobile terminal modifiers encode control characters", () => {
+  assert.equal(applyTerminalModifiers("d", new Set(["ctrl"])), "\x04");
+  assert.equal(applyTerminalModifiers("c", new Set(["ctrl"])), "\x03");
+  assert.equal(applyTerminalModifiers("d", new Set(["ctrl", "alt"])), "\x1b\x04");
+  assert.equal(applyTerminalModifiers("a", new Set(["shift"])), "A");
+});
+
+test("control modifiers do not corrupt paste or unsupported characters", () => {
+  assert.equal(applyTerminalModifiers("echo hello", new Set(["ctrl"])), "echo hello");
+  assert.equal(applyTerminalModifiers("1", new Set(["ctrl"])), "1");
 });
