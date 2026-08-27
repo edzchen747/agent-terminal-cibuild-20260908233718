@@ -29,6 +29,9 @@ test("mobile terminal modifiers encode control characters", () => {
   assert.equal(applyTerminalModifiers("a", new Set(["shift"])), "A");
   assert.equal(applyTerminalModifiers("\t", new Set(["shift"])), "\x1b[Z");
   assert.equal(applyTerminalModifiers("\x1b[D", new Set(["ctrl"])), "\x1b[1;5D");
+  assert.equal(applyTerminalModifiers("\x7f", new Set(["ctrl"])), "\x17");
+  assert.equal(applyTerminalModifiers("\x08", new Set(["ctrl"])), "\x17");
+  assert.equal(applyTerminalModifiers("\x7f", new Set(["ctrl", "alt"])), "\x1b\x17");
 });
 
 test("control modifiers do not corrupt paste or unsupported characters", () => {

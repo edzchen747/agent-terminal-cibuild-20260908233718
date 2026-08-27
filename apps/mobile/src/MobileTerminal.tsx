@@ -17,10 +17,10 @@ interface AccessibilityKey {
 
 const ACCESSIBILITY_KEY_ROWS: AccessibilityKey[][] = [
   [
+    { id: "esc", label: "Esc", value: "\x1b" },
     { id: "ctrl", label: "Ctrl", modifier: "ctrl" },
     { id: "alt", label: "Alt", modifier: "alt" },
     { id: "shift", label: "Shift", modifier: "shift" },
-    { id: "esc", label: "Esc", value: "\x1b" },
     { id: "tab", label: "Tab", value: "\t" },
     { id: "pipe", label: "|", value: "|" },
     { id: "tilde", label: "~", value: "~" }
@@ -34,7 +34,6 @@ const ACCESSIBILITY_KEY_ROWS: AccessibilityKey[][] = [
     { id: "down", label: "↓", value: "\x1b[B" },
     { id: "right", label: "→", value: "\x1b[C" },
     { id: "word-right", label: "⌃→", value: "\x1b[1;5C" },
-    { id: "backspace", label: "⌫", value: "\x7f" },
     { id: "enter", label: "Enter", value: "\r" }
   ]
 ];
@@ -96,6 +95,8 @@ export function MobileTerminal({ connection, session }: Props) {
       fontSize: 12,
       lineHeight: 1.18,
       scrollback: 5000,
+      screenReaderMode: true,
+      overviewRuler: { width: 28 },
       smoothScrollDuration: 75,
       theme: { background: "#080b0f", foreground: "#d7dce6", cursor: "#79ddc7", selectionBackground: "#315b64aa" }
     });
@@ -160,6 +161,14 @@ export function MobileTerminal({ connection, session }: Props) {
     const screen = hostElement.querySelector<HTMLElement>(".xterm-screen");
     let activeTouchId: number | undefined;
     let previousTouchY: number | undefined;
+    let touchStartX: number | undefined;
+    let touchStartY: number | undefined;
+    let touchStartedAt = 0;
+    let touchMoved = false;
+    let selectionGesture = false;
+    let scrollbarGesture = false;
+    let suppressTap = false;
+    let tapTimer: number | undefined;
     const findTouch = (touches: TouchList, identifier: number) => {
       for (let index = 0; index < touches.length; index += 1) {
         const touch = touches.item(index);
@@ -170,6 +179,40 @@ export function MobileTerminal({ connection, session }: Props) {
     const resetTouch = () => {
       activeTouchId = undefined;
       previousTouchY = undefined;
+      touchStartX = undefined;
+      touchStartY = undefined;
+      touchMoved = false;
+      selectionGesture = false;
+      scrollbarGesture = false;
+      suppressTap = false;
+    };
+    const moveCursorToTouch = (clientX: number, clientY: number) => {
+      terminal.focus();
+      resize(true);
+      if (!screen || terminal.hasSelection() || terminal.modes.mouseTrackingMode !== "none") return;
+
+      const buffer = terminal.buffer.active;
+      if (buffer.type !== "normal") return;
+      const bounds = screen.getBoundingClientRect();
+      if (!bounds.width || !bounds.height || clientX < bounds.left || clientX > bounds.right || clientY < bounds.top || clientY > bounds.bottom) return;
+
+      const targetColumn = Math.max(0, Math.min(terminal.cols, Math.round((clientX - bounds.left) / (bounds.width / terminal.cols))));
+      const viewportRow = Math.max(0, Math.min(terminal.rows - 1, Math.floor((clientY - bounds.top) / (bounds.height / terminal.rows))));
+      const targetRow = buffer.viewportY + viewportRow;
+      const cursorRow = buffer.baseY + buffer.cursorY;
+
+      let inputStartRow = cursorRow;
+      while (inputStartRow > 0 && buffer.getLine(inputStartRow)?.isWrapped) inputStartRow -= 1;
+      let inputEndRow = cursorRow;
+      while (inputEndRow + 1 < buffer.length && buffer.getLine(inputEndRow + 1)?.isWrapped) inputEndRow += 1;
+      if (targetRow < inputStartRow || targetRow > inputEndRow) return;
+
+      const targetOffset = (targetRow - inputStartRow) * terminal.cols + targetColumn;
+      const cursorOffset = (cursorRow - inputStartRow) * terminal.cols + buffer.cursorX;
+      const distance = targetOffset - cursorOffset;
+      if (!distance) return;
+      const arrow = distance < 0 ? "\x1b[D" : "\x1b[C";
+      connection.send({ type: "session.input", sessionId: session.id, data: arrow.repeat(Math.abs(distance)) });
     };
     const handleTouchStart = (event: TouchEvent) => {
       if (event.touches.length !== 1) {
@@ -178,13 +221,25 @@ export function MobileTerminal({ connection, session }: Props) {
       }
       const touch = event.touches.item(0);
       if (!touch) return;
+      suppressTap = tapTimer !== undefined;
+      if (tapTimer !== undefined) window.clearTimeout(tapTimer);
+      tapTimer = undefined;
       activeTouchId = touch.identifier;
       previousTouchY = touch.clientY;
+      touchStartX = touch.clientX;
+      touchStartY = touch.clientY;
+      touchStartedAt = performance.now();
+      touchMoved = false;
+      selectionGesture = terminal.hasSelection();
+      scrollbarGesture = event.target instanceof Element && Boolean(event.target.closest(".scrollbar.vertical"));
     };
     const handleTouchMove = (event: TouchEvent) => {
-      if (activeTouchId === undefined || previousTouchY === undefined || terminal.hasSelection()) return;
+      if (activeTouchId === undefined || previousTouchY === undefined) return;
       const touch = findTouch(event.touches, activeTouchId);
       if (!touch) return;
+      if (scrollbarGesture) return;
+      if (touchStartX !== undefined && touchStartY !== undefined && Math.hypot(touch.clientX - touchStartX, touch.clientY - touchStartY) > 7) touchMoved = true;
+      if (selectionGesture || terminal.hasSelection()) return;
       const deltaY = touch.clientY - previousTouchY;
       previousTouchY = touch.clientY;
       if (Math.abs(deltaY) < 0.5) return;
@@ -197,9 +252,22 @@ export function MobileTerminal({ connection, session }: Props) {
         deltaY
       }));
     };
+    const handleTouchEnd = (event: TouchEvent) => {
+      if (activeTouchId === undefined) return resetTouch();
+      const touch = findTouch(event.changedTouches, activeTouchId);
+      const isQuickTap = performance.now() - touchStartedAt < 420;
+      if (touch && isQuickTap && !touchMoved && !selectionGesture && !scrollbarGesture && !suppressTap) {
+        const { clientX, clientY } = touch;
+        tapTimer = window.setTimeout(() => {
+          tapTimer = undefined;
+          moveCursorToTouch(clientX, clientY);
+        }, 280);
+      }
+      resetTouch();
+    };
     hostElement.addEventListener("touchstart", handleTouchStart, { passive: true });
     hostElement.addEventListener("touchmove", handleTouchMove, { passive: false });
-    hostElement.addEventListener("touchend", resetTouch, { passive: true });
+    hostElement.addEventListener("touchend", handleTouchEnd, { passive: true });
     hostElement.addEventListener("touchcancel", resetTouch, { passive: true });
 
     const attachment = connection.request({ type: "session.attach", requestId: createRequestId(), sessionId: session.id, cols: terminal.cols, rows: terminal.rows }).then((message) => {
@@ -221,8 +289,9 @@ export function MobileTerminal({ connection, session }: Props) {
       window.removeEventListener("pointerdown", handlePointerActivity, true);
       hostElement.removeEventListener("touchstart", handleTouchStart);
       hostElement.removeEventListener("touchmove", handleTouchMove);
-      hostElement.removeEventListener("touchend", resetTouch);
+      hostElement.removeEventListener("touchend", handleTouchEnd);
       hostElement.removeEventListener("touchcancel", resetTouch);
+      if (tapTimer !== undefined) window.clearTimeout(tapTimer);
       if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
       input.dispose(); output(); terminal.dispose(); terminalRef.current = null;
       resizeRef.current = () => undefined;

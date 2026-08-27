@@ -54,5 +54,8 @@
 - User-facing and persisted Windows paths omit the verbatim `\\?\` prefix, including PowerShell prompts and saved project working directories.
 - Changing the terminal type replaces the active session in place when it is still pristine; after the user has entered input, the selection changes only the default for future sessions.
 - Mobile accessibility keys form animated three-second chords; mobile keyboard input consumes armed modifiers immediately.
+- The mobile terminal supports native long-press and double-tap text selection with draggable Android selection handles, while terminal taps move the shell input cursor without overriding alternate-screen TUI mouse handling.
+- The mobile terminal scrollbar uses a forgiving touch target while retaining a slim visual thumb.
+- The mobile utility row places Esc before Ctrl and does not duplicate the software keyboard's Backspace key; an armed Ctrl converts software-keyboard Backspace into a previous-word erase.
 - Desktop Ctrl+C copies when terminal text is selected; with no selection it must continue to send the shell interrupt signal.
 - A successful selection copy displays a brief toast positioned above the selected terminal text.

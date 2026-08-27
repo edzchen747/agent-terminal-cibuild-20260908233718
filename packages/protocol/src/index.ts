@@ -18,7 +18,11 @@ export function applyTerminalModifiers(value: string, modifiers: ReadonlySet<Ter
     output = output.toUpperCase();
   }
 
-  if (modifiers.has("ctrl") && Array.from(output).length === 1) {
+  if (modifiers.has("ctrl") && (output === "\x7f" || output === "\x08")) {
+    // Mobile keyboards report Backspace as DEL or BS. Ctrl+Backspace should
+    // erase the previous word consistently across PowerShell, cmd and Bash.
+    output = "\x17";
+  } else if (modifiers.has("ctrl") && Array.from(output).length === 1) {
     const character = output.toUpperCase();
     const code = character.charCodeAt(0);
 
