@@ -1,5 +1,16 @@
 # Updated acceptance criteria
 
+## Desktop runtime and distribution
+
+- The Windows desktop runtime uses Tauri 2 with a Rust authority process; Electron, Electron Builder, Node PTY, and a Node desktop WebSocket process are not shipped.
+- The desktop web UI, Rust backend, ConPTY integration, connection host, and tray behavior compile into one portable `agent-terminal.exe` with no installation step or sidecar process.
+- The portable executable uses the WebView2 runtime provided by supported Windows 10 and Windows 11 systems.
+- The Tauri process creates a system-tray icon and remains the owner of terminal sessions, pairing, direct WebSockets, relay connections, authorization, and desktop state while terminal windows are hidden.
+- Left-clicking the tray icon opens or restores the terminal application.
+- Right-clicking the tray icon opens a native menu containing an Exit action.
+- Closing a terminal window hides that window without stopping the tray host or active mobile connections. Exit from the tray is the explicit full-process shutdown path.
+- The tray host is the extension point for additional connection methods added later.
+
 ## Pairing
 
 - QR scanning is a one-time device-binding process for each phone.

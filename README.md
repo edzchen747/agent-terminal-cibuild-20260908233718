@@ -1,6 +1,6 @@
 # Agent Terminal
 
-Agent Terminal is a Windows terminal host with an Android-first companion app. It runs real interactive shells through Windows ConPTY, renders them with xterm.js, and lets an authorized phone create projects, open terminal sessions, and interact with those sessions remotely.
+Agent Terminal is a portable Tauri 2 Windows terminal host with an Android-first companion app. Its Rust tray process runs real interactive shells through Windows ConPTY, renders them with xterm.js, and lets an authorized phone create projects, open terminal sessions, and interact with those sessions remotely.
 
 This repository is an end-to-end MVP, not a UI-only prototype.
 
@@ -8,6 +8,9 @@ This repository is an end-to-end MVP, not a UI-only prototype.
 
 ### Windows desktop
 
+- One portable `agent-terminal.exe`; there is no installer, Electron runtime, Node sidecar, or separate connection process.
+- A native tray host owns terminal sessions and all direct/relay connections even when terminal windows are hidden.
+- Left-clicking the tray icon restores the terminal. Right-clicking opens a menu with Exit.
 - Interactive ConPTY terminal sessions with Command Prompt, Windows PowerShell, PowerShell 7, WSL, and Git Bash detection.
 - A collapsible project sidebar. Opening a different project creates/focuses a dedicated desktop window.
 - Multiple terminal tabs per project.
@@ -40,7 +43,7 @@ The mobile app persists only its host identity, endpoint, device ID, and device 
 
 ```text
 apps/
-  desktop/       Electron host, ConPTY manager, remote server, desktop UI
+  desktop/       Tauri/Rust tray host, ConPTY manager, connection server, React desktop UI
   mobile/        React mobile UI and Capacitor Android project
 packages/
   protocol/      Shared typed wire protocol and data model
@@ -52,6 +55,8 @@ docs/            Architecture and security notes
 
 - Windows 10 1809 or newer (Windows 11 recommended).
 - Node.js 22 or newer.
+- Rust stable and the Microsoft C++ desktop build tools for local desktop compilation.
+- Microsoft Edge WebView2 at runtime. Supported Windows 10/11 systems normally include it.
 - Android Studio with Java 21 and Android SDK 36 to build the Android APK.
 - A deployed WebSocket relay for cross-network use. The desktop connects to it with `AGENT_TERMINAL_RELAY_URL`.
 
@@ -90,15 +95,17 @@ npm run bootstrap
 npm run dev
 ```
 
-The bootstrap helper keeps npm and Electron caches inside this repository. At runtime, an installed desktop build stores its user data in Electron's normal per-user application data directory.
+The bootstrap helper keeps npm and Cargo caches inside this repository. At runtime, the portable desktop executable stores its desktop-owned state in Tauri's normal per-user application data directory. Closing all terminal windows leaves the tray host and active connections running.
 
-To create a Windows installer:
+For isolated development or automated tests, set `AGENT_TERMINAL_DATA_DIR` to keep the desktop state in a specific directory.
+
+To create the portable Windows executable:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 ```
 
-The installer is written to `apps/desktop/release`.
+The self-contained application executable is written to `apps/desktop/src-tauri/target/release/agent-terminal.exe`. It embeds the desktop web assets and Rust backend. It relies on the system WebView2 runtime rather than bundling a second browser engine.
 
 ## Run and build Android
 
@@ -124,6 +131,7 @@ Then build/run from Android Studio. The QR scanner requires a physical device or
 3. Open the mobile app and scan the QR code once.
 4. The phone saves only that host connection. Future launches authenticate automatically from any network until the desktop revokes the phone.
 5. Open a project to see its live sessions, or create a terminal. A project without a current desktop window opens in a new window; another session in that project appears as a new tab.
+6. Close terminal windows to leave the host running in the tray. Use the tray's Exit menu item for a full shutdown.
 
 See [Architecture](docs/ARCHITECTURE.md) and [Security](docs/SECURITY.md) for implementation details and production-hardening guidance.
 
@@ -133,6 +141,7 @@ See [Architecture](docs/ARCHITECTURE.md) and [Security](docs/SECURITY.md) for im
 npm run typecheck
 npm run test
 npm run build
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
 ```
 
 ## Current product boundary

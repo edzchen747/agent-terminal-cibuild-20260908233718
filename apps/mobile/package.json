@@ -1,11 +1,11 @@
 {
   "name": "@agentterminal/mobile",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
-    "build": "vite build",
+    "build": "vite build --configLoader runner",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "android:add": "cap add android",
     "android:sync": "npm run build && cap sync android",

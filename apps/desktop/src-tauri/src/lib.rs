@@ -1,0 +1,270 @@
+mod core;
+mod models;
+mod remote;
+mod shells;
+mod store;
+
+use std::sync::Arc;
+
+use arboard::Clipboard;
+use core::Core;
+use models::{DesktopState, PairingPayload, Project, TerminalSession};
+use store::DesktopStore;
+use tauri::{
+    Manager, State, WebviewWindow,
+    image::Image,
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+};
+
+#[tauri::command]
+fn get_state(window: WebviewWindow, state: State<'_, Arc<Core>>) -> DesktopState {
+    state.state_for_window(window.label())
+}
+
+#[tauri::command]
+async fn create_project(state: State<'_, Arc<Core>>) -> Result<Option<Project>, String> {
+    let core = Arc::clone(state.inner());
+    let folder = rfd::AsyncFileDialog::new()
+        .set_title("Choose a project folder")
+        .pick_folder()
+        .await;
+    let Some(folder) = folder else {
+        return Ok(None);
+    };
+    let path = folder.path().to_string_lossy().into_owned();
+    let name = folder
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Project");
+    let project = core
+        .create_persistent_project(name, &path)
+        .map_err(error_string)?;
+    let has_session = core
+        .snapshot()
+        .sessions
+        .iter()
+        .any(|session| session.project_id == project.id);
+    if !has_session {
+        core.create_session(&project.id, None)
+            .map_err(error_string)?;
+    } else {
+        core.ensure_project_window(&project.id)
+            .map_err(error_string)?;
+    }
+    Ok(Some(project))
+}
+
+#[tauri::command]
+fn remove_project(state: State<'_, Arc<Core>>, project_id: String) -> Result<(), String> {
+    state
+        .set_project_persistence(&project_id, false)
+        .map(|_| ())
+        .map_err(error_string)
+}
+
+#[tauri::command]
+fn set_project_persistent(
+    state: State<'_, Arc<Core>>,
+    project_id: String,
+    persistent: bool,
+) -> Result<Project, String> {
+    state
+        .set_project_persistence(&project_id, persistent)
+        .map_err(error_string)
+}
+
+#[tauri::command]
+fn open_project(state: State<'_, Arc<Core>>, project_id: String) -> Result<(), String> {
+    Arc::clone(state.inner())
+        .open_project(&project_id)
+        .map_err(error_string)
+}
+
+#[tauri::command]
+fn create_session(
+    state: State<'_, Arc<Core>>,
+    project_id: String,
+    shell_id: Option<String>,
+) -> Result<TerminalSession, String> {
+    Arc::clone(state.inner())
+        .create_session(&project_id, shell_id.as_deref())
+        .map_err(error_string)
+}
+
+#[tauri::command]
+fn close_session(state: State<'_, Arc<Core>>, session_id: String) {
+    Arc::clone(state.inner()).close_session(&session_id);
+}
+
+#[tauri::command]
+fn write_session(state: State<'_, Arc<Core>>, session_id: String, data: String) {
+    state.write_session(&session_id, &data);
+}
+
+#[tauri::command]
+fn resize_session(
+    state: State<'_, Arc<Core>>,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+    force: Option<bool>,
+) {
+    state.resize_session(&session_id, cols, rows, force.unwrap_or(false));
+}
+
+#[tauri::command]
+fn get_buffer(state: State<'_, Arc<Core>>, session_id: String) -> String {
+    state.session_buffer(&session_id)
+}
+
+#[tauri::command]
+fn copy_text(text: String) -> Result<(), String> {
+    Clipboard::new()
+        .and_then(|mut clipboard| clipboard.set_text(text))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn start_pairing(state: State<'_, Arc<Core>>) -> PairingPayload {
+    state.start_pairing()
+}
+
+#[tauri::command]
+fn revoke_device(state: State<'_, Arc<Core>>, device_id: String) -> Result<(), String> {
+    state.revoke_device(&device_id).map_err(error_string)
+}
+
+#[tauri::command]
+fn set_default_shell(state: State<'_, Arc<Core>>, shell_id: String) -> Result<(), String> {
+    state.set_default_shell(&shell_id).map_err(error_string)
+}
+
+pub fn run() {
+    let app = tauri::Builder::default()
+        .setup(|app| {
+            let data_path = std::env::var_os("AGENT_TERMINAL_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or(app.path().app_data_dir()?)
+                .join("agent-terminal.json");
+            let store = DesktopStore::load(data_path)?;
+            let core = Core::new(app.handle().clone(), store);
+            app.manage(Arc::clone(&core));
+            build_tray(app)?;
+            core.initialize()?;
+            remote::start(core);
+            Ok(())
+        })
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+            tauri::WindowEvent::Focused(true) => {
+                window
+                    .state::<Arc<Core>>()
+                    .mark_window_focused(window.label());
+            }
+            _ => {}
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_state,
+            create_project,
+            remove_project,
+            set_project_persistent,
+            open_project,
+            create_session,
+            close_session,
+            write_session,
+            resize_session,
+            get_buffer,
+            copy_text,
+            start_pairing,
+            revoke_device,
+            set_default_shell,
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building Agent Terminal");
+
+    app.run(|handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            handle.state::<Arc<Core>>().shutdown();
+        }
+    });
+}
+
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    let exit = MenuItem::with_id(app, "exit", "Exit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&exit])?;
+    TrayIconBuilder::with_id("agent-terminal")
+        .icon(tray_icon())
+        .tooltip("Agent Terminal")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| {
+            if event.id.as_ref() == "exit" {
+                app.state::<Arc<Core>>().shutdown();
+                app.exit(0);
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let core = Arc::clone(tray.app_handle().state::<Arc<Core>>().inner());
+                core.show_terminal_window();
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+fn tray_icon() -> Image<'static> {
+    let width = 32_u32;
+    let height = 32_u32;
+    let mut rgba = vec![0_u8; (width * height * 4) as usize];
+    for y in 3..29 {
+        for x in 3..29 {
+            let rounded_corner = !(6..=26).contains(&x) && !(6..=26).contains(&y);
+            if rounded_corner {
+                continue;
+            }
+            set_pixel(&mut rgba, width, x, y, [22, 29, 38, 255]);
+        }
+    }
+    for offset in 0..8 {
+        set_pixel(
+            &mut rgba,
+            width,
+            9 + offset,
+            10 + offset / 2,
+            [126, 224, 201, 255],
+        );
+        set_pixel(
+            &mut rgba,
+            width,
+            16 - offset,
+            14 + offset / 2,
+            [126, 224, 201, 255],
+        );
+    }
+    for x in 17..24 {
+        for y in 21..23 {
+            set_pixel(&mut rgba, width, x, y, [126, 224, 201, 255]);
+        }
+    }
+    Image::new_owned(rgba, width, height)
+}
+
+fn set_pixel(rgba: &mut [u8], width: u32, x: u32, y: u32, color: [u8; 4]) {
+    let start = ((y * width + x) * 4) as usize;
+    rgba[start..start + 4].copy_from_slice(&color);
+}
+
+fn error_string(error: impl std::fmt::Display) -> String {
+    error.to_string()
+}

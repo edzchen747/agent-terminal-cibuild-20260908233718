@@ -7,10 +7,12 @@ node_modules/
 .electron-gyp/
 .node-gyp/
 .electron-builder-cache/
+.cargo-home/
 .runtime/
 dist/
 out/
 release/
+target/
 *.log
 .DS_Store
 Thumbs.db

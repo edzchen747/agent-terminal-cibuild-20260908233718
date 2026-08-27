@@ -13,7 +13,7 @@ Agent Terminal exposes command execution, so the desktop is deliberately authori
 - Device revocation closes currently connected sockets immediately.
 - Remote project paths must resolve to existing desktop directories.
 - Terminal dimensions and WebSocket payload sizes are bounded.
-- Electron renderers use context isolation, no Node integration, and a narrow preload API.
+- Tauri webviews have no Node runtime and use an allowlisted command/event capability surface.
 
 ## Transport and relay boundary
 
@@ -25,4 +25,4 @@ Before an internet-facing release, add relay admission/rate controls, relay abus
 
 ## Desktop data
 
-The installed app stores project metadata, device records, and settings in Electron's per-user application data directory. Terminal output is retained only in memory and is discarded when the desktop app exits. The mobile app stores one host connection record through Capacitor Preferences and no project/session state.
+The portable app stores project metadata, device records, and settings in Tauri's per-user application data directory, migrating the previous Electron JSON record when present. Terminal output is retained only in memory and is discarded when the tray process exits. The mobile app stores one host connection record through Capacitor Preferences and no project/session state.

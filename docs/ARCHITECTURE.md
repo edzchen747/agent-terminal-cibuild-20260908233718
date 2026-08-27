@@ -9,22 +9,24 @@ Android / future iOS client
 Relay service (cross-network routing only)
         │ outbound WebSocket
         ▼
-Electron main process (desktop authority)
+Tauri 2 Rust process (desktop and tray authority)
         ├── pairing and device authorization
         ├── project/device JSON persistence
         ├── project-window and session-tab routing
-        └── ConPTY session manager
+        ├── direct and relay connection host
+        ├── native system tray
+        └── portable-pty / Windows ConPTY session manager
                  │
                  ▼
         PowerShell / cmd / WSL / Git Bash
 
-Electron renderer
-        └── xterm.js views over typed IPC
+Tauri WebView2 windows
+        └── React + xterm.js views over allowlisted Tauri commands/events
 ```
 
 When `AGENT_TERMINAL_RELAY_URL` is configured, both the desktop and phone initiate outbound WebSocket connections to the relay. The relay matches the desktop's host ID to the phone's temporary connection ID and forwards opaque protocol payloads. It has no project, device, or terminal state. If the variable is absent, the QR payload uses the desktop's direct LAN WebSocket as a development fallback.
 
-The Electron main process is the only authority. Renderers and mobile clients request operations; they never access the file system or spawn processes directly.
+The Rust process is the only authority. Tauri webviews and mobile clients request operations; they never access the file system or spawn processes directly. The same process owns the tray and connections, so hiding every terminal window does not disconnect paired phones or terminate PTYs.
 
 ## State ownership
 
@@ -33,7 +35,7 @@ The Electron main process is the only authority. Renderers and mobile clients re
 | Saved projects | Persistent | Desktop JSON store |
 | Authorized devices | Persistent | Desktop JSON store |
 | Default shell | Persistent | Desktop JSON store |
-| Terminal processes and scrollback | Desktop process lifetime | Desktop session manager |
+| Terminal processes and scrollback | Tauri tray-process lifetime | Rust session manager |
 | Paired host endpoint, transport, and credential | Persistent | Mobile Capacitor Preferences |
 | Current mobile screen, project snapshots, terminal output | In memory | Mobile app |
 
@@ -45,7 +47,9 @@ Temporary projects are derived from live desktop sessions. They disappear when t
 - A session belongs to exactly one project.
 - Creating the first live session for a project opens its window.
 - Creating another session in that project adds a tab to the existing window.
-- Closing a project window terminates that project's sessions.
+- Closing a project window hides it; its sessions and remote connections remain owned by the tray process.
+- Left-clicking the tray restores the most recently focused terminal window.
+- Right-clicking the tray exposes the explicit Exit action that terminates sessions and the connection host.
 
 ## Pairing lifecycle
 

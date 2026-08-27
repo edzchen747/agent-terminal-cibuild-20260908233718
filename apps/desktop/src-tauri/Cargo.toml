@@ -1,0 +1,42 @@
+[package]
+name = "agent-terminal"
+version = "0.2.0"
+description = "Portable Windows terminal host with paired mobile access"
+authors = ["Agent Terminal contributors"]
+edition = "2024"
+
+[lib]
+name = "agent_terminal_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+arboard = "3"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+hostname = "0.4"
+percent-encoding = "2"
+portable-pty = "0.9"
+rand = "0.9"
+regex = "1"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tauri = { version = "2", features = ["tray-icon"] }
+tokio = { version = "1", features = ["macros", "net", "sync", "time"] }
+tokio-tungstenite = "0.28"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
