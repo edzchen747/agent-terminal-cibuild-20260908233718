@@ -98,7 +98,7 @@ export function MobileTerminal({ connection, session }: Props) {
       screenReaderMode: true,
       overviewRuler: { width: 28 },
       smoothScrollDuration: 75,
-      theme: { background: "#080b0f", foreground: "#d7dce6", cursor: "#79ddc7", selectionBackground: "#315b64aa" }
+      theme: { background: "#080b0f", foreground: "#d7dce6", cursor: "#79ddc7", selectionBackground: "#315b64aa", overviewRulerBorder: "transparent" }
     });
     terminalRef.current = terminal;
     const fit = new FitAddon();
