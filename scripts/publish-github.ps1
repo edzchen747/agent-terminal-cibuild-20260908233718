@@ -65,7 +65,7 @@ foreach ($relative in $files) {
     $relative -eq 'package-lock.json' -or
     $relative -eq 'tsconfig.base.json' -or
     $relative.StartsWith('packages/protocol/')
-  ) { 0 } elseif ($relative.StartsWith('apps/desktop/')) { 1 } elseif ($relative.StartsWith('apps/mobile/')) { 2 } elseif ($relative -eq 'README.md' -or $relative.StartsWith('docs/') -or $relative.StartsWith('scripts/')) { 3 } else { continue }
+  ) { 0 } elseif ($relative.StartsWith('apps/desktop/')) { 1 } elseif ($relative.StartsWith('apps/mobile/')) { 2 } elseif ($relative -eq 'README.md' -or $relative.StartsWith('docs/') -or $relative.StartsWith('scripts/') -or $relative.StartsWith('.github/')) { 3 } else { continue }
 
   $blobSha = Get-BlobSha $relative
   $blobByPath[$relative] = $blobSha
