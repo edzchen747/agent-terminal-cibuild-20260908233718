@@ -65,6 +65,8 @@ button { color: inherit; }
 .terminal-pane.is-active { visibility: visible; }
 .terminal-pane .xterm { height: 100%; }
 .terminal-pane .xterm-viewport { scrollbar-width: thin; scrollbar-color: #323846 transparent; }
+.terminal-copy-toast { position: absolute; z-index: 5; padding: 5px 8px; border: 1px solid #3d655d; border-radius: 6px; background: #162a25ed; box-shadow: 0 7px 24px #0008; color: #a1ead9; font: 700 10px/1 "Segoe UI", sans-serif; letter-spacing: .02em; pointer-events: none; opacity: 0; transform: translateY(4px) scale(.97); transition: opacity .12s ease, transform .12s ease; }
+.terminal-copy-toast.is-visible { opacity: 1; transform: translateY(0) scale(1); }
 .statusbar { display: grid; grid-template-columns: 140px 1fr 70px; align-items: center; gap: 10px; padding: 0 10px; border-top: 1px solid #181c24; color: #565e6d; background: #0c0f14; font-size: 9.5px; }
 .statusbar span { display: flex; align-items: center; gap: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .statusbar span:last-child { justify-content: end; }
@@ -107,4 +109,3 @@ button { color: inherit; }
 .boot { gap: 10px; font-size: 12px; }
 .boot svg { color: #78d9c4; }
 @media (max-width: 900px) { .host-online { display: none; } .sidebar { width: 220px; flex-basis: 220px; } }
-

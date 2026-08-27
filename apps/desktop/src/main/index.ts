@@ -3,7 +3,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { app, BrowserWindow, dialog, ipcMain, type WebContents } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, type WebContents } from "electron";
 import type {
   ClientMessage,
   DeviceIdentity,
@@ -246,6 +246,10 @@ function registerIpc(): void {
   ipcMain.on("desktop:write", (_event, sessionId: string, data: string) => sessions.write(sessionId, data));
   ipcMain.on("desktop:resize", (_event, sessionId: string, cols: number, rows: number) => sessions.resize(sessionId, cols, rows));
   ipcMain.handle("desktop:get-buffer", (_event, sessionId: string) => sessions.buffer(sessionId));
+  ipcMain.handle("desktop:copy-text", (_event, text: string) => {
+    if (typeof text !== "string") throw new Error("Clipboard content must be text.");
+    clipboard.writeText(text);
+  });
   ipcMain.handle("desktop:start-pairing", () => startPairing());
   ipcMain.handle("desktop:revoke-device", (_event, deviceId: string) => {
     store.revokeDevice(deviceId);

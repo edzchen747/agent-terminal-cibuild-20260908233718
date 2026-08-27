@@ -33,6 +33,44 @@ export function TerminalPane({ sessionId, active }: Props) {
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(hostRef.current);
+    let copyToastTimer: number | undefined;
+    const copyToast = document.createElement("div");
+    copyToast.className = "terminal-copy-toast";
+    copyToast.textContent = "Copied";
+    copyToast.setAttribute("role", "status");
+    copyToast.setAttribute("aria-live", "polite");
+    hostRef.current.appendChild(copyToast);
+
+    const showCopyToast = () => {
+      const selection = terminal.getSelectionPosition();
+      const screen = hostRef.current?.querySelector<HTMLElement>(".xterm-screen");
+      if (!selection || !screen || !hostRef.current) return;
+      const hostRect = hostRef.current.getBoundingClientRect();
+      const screenRect = screen.getBoundingClientRect();
+      const viewportRow = selection.start.y - 1 - terminal.buffer.active.viewportY;
+      const visibleRow = Math.max(0, Math.min(terminal.rows - 1, viewportRow));
+      const cellWidth = screenRect.width / terminal.cols;
+      const cellHeight = screenRect.height / terminal.rows;
+      const selectionX = Math.max(0, selection.start.x - 1) * cellWidth;
+      const left = Math.max(8, Math.min(screenRect.left - hostRect.left + selectionX, hostRect.width - 72));
+      const top = Math.max(5, screenRect.top - hostRect.top + visibleRow * cellHeight - 31);
+      copyToast.style.left = `${left}px`;
+      copyToast.style.top = `${top}px`;
+      copyToast.classList.remove("is-visible");
+      requestAnimationFrame(() => copyToast.classList.add("is-visible"));
+      if (copyToastTimer) window.clearTimeout(copyToastTimer);
+      copyToastTimer = window.setTimeout(() => copyToast.classList.remove("is-visible"), 900);
+    };
+
+    terminal.attachCustomKeyEventHandler((event) => {
+      const isCopy = event.ctrlKey && event.key.toLowerCase() === "c";
+      if (!isCopy || !terminal.hasSelection()) return true;
+      if (event.type === "keydown" && !event.repeat) {
+        const selectedText = terminal.getSelection();
+        void window.agentTerminal.copyText(selectedText).then(showCopyToast).catch(() => undefined);
+      }
+      return false;
+    });
     const resize = () => {
       try { fit.fit(); window.agentTerminal.resize(sessionId, terminal.cols, terminal.rows); } catch { /* hidden pane */ }
     };
@@ -49,6 +87,7 @@ export function TerminalPane({ sessionId, active }: Props) {
       observer.disconnect();
       dataSubscription.dispose();
       offData();
+      if (copyToastTimer) window.clearTimeout(copyToastTimer);
       terminal.dispose();
     };
   }, [sessionId]);
@@ -59,4 +98,3 @@ export function TerminalPane({ sessionId, active }: Props) {
 
   return <div ref={hostRef} className={`terminal-pane ${active ? "is-active" : ""}`} />;
 }
-

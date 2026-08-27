@@ -11,6 +11,7 @@ const api: DesktopApi = {
   write: (sessionId, data) => ipcRenderer.send("desktop:write", sessionId, data),
   resize: (sessionId, cols, rows) => ipcRenderer.send("desktop:resize", sessionId, cols, rows),
   getBuffer: (sessionId) => ipcRenderer.invoke("desktop:get-buffer", sessionId),
+  copyText: (text) => ipcRenderer.invoke("desktop:copy-text", text),
   startPairing: () => ipcRenderer.invoke("desktop:start-pairing"),
   revokeDevice: (deviceId) => ipcRenderer.invoke("desktop:revoke-device", deviceId),
   setDefaultShell: (shellId) => ipcRenderer.invoke("desktop:set-default-shell", shellId),
@@ -27,4 +28,3 @@ const api: DesktopApi = {
 };
 
 contextBridge.exposeInMainWorld("agentTerminal", api);
-
