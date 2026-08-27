@@ -40,6 +40,7 @@
 - Projects and authorized devices remain desktop-owned and persistent.
 - Live sessions are discovered after every successful reconnect.
 - New projects open desktop windows; additional sessions in one project open desktop tabs.
+- Opening a saved project creates and renders its terminal window without blocking the tray host or any existing terminal window.
 - Temporary projects are derived from live sessions and are not persisted.
 - Desktop and mobile can save a temporary project or return a saved project to temporary status without interrupting its sessions.
 - Terminal bytes travel over the live paired connection with resize and scrollback support.
@@ -48,6 +49,7 @@
 - Shell working-directory reports move sessions to the longest matching saved project, or to a temporary project for an unknown folder.
 - When an active session changes to another project, its current window switches to the new project and removes the old project's tabs. Any remaining old-project tabs move into a replacement window opened behind the current window.
 - A desktop window may attach only to sessions owned by its tray-assigned project; reassignment retains the moved terminal's live attachment while removing the old tabs, so input echo and output continue without interruption.
+- Desktop state snapshots and terminal output events are addressed only to their assigned window; creating a tab in one project must never switch or populate another project window.
 - Closing every terminal window retains the most recently focused project in tray memory. Reopening from the tray restores that project and reattaches its live session IDs and scrollback.
 - User-facing and persisted Windows paths omit the verbatim `\\?\` prefix, including PowerShell prompts and saved project working directories.
 - Changing the terminal type replaces the active session in place when it is still pristine; after the user has entered input, the selection changes only the default for future sessions.

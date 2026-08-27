@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type { DesktopApi, DesktopState } from "../../shared/api";
 
 interface TerminalDataEvent {
@@ -10,14 +11,15 @@ interface TerminalDataEvent {
 const stateListeners = new Set<(state: DesktopState) => void>();
 const dataListeners = new Set<(sessionId: string, data: string) => void>();
 const pairingListeners = new Set<() => void>();
+const currentWindowTarget = getCurrentWebviewWindow().label;
 
 const stateBridgeReady = listen<DesktopState>("desktop-state", ({ payload }) => {
   for (const listener of stateListeners) listener(payload);
-});
+}, { target: currentWindowTarget });
 
 const dataBridgeReady = listen<TerminalDataEvent>("desktop-data", ({ payload }) => {
   for (const listener of dataListeners) listener(payload.sessionId, payload.data);
-});
+}, { target: currentWindowTarget });
 
 const pairingBridgeReady = listen<string>("pairing-succeeded", () => {
   for (const listener of pairingListeners) listener();

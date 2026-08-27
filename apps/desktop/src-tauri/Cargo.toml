@@ -1,6 +1,6 @@
 [package]
 name = "agent-terminal"
-version = "0.3.2"
+version = "0.3.3"
 description = "Portable Windows terminal host with paired mobile access"
 authors = ["Agent Terminal contributors"]
 edition = "2024"

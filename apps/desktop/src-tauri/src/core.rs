@@ -15,7 +15,7 @@ use chrono::{Duration, Utc};
 use percent_encoding::percent_decode_str;
 use portable_pty::{ChildKiller, MasterPty, PtySize, native_pty_system};
 use regex::Regex;
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Emitter, EventTarget, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::mpsc;
 use url::Url;
 use uuid::Uuid;
@@ -237,7 +237,7 @@ impl Core {
     }
 
     pub fn broadcast(&self) {
-        for (label, window) in self.app.webview_windows() {
+        for label in self.app.webview_windows().into_keys() {
             let registered = self
                 .inner
                 .lock()
@@ -245,7 +245,11 @@ impl Core {
                 .windows
                 .is_registered(&label);
             if registered {
-                let _ = window.emit("desktop-state", self.state_for_window(&label));
+                let _ = self.app.emit_to(
+                    EventTarget::webview_window(label.clone()),
+                    "desktop-state",
+                    self.state_for_window(&label),
+                );
             }
         }
         let snapshot = self.snapshot();
@@ -569,7 +573,10 @@ impl Core {
             }
         });
 
-        self.ensure_project_window(&project.id)?;
+        if let Err(error) = self.ensure_project_window(&project.id) {
+            self.close_session(&id);
+            return Err(error);
+        }
         self.broadcast();
         Ok(metadata)
     }
@@ -1184,9 +1191,11 @@ impl Core {
             data: data.clone(),
         };
         for label in window_clients {
-            if let Some(window) = self.app.get_webview_window(&label) {
-                let _ = window.emit("desktop-data", event.clone());
-            }
+            let _ = self.app.emit_to(
+                EventTarget::webview_window(label),
+                "desktop-data",
+                event.clone(),
+            );
         }
         self.send_terminal_output(session_id, &data);
         if let Some(cwd) = reported_cwd {

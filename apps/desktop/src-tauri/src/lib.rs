@@ -78,14 +78,14 @@ fn set_project_persistent(
 }
 
 #[tauri::command]
-fn open_project(state: State<'_, Arc<Core>>, project_id: String) -> Result<(), String> {
+async fn open_project(state: State<'_, Arc<Core>>, project_id: String) -> Result<(), String> {
     Arc::clone(state.inner())
         .open_project(&project_id)
         .map_err(error_string)
 }
 
 #[tauri::command]
-fn create_session(
+async fn create_session(
     state: State<'_, Arc<Core>>,
     project_id: String,
     shell_id: Option<String>,
@@ -164,7 +164,7 @@ fn set_default_shell(state: State<'_, Arc<Core>>, shell_id: String) -> Result<()
 }
 
 #[tauri::command]
-fn select_shell(
+async fn select_shell(
     state: State<'_, Arc<Core>>,
     session_id: Option<String>,
     shell_id: String,
@@ -178,7 +178,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(core) = app.try_state::<Arc<Core>>() {
-                Arc::clone(core.inner()).show_terminal_window();
+                show_terminal_window_from_worker(Arc::clone(core.inner()));
             }
         }))
         .setup(|app| {
@@ -262,11 +262,17 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
             } = event
             {
                 let core = Arc::clone(tray.app_handle().state::<Arc<Core>>().inner());
-                core.show_terminal_window();
+                show_terminal_window_from_worker(core);
             }
         })
         .build(app)?;
     Ok(())
+}
+
+// WebView2 can deadlock when a second webview is constructed directly inside a
+// Windows event handler. Keep tray and single-instance callbacks off that thread.
+fn show_terminal_window_from_worker(core: Arc<Core>) {
+    let _ = std::thread::spawn(move || core.show_terminal_window());
 }
 
 fn tray_icon() -> Image<'static> {
