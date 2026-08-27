@@ -19,11 +19,18 @@ export function App() {
     return window.agentTerminal.onState(setState);
   }, []);
 
+  useEffect(() => window.agentTerminal.onPairingSucceeded(() => {
+    setModal((current) => current === "pair" ? null : current);
+    setQr("");
+    setPairError("");
+  }), []);
+
   const currentProject = state?.projects.find((project) => project.id === state.currentProjectId);
   const projectSessions = useMemo(
     () => state?.sessions.filter((session) => session.projectId === state.currentProjectId) ?? [],
     [state]
   );
+  const activeSession = projectSessions.find((session) => session.id === activeSessionId);
 
   useEffect(() => {
     if (!projectSessions.some((session) => session.id === activeSessionId)) {
@@ -51,6 +58,11 @@ export function App() {
 
   async function closeTab(sessionId: string) {
     await window.agentTerminal.closeSession(sessionId);
+  }
+
+  async function selectShell(shellId: string) {
+    const replacement = await window.agentTerminal.selectShell(activeSessionId, shellId);
+    if (replacement) setActiveSessionId(replacement.id);
   }
 
   async function toggleProjectPersistence() {
@@ -103,7 +115,7 @@ export function App() {
               </button>)}
               <button className="add-tab" onClick={() => void addTab()} title="New terminal tab"><PlusIcon /></button>
             </div>
-            <select className="shell-picker" value={state.defaultShellId} onChange={(event) => void window.agentTerminal.setDefaultShell(event.target.value)} title="Default shell">
+            <select className="shell-picker" value={activeSession?.shellId ?? state.defaultShellId} onChange={(event) => void selectShell(event.target.value)} title="Terminal shell">
               {state.shells.map((shell) => <option key={shell.id} value={shell.id}>{shell.name}</option>)}
             </select>
           </div>

@@ -15,6 +15,9 @@ This repository is an end-to-end MVP, not a UI-only prototype.
 - A collapsible project sidebar. Opening a different project creates/focuses a dedicated desktop window.
 - Multiple terminal tabs per project.
 - Automatic session regrouping when shell integration reports a changed working directory: the active window follows the moved tab, while remaining old-project tabs reopen together in a background window.
+- Project-scoped session attachments prevent terminal windows from mirroring or adopting one another's tabs during directory changes.
+- Clean Windows working-directory paths in prompts and project state, without the internal `\\?\` filesystem prefix.
+- Seamless replacement of a pristine tab when its terminal type is changed; tabs with user input remain running and the selection becomes the default for new sessions.
 - Context-aware Ctrl+C: copies selected terminal text and otherwise sends the normal interrupt signal to the shell.
 - Native folder picker for saved projects.
 - QR pairing that authorizes a phone once; ordinary reconnects use the saved device credential.

@@ -8,9 +8,9 @@ use std::{
 use portable_pty::CommandBuilder;
 use uuid::Uuid;
 
-use crate::models::ShellProfile;
+use crate::{models::ShellProfile, path_utils::strip_windows_verbatim_prefix};
 
-const POWERSHELL_CWD_HOOK: &str = "$global:__AgentTerminalOriginalPrompt=$function:prompt; function global:prompt { $loc=$executionContext.SessionState.Path.CurrentLocation; $prefix=[string]([char]27)+']9;9;'+$loc+[char]27+'\\'; if ($global:__AgentTerminalOriginalPrompt) { $prefix+(& $global:__AgentTerminalOriginalPrompt) } else { $prefix+'PS '+$loc+'> ' } }";
+const POWERSHELL_CWD_HOOK: &str = "$global:__AgentTerminalOriginalPrompt=$function:prompt; function global:prompt { $loc=$executionContext.SessionState.Path.CurrentLocation; $path=$loc.ProviderPath; if (-not $path) { $path=[string]$loc }; $prefix=[string]([char]27)+']9;9;'+$path+[char]27+'\\'; if ($global:__AgentTerminalOriginalPrompt) { $prefix+(& $global:__AgentTerminalOriginalPrompt) } else { $prefix+'PS '+$path+'> ' } }";
 
 pub fn detect_shells() -> Vec<ShellProfile> {
     let mut shells = Vec::new();
@@ -109,7 +109,7 @@ pub fn command_for(shell: &ShellProfile, cwd: &str) -> CommandBuilder {
 
     let mut command = CommandBuilder::new(&shell.executable);
     command.args(args);
-    command.cwd(cwd);
+    command.cwd(strip_windows_verbatim_prefix(cwd));
     for (key, value) in extra_environment {
         command.env(key, value);
     }

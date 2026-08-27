@@ -1,6 +1,6 @@
 {
   "name": "@agentterminal/desktop",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Windows terminal host for the Agent Terminal mobile companion.",
   "author": "Agent Terminal contributors",

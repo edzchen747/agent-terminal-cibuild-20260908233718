@@ -84,7 +84,10 @@ export function TerminalPane({ sessionId, active }: Props) {
       if (activeRef.current) resize(true);
     };
     window.addEventListener("pointerdown", handlePointerActivity, true);
-    const dataSubscription = terminal.onData((data) => window.agentTerminal.write(sessionId, data));
+    const dataSubscription = terminal.onData((data) => {
+      try { fit.fit(); } catch { /* hidden pane */ }
+      window.agentTerminal.write(sessionId, data, terminal.cols, terminal.rows);
+    });
     let initialized = false;
     let disposed = false;
     const pendingData: string[] = [];
@@ -104,7 +107,9 @@ export function TerminalPane({ sessionId, active }: Props) {
       initialized = true;
       resize();
       if (active) terminal.focus();
-    }).catch(() => undefined);
+    }).catch((cause) => {
+      if (!disposed) terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
+    });
     return () => {
       disposed = true;
       observer.disconnect();

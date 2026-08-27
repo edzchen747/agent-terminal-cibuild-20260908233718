@@ -1,5 +1,6 @@
 mod core;
 mod models;
+mod path_utils;
 mod remote;
 mod shells;
 mod store;
@@ -100,7 +101,16 @@ fn close_session(state: State<'_, Arc<Core>>, session_id: String) {
 }
 
 #[tauri::command]
-fn write_session(state: State<'_, Arc<Core>>, session_id: String, data: String) {
+fn write_session(
+    state: State<'_, Arc<Core>>,
+    session_id: String,
+    data: String,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) {
+    if let (Some(cols), Some(rows)) = (cols, rows) {
+        state.resize_session(&session_id, cols, rows, true);
+    }
     state.write_session(&session_id, &data);
 }
 
@@ -153,6 +163,17 @@ fn set_default_shell(state: State<'_, Arc<Core>>, shell_id: String) -> Result<()
     state.set_default_shell(&shell_id).map_err(error_string)
 }
 
+#[tauri::command]
+fn select_shell(
+    state: State<'_, Arc<Core>>,
+    session_id: Option<String>,
+    shell_id: String,
+) -> Result<Option<TerminalSession>, String> {
+    Arc::clone(state.inner())
+        .select_shell(session_id.as_deref(), &shell_id)
+        .map_err(error_string)
+}
+
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -202,6 +223,7 @@ pub fn run() {
             start_pairing,
             revoke_device,
             set_default_shell,
+            select_shell,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Agent Terminal");

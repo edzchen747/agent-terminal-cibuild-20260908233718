@@ -42,6 +42,7 @@ const ACCESSIBILITY_KEY_ROWS: AccessibilityKey[][] = [
 export function MobileTerminal({ connection, session }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
+  const resizeRef = useRef<(force?: boolean) => void>(() => undefined);
   const selectedKeysRef = useRef<AccessibilityKey[]>([]);
   const countdownTimerRef = useRef<number | undefined>(undefined);
   const [selectedKeyIds, setSelectedKeyIds] = useState<ReadonlySet<string>>(new Set());
@@ -59,7 +60,10 @@ export function MobileTerminal({ connection, session }: Props) {
   const executeChord = (keys: AccessibilityKey[]) => {
     const modifiers = activeModifiers(keys);
     const output = keys.flatMap((key) => key.value ? [applyTerminalModifiers(key.value, modifiers)] : []).join("");
-    if (output) connection.send({ type: "session.input", sessionId: session.id, data: output });
+    if (output) {
+      resizeRef.current(true);
+      connection.send({ type: "session.input", sessionId: session.id, data: output });
+    }
   };
 
   const restartCountdown = (keys: AccessibilityKey[]) => {
@@ -105,6 +109,19 @@ export function MobileTerminal({ connection, session }: Props) {
     let forceResizePending = false;
     let lastSize = { cols: 0, rows: 0 };
     const resize = (force = false) => {
+      if (force) {
+        if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
+        resizeFrame = undefined;
+        forceResizePending = false;
+        try {
+          fit.fit();
+          lastSize = { cols: terminal.cols, rows: terminal.rows };
+          connection.send({ type: "session.resize", sessionId: session.id, cols: terminal.cols, rows: terminal.rows, force: true });
+        } catch {
+          // The WebView can report an intermediate zero-sized layout while the keyboard opens.
+        }
+        return;
+      }
       forceResizePending ||= force;
       if (resizeFrame !== undefined) return;
       resizeFrame = requestAnimationFrame(() => {
@@ -122,12 +139,23 @@ export function MobileTerminal({ connection, session }: Props) {
         }
       });
     };
+    resizeRef.current = resize;
     const observer = new ResizeObserver(() => resize());
     observer.observe(hostElement);
     const handlePointerActivity = () => resize(true);
     window.addEventListener("pointerdown", handlePointerActivity, true);
-    const input = terminal.onData((data) => connection.send({ type: "session.input", sessionId: session.id, data: consumeSelectedKeys(data) }));
-    const output = connection.on("output", (event) => { if (event.sessionId === session.id) terminal.write(event.data); });
+    const input = terminal.onData((data) => {
+      resize(true);
+      connection.send({ type: "session.input", sessionId: session.id, data: consumeSelectedKeys(data) });
+    });
+    let initialized = false;
+    let disposed = false;
+    const pendingOutput: string[] = [];
+    const output = connection.on("output", (event) => {
+      if (event.sessionId !== session.id) return;
+      if (initialized) terminal.write(event.data);
+      else pendingOutput.push(event.data);
+    });
 
     const screen = hostElement.querySelector<HTMLElement>(".xterm-screen");
     let activeTouchId: number | undefined;
@@ -174,13 +202,20 @@ export function MobileTerminal({ connection, session }: Props) {
     hostElement.addEventListener("touchend", resetTouch, { passive: true });
     hostElement.addEventListener("touchcancel", resetTouch, { passive: true });
 
-    void connection.request({ type: "session.attach", requestId: createRequestId(), sessionId: session.id, cols: terminal.cols, rows: terminal.rows }).then((message) => {
+    const attachment = connection.request({ type: "session.attach", requestId: createRequestId(), sessionId: session.id, cols: terminal.cols, rows: terminal.rows }).then((message) => {
+      if (disposed) return;
       if (message.type === "session.buffer") terminal.write(message.data);
+      for (const data of pendingOutput) terminal.write(data);
+      pendingOutput.length = 0;
+      initialized = true;
       resize();
       terminal.focus();
+    }).catch((cause) => {
+      if (!disposed) terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
     });
     return () => {
-      connection.send({ type: "session.detach", requestId: createRequestId(), sessionId: session.id });
+      disposed = true;
+      void attachment.finally(() => connection.send({ type: "session.detach", requestId: createRequestId(), sessionId: session.id }));
       observer.disconnect();
       if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
       window.removeEventListener("pointerdown", handlePointerActivity, true);
@@ -190,6 +225,7 @@ export function MobileTerminal({ connection, session }: Props) {
       hostElement.removeEventListener("touchcancel", resetTouch);
       if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
       input.dispose(); output(); terminal.dispose(); terminalRef.current = null;
+      resizeRef.current = () => undefined;
     };
   }, [connection, session.id]);
 
@@ -198,6 +234,7 @@ export function MobileTerminal({ connection, session }: Props) {
     const isSelected = current.some((item) => item.id === key.id);
     const next = isSelected ? current.filter((item) => item.id !== key.id) : [...current, key];
     if (!current.length && !isSelected && key.value) {
+      resizeRef.current(true);
       connection.send({ type: "session.input", sessionId: session.id, data: key.value });
     }
     selectedKeysRef.current = next;

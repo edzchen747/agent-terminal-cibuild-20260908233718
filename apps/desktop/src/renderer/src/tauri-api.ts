@@ -9,6 +9,7 @@ interface TerminalDataEvent {
 
 const stateListeners = new Set<(state: DesktopState) => void>();
 const dataListeners = new Set<(sessionId: string, data: string) => void>();
+const pairingListeners = new Set<() => void>();
 
 const stateBridgeReady = listen<DesktopState>("desktop-state", ({ payload }) => {
   for (const listener of stateListeners) listener(payload);
@@ -18,7 +19,12 @@ const dataBridgeReady = listen<TerminalDataEvent>("desktop-data", ({ payload }) 
   for (const listener of dataListeners) listener(payload.sessionId, payload.data);
 });
 
+const pairingBridgeReady = listen<string>("pairing-succeeded", () => {
+  for (const listener of pairingListeners) listener();
+});
+
 void stateBridgeReady;
+void pairingBridgeReady;
 
 const api: DesktopApi = {
   getState: () => invoke("get_state"),
@@ -28,7 +34,7 @@ const api: DesktopApi = {
   openProject: (projectId) => invoke("open_project", { projectId }),
   createSession: (projectId, shellId) => invoke("create_session", { projectId, shellId }),
   closeSession: (sessionId) => invoke("close_session", { sessionId }),
-  write: (sessionId, data) => { void invoke("write_session", { sessionId, data }); },
+  write: (sessionId, data, cols, rows) => { void invoke("write_session", { sessionId, data, cols, rows }); },
   resize: (sessionId, cols, rows, force) => { void invoke("resize_session", { sessionId, cols, rows, force }); },
   attachSession: async (sessionId) => {
     await dataBridgeReady;
@@ -39,6 +45,11 @@ const api: DesktopApi = {
   startPairing: () => invoke("start_pairing"),
   revokeDevice: (deviceId) => invoke("revoke_device", { deviceId }),
   setDefaultShell: (shellId) => invoke("set_default_shell", { shellId }),
+  selectShell: (sessionId, shellId) => invoke("select_shell", { sessionId, shellId }),
+  onPairingSucceeded: (callback) => {
+    pairingListeners.add(callback);
+    return () => pairingListeners.delete(callback);
+  },
   onState: (callback) => {
     stateListeners.add(callback);
     return () => stateListeners.delete(callback);

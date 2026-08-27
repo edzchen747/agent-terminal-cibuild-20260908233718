@@ -33,6 +33,7 @@
 - The desktop QR modal and mobile onboarding must describe pairing as a one-time device binding, not a one-time reconnect code.
 - Pairing UI must not label the QR as a one-time code or present its setup-grant expiry as the lifetime of the device pairing.
 - The confirmation language must state that the phone remains authorized until explicitly revoked.
+- The desktop QR modal closes as soon as the tray authority accepts the pairing and persists the authorized device.
 
 ## Session behavior
 
@@ -43,8 +44,13 @@
 - Desktop and mobile can save a temporary project or return a saved project to temporary status without interrupting its sessions.
 - Terminal bytes travel over the live paired connection with resize and scrollback support.
 - Desktop clicks and mobile taps force a PTY resize notification even when the cell dimensions are unchanged.
+- Desktop and mobile text input force a PTY resize before the input bytes are delivered, so interactive TUIs promptly receive the current dimensions.
 - Shell working-directory reports move sessions to the longest matching saved project, or to a temporary project for an unknown folder.
 - When an active session changes to another project, its current window switches to the new project and removes the old project's tabs. Any remaining old-project tabs move into a replacement window opened behind the current window.
+- A desktop window may attach only to sessions owned by its tray-assigned project; reassignment clears prior subscriptions so windows cannot mirror or switch between one another's tabs.
+- Closing every terminal window retains the most recently focused project in tray memory. Reopening from the tray restores that project and reattaches its live session IDs and scrollback.
+- User-facing and persisted Windows paths omit the verbatim `\\?\` prefix, including PowerShell prompts and saved project working directories.
+- Changing the terminal type replaces the active session in place when it is still pristine; after the user has entered input, the selection changes only the default for future sessions.
 - Mobile accessibility keys form animated three-second chords; mobile keyboard input consumes armed modifiers immediately.
 - Desktop Ctrl+C copies when terminal text is selected; with no selection it must continue to send the shell interrupt signal.
 - A successful selection copy displays a brief toast positioned above the selected terminal text.

@@ -26,6 +26,7 @@ use crate::{
         PairingPayload, Project, RelayMessage, ServerMessage, ShellProfile, TerminalDataEvent,
         TerminalSession,
     },
+    path_utils::user_visible_path,
     shells::{command_for, detect_shells},
     store::{DesktopStore, random_token},
     window_clients::WindowClients,
@@ -41,6 +42,7 @@ struct ManagedSession {
     killer: Box<dyn ChildKiller + Send + Sync>,
     buffer: String,
     control_tail: String,
+    has_user_input: bool,
 }
 
 #[derive(Clone)]
@@ -217,18 +219,14 @@ impl Core {
     }
 
     pub fn state_for_window(&self, label: &str) -> DesktopState {
-        let snapshot = self.snapshot();
-        let current_project_id = self
-            .inner
-            .lock()
-            .expect("desktop state poisoned")
+        let inner = self.inner.lock().expect("desktop state poisoned");
+        let current_project_id = inner
             .windows
             .project_for_window(label)
             .map(str::to_owned)
-            .or_else(|| snapshot.projects.first().map(|project| project.id.clone()))
             .unwrap_or_default();
         DesktopState {
-            snapshot,
+            snapshot: snapshot_from_inner(&inner),
             current_project_id,
         }
     }
@@ -240,7 +238,15 @@ impl Core {
 
     pub fn broadcast(&self) {
         for (label, window) in self.app.webview_windows() {
-            let _ = window.emit("desktop-state", self.state_for_window(&label));
+            let registered = self
+                .inner
+                .lock()
+                .expect("desktop state poisoned")
+                .windows
+                .is_registered(&label);
+            if registered {
+                let _ = window.emit("desktop-state", self.state_for_window(&label));
+            }
         }
         let snapshot = self.snapshot();
         let client_ids = self
@@ -281,11 +287,28 @@ impl Core {
     pub fn show_terminal_window(self: &Arc<Self>) {
         let (label, fallback_project) = {
             let inner = self.inner.lock().expect("desktop state poisoned");
+            let preferred = inner
+                .windows
+                .last_project()
+                .filter(|project_id| project_by_id(&inner, project_id).is_some())
+                .map(str::to_owned)
+                .or_else(|| {
+                    inner
+                        .sessions
+                        .values()
+                        .filter(|session| session.metadata.status == "running")
+                        .max_by(|left, right| {
+                            left.metadata.created_at.cmp(&right.metadata.created_at)
+                        })
+                        .map(|session| session.metadata.project_id.clone())
+                });
             (
                 inner.windows.last_or_any(),
-                public_projects(&inner)
-                    .first()
-                    .map(|project| project.id.clone()),
+                preferred.or_else(|| {
+                    public_projects(&inner)
+                        .first()
+                        .map(|project| project.id.clone())
+                }),
             )
         };
         if let Some(label) = label
@@ -519,6 +542,7 @@ impl Core {
                     killer,
                     buffer: String::new(),
                     control_tail: String::new(),
+                    has_user_input: false,
                 },
             );
         }
@@ -569,6 +593,9 @@ impl Core {
             return;
         };
         if session.metadata.status == "running" {
+            if !data.is_empty() {
+                session.has_user_input = true;
+            }
             let _ = session.writer.write_all(data.as_bytes());
             let _ = session.writer.flush();
         }
@@ -603,11 +630,21 @@ impl Core {
 
     pub fn attach_window_session(&self, label: &str, session_id: &str) -> Result<String> {
         let mut inner = self.inner.lock().expect("desktop state poisoned");
-        let buffer = inner
+        let window_project_id = inner
+            .windows
+            .project_for_window(label)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                anyhow!("Terminal window is no longer registered with the tray host.")
+            })?;
+        let (session_project_id, buffer) = inner
             .sessions
             .get(session_id)
-            .map(|session| session.buffer.clone())
+            .map(|session| (session.metadata.project_id.clone(), session.buffer.clone()))
             .ok_or_else(|| anyhow!("Terminal session not found."))?;
+        if session_project_id != window_project_id {
+            return Err(anyhow!("Terminal session moved to another project window."));
+        }
         if !inner.windows.attach(label, session_id) {
             return Err(anyhow!(
                 "Terminal window is no longer registered with the tray host."
@@ -644,6 +681,35 @@ impl Core {
         }
         self.broadcast();
         Ok(())
+    }
+
+    pub fn select_shell(
+        self: &Arc<Self>,
+        session_id: Option<&str>,
+        shell_id: &str,
+    ) -> Result<Option<TerminalSession>> {
+        self.set_default_shell(shell_id)?;
+        let replace_project = {
+            let inner = self.inner.lock().expect("desktop state poisoned");
+            let Some(session_id) = session_id else {
+                return Ok(None);
+            };
+            let Some(session) = inner.sessions.get(session_id) else {
+                return Ok(None);
+            };
+            (session.metadata.status == "running"
+                && !session.has_user_input
+                && session.metadata.shell_id != shell_id)
+                .then(|| session.metadata.project_id.clone())
+        };
+        let Some(project_id) = replace_project else {
+            return Ok(None);
+        };
+        let replacement = self.create_session(&project_id, Some(shell_id))?;
+        if let Some(session_id) = session_id {
+            self.close_session(session_id);
+        }
+        Ok(Some(replacement))
     }
 
     pub fn start_pairing(&self) -> Result<PairingPayload> {
@@ -797,6 +863,7 @@ impl Core {
                         snapshot: self.snapshot(),
                     },
                 );
+                let _ = self.app.emit("pairing-succeeded", device.id);
                 self.broadcast();
                 return;
             }
@@ -1211,9 +1278,10 @@ impl Core {
                         .map(str::to_owned)
                 })
                 .flatten();
-            let displaced_window = active_window
-                .as_ref()
-                .and_then(|label| inner.windows.assign(label, &project.id).displaced_window);
+            let displaced_window = active_window.as_ref().and_then(|label| {
+                inner.windows.clear_attachments(label);
+                inner.windows.assign(label, &project.id).displaced_window
+            });
             let old_has_sessions = project_changed
                 && inner
                     .sessions
@@ -1370,7 +1438,7 @@ fn canonical_directory(value: impl AsRef<Path>) -> Result<PathBuf> {
     if !resolved.is_dir() {
         return Err(anyhow!("The desktop path is not a folder."));
     }
-    Ok(resolved)
+    Ok(user_visible_path(resolved))
 }
 
 fn normalized_path(path: &Path) -> String {

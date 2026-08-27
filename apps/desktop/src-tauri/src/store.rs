@@ -12,7 +12,10 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
-use crate::models::{AuthorizedDevice, Project};
+use crate::{
+    models::{AuthorizedDevice, Project},
+    path_utils::strip_windows_verbatim_prefix,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,13 +58,16 @@ pub struct DesktopStore {
 
 impl DesktopStore {
     pub fn load(file_path: PathBuf) -> Result<Self> {
-        let state = read_state(&file_path)
+        let mut state = read_state(&file_path)
             .or_else(|| {
                 migration_candidates()
                     .into_iter()
                     .find_map(|candidate| read_state(&candidate))
             })
             .unwrap_or_else(default_state);
+        for project in &mut state.projects {
+            project.path = strip_windows_verbatim_prefix(&project.path);
+        }
         let store = Self { file_path, state };
         store.write()?;
         Ok(store)

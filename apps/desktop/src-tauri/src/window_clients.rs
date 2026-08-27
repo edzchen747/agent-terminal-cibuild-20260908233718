@@ -6,6 +6,7 @@ pub struct WindowClients {
     window_projects: HashMap<String, String>,
     attached_sessions: HashMap<String, HashSet<String>>,
     last_window: Option<String>,
+    last_project: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -25,6 +26,14 @@ impl WindowClients {
 
     pub fn has_project(&self, project_id: &str) -> bool {
         self.project_windows.contains_key(project_id)
+    }
+
+    pub fn is_registered(&self, label: &str) -> bool {
+        self.window_projects.contains_key(label)
+    }
+
+    pub fn last_project(&self) -> Option<&str> {
+        self.last_project.as_deref()
     }
 
     pub fn last_or_any(&self) -> Option<String> {
@@ -54,6 +63,9 @@ impl WindowClients {
         }
         self.window_projects
             .insert(label.to_string(), project_id.to_string());
+        if self.last_window.as_deref() == Some(label) {
+            self.last_project = Some(project_id.to_string());
+        }
 
         WindowAssignment {
             previous_project,
@@ -63,10 +75,14 @@ impl WindowClients {
 
     pub fn remove_window(&mut self, label: &str) -> Option<String> {
         self.attached_sessions.remove(label);
-        if self.last_window.as_deref() == Some(label) {
+        let was_last_window = self.last_window.as_deref() == Some(label);
+        if was_last_window {
             self.last_window = None;
         }
         let project_id = self.window_projects.remove(label)?;
+        if was_last_window || self.last_window.is_none() {
+            self.last_project = Some(project_id.clone());
+        }
         if self.project_windows.get(&project_id).map(String::as_str) == Some(label) {
             self.project_windows.remove(&project_id);
         }
@@ -74,9 +90,14 @@ impl WindowClients {
     }
 
     pub fn mark_focused(&mut self, label: &str) {
-        if self.window_projects.contains_key(label) {
+        if let Some(project_id) = self.window_projects.get(label) {
             self.last_window = Some(label.to_string());
+            self.last_project = Some(project_id.clone());
         }
+    }
+
+    pub fn clear_attachments(&mut self, label: &str) {
+        self.attached_sessions.remove(label);
     }
 
     pub fn attach(&mut self, label: &str, session_id: &str) -> bool {
@@ -146,5 +167,28 @@ mod tests {
         assert_eq!(clients.subscribers("session-1"), vec!["window-a"]);
         clients.detach("window-a", "session-1");
         assert!(clients.subscribers("session-1").is_empty());
+    }
+
+    #[test]
+    fn closing_the_last_window_retains_its_project_for_tray_restore() {
+        let mut clients = WindowClients::default();
+        clients.assign("window-a", "project-a");
+        clients.mark_focused("window-a");
+        clients.remove_window("window-a");
+
+        assert_eq!(clients.last_or_any(), None);
+        assert_eq!(clients.last_project(), Some("project-a"));
+    }
+
+    #[test]
+    fn closing_a_background_window_does_not_replace_the_restore_project() {
+        let mut clients = WindowClients::default();
+        clients.assign("window-a", "project-a");
+        clients.assign("window-b", "project-b");
+        clients.mark_focused("window-b");
+        clients.remove_window("window-a");
+
+        assert_eq!(clients.last_or_any(), Some("window-b".into()));
+        assert_eq!(clients.last_project(), Some("project-b"));
     }
 }

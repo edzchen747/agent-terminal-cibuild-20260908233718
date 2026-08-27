@@ -50,9 +50,10 @@ Temporary projects are derived from live desktop sessions. They disappear when t
 - Creating the first live session for a project opens its window.
 - Creating another session in that project adds a tab to the existing window.
 - A terminal webview explicitly attaches to each rendered session. Attachment atomically returns the current scrollback and registers the window for subsequent live bytes, preventing gaps or duplicate output during tab/window transitions.
+- The tray validates that an attachment's session belongs to the webview's assigned project. Project reassignment clears the old window's subscriptions before either window renders its new tab set.
 - Closing a project window destroys that client and its subscriptions; its sessions and remote connections remain owned by the tray process.
 - If a shell changes directory into another project, the active window is reassigned to the destination project. Remaining tabs from the previous project are rendered by a replacement window shown behind the active window.
-- Left-clicking the tray restores the most recently focused terminal window.
+- Left-clicking the tray restores the most recently focused terminal window, or recreates a client for its remembered project after every terminal window has been closed.
 - Right-clicking the tray exposes the explicit Exit action that terminates sessions and the connection host.
 
 ## Pairing lifecycle
