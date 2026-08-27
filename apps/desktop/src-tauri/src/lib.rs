@@ -127,8 +127,8 @@ fn copy_text(text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn start_pairing(state: State<'_, Arc<Core>>) -> PairingPayload {
-    state.start_pairing()
+fn start_pairing(state: State<'_, Arc<Core>>) -> Result<PairingPayload, String> {
+    state.start_pairing().map_err(error_string)
 }
 
 #[tauri::command]
@@ -143,6 +143,11 @@ fn set_default_shell(state: State<'_, Arc<Core>>, shell_id: String) -> Result<()
 
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(core) = app.try_state::<Arc<Core>>() {
+                Arc::clone(core.inner()).show_terminal_window();
+            }
+        }))
         .setup(|app| {
             let data_path = std::env::var_os("AGENT_TERMINAL_DATA_DIR")
                 .map(std::path::PathBuf::from)

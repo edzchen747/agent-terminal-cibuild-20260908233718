@@ -6,6 +6,7 @@
 - The desktop web UI, Rust backend, ConPTY integration, connection host, and tray behavior compile into one portable `agent-terminal.exe` with no installation step or sidecar process.
 - The portable executable uses the WebView2 runtime provided by supported Windows 10 and Windows 11 systems.
 - The Tauri process creates a system-tray icon and remains the owner of terminal sessions, pairing, direct WebSockets, relay connections, authorization, and desktop state while terminal windows are hidden.
+- Only one desktop host process may run at a time. Launching the executable again focuses the existing terminal window so every QR grant is issued by the process that owns the connection port.
 - Left-clicking the tray icon opens or restores the terminal application.
 - Right-clicking the tray icon opens a native menu containing an Exit action.
 - Closing a terminal window hides that window without stopping the tray host or active mobile connections. Exit from the tray is the explicit full-process shutdown path.

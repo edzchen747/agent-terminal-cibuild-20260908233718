@@ -1,6 +1,6 @@
 [package]
 name = "agent-terminal"
-version = "0.2.0"
+version = "0.2.1"
 description = "Portable Windows terminal host with paired mobile access"
 authors = ["Agent Terminal contributors"]
 edition = "2024"
@@ -29,6 +29,7 @@ serde_json = "1"
 sha2 = "0.10"
 subtle = "2"
 tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
 tokio = { version = "1", features = ["macros", "net", "sync", "time"] }
 tokio-tungstenite = "0.28"
 url = "2"

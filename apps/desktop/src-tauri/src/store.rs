@@ -207,3 +207,38 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, ()> {
         .map(|index| u8::from_str_radix(&value[index..index + 2], 16).map_err(|_| ()))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::DesktopStore;
+    use crate::models::AuthorizedDevice;
+    use std::{fs, path::PathBuf};
+    use uuid::Uuid;
+
+    #[test]
+    fn authorized_device_credentials_survive_a_store_reload() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let device = AuthorizedDevice {
+            id: "phone-1".into(),
+            name: "Android phone".into(),
+            platform: "android".into(),
+            added_at: "2026-08-27T00:00:00Z".into(),
+            last_seen_at: "2026-08-27T00:00:00Z".into(),
+        };
+
+        let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
+        store
+            .authorize_device(device, "durable-device-credential")
+            .expect("authorize device");
+        drop(store);
+
+        let reloaded = DesktopStore::load(state_path.clone()).expect("reloaded store");
+        assert!(reloaded.authenticate("phone-1", "durable-device-credential"));
+        assert!(!reloaded.authenticate("phone-1", "wrong-credential"));
+        fs::remove_file(state_path).expect("remove test state");
+    }
+}

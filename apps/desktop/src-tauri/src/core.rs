@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     thread,
 };
@@ -80,6 +80,7 @@ pub struct Core {
     clients: Mutex<HashMap<String, RemoteClient>>,
     relay_sender: Mutex<Option<mpsc::UnboundedSender<RelayMessage>>>,
     remote_port: AtomicU16,
+    direct_server_ready: AtomicBool,
 }
 
 impl Core {
@@ -100,6 +101,7 @@ impl Core {
             clients: Mutex::new(HashMap::new()),
             relay_sender: Mutex::new(None),
             remote_port: AtomicU16::new(remote_port),
+            direct_server_ready: AtomicBool::new(false),
         })
     }
 
@@ -174,6 +176,10 @@ impl Core {
 
     pub fn set_remote_port(&self, port: u16) {
         self.remote_port.store(port, Ordering::Relaxed);
+    }
+
+    pub fn set_direct_server_ready(&self, ready: bool) {
+        self.direct_server_ready.store(ready, Ordering::Release);
     }
 
     pub fn relay_endpoint(&self) -> Option<String> {
@@ -580,7 +586,14 @@ impl Core {
         Ok(())
     }
 
-    pub fn start_pairing(&self) -> PairingPayload {
+    pub fn start_pairing(&self) -> Result<PairingPayload> {
+        let relay = self.relay_endpoint();
+        if relay.is_none() && !self.direct_server_ready.load(Ordering::Acquire) {
+            return Err(anyhow!(
+                "Local pairing is unavailable because this process does not own port {}. Another Agent Terminal instance may already be running in the tray. Exit every Agent Terminal tray instance, then reopen the latest build.",
+                self.configured_port()
+            ));
+        }
         let token = random_token(24);
         let expires_at = Utc::now() + Duration::minutes(5);
         let (host_id, host_name) = {
@@ -596,8 +609,7 @@ impl Core {
                 inner.store.host().name.clone(),
             )
         };
-        let relay = self.relay_endpoint();
-        PairingPayload {
+        Ok(PairingPayload {
             version: PROTOCOL_VERSION,
             host_id,
             host_name,
@@ -615,7 +627,7 @@ impl Core {
             },
             pairing_token: token,
             expires_at: expires_at.to_rfc3339(),
-        }
+        })
     }
 
     pub fn revoke_device(&self, device_id: &str) -> Result<()> {
@@ -921,8 +933,7 @@ impl Core {
         let device_token = random_token(32);
         let now = Utc::now();
         let mut inner = self.inner.lock().expect("desktop state poisoned");
-        let grant = inner.pairing_grants.remove(token)?;
-        if grant.expires_at_ms < now.timestamp_millis() {
+        if !take_valid_pairing_grant(&mut inner.pairing_grants, token, now.timestamp_millis()) {
             return None;
         }
         let authorized = AuthorizedDevice {
@@ -1336,10 +1347,22 @@ fn local_address() -> String {
         .unwrap_or_else(|_| "127.0.0.1".into())
 }
 
+fn take_valid_pairing_grant(
+    grants: &mut HashMap<String, PairingGrant>,
+    token: &str,
+    now_ms: i64,
+) -> bool {
+    grants
+        .remove(token)
+        .is_some_and(|grant| grant.expires_at_ms >= now_ms)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_within_project, parse_working_directories};
-    use std::path::Path;
+    use super::{
+        PairingGrant, is_within_project, parse_working_directories, take_valid_pairing_grant,
+    };
+    use std::{collections::HashMap, path::Path};
 
     #[test]
     fn parses_windows_terminal_working_directory_reports() {
@@ -1360,5 +1383,21 @@ mod tests {
             Path::new("C:\\Work\\Project-copy"),
             Path::new("C:\\Work\\Project")
         ));
+    }
+
+    #[test]
+    fn pairing_grants_are_valid_until_expiry_and_consumed_once() {
+        let mut grants = HashMap::from([(
+            "fresh".to_string(),
+            PairingGrant {
+                expires_at_ms: 1_000,
+            },
+        )]);
+        assert!(take_valid_pairing_grant(&mut grants, "fresh", 1_000));
+        assert!(!take_valid_pairing_grant(&mut grants, "fresh", 1_000));
+
+        grants.insert("expired".to_string(), PairingGrant { expires_at_ms: 999 });
+        assert!(!take_valid_pairing_grant(&mut grants, "expired", 1_000));
+        assert!(!grants.contains_key("expired"));
     }
 }

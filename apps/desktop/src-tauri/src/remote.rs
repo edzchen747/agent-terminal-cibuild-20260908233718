@@ -29,6 +29,7 @@ async fn run_direct_server(core: Arc<Core>) {
     let listener = match TcpListener::bind(&address).await {
         Ok(listener) => listener,
         Err(error) => {
+            core.set_direct_server_ready(false);
             eprintln!("Agent Terminal direct server could not bind {address}: {error}");
             return;
         }
@@ -36,6 +37,7 @@ async fn run_direct_server(core: Arc<Core>) {
     if let Ok(address) = listener.local_addr() {
         core.set_remote_port(address.port());
     }
+    core.set_direct_server_ready(true);
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {

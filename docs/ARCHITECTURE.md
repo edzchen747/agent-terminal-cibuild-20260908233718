@@ -26,6 +26,8 @@ Tauri WebView2 windows
 
 When `AGENT_TERMINAL_RELAY_URL` is configured, both the desktop and phone initiate outbound WebSocket connections to the relay. The relay matches the desktop's host ID to the phone's temporary connection ID and forwards opaque protocol payloads. It has no project, device, or terminal state. If the variable is absent, the QR payload uses the desktop's direct LAN WebSocket as a development fallback.
 
+The desktop is single-instance. A second launch delegates focus to the existing tray host and exits before starting another runtime. In direct mode, the desktop refuses to issue a QR unless its process successfully owns the configured WebSocket port.
+
 The Rust process is the only authority. Tauri webviews and mobile clients request operations; they never access the file system or spawn processes directly. The same process owns the tray and connections, so hiding every terminal window does not disconnect paired phones or terminate PTYs.
 
 ## State ownership

@@ -12,6 +12,7 @@ export function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [modal, setModal] = useState<Modal>(null);
   const [qr, setQr] = useState("");
+  const [pairError, setPairError] = useState("");
 
   useEffect(() => {
     void window.agentTerminal.getState().then(setState);
@@ -32,8 +33,14 @@ export function App() {
 
   async function showPairing() {
     setModal("pair");
-    const payload = await window.agentTerminal.startPairing();
-    setQr(await QRCode.toDataURL(JSON.stringify(payload), { width: 320, margin: 2, color: { dark: "#0a1015", light: "#ffffff" } }));
+    setQr("");
+    setPairError("");
+    try {
+      const payload = await window.agentTerminal.startPairing();
+      setQr(await QRCode.toDataURL(JSON.stringify(payload), { width: 320, margin: 2, color: { dark: "#0a1015", light: "#ffffff" } }));
+    } catch (cause) {
+      setPairError(cause instanceof Error ? cause.message : String(cause));
+    }
   }
 
   async function addTab() {
@@ -113,7 +120,7 @@ export function App() {
         <div className="modal-kicker"><PhoneIcon /> Connect your phone</div>
         <h1>Pair once. Reconnect anytime.</h1>
         <p>Scan this QR once to add your phone as an authorized device. It stays paired across every network until you revoke it in Settings.</p>
-        <div className="qr-frame">{qr ? <img src={qr} alt="Mobile pairing QR" /> : <div className="qr-loading">Preparing secure pairing…</div>}</div>
+        <div className={`qr-frame ${pairError ? "has-error" : ""}`}>{qr ? <img src={qr} alt="Mobile pairing QR" /> : pairError ? <div className="pair-error">{pairError}</div> : <div className="qr-loading">Preparing secure pairing…</div>}</div>
         <div className="pair-details"><span><i /> This phone stays authorized</span><span>Reconnect from anywhere</span></div>
       </section></div>}
 
