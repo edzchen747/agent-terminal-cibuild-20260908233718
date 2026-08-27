@@ -8,11 +8,12 @@ export interface DesktopApi {
   getState(): Promise<DesktopState>;
   createProject(): Promise<Project | null>;
   removeProject(projectId: string): Promise<void>;
+  setProjectPersistent(projectId: string, persistent: boolean): Promise<Project>;
   openProject(projectId: string): Promise<void>;
   createSession(projectId: string, shellId?: string): Promise<TerminalSession>;
   closeSession(sessionId: string): Promise<void>;
   write(sessionId: string, data: string): void;
-  resize(sessionId: string, cols: number, rows: number): void;
+  resize(sessionId: string, cols: number, rows: number, force?: boolean): void;
   getBuffer(sessionId: string): Promise<string>;
   copyText(text: string): Promise<void>;
   startPairing(): Promise<PairingPayload>;

@@ -1,6 +1,6 @@
 {
   "name": "agent-terminal",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "description": "A Windows terminal that can be securely controlled from a paired mobile device.",
   "workspaces": [

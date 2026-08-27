@@ -5,6 +5,14 @@ export type TerminalModifier = "ctrl" | "alt" | "shift";
 
 export function applyTerminalModifiers(value: string, modifiers: ReadonlySet<TerminalModifier>): string {
   let output = value;
+  const modifierCode = 1 + (modifiers.has("shift") ? 1 : 0) + (modifiers.has("alt") ? 2 : 0) + (modifiers.has("ctrl") ? 4 : 0);
+  const arrow = output.match(/^\x1b\[([ABCD])$/);
+  if (arrow && modifierCode > 1) return `\x1b[1;${modifierCode}${arrow[1]}`;
+  const page = output.match(/^\x1b\[([56])~$/);
+  if (page && modifierCode > 1) return `\x1b[${page[1]};${modifierCode}~`;
+  if (output === "\t" && modifiers.has("shift")) {
+    return `${modifiers.has("alt") ? "\x1b" : ""}\x1b[Z`;
+  }
 
   if (modifiers.has("shift") && Array.from(output).length === 1) {
     output = output.toUpperCase();
@@ -28,6 +36,30 @@ export function applyTerminalModifiers(value: string, modifiers: ReadonlySet<Ter
   }
 
   return output;
+}
+
+export function parseTerminalWorkingDirectories(value: string): string[] {
+  const directories: string[] = [];
+  const pattern = /\x1b\]([^\x07]*?)(?:\x07|\x1b\\)/g;
+  for (const match of value.matchAll(pattern)) {
+    const payload = match[1] ?? "";
+    if (payload.startsWith("9;9;")) {
+      const directory = payload.slice(4).trim().replace(/^"|"$/g, "");
+      if (directory) directories.push(directory);
+      continue;
+    }
+    if (!payload.startsWith("7;")) continue;
+    try {
+      const location = new URL(payload.slice(2));
+      if (location.protocol !== "file:") continue;
+      let pathname = decodeURIComponent(location.pathname);
+      if (/^\/[a-zA-Z]:\//.test(pathname)) pathname = pathname.slice(1);
+      directories.push(location.hostname ? `//${location.hostname}${pathname}` : pathname);
+    } catch {
+      // Ignore malformed shell-integration metadata.
+    }
+  }
+  return directories;
 }
 
 export interface DeviceIdentity {
@@ -105,12 +137,13 @@ export type ClientMessage =
   | { type: "snapshot.request"; requestId: string }
   | { type: "project.create"; requestId: string; name: string; path: string }
   | { type: "project.remove"; requestId: string; projectId: string }
+  | { type: "project.persistence"; requestId: string; projectId: string; persistent: boolean }
   | { type: "session.create"; requestId: string; projectId: string; shellId?: string }
   | { type: "session.close"; requestId: string; sessionId: string }
   | { type: "session.attach"; requestId: string; sessionId: string; cols: number; rows: number }
   | { type: "session.detach"; requestId: string; sessionId: string }
   | { type: "session.input"; sessionId: string; data: string }
-  | { type: "session.resize"; sessionId: string; cols: number; rows: number };
+  | { type: "session.resize"; sessionId: string; cols: number; rows: number; force?: boolean };
 
 export type ServerMessage =
   | { type: "pair.accepted"; requestId: string; deviceToken: string; snapshot: HostSnapshot }

@@ -44,7 +44,7 @@ function publicProjects(): Project[] {
   const activeProjectIds = new Set(sessions.list().map((session) => session.projectId));
   return [
     ...store.projects,
-    ...[...temporaryProjects.values()].filter((project) => activeProjectIds.has(project.id))
+    ...[...temporaryProjects.values()].filter((project) => activeProjectIds.has(project.id) || projectWindows.has(project.id))
   ];
 }
 
@@ -67,7 +67,7 @@ function stateFor(contents: WebContents): HostSnapshot & { currentProjectId: str
 
 function broadcastState(): void {
   for (const window of BrowserWindow.getAllWindows()) {
-    if (!window.isDestroyed()) window.webContents.send("desktop:state", stateFor(window.webContents));
+    if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send("desktop:state", stateFor(window.webContents));
   }
   remote?.broadcastSnapshot();
 }
@@ -110,13 +110,15 @@ function ensureProjectWindow(projectId: string): BrowserWindow {
     }
   });
   projectWindows.set(projectId, window);
-  windowProjects.set(window.webContents.id, projectId);
+  const webContentsId = window.webContents.id;
+  windowProjects.set(webContentsId, projectId);
   window.once("ready-to-show", () => window.show());
   window.on("closed", () => {
     projectWindows.delete(projectId);
-    windowProjects.delete(window.webContents.id);
+    windowProjects.delete(webContentsId);
     if (!isQuitting) {
       for (const session of sessions.list().filter((item) => item.projectId === projectId)) sessions.close(session.id);
+      temporaryProjects.delete(projectId);
     }
   });
   if (process.env.ELECTRON_RENDERER_URL) {
@@ -127,11 +129,78 @@ function ensureProjectWindow(projectId: string): BrowserWindow {
   return window;
 }
 
+function setProjectPersistence(projectId: string, persistent: boolean): Project {
+  const current = projectById(projectId);
+  if (current.persistent === persistent) return current;
+
+  const project: Project = {
+    ...current,
+    persistent,
+    createdAt: persistent ? current.createdAt ?? new Date().toISOString() : current.createdAt
+  };
+  if (persistent) {
+    temporaryProjects.delete(projectId);
+    store.saveProject(project);
+  } else {
+    store.removeProject(projectId);
+    temporaryProjects.set(projectId, project);
+  }
+  broadcastState();
+  return project;
+}
+
+function handleSessionWorkingDirectory(sessionId: string, reportedCwd: string): void {
+  const session = sessions.list().find((item) => item.id === sessionId);
+  if (!session) return;
+  let candidate = reportedCwd.trim().replace(/^"|"$/g, "");
+  if (/^\/[a-zA-Z]:\//.test(candidate)) candidate = candidate.slice(1);
+  candidate = candidate.replace(/\//g, path.sep);
+  const cwd = path.resolve(candidate);
+  if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) return;
+
+  const savedProject = store.projects
+    .filter((project) => isWithinProject(cwd, project.path))
+    .sort((left, right) => path.resolve(right.path).length - path.resolve(left.path).length)[0];
+  let project = savedProject ?? [...temporaryProjects.values()].find((item) => samePath(item.path, cwd));
+  if (!project) {
+    project = {
+      id: `temporary-${crypto.randomUUID()}`,
+      name: path.basename(cwd) || cwd,
+      path: cwd,
+      persistent: false
+    };
+    temporaryProjects.set(project.id, project);
+  }
+
+  const previousProjectId = session.projectId;
+  sessions.updateLocation(sessionId, project.id, cwd);
+  if (project.id === previousProjectId) return;
+  ensureProjectWindow(project.id);
+
+  const previousProject = temporaryProjects.get(previousProjectId);
+  if (previousProject && !sessions.list().some((item) => item.projectId === previousProjectId)) {
+    const previousWindow = projectWindows.get(previousProjectId);
+    if (previousWindow && !previousWindow.isDestroyed()) previousWindow.close();
+  }
+}
+
+function samePath(left: string, right: string): boolean {
+  return path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase();
+}
+
+function isWithinProject(candidate: string, projectPath: string): boolean {
+  const relative = path.relative(path.resolve(projectPath), candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 function createPersistentProject(name: string, folderPath: string): Project {
   const resolved = path.resolve(folderPath);
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) throw new Error("The desktop folder does not exist.");
-  const duplicate = store.projects.find((project) => path.normalize(project.path).toLowerCase() === path.normalize(resolved).toLowerCase());
-  if (duplicate) return duplicate;
+  const normalized = path.normalize(resolved).toLowerCase();
+  const savedDuplicate = store.projects.find((project) => path.normalize(project.path).toLowerCase() === normalized);
+  if (savedDuplicate) return savedDuplicate;
+  const temporaryDuplicate = [...temporaryProjects.values()].find((project) => path.normalize(project.path).toLowerCase() === normalized);
+  if (temporaryDuplicate) return setProjectPersistence(temporaryDuplicate.id, true);
   const project: Project = {
     id: crypto.randomUUID(),
     name: name.trim() || path.basename(resolved),
@@ -163,8 +232,10 @@ async function executeRemote(message: ClientMessage): Promise<ServerMessage | nu
       createPersistentProject(message.name, message.path);
       return { type: "snapshot", requestId: message.requestId, snapshot: snapshot() };
     case "project.remove":
-      store.removeProject(message.projectId);
-      broadcastState();
+      setProjectPersistence(message.projectId, false);
+      return { type: "snapshot", requestId: message.requestId, snapshot: snapshot() };
+    case "project.persistence":
+      setProjectPersistence(message.projectId, message.persistent);
       return { type: "snapshot", requestId: message.requestId, snapshot: snapshot() };
     case "session.create": {
       const session = createSession(message.projectId, message.shellId);
@@ -182,7 +253,7 @@ async function executeRemote(message: ClientMessage): Promise<ServerMessage | nu
       sessions.write(message.sessionId, message.data);
       return null;
     case "session.resize":
-      sessions.resize(message.sessionId, message.cols, message.rows);
+      sessions.resize(message.sessionId, message.cols, message.rows, message.force);
       return null;
     case "pair":
     case "auth":
@@ -234,9 +305,9 @@ function registerIpc(): void {
     return project;
   });
   ipcMain.handle("desktop:remove-project", (_event, projectId: string) => {
-    store.removeProject(projectId);
-    broadcastState();
+    setProjectPersistence(projectId, false);
   });
+  ipcMain.handle("desktop:set-project-persistent", (_event, projectId: string, persistent: boolean) => setProjectPersistence(projectId, persistent));
   ipcMain.handle("desktop:open-project", (_event, projectId: string) => {
     if (!sessions.list().some((session) => session.projectId === projectId && session.status === "running")) createSession(projectId);
     else ensureProjectWindow(projectId);
@@ -244,7 +315,7 @@ function registerIpc(): void {
   ipcMain.handle("desktop:create-session", (_event, projectId: string, shellId?: string) => createSession(projectId, shellId));
   ipcMain.handle("desktop:close-session", (_event, sessionId: string) => sessions.close(sessionId));
   ipcMain.on("desktop:write", (_event, sessionId: string, data: string) => sessions.write(sessionId, data));
-  ipcMain.on("desktop:resize", (_event, sessionId: string, cols: number, rows: number) => sessions.resize(sessionId, cols, rows));
+  ipcMain.on("desktop:resize", (_event, sessionId: string, cols: number, rows: number, force?: boolean) => sessions.resize(sessionId, cols, rows, force));
   ipcMain.handle("desktop:get-buffer", (_event, sessionId: string) => sessions.buffer(sessionId));
   ipcMain.handle("desktop:copy-text", (_event, text: string) => {
     if (typeof text !== "string") throw new Error("Clipboard content must be text.");
@@ -268,10 +339,13 @@ app.whenReady().then(() => {
   shells = detectShells();
   sessions = new SessionManager();
   sessions.on("data", (sessionId: string, data: string) => {
-    for (const window of BrowserWindow.getAllWindows()) window.webContents.send("desktop:data", sessionId, data);
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send("desktop:data", sessionId, data);
+    }
     remote.sendOutput(sessionId, data);
   });
   sessions.on("changed", () => broadcastState());
+  sessions.on("cwd", (sessionId: string, cwd: string) => handleSessionWorkingDirectory(sessionId, cwd));
   remote = new RemoteServer({
     port: store.settings.port,
     getSnapshot: snapshot,

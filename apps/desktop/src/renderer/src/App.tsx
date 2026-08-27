@@ -46,6 +46,11 @@ export function App() {
     await window.agentTerminal.closeSession(sessionId);
   }
 
+  async function toggleProjectPersistence() {
+    if (!currentProject) return;
+    await window.agentTerminal.setProjectPersistent(currentProject.id, !currentProject.persistent);
+  }
+
   if (!state) return <div className="boot"><TerminalIcon/><span>Starting Agent Terminal…</span></div>;
 
   return (
@@ -59,6 +64,7 @@ export function App() {
         </div>
         <div className="titlebar-actions">
           <span className="host-online"><i /> Remote host online</span>
+          {currentProject && <button className={`project-persistence-action ${currentProject.persistent ? "is-saved" : ""}`} onClick={() => void toggleProjectPersistence()} title={currentProject.persistent ? "Stop saving this project" : "Save this temporary project"}>{currentProject.persistent ? <BookmarkIcon /> : <ClockIcon />}<span>{currentProject.persistent ? "Unsave" : "Save project"}</span></button>}
           <button className="icon-button" onClick={() => void showPairing()} title="Pair a mobile device"><PhoneIcon /></button>
           <button className="icon-button" onClick={() => setModal("settings")} title="Settings and devices"><SettingsIcon /></button>
         </div>

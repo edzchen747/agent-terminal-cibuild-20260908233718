@@ -8,20 +8,77 @@ import "@xterm/xterm/css/xterm.css";
 
 interface Props { connection: HostConnection; session: TerminalSession; }
 
+interface AccessibilityKey {
+  id: string;
+  label: string;
+  modifier?: TerminalModifier;
+  value?: string;
+}
+
+const ACCESSIBILITY_KEY_ROWS: AccessibilityKey[][] = [
+  [
+    { id: "ctrl", label: "Ctrl", modifier: "ctrl" },
+    { id: "alt", label: "Alt", modifier: "alt" },
+    { id: "shift", label: "Shift", modifier: "shift" },
+    { id: "esc", label: "Esc", value: "\x1b" },
+    { id: "tab", label: "Tab", value: "\t" },
+    { id: "pipe", label: "|", value: "|" },
+    { id: "tilde", label: "~", value: "~" }
+  ],
+  [
+    { id: "page-up", label: "PgUp", value: "\x1b[5~" },
+    { id: "page-down", label: "PgDn", value: "\x1b[6~" },
+    { id: "word-left", label: "⌃←", value: "\x1b[1;5D" },
+    { id: "left", label: "←", value: "\x1b[D" },
+    { id: "up", label: "↑", value: "\x1b[A" },
+    { id: "down", label: "↓", value: "\x1b[B" },
+    { id: "right", label: "→", value: "\x1b[C" },
+    { id: "word-right", label: "⌃→", value: "\x1b[1;5C" },
+    { id: "backspace", label: "⌫", value: "\x7f" },
+    { id: "enter", label: "Enter", value: "\r" }
+  ]
+];
+
 export function MobileTerminal({ connection, session }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
-  const modifiersRef = useRef<ReadonlySet<TerminalModifier>>(new Set());
-  const [modifiers, setModifiers] = useState<ReadonlySet<TerminalModifier>>(new Set());
+  const selectedKeysRef = useRef<AccessibilityKey[]>([]);
+  const countdownTimerRef = useRef<number | undefined>(undefined);
+  const [selectedKeyIds, setSelectedKeyIds] = useState<ReadonlySet<string>>(new Set());
+  const [countdownVersion, setCountdownVersion] = useState(0);
 
-  const consumeModifiers = (value: string) => {
-    const activeModifiers = modifiersRef.current;
-    const output = applyTerminalModifiers(value, activeModifiers);
-    if (activeModifiers.size) {
-      const cleared = new Set<TerminalModifier>();
-      modifiersRef.current = cleared;
-      setModifiers(cleared);
+  const activeModifiers = (keys = selectedKeysRef.current) => new Set(keys.flatMap((key) => key.modifier ? [key.modifier] : []));
+
+  const clearSelectedKeys = () => {
+    if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
+    countdownTimerRef.current = undefined;
+    selectedKeysRef.current = [];
+    setSelectedKeyIds(new Set());
+  };
+
+  const executeChord = (keys: AccessibilityKey[]) => {
+    const modifiers = activeModifiers(keys);
+    const output = keys.flatMap((key) => key.value ? [applyTerminalModifiers(key.value, modifiers)] : []).join("");
+    if (output) connection.send({ type: "session.input", sessionId: session.id, data: output });
+  };
+
+  const restartCountdown = (keys: AccessibilityKey[]) => {
+    if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
+    setCountdownVersion((version) => version + 1);
+    if (!keys.length) {
+      countdownTimerRef.current = undefined;
+      return;
     }
+    countdownTimerRef.current = window.setTimeout(() => {
+      const pending = selectedKeysRef.current;
+      if (pending.length > 1) executeChord(pending);
+      clearSelectedKeys();
+    }, 3000);
+  };
+
+  const consumeSelectedKeys = (value: string) => {
+    const output = applyTerminalModifiers(value, activeModifiers());
+    if (selectedKeysRef.current.length) clearSelectedKeys();
     return output;
   };
 
@@ -58,7 +115,7 @@ export function MobileTerminal({ connection, session }: Props) {
           fit.fit();
           if (shouldForce || terminal.cols !== lastSize.cols || terminal.rows !== lastSize.rows) {
             lastSize = { cols: terminal.cols, rows: terminal.rows };
-            connection.send({ type: "session.resize", sessionId: session.id, cols: terminal.cols, rows: terminal.rows });
+            connection.send({ type: "session.resize", sessionId: session.id, cols: terminal.cols, rows: terminal.rows, force: shouldForce });
           }
         } catch {
           // The WebView can report an intermediate zero-sized layout while the keyboard opens.
@@ -69,7 +126,7 @@ export function MobileTerminal({ connection, session }: Props) {
     observer.observe(hostElement);
     const handlePointerActivity = () => resize(true);
     window.addEventListener("pointerdown", handlePointerActivity, true);
-    const input = terminal.onData((data) => connection.send({ type: "session.input", sessionId: session.id, data: consumeModifiers(data) }));
+    const input = terminal.onData((data) => connection.send({ type: "session.input", sessionId: session.id, data: consumeSelectedKeys(data) }));
     const output = connection.on("output", (event) => { if (event.sessionId === session.id) terminal.write(event.data); });
 
     const screen = hostElement.querySelector<HTMLElement>(".xterm-screen");
@@ -131,37 +188,31 @@ export function MobileTerminal({ connection, session }: Props) {
       hostElement.removeEventListener("touchmove", handleTouchMove);
       hostElement.removeEventListener("touchend", resetTouch);
       hostElement.removeEventListener("touchcancel", resetTouch);
+      if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
       input.dispose(); output(); terminal.dispose(); terminalRef.current = null;
     };
   }, [connection, session.id]);
 
-  function toggle(modifier: TerminalModifier) {
-    const next = new Set(modifiersRef.current);
-    if (next.has(modifier)) next.delete(modifier); else next.add(modifier);
-    modifiersRef.current = next;
-    setModifiers(next);
-    terminalRef.current?.focus();
-  }
-
-  function send(value: string) {
-    connection.send({ type: "session.input", sessionId: session.id, data: consumeModifiers(value) });
+  function pressAccessibilityKey(key: AccessibilityKey) {
+    const current = selectedKeysRef.current;
+    const isSelected = current.some((item) => item.id === key.id);
+    const next = isSelected ? current.filter((item) => item.id !== key.id) : [...current, key];
+    if (!current.length && !isSelected && key.value) {
+      connection.send({ type: "session.input", sessionId: session.id, data: key.value });
+    }
+    selectedKeysRef.current = next;
+    setSelectedKeyIds(new Set(next.map((item) => item.id)));
+    restartCountdown(next);
     terminalRef.current?.focus();
   }
 
   return <div className="mobile-terminal-shell">
     <div ref={hostRef} className="mobile-terminal" />
     <div className="extra-keys" aria-label="Terminal function keys">
-      <div className="key-row">
-        <button aria-pressed={modifiers.has("ctrl")} className={modifiers.has("ctrl") ? "latched" : ""} onClick={() => toggle("ctrl")}>Ctrl</button>
-        <button aria-pressed={modifiers.has("alt")} className={modifiers.has("alt") ? "latched" : ""} onClick={() => toggle("alt")}>Alt</button>
-        <button aria-pressed={modifiers.has("shift")} className={modifiers.has("shift") ? "latched" : ""} onClick={() => toggle("shift")}>Shift</button>
-        <button onClick={() => send("\x1b")}>Esc</button><button onClick={() => send("\t")}>Tab</button>
-        <button onClick={() => send("|")}>|</button><button onClick={() => send("~")}>~</button>
-      </div>
-      <div className="key-row">
-        <button onClick={() => send("\x1b[5~")}>PgUp</button><button onClick={() => send("\x1b[6~")}>PgDn</button><button onClick={() => send("\x1b[1;5D")}>⌃←</button><button onClick={() => send("\x1b[D")}>←</button><button onClick={() => send("\x1b[A")}>↑</button><button onClick={() => send("\x1b[B")}>↓</button><button onClick={() => send("\x1b[C")}>→</button>
-        <button onClick={() => send("\x1b[1;5C")}>⌃→</button><button onClick={() => send("\x7f")}>⌫</button><button onClick={() => send("\r")}>Enter</button>
-      </div>
+      {ACCESSIBILITY_KEY_ROWS.map((row, rowIndex) => <div className="key-row" key={rowIndex}>{row.map((key) => {
+        const selected = selectedKeyIds.has(key.id);
+        return <button key={key.id} aria-pressed={selected} className={selected ? "latched chord-pending" : ""} onClick={() => pressAccessibilityKey(key)}><span>{key.label}</span>{selected && <i key={countdownVersion} className="key-countdown" />}</button>;
+      })}</div>)}
     </div>
   </div>;
 }

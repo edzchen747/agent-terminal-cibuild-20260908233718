@@ -15,6 +15,11 @@ button { color: inherit; }
 .titlebar-actions { margin-left: auto; display: flex; align-items: center; gap: 4px; }
 .host-online { display: flex; align-items: center; gap: 7px; margin-right: 8px; padding: 4px 9px; border: 1px solid #263129; border-radius: 99px; color: #89918f; font-size: 11px; }
 .host-online i, .status-dot, .pair-details i { width: 6px; height: 6px; border-radius: 50%; background: #69d58a; box-shadow: 0 0 8px #69d58a88; }
+.project-persistence-action { height: 30px; padding: 0 9px; display: flex; align-items: center; gap: 6px; border: 1px solid #34303a; border-radius: 7px; background: #17151b; color: #9990a0; cursor: pointer; font-size: 10.5px; }
+.project-persistence-action:hover { border-color: #4d685f; background: #17211e; color: #a6ded2; }
+.project-persistence-action.is-saved { border-color: #30463f; background: #14201d; color: #81cbbb; }
+.project-persistence-action svg { width: 13px; height: 13px; }
+.project-persistence-action.is-saved svg { fill: currentColor; }
 .icon-button { width: 32px; height: 32px; padding: 0; border: 0; border-radius: 7px; background: transparent; display: grid; place-items: center; color: #858d9d; cursor: pointer; }
 .icon-button:hover { background: #1b1f29; color: #e7eaf0; }
 .icon-button.small { width: 27px; height: 27px; }

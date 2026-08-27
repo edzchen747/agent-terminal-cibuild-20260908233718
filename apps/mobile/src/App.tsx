@@ -130,7 +130,7 @@ export function App() {
     const project = snapshot.projects.find((item) => item.id === activeSession.projectId);
     return <div className="mobile-app terminal-view">
       <MobileHeader title={activeSession.title} subtitle={project?.name ?? activeSession.cwd} onBack={() => setView({ type: "project", projectId: activeSession.projectId })} trailing={<div className="session-actions"><span className={`session-state ${activeSession.status}`}>{activeSession.status}</span><button className="close-session-button" onClick={() => setSessionToClose(activeSession)} aria-label="Close terminal session" title="Close terminal session"><CloseIcon /></button></div>} />
-      <MobileTerminal connection={connection} session={activeSession} />
+      <MobileTerminal key={activeSession.id} connection={connection} session={activeSession} />
       {sessionToClose?.id === activeSession.id && <CloseSessionSheet session={activeSession} onClose={() => setSessionToClose(null)} onConfirm={() => closeSession(activeSession)} />}
     </div>;
   }
@@ -156,6 +156,8 @@ export function App() {
 
 function ProjectScreen({ project, snapshot, connection, onBack, onOpen }: { project: Project; snapshot: HostSnapshot; connection: HostConnection; onBack: () => void; onOpen: (session: TerminalSession) => void }) {
   const sessions = snapshot.sessions.filter((session) => session.projectId === project.id);
+  const [changingPersistence, setChangingPersistence] = useState(false);
+  const [persistenceError, setPersistenceError] = useState("");
   async function createSession() {
     const response = await connection.request({ type: "session.create", requestId: createRequestId(), projectId: project.id });
     if (response.type === "snapshot") {
@@ -163,9 +165,19 @@ function ProjectScreen({ project, snapshot, connection, onBack, onOpen }: { proj
       if (created) onOpen(created);
     }
   }
+  async function togglePersistence() {
+    setChangingPersistence(true); setPersistenceError("");
+    try {
+      await connection.request({ type: "project.persistence", requestId: createRequestId(), projectId: project.id, persistent: !project.persistent });
+    } catch (cause) {
+      setPersistenceError(cause instanceof Error ? cause.message : "Could not change the project.");
+    } finally {
+      setChangingPersistence(false);
+    }
+  }
   return <div className="mobile-app project-view">
     <MobileHeader title={project.name} subtitle={project.path} onBack={onBack} trailing={project.persistent ? <BookmarkIcon className="saved-icon" /> : <ClockIcon className="temp-icon" />} />
-    <section className="project-hero"><div className="large-folder"><FolderIcon /></div><span>{project.persistent ? "Saved project" : "Temporary project"}</span><h1>{project.name}</h1><p>{project.path}</p><button className="mobile-primary" onClick={() => void createSession()}><PlusIcon /> New terminal session</button></section>
+    <section className="project-hero"><div className="large-folder"><FolderIcon /></div><span>{project.persistent ? "Saved project" : "Temporary project"}</span><h1>{project.name}</h1><p>{project.path}</p><div className="project-actions"><button className="mobile-primary" onClick={() => void createSession()}><PlusIcon /> New terminal</button><button className="mobile-secondary" disabled={changingPersistence} onClick={() => void togglePersistence()}>{project.persistent ? <ClockIcon /> : <BookmarkIcon />}{changingPersistence ? "Updating…" : project.persistent ? "Make temporary" : "Save project"}</button></div>{persistenceError && <div className="form-error project-error">{persistenceError}</div>}</section>
     <section className="session-section"><div className="section-title"><span>Sessions</span><small>{sessions.length}</small></div>
       {sessions.length ? <div className="session-list">{sessions.map((session, index) => <button key={session.id} onClick={() => onOpen(session)}><span className="session-icon"><TerminalIcon /></span><span><strong>{session.title} {index + 1}</strong><small>{session.status === "running" ? "Active now" : `Exited · ${session.exitCode ?? "—"}`}</small></span><i className={session.status} /><ChevronIcon /></button>)}</div> : <div className="inline-empty">No open terminal sessions.</div>}
     </section>

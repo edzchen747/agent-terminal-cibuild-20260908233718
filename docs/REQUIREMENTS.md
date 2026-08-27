@@ -27,6 +27,10 @@
 - Live sessions are discovered after every successful reconnect.
 - New projects open desktop windows; additional sessions in one project open desktop tabs.
 - Temporary projects are derived from live sessions and are not persisted.
+- Desktop and mobile can save a temporary project or return a saved project to temporary status without interrupting its sessions.
 - Terminal bytes travel over the live paired connection with resize and scrollback support.
+- Desktop clicks and mobile taps force a PTY resize notification even when the cell dimensions are unchanged.
+- Shell working-directory reports move sessions to the longest matching saved project, or to a temporary project for an unknown folder.
+- Mobile accessibility keys form animated three-second chords; mobile keyboard input consumes armed modifiers immediately.
 - Desktop Ctrl+C copies when terminal text is selected; with no selection it must continue to send the shell interrupt signal.
 - A successful selection copy displays a brief toast positioned above the selected terminal text.

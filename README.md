@@ -11,6 +11,7 @@ This repository is an end-to-end MVP, not a UI-only prototype.
 - Interactive ConPTY terminal sessions with Command Prompt, Windows PowerShell, PowerShell 7, WSL, and Git Bash detection.
 - A collapsible project sidebar. Opening a different project creates/focuses a dedicated desktop window.
 - Multiple terminal tabs per project.
+- Automatic session regrouping when shell integration reports a changed working directory.
 - Context-aware Ctrl+C: copies selected terminal text and otherwise sends the normal interrupt signal to the shell.
 - Native folder picker for saved projects.
 - QR pairing that authorizes a phone once; ordinary reconnects use the saved device credential.
@@ -18,6 +19,7 @@ This repository is an end-to-end MVP, not a UI-only prototype.
 - Outbound relay support for connections across Wi-Fi, mobile data, NAT, and firewall boundaries.
 - Direct local WebSocket fallback on port `47831` for development without a relay.
 - Desktop-owned persistence for projects, devices, and the default shell.
+- Save or unsave the active project without closing its window or terminal sessions.
 
 ### Android-first mobile app
 
@@ -26,8 +28,9 @@ This repository is an end-to-end MVP, not a UI-only prototype.
 - Live project/session discovery whenever the app connects.
 - Saved-project marker and automatic temporary projects for open desktop folders that were not saved.
 - Project creation against an existing absolute folder path on the desktop.
+- Save temporary projects or make saved projects temporary from the project screen.
 - Session creation and full terminal input/output.
-- Latchable Ctrl, Alt, and Shift modifiers plus Esc, Tab, arrows, word navigation, Backspace, and Enter.
+- Animated three-second key chords for Ctrl, Alt, Shift, Esc, Tab, arrows, word navigation, Backspace, and Enter; armed modifiers apply immediately to mobile keyboard input.
 - Capacitor Android project checked into `apps/mobile/android` with minimum SDK 26.
 - A web-first codebase that can add the Capacitor iOS target without rewriting the UI or protocol.
 

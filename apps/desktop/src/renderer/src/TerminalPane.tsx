@@ -74,14 +74,14 @@ export function TerminalPane({ sessionId, active }: Props) {
       }
       return false;
     });
-    const resize = () => {
-      try { fit.fit(); window.agentTerminal.resize(sessionId, terminal.cols, terminal.rows); } catch { /* hidden pane */ }
+    const resize = (force = false) => {
+      try { fit.fit(); window.agentTerminal.resize(sessionId, terminal.cols, terminal.rows, force); } catch { /* hidden pane */ }
     };
     resizeRef.current = resize;
-    const observer = new ResizeObserver(resize);
+    const observer = new ResizeObserver(() => resize());
     observer.observe(hostRef.current);
     const handlePointerActivity = () => {
-      if (activeRef.current) resize();
+      if (activeRef.current) resize(true);
     };
     window.addEventListener("pointerdown", handlePointerActivity, true);
     const dataSubscription = terminal.onData((data) => window.agentTerminal.write(sessionId, data));
