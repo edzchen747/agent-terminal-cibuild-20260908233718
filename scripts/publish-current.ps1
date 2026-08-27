@@ -36,7 +36,7 @@ function Get-WorkspaceFiles {
   $included = [System.Collections.Generic.List[string]]::new()
   foreach ($relative in $files) {
     $relative = $relative.Replace('\', '/')
-    & git check-ignore -q -- $relative
+    & git -c "safe.directory=$Root" check-ignore -q -- $relative
     if ($LASTEXITCODE -eq 0) { continue }
     if ($relative -match '(^|/)(node_modules|\.git|\.tools|\.gh-config|\.gh-cache|\.npm-cache|\.electron-cache|\.electron-gyp|\.node-gyp|\.electron-builder-cache|out|dist|release|build|assets)(/|$)') { continue }
     $included.Add($relative)
