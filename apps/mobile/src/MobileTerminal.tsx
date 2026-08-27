@@ -248,7 +248,20 @@ export function MobileTerminal({ connection, session }: Props) {
     <div className="extra-keys" aria-label="Terminal function keys">
       {ACCESSIBILITY_KEY_ROWS.map((row, rowIndex) => <div className="key-row" key={rowIndex}>{row.map((key) => {
         const selected = selectedKeyIds.has(key.id);
-        return <button key={key.id} aria-pressed={selected} className={selected ? "latched chord-pending" : ""} onClick={() => pressAccessibilityKey(key)}><span>{key.label}</span>{selected && <i key={countdownVersion} className="key-countdown" />}</button>;
+        return <button
+          key={key.id}
+          type="button"
+          aria-pressed={selected}
+          className={selected ? "latched chord-pending" : ""}
+          onPointerDown={(event) => {
+            event.preventDefault();
+            pressAccessibilityKey(key);
+          }}
+          onClick={(event) => {
+            // Pointer taps are handled immediately above. Keep keyboard activation accessible.
+            if (event.detail === 0) pressAccessibilityKey(key);
+          }}
+        ><span>{key.label}</span>{selected && <i key={countdownVersion} className="key-countdown" />}</button>;
       })}</div>)}
     </div>
   </div>;

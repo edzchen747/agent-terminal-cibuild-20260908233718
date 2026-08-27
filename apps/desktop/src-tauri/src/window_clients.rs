@@ -96,8 +96,12 @@ impl WindowClients {
         }
     }
 
-    pub fn clear_attachments(&mut self, label: &str) {
-        self.attached_sessions.remove(label);
+    pub fn retain_attachment(&mut self, label: &str, session_id: &str) {
+        if !self.window_projects.contains_key(label) {
+            return;
+        }
+        self.attached_sessions
+            .insert(label.to_string(), HashSet::from([session_id.to_string()]));
     }
 
     pub fn attach(&mut self, label: &str, session_id: &str) -> bool {
@@ -190,5 +194,19 @@ mod tests {
 
         assert_eq!(clients.last_or_any(), Some("window-b".into()));
         assert_eq!(clients.last_project(), Some("project-b"));
+    }
+
+    #[test]
+    fn project_reassignment_retains_only_the_moved_terminal_attachment() {
+        let mut clients = WindowClients::default();
+        clients.assign("window-a", "project-a");
+        clients.attach("window-a", "moved-session");
+        clients.attach("window-a", "old-session");
+
+        clients.retain_attachment("window-a", "moved-session");
+        clients.assign("window-a", "project-b");
+
+        assert_eq!(clients.subscribers("moved-session"), vec!["window-a"]);
+        assert!(clients.subscribers("old-session").is_empty());
     }
 }

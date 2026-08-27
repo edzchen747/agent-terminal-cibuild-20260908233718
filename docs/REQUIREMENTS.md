@@ -47,7 +47,7 @@
 - Desktop and mobile text input force a PTY resize before the input bytes are delivered, so interactive TUIs promptly receive the current dimensions.
 - Shell working-directory reports move sessions to the longest matching saved project, or to a temporary project for an unknown folder.
 - When an active session changes to another project, its current window switches to the new project and removes the old project's tabs. Any remaining old-project tabs move into a replacement window opened behind the current window.
-- A desktop window may attach only to sessions owned by its tray-assigned project; reassignment clears prior subscriptions so windows cannot mirror or switch between one another's tabs.
+- A desktop window may attach only to sessions owned by its tray-assigned project; reassignment retains the moved terminal's live attachment while removing the old tabs, so input echo and output continue without interruption.
 - Closing every terminal window retains the most recently focused project in tray memory. Reopening from the tray restores that project and reattaches its live session IDs and scrollback.
 - User-facing and persisted Windows paths omit the verbatim `\\?\` prefix, including PowerShell prompts and saved project working directories.
 - Changing the terminal type replaces the active session in place when it is still pristine; after the user has entered input, the selection changes only the default for future sessions.

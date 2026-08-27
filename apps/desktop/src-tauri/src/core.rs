@@ -1279,7 +1279,7 @@ impl Core {
                 })
                 .flatten();
             let displaced_window = active_window.as_ref().and_then(|label| {
-                inner.windows.clear_attachments(label);
+                inner.windows.retain_attachment(label, session_id);
                 inner.windows.assign(label, &project.id).displaced_window
             });
             let old_has_sessions = project_changed
