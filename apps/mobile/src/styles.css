@@ -46,15 +46,18 @@ button { color: inherit; }
 .mobile-empty > svg { width: 40px; height: 40px; }
 .mobile-empty h2 { margin: 11px 0 3px; color: #9aa2af; font-size: 16px; }
 .mobile-empty p { margin: 0; font-size: 11px; }
-.mobile-header { height: 66px; padding: 0 14px; flex: 0 0 66px; display: grid; grid-template-columns: 42px 1fr 62px; gap: 10px; align-items: center; border-bottom: 1px solid #20252e; background: #0d1117; }
+.mobile-header { height: 66px; padding: 0 14px; flex: 0 0 66px; display: grid; grid-template-columns: 42px minmax(0,1fr) auto; gap: 10px; align-items: center; border-bottom: 1px solid #20252e; background: #0d1117; }
 .mobile-header .round-button { width: 38px; height: 38px; }
 .mobile-header > span { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .mobile-header strong { color: #e7eaf0; font-size: 14px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .mobile-header small { color: #5f6877; font-size: 9.5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.header-trailing { display: flex; justify-content: flex-end; align-items: center; color: #7bd5c3; }
+.header-trailing, .session-actions { display: flex; justify-content: flex-end; align-items: center; gap: 6px; color: #7bd5c3; }
 .header-trailing > svg { width: 17px; }
 .session-state { padding: 4px 8px; border: 1px solid #29463e; border-radius: 99px; color: #6fd091; background: #14221d; text-transform: capitalize; font-size: 9px; }
 .session-state.exited { border-color: #4d3b2d; color: #d09a6f; background: #231a14; }
+.close-session-button { width: 32px; height: 32px; padding: 0; display: grid; place-items: center; border: 1px solid #3d2b31; border-radius: 9px; background: #1c1418; color: #b97884; }
+.close-session-button:active { background: #321c23; transform: scale(.96); }
+.close-session-button svg { width: 16px; height: 16px; }
 .project-view { overflow-y: auto; }
 .project-hero { padding: 26px 20px 22px; display: flex; flex-direction: column; align-items: center; border-bottom: 1px solid #1f242c; background: radial-gradient(circle at 50% 0,#172d2a,#0b0e13 55%); }
 .large-folder { width: 65px; height: 65px; display: grid; place-items: center; border: 1px solid #2b4b44; border-radius: 18px; color: #87dcc9; background: linear-gradient(145deg,#213832,#152420); box-shadow: 0 14px 45px #64c4b01c; }
@@ -97,6 +100,9 @@ button { color: inherit; }
 .bottom-sheet input:focus { border-color: #477b71; box-shadow: 0 0 0 3px #65c5b319; }
 .form-error, .pair-error { padding: 9px 11px; margin-bottom: 12px; border: 1px solid #56303a; border-radius: 8px; background: #25151a; color: #df8492; font-size: 10px; }
 .text-button { width: 100%; height: 40px; border: 0; background: transparent; color: #737d8c; font-size: 11px; }
+.danger-button { width: 100%; min-height: 43px; border: 1px solid #713844; border-radius: 11px; background: linear-gradient(135deg,#a74859,#7f3240); color: #fff2f4; font-size: 12px; font-weight: 800; }
+.danger-button:disabled, .text-button:disabled { opacity: .55; }
+.confirm-sheet strong { color: #cfd5df; }
 .onboarding { min-height: 100%; position: relative; padding: calc(22px + env(safe-area-inset-top)) 24px calc(17px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; overflow-y: auto; background: radial-gradient(circle at 75% 15%,#17312d,#090c11 42%); }
 .ambient { position: absolute; border-radius: 50%; filter: blur(70px); pointer-events: none; }
 .ambient.one { width: 220px; height: 220px; top: -90px; right: -100px; background: #52b7a226; }

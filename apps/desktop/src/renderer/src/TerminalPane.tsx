@@ -7,6 +7,9 @@ interface Props { sessionId: string; active: boolean; }
 
 export function TerminalPane({ sessionId, active }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const activeRef = useRef(active);
+  const resizeRef = useRef<() => void>(() => undefined);
+  activeRef.current = active;
 
   useEffect(() => {
     if (!hostRef.current) return;
@@ -74,8 +77,13 @@ export function TerminalPane({ sessionId, active }: Props) {
     const resize = () => {
       try { fit.fit(); window.agentTerminal.resize(sessionId, terminal.cols, terminal.rows); } catch { /* hidden pane */ }
     };
+    resizeRef.current = resize;
     const observer = new ResizeObserver(resize);
     observer.observe(hostRef.current);
+    const handlePointerActivity = () => {
+      if (activeRef.current) resize();
+    };
+    window.addEventListener("pointerdown", handlePointerActivity, true);
     const dataSubscription = terminal.onData((data) => window.agentTerminal.write(sessionId, data));
     const offData = window.agentTerminal.onData((id, data) => { if (id === sessionId) terminal.write(data); });
     void window.agentTerminal.getBuffer(sessionId).then((buffer) => {
@@ -85,15 +93,20 @@ export function TerminalPane({ sessionId, active }: Props) {
     });
     return () => {
       observer.disconnect();
+      window.removeEventListener("pointerdown", handlePointerActivity, true);
       dataSubscription.dispose();
       offData();
       if (copyToastTimer) window.clearTimeout(copyToastTimer);
       terminal.dispose();
+      resizeRef.current = () => undefined;
     };
   }, [sessionId]);
 
   useEffect(() => {
-    if (active) hostRef.current?.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea")?.focus();
+    if (active) {
+      resizeRef.current();
+      hostRef.current?.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea")?.focus();
+    }
   }, [active]);
 
   return <div ref={hostRef} className={`terminal-pane ${active ? "is-active" : ""}`} />;

@@ -45,14 +45,18 @@ export function MobileTerminal({ connection, session }: Props) {
     fit.fit();
 
     let resizeFrame: number | undefined;
+    let forceResizePending = false;
     let lastSize = { cols: 0, rows: 0 };
-    const resize = () => {
+    const resize = (force = false) => {
+      forceResizePending ||= force;
       if (resizeFrame !== undefined) return;
       resizeFrame = requestAnimationFrame(() => {
         resizeFrame = undefined;
+        const shouldForce = forceResizePending;
+        forceResizePending = false;
         try {
           fit.fit();
-          if (terminal.cols !== lastSize.cols || terminal.rows !== lastSize.rows) {
+          if (shouldForce || terminal.cols !== lastSize.cols || terminal.rows !== lastSize.rows) {
             lastSize = { cols: terminal.cols, rows: terminal.rows };
             connection.send({ type: "session.resize", sessionId: session.id, cols: terminal.cols, rows: terminal.rows });
           }
@@ -61,8 +65,10 @@ export function MobileTerminal({ connection, session }: Props) {
         }
       });
     };
-    const observer = new ResizeObserver(resize);
+    const observer = new ResizeObserver(() => resize());
     observer.observe(hostElement);
+    const handlePointerActivity = () => resize(true);
+    window.addEventListener("pointerdown", handlePointerActivity, true);
     const input = terminal.onData((data) => connection.send({ type: "session.input", sessionId: session.id, data: consumeModifiers(data) }));
     const output = connection.on("output", (event) => { if (event.sessionId === session.id) terminal.write(event.data); });
 
@@ -94,7 +100,7 @@ export function MobileTerminal({ connection, session }: Props) {
       if (activeTouchId === undefined || previousTouchY === undefined || terminal.hasSelection()) return;
       const touch = findTouch(event.touches, activeTouchId);
       if (!touch) return;
-      const deltaY = previousTouchY - touch.clientY;
+      const deltaY = touch.clientY - previousTouchY;
       previousTouchY = touch.clientY;
       if (Math.abs(deltaY) < 0.5) return;
 
@@ -120,6 +126,7 @@ export function MobileTerminal({ connection, session }: Props) {
       connection.send({ type: "session.detach", requestId: createRequestId(), sessionId: session.id });
       observer.disconnect();
       if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
+      window.removeEventListener("pointerdown", handlePointerActivity, true);
       hostElement.removeEventListener("touchstart", handleTouchStart);
       hostElement.removeEventListener("touchmove", handleTouchMove);
       hostElement.removeEventListener("touchend", resetTouch);

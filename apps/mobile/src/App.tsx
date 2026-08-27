@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { App as CapacitorApp } from "@capacitor/app";
 import { Capacitor } from "@capacitor/core";
 import {
   CapacitorBarcodeScanner,
@@ -9,10 +10,10 @@ import {
 import type { HostSnapshot, PairingPayload, Platform, Project, TerminalSession } from "@agentterminal/protocol";
 import { createRequestId, parsePairingPayload } from "@agentterminal/protocol";
 import { HostConnection } from "./connection";
-import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, TerminalIcon, WifiIcon } from "./icons";
+import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, TerminalIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
 
-type View = { type: "home" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string };
+type View = { type: "home" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
 
 export function App() {
   const [connection, setConnection] = useState<HostConnection | null>(null);
@@ -23,6 +24,35 @@ export function App() {
   const [showManual, setShowManual] = useState(false);
   const [view, setView] = useState<View>({ type: "home" });
   const [showCreateProject, setShowCreateProject] = useState(false);
+  const [sessionToClose, setSessionToClose] = useState<TerminalSession | null>(null);
+  const navigationRef = useRef({ view, status, showCreateProject, sessionToClose });
+  navigationRef.current = { view, status, showCreateProject, sessionToClose };
+
+  useEffect(() => {
+    if (Capacitor.getPlatform() !== "android") return;
+    const listener = CapacitorApp.addListener("backButton", () => {
+      const navigation = navigationRef.current;
+      if (navigation.sessionToClose) {
+        setSessionToClose(null);
+        return;
+      }
+      if (navigation.showCreateProject) {
+        setShowCreateProject(false);
+        return;
+      }
+      if (navigation.status !== "connected") return;
+      if (navigation.view.type === "terminal") {
+        setView({ type: "project", projectId: navigation.view.projectId });
+        return;
+      }
+      if (navigation.view.type === "project") {
+        setView({ type: "home" });
+        return;
+      }
+      void CapacitorApp.exitApp();
+    });
+    return () => { void listener.then((handle) => handle.remove()); };
+  }, []);
 
   useEffect(() => {
     let current: HostConnection | null = null;
@@ -82,6 +112,13 @@ export function App() {
     setConnection(null); setSnapshot(null); setError(""); setStatus("pairing"); setView({ type: "home" });
   }
 
+  async function closeSession(session: TerminalSession) {
+    if (!connection) return;
+    await connection.request({ type: "session.close", requestId: createRequestId(), sessionId: session.id });
+    setSessionToClose(null);
+    setView({ type: "project", projectId: session.projectId });
+  }
+
   if (status === "loading" || status === "connecting") return <Splash label={status === "loading" ? "Opening Agent Terminal" : "Connecting to desktop"} />;
   if (status === "pairing") return <PairScreen error={error} manualCode={manualCode} showManual={showManual} onManualCode={setManualCode} onShowManual={() => setShowManual(true)} onScan={() => void scan()} onPair={() => void pair(manualCode)} />;
   if (status === "error") return <ErrorScreen message={error} onRetry={() => window.location.reload()} onForget={() => void forgetHost()} />;
@@ -92,12 +129,13 @@ export function App() {
   if (view.type === "terminal" && activeSession) {
     const project = snapshot.projects.find((item) => item.id === activeSession.projectId);
     return <div className="mobile-app terminal-view">
-      <MobileHeader title={activeSession.title} subtitle={project?.name ?? activeSession.cwd} onBack={() => setView({ type: "project", projectId: activeSession.projectId })} trailing={<span className={`session-state ${activeSession.status}`}>{activeSession.status}</span>} />
+      <MobileHeader title={activeSession.title} subtitle={project?.name ?? activeSession.cwd} onBack={() => setView({ type: "project", projectId: activeSession.projectId })} trailing={<div className="session-actions"><span className={`session-state ${activeSession.status}`}>{activeSession.status}</span><button className="close-session-button" onClick={() => setSessionToClose(activeSession)} aria-label="Close terminal session" title="Close terminal session"><CloseIcon /></button></div>} />
       <MobileTerminal connection={connection} session={activeSession} />
+      {sessionToClose?.id === activeSession.id && <CloseSessionSheet session={activeSession} onClose={() => setSessionToClose(null)} onConfirm={() => closeSession(activeSession)} />}
     </div>;
   }
   if (view.type === "project" && activeProject) {
-    return <ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={() => setView({ type: "home" })} onOpen={(session) => setView({ type: "terminal", sessionId: session.id })} />;
+    return <ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={() => setView({ type: "home" })} onOpen={(session) => setView({ type: "terminal", sessionId: session.id, projectId: session.projectId })} />;
   }
   return <div className="mobile-app home-view">
     <header className="home-header">
@@ -107,7 +145,7 @@ export function App() {
     <section className="home-content">
       <div className="section-title"><span>Projects</span><button onClick={() => setShowCreateProject(true)}><PlusIcon /> New</button></div>
       <div className="project-cards">
-        {snapshot.projects.map((project) => <ProjectCard key={project.id} project={project} sessions={snapshot.sessions.filter((session) => session.projectId === project.id)} onClick={() => setView({ type: "project", projectId: project.id })} onSession={(session) => setView({ type: "terminal", sessionId: session.id })} />)}
+        {snapshot.projects.map((project) => <ProjectCard key={project.id} project={project} sessions={snapshot.sessions.filter((session) => session.projectId === project.id)} onClick={() => setView({ type: "project", projectId: project.id })} onSession={(session) => setView({ type: "terminal", sessionId: session.id, projectId: session.projectId })} />)}
       </div>
       {!snapshot.projects.length && <div className="mobile-empty"><FolderIcon /><h2>No projects yet</h2><p>Add a folder from your desktop to begin.</p></div>}
     </section>
@@ -148,6 +186,17 @@ function CreateProjectSheet({ connection, onClose }: { connection: HostConnectio
     catch (cause) { setError(cause instanceof Error ? cause.message : "Could not create the project."); }
   }
   return <div className="sheet-backdrop" onClick={onClose}><section className="bottom-sheet" onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Desktop project</span><h2>Add a project</h2><p>Projects point directly to an existing folder on {connection.host.name}.</p><label>Project name<input value={name} onChange={(event) => setName(event.target.value)} placeholder="My project" /></label><label>Desktop folder path<input value={folderPath} onChange={(event) => setFolderPath(event.target.value)} placeholder="C:\Users\you\Projects\app" autoCapitalize="none" autoCorrect="off" /></label>{error && <div className="form-error">{error}</div>}<button className="mobile-primary full" onClick={() => void submit()}>Add project</button><button className="text-button" onClick={onClose}>Cancel</button></section></div>;
+}
+
+function CloseSessionSheet({ session, onClose, onConfirm }: { session: TerminalSession; onClose: () => void; onConfirm: () => Promise<void> }) {
+  const [closing, setClosing] = useState(false);
+  const [error, setError] = useState("");
+  async function confirm() {
+    setClosing(true); setError("");
+    try { await onConfirm(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Could not close the terminal session."); setClosing(false); }
+  }
+  return <div className="sheet-backdrop" onClick={closing ? undefined : onClose}><section className="bottom-sheet confirm-sheet" onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Close terminal</span><h2>End this session?</h2><p>This will terminate <strong>{session.title}</strong> and remove its tab from the desktop and phone.</p>{error && <div className="form-error">{error}</div>}<button className="danger-button" disabled={closing} onClick={() => void confirm()}>{closing ? "Closing…" : "Close terminal"}</button><button className="text-button" disabled={closing} onClick={onClose}>Cancel</button></section></div>;
 }
 
 function MobileHeader({ title, subtitle, onBack, trailing }: { title: string; subtitle: string; onBack: () => void; trailing?: React.ReactNode }) {
