@@ -50,15 +50,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
   const [selectedKeyIds, setSelectedKeyIds] = useState<ReadonlySet<string>>(new Set());
   const [countdownVersion, setCountdownVersion] = useState(0);
 
-  useEffect(() => {
-    if (!activeRef.current) {
-      terminalRef.current?.blur();
-      return;
-    }
-    terminalRef.current?.focus();
-    resizeRef.current(true);
-  }, [active, fontWidthScale]);
-
   const activeModifiers = (keys = selectedKeysRef.current) => new Set(keys.flatMap((key) => key.modifier ? [key.modifier] : []));
 
   const clearSelectedKeys = () => {
@@ -73,7 +64,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const modifiers = activeModifiers(keys);
     const output = keys.flatMap((key) => key.value ? [applyTerminalModifiers(key.value, modifiers)] : []).join("");
     if (output) {
-      resizeRef.current(true);
       connection.send({ type: "session.input", sessionId: session.id, data: output });
     }
   };
@@ -190,7 +180,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const sendInput = (data: string) => {
       if (!data || !activeRef.current) return;
       terminal.focus();
-      resize(true);
       const output = consumeSelectedKeys(data);
       if (output) connection.send({ type: "session.input", sessionId: session.id, data: output });
     };
@@ -358,7 +347,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const moveCursorToTouch = (clientX: number, clientY: number) => {
       if (!activeRef.current) return;
       terminal.focus();
-      resize(true);
       if (!screen || terminal.hasSelection() || terminal.modes.mouseTrackingMode !== "none") return;
 
       const buffer = terminal.buffer.active;
@@ -502,6 +490,15 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     };
   }, [connection, session.id]);
 
+  useEffect(() => {
+    if (!activeRef.current) {
+      terminalRef.current?.blur();
+      return;
+    }
+    terminalRef.current?.focus();
+    resizeRef.current(true);
+  }, [active, fontWidthScale]);
+
   function pressAccessibilityKey(key: AccessibilityKey) {
     if (!activeRef.current) return;
     const current = selectedKeysRef.current;
@@ -509,7 +506,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const next = isSelected ? current.filter((item) => item.id !== key.id) : [...current, key];
     if (!current.length && !isSelected && key.value) {
       terminalRef.current?.focus();
-      resizeRef.current(true);
       connection.send({ type: "session.input", sessionId: session.id, data: key.value });
     }
     selectedKeysRef.current = next;
