@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import QRCode from "qrcode";
-import { encodePairingPayload } from "@agentterminal/protocol";
+import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH } from "@agentterminal/protocol";
 import type { DesktopState } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, PhoneIcon, PlusIcon, SettingsIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { TerminalPane } from "./TerminalPane";
@@ -372,7 +372,7 @@ export function App() {
         <button className="icon-button title-action" onClick={() => setSidebarOpen((value) => !value)} aria-label="Toggle project sidebar"><MenuIcon /></button>
         <div className="brand-mark"><TerminalIcon /></div>
         <div className="window-title">
-          <strong>{currentProject?.name ?? "Agent Terminal"}</strong>
+          <strong className="display-name" title={currentProject?.name ?? "Agent Terminal"}>{currentProject?.name ?? "Agent Terminal"}</strong>
           <span>{currentProject?.path}</span>
         </div>
         <div className="titlebar-actions">
@@ -395,7 +395,7 @@ export function App() {
               const count = state.sessions.filter((session) => session.projectId === project.id && session.status === "running").length;
               return <div key={project.id} ref={(element) => { if (element) projectElementsRef.current.set(project.id, element); else projectElementsRef.current.delete(project.id); }} role="button" tabIndex={0} className={`project-item ${project.id === state.currentProjectId ? "active" : ""} ${project.id === projectDrag?.projectId ? "is-dragging" : ""}`} style={{ transform: projectDragTransform(project.id, index) }} onClick={() => void window.agentTerminal.openProject(project.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") void window.agentTerminal.openProject(project.id); }}>
                 <span className="project-icon"><FolderIcon /></span>
-                <span className="project-copy"><strong>{project.name}</strong><small>{count ? `${count} active session${count === 1 ? "" : "s"}` : "No active sessions"}</small></span>
+                <span className="project-copy"><strong className="display-name" title={project.name}>{project.name}</strong><small>{count ? `${count} active session${count === 1 ? "" : "s"}` : "No active sessions"}</small></span>
                 <span className="project-item-actions"><span className="project-drag-handle" role="button" aria-label={`Reorder ${project.name}`} title="Drag to reorder" onClick={(event) => event.stopPropagation()} onPointerDown={(event) => beginProjectDrag(event, project.id, index)} onPointerMove={moveProjectDrag} onPointerUp={(event) => finishProjectDrag(event, true)} onPointerCancel={(event) => finishProjectDrag(event, false)}>⠿</span><span className="persistence" title={project.persistent ? "Saved project" : "Temporary project"}>{project.persistent ? <BookmarkIcon /> : <ClockIcon />}</span><button className="project-rename" onClick={(event) => { event.stopPropagation(); startRename(project.id); }} title={`Rename ${project.name}`} aria-label={`Rename ${project.name}`}><EditIcon /></button></span>
               </div>;
             })}
@@ -408,7 +408,7 @@ export function App() {
           <div className="tabbar">
             <div className="tabs">
               {projectSessions.map((session, index) => <button key={session.id} ref={(element) => { if (element) tabElementsRef.current.set(session.id, element); else tabElementsRef.current.delete(session.id); }} className={`terminal-tab ${session.id === activeSessionId ? "active" : ""} ${session.id === tabDrag?.sessionId ? "is-dragging" : ""} ${closingSessionIds.has(session.id) ? "is-closing" : ""}`} style={{ transform: tabDragTransform(session.id, index) }} onClick={() => { if (!suppressTabClickRef.current) setActiveSessionId(session.id); }} onPointerDown={(event) => beginTabDrag(event, session.id, index)} onPointerMove={moveTabDrag} onPointerUp={(event) => finishTabDrag(event, true)} onPointerCancel={(event) => finishTabDrag(event, false)}>
-                <TerminalIcon /><span>{session.title}</span>{session.status === "exited" && <i className="exit-dot" title={`Exited (${session.exitCode ?? "unknown"})`} />}
+                <TerminalIcon /><span className="terminal-tab-label display-name" title={session.title}>{session.title}</span>{session.status === "exited" && <i className="exit-dot" title={`Exited (${session.exitCode ?? "unknown"})`} />}
                 <span className="tab-close" role="button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void closeTab(session.id); }}><CloseIcon /></span>
               </button>)}
               <button className="add-tab" onClick={() => void addTab()} title="New terminal tab"><PlusIcon /></button>
@@ -419,7 +419,7 @@ export function App() {
           </div>
           <div className="terminal-stack">
             {projectSessions.map((session) => <TerminalPane key={session.id} sessionId={session.id} active={session.id === activeSessionId} />)}
-            {!projectSessions.length && <div className="empty-terminal"><TerminalIcon /><h2>No open terminals</h2><p>Start a session in {currentProject?.name}.</p><button className="primary" onClick={() => void addTab()}><PlusIcon /> New terminal</button></div>}
+            {!projectSessions.length && <div className="empty-terminal"><TerminalIcon /><h2>No open terminals</h2><p className="display-name" title={`Start a session in ${currentProject?.name}.`}>Start a session in {currentProject?.name}.</p><button className="primary" onClick={() => void addTab()}><PlusIcon /> New terminal</button></div>}
           </div>
           <footer className="statusbar"><span><i className="status-dot" /> {projectSessions.filter((session) => session.status === "running").length} running</span><span>{currentProject?.path}</span><span>UTF-8</span></footer>
         </section>
@@ -452,7 +452,7 @@ export function App() {
         <div className="modal-kicker"><EditIcon /> Project name</div>
         <h1>Rename project</h1>
         <p>The folder stays at {renamingProject.path}.</p>
-        <label className="rename-field">Name<input autoFocus maxLength={100} value={projectName} onChange={(event) => setProjectName(event.target.value)} /></label>
+        <label className="rename-field">Name<input autoFocus maxLength={MAX_PROJECT_NAME_LENGTH} value={projectName} onChange={(event) => setProjectName(event.target.value)} /></label>
         {renameError && <div className="form-error">{renameError}</div>}
         <button className="primary wide" disabled={renaming} type="submit">{renaming ? "Renaming…" : "Save name"}</button>
       </form></div>}

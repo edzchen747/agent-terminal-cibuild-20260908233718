@@ -7,6 +7,7 @@ export const OVERLAY_CONTROL_URL = "https://node.hopto.org" as const;
 export const OVERLAY_TAILNET_DOMAIN = "agent-terminal.internal" as const;
 export const LAN_CONNECT_TIMEOUT_MS = 1_500 as const;
 export const NODE_INACTIVITY_TIMEOUT_DAYS = 30 as const;
+export const MAX_PROJECT_NAME_LENGTH = 100 as const;
 
 export type Platform = "android" | "ios" | "web";
 export type TerminalModifier = "ctrl" | "alt" | "shift";

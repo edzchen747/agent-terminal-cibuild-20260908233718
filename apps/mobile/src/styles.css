@@ -7,6 +7,7 @@ html, body, #root { width: 100%; min-width: 320px; height: 100%; margin: 0; over
 .mobile-page { height: 100%; min-width: 0; flex: 0 0 100%; position: relative; overflow: hidden; background: #090c11; box-shadow: -12px 0 28px #0008; }
 button, input, textarea { font: inherit; }
 button { color: inherit; }
+.display-name { min-width: 0; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .mobile-app { height: 100%; display: flex; flex-direction: column; padding-top: env(safe-area-inset-top); background: #090c11; }
 .mobile-registration-banner { position: fixed; z-index: 18; top: calc(9px + env(safe-area-inset-top)); left: 12px; right: 12px; min-height: 36px; padding: 7px 8px 7px 11px; display: flex; align-items: center; justify-content: space-between; gap: 9px; border: 1px solid #663943; border-radius: 10px; background: #29181dee; box-shadow: 0 9px 28px #0009; color: #e0a0aa; font-size: 10px; line-height: 1.35; }
 .mobile-registration-banner button { flex: none; height: 25px; padding: 0 10px; border: 1px solid #81515d; border-radius: 6px; background: #45242d; color: #f4c1c8; font-size: 10px; font-weight: 800; }
@@ -42,9 +43,9 @@ button { color: inherit; }
 .mobile-project-drag { width: 22px; height: 38px; display: grid; place-items: center; color: #65707f; font-size: 17px; cursor: grab; touch-action: none; user-select: none; }
 .mobile-project-drag:active { color: #8de0ce; cursor: grabbing; }
 .card-sessions { min-height: 40px; padding: 6px 10px; display: flex; gap: 5px; align-items: center; border-top: 1px solid #222832; overflow-x: auto; }
-.card-sessions button { flex: 0 0 auto; height: 29px; max-width: 125px; padding: 0 9px; display: flex; align-items: center; gap: 6px; border: 1px solid #29303b; border-radius: 7px; background: #161b23; color: #87909f; font-size: 10px; }
-.card-sessions button svg { width: 13px; }
-.card-sessions button span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.card-sessions button { min-width: 0; flex: 0 0 auto; height: 29px; max-width: 125px; padding: 0 9px; display: flex; align-items: center; gap: 6px; overflow: hidden; border: 1px solid #29303b; border-radius: 7px; background: #161b23; color: #87909f; font-size: 10px; }
+.card-sessions button svg { width: 13px; flex: none; }
+.card-sessions button i { flex: none; }
 .card-sessions i, .session-list i { width: 5px; height: 5px; border-radius: 50%; background: #707887; }
 .card-sessions i.running, .session-list i.running { background: #62d185; box-shadow: 0 0 6px #62d18588; }
 .more-sessions { color: #626b79; font-size: 10px; }
@@ -79,7 +80,7 @@ button { color: inherit; }
 .large-folder { width: 65px; height: 65px; display: grid; place-items: center; border: 1px solid #2b4b44; border-radius: 18px; color: #87dcc9; background: linear-gradient(145deg,#213832,#152420); box-shadow: 0 14px 45px #64c4b01c; }
 .large-folder svg { width: 34px; height: 34px; }
 .project-hero > span { margin-top: 14px; color: #6f7a89; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; }
-.project-hero h1 { margin: 6px 0 3px; color: #edf0f5; font-size: 25px; letter-spacing: -.04em; }
+.project-hero h1 { width: 100%; margin: 6px 0 3px; color: #edf0f5; font-size: 25px; letter-spacing: -.04em; text-align: center; }
 .project-hero p { max-width: 90%; margin: 0 0 19px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #626b78; font-family: "Roboto Mono", monospace; font-size: 9.5px; }
 .mobile-primary { min-height: 43px; padding: 0 17px; display: flex; align-items: center; justify-content: center; gap: 7px; border: 0; border-radius: 11px; background: linear-gradient(135deg,#8be0ce,#69c8ba); color: #0b1714; font-size: 12px; font-weight: 800; box-shadow: 0 9px 30px #55bca926; }
 .mobile-primary:active { transform: scale(.98); filter: brightness(.95); }
@@ -95,7 +96,7 @@ button { color: inherit; }
 .project-error { width: min(100%,390px); margin: 10px 0 0; text-align: left; }
 .session-section { padding: 17px 15px 35px; }
 .session-list { margin-top: 5px; overflow: hidden; border: 1px solid #232934; border-radius: 13px; }
-.session-list button { width: 100%; min-height: 63px; padding: 8px 11px; display: grid; grid-template-columns: 37px 1fr 8px 18px; gap: 9px; align-items: center; border: 0; border-bottom: 1px solid #212630; background: #11151c; text-align: left; }
+.session-list button { width: 100%; min-height: 63px; padding: 8px 11px; display: grid; grid-template-columns: 37px minmax(0,1fr) 8px 18px; gap: 9px; align-items: center; border: 0; border-bottom: 1px solid #212630; background: #11151c; text-align: left; }
 .session-list button:last-child { border-bottom: 0; }
 .session-icon { width: 36px; height: 36px; display: grid; place-items: center; border-radius: 9px; background: #1b222b; color: #7f8999; }
 .session-icon svg { width: 18px; }
@@ -157,7 +158,7 @@ button { color: inherit; }
 .text-button { width: 100%; height: 40px; border: 0; background: transparent; color: #737d8c; font-size: 11px; }
 .danger-button { width: 100%; min-height: 43px; border: 1px solid #713844; border-radius: 11px; background: linear-gradient(135deg,#a74859,#7f3240); color: #fff2f4; font-size: 12px; font-weight: 800; }
 .danger-button:disabled, .text-button:disabled { opacity: .55; }
-.confirm-sheet strong { color: #cfd5df; }
+.confirm-sheet strong { overflow-wrap: anywhere; color: #cfd5df; }
 .terminal-settings-sheet { padding-bottom: calc(22px + env(safe-area-inset-bottom)); }
 .font-width-control { margin: 2px 0 16px !important; padding: 14px; border: 1px solid #29313a; border-radius: 12px; background: #0c1016; }
 .font-width-control > span { display: flex; align-items: center; justify-content: space-between; color: #bfc7d1; }

@@ -39,6 +39,7 @@ use crate::{
 
 const MAX_SCROLLBACK_BYTES: usize = 512_000;
 const MAX_CONTROL_BYTES: usize = 8_192;
+const MAX_PROJECT_NAME_CHARACTERS: usize = 100;
 
 struct ManagedSession {
     metadata: TerminalSession,
@@ -840,6 +841,10 @@ impl Core {
         folder: &str,
     ) -> Result<Project> {
         let resolved = canonical_directory(folder)?;
+        let name = name.trim();
+        if !name.is_empty() {
+            validate_project_name(name)?;
+        }
         let normalized = normalized_path(&resolved);
         let mut persisted_existing = None;
         let project = {
@@ -863,10 +868,10 @@ impl Core {
             } else {
                 let project = Project {
                     id: Uuid::new_v4().to_string(),
-                    name: if name.trim().is_empty() {
+                    name: if name.is_empty() {
                         folder_name(&resolved)
                     } else {
-                        name.trim().to_string()
+                        name.to_string()
                     },
                     path: resolved.to_string_lossy().into_owned(),
                     persistent: true,
@@ -885,13 +890,7 @@ impl Core {
     }
 
     pub fn rename_project(&self, project_id: &str, name: &str) -> Result<Project> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(anyhow!("Project name cannot be empty."));
-        }
-        if name.chars().count() > 100 || name.chars().any(char::is_control) {
-            return Err(anyhow!("Project name must be 100 characters or fewer."));
-        }
+        let name = validate_project_name(name)?;
         let (project, window_label) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let mut project =
@@ -2277,6 +2276,19 @@ fn parse_terminal_titles(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn validate_project_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(anyhow!("Project name cannot be empty."));
+    }
+    if name.chars().count() > MAX_PROJECT_NAME_CHARACTERS || name.chars().any(char::is_control) {
+        return Err(anyhow!(
+            "Project name must be {MAX_PROJECT_NAME_CHARACTERS} characters or fewer."
+        ));
+    }
+    Ok(name)
+}
+
 fn local_address() -> String {
     UdpSocket::bind("0.0.0.0:0")
         .and_then(|socket| {
@@ -2338,6 +2350,7 @@ mod tests {
     use super::{
         EmbeddedNodeStatus, PairingGrant, is_dropped_node_status, is_within_project,
         parse_terminal_titles, parse_working_directories, take_valid_pairing_grant,
+        validate_project_name,
     };
     use std::{collections::HashMap, path::Path};
 
@@ -2402,5 +2415,16 @@ mod tests {
 
         assert!(is_dropped_node_status(&dropped));
         assert!(!is_dropped_node_status(&unavailable));
+    }
+
+    #[test]
+    fn project_names_have_a_bounded_character_count() {
+        assert_eq!(
+            validate_project_name("  Project name  ").unwrap(),
+            "Project name"
+        );
+        assert!(validate_project_name(&"x".repeat(100)).is_ok());
+        assert!(validate_project_name(&"x".repeat(101)).is_err());
+        assert!(validate_project_name("\n").is_err());
     }
 }
