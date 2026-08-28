@@ -69,7 +69,7 @@ No Visual Studio C++ workload is required: the desktop uses a prebuilt ConPTY bi
 
 ## Run the Headscale stack
 
-The public deployment bundle is in [`server/relay`](server/relay/README.md). It includes Headscale's embedded DERP/STUN server, Caddy TLS termination, and the 30-day inactive-node reaper. It is configured entirely through `.env`.
+The public deployment bundle is in [`server/relay`](server/relay/README.md). It includes Headscale's embedded DERP/STUN server, the narrow enrollment service, Caddy TLS termination, and the 30-day inactive-node reaper. It is configured entirely through `.env`.
 
 For production, copy `server/relay/.env.example` to `.env`, set DNS/ports/secrets, and run `docker compose up -d --build` from that directory. Self-hosted client values are supplied through:
 
@@ -78,11 +78,13 @@ $env:AGENT_TERMINAL_CONTROL_URL = "https://headscale.example.com"
 $env:AGENT_TERMINAL_REMOTE_ENDPOINT = "ws://desktop-host-id.agent-terminal.internal:47831"
 $env:AGENT_TERMINAL_REMOTE_TRANSPORT = "overlay"
 $env:AGENT_TERMINAL_TAILNET_DOMAIN = "agent-terminal.internal"
-$env:AGENT_TERMINAL_NODE_AUTH_KEY = "<short-lived-headscale-preauth-key>"
+$env:AGENT_TERMINAL_PROVISIONING_TOKEN = "<unique-per-installation-client-token>"
+# Optional, desktop-only bootstrap key. It is never copied into pairing data.
+$env:AGENT_TERMINAL_NODE_AUTH_KEY = "<single-use-desktop-preauth-key>"
 npm run dev
 ```
 
-QR pairing is LAN-only: the QR contains the desktop's local WebSocket endpoint and the phone must be on the same network for the first authorization. After pairing, the phone probes that endpoint for 1.5 seconds; if it is unavailable, it starts its embedded node engine and uses the remote Headscale/DERP path. Neither endpoint needs an inbound port-forwarding rule.
+QR pairing is LAN-only: the QR contains the desktop's local WebSocket endpoint and a five-minute device-binding grant, never a Headscale key. After the desktop accepts the phone, it exchanges its scoped installation credential for a 60-second activation and requests a separate single-use mobile pre-auth key. That key is returned only on the already-authorized LAN socket and is not persisted by the web layer. Later, the phone probes LAN for 1.5 seconds before using its persistent embedded-node identity over Headscale/DERP. Neither endpoint needs an inbound port-forwarding rule.
 
 ## Start the desktop app
 

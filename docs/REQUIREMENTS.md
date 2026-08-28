@@ -21,6 +21,8 @@
 - The desktop stores the authorized device record and can revoke it.
 - Revoking a device invalidates its saved credential and disconnects it.
 - A new QR scan is required only when adding a new phone or after revocation.
+- QR/manual pairing data contains no Headscale enrollment or API credential.
+- After device binding, the authorized LAN socket may request exactly one separately generated mobile enrollment key. Mobile enrolls immediately and does not persist that key.
 
 ## Network reachability
 
@@ -30,6 +32,8 @@
 - The default control plane is `https://node.hopto.org`; Headscale's embedded DERP/STUN service coordinates process-isolated nodes for direct NAT traversal and encrypted relay fallback.
 - The first QR pairing uses the desktop's LAN endpoint only. On reconnect, mobile gives the saved LAN endpoint a 1.5-second timeout, then starts the embedded node and uses the saved remote endpoint.
 - Desktop and mobile persist their embedded-node private key and network state across restarts. Node keys have no age expiry; the deployment reaper expires nodes after 30 days of inactivity.
+- The provisioning service is authenticated, consumes short-lived activations/nonces once, fixes the Headscale user/tag and expiry, creates only single-use keys, rate-limits requests, and exposes no arbitrary Headscale API proxy.
+- Headscale administrative API keys remain server-only and are never included in either app or pairing payload.
 - Direct LAN WebSocket is used for first pairing and remains available as a trusted-network fast path.
 - The desktop QR modal and mobile onboarding must describe pairing as a one-time device binding, not a one-time reconnect code.
 - Pairing UI must not label the QR as a one-time code or present its setup-grant expiry as the lifetime of the device pairing.

@@ -3,13 +3,13 @@ set -eu
 
 apk add --no-cache coreutils curl jq >/dev/null
 
-api_key="${HEADSCALE_API_KEY:-}"
-base_url="${HEADSCALE_PUBLIC_URL:-https://node.hopto.org}"
+api_key="${HEADSCALE_REAPER_API_KEY:-}"
+base_url="${HEADSCALE_INTERNAL_URL:-http://headscale:8080}"
 inactive_days="${NODE_INACTIVITY_DAYS:-30}"
 interval="${NODE_REAPER_INTERVAL_SECONDS:-3600}"
 
 if [ -z "$api_key" ]; then
-  echo "node-reaper: HEADSCALE_API_KEY is empty; inactivity expiry is disabled" >&2
+  echo "node-reaper: HEADSCALE_REAPER_API_KEY is empty; inactivity expiry is disabled" >&2
   while :; do sleep "$interval"; done
 fi
 

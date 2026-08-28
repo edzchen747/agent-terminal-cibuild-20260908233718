@@ -14,6 +14,19 @@ test("pairing payloads round-trip", () => {
   assert.deepEqual(parsePairingPayload(JSON.stringify(payload)), payload);
 });
 
+test("legacy pairing payloads discard QR-carried Headscale keys", () => {
+  const decoded = parsePairingPayload(JSON.stringify({
+    version: PROTOCOL_VERSION,
+    hostId: "host-1",
+    hostName: "Workstation",
+    endpoint: "ws://192.168.1.10:47831",
+    pairingToken: "one-time-secret",
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    nodeAuthKey: "legacy-shared-key"
+  }));
+  assert.equal("nodeAuthKey" in decoded, false);
+});
+
 test("network defaults keep pairing local and remote control configurable", () => {
   assert.equal(LAN_CONNECT_TIMEOUT_MS, 1_500);
   assert.equal(OVERLAY_CONTROL_URL, "https://node.hopto.org");
@@ -44,8 +57,7 @@ test("compact pairing payloads preserve connection data", () => {
     transport: "direct" as const,
     remoteTransport: "overlay" as const,
     pairingToken: "one-time-secret",
-    expiresAt: "2026-08-28T12:00:00.000Z",
-    nodeAuthKey: "node-auth-key"
+    expiresAt: "2026-08-28T12:00:00.000Z"
   };
   const encoded = encodePairingPayload(payload);
   const decoded = parsePairingPayload(encoded);
@@ -61,7 +73,7 @@ test("compact pairing payloads preserve connection data", () => {
   assert.equal(decoded.remoteEndpoint, undefined);
   assert.equal(decoded.controlUrl, undefined);
   assert.equal(decoded.remoteTransport, undefined);
-  assert.equal(decoded.nodeAuthKey, payload.nodeAuthKey);
+  assert.equal(encoded.includes("node-auth-key"), false);
 });
 
 test("messages encode as JSON", () => {

@@ -1,9 +1,10 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use rand::RngCore;
@@ -82,8 +83,16 @@ impl DesktopStore {
             })
             .unwrap_or_else(default_state);
         for project in &mut state.projects {
-            project.path = strip_windows_verbatim_prefix(&project.path);
+            let visible_path = strip_windows_verbatim_prefix(&project.path);
+            project.path = fs::canonicalize(&visible_path)
+                .map(|path| strip_windows_verbatim_prefix(path.to_string_lossy().as_ref()))
+                .unwrap_or(visible_path);
         }
+        let mut paths = HashSet::new();
+        state.projects.retain(|project| {
+            // Keep the first record so existing project IDs remain stable.
+            paths.insert(normalized_project_path(&project.path))
+        });
         let store = Self { file_path, state };
         store.write()?;
         Ok(store)
@@ -120,6 +129,12 @@ impl DesktopStore {
     }
 
     pub fn save_project(&mut self, project: Project) -> Result<()> {
+        if self.state.projects.iter().any(|item| {
+            item.id != project.id
+                && normalized_project_path(&item.path) == normalized_project_path(&project.path)
+        }) {
+            return Err(anyhow!("A project already exists for this folder."));
+        }
         if let Some(existing) = self
             .state
             .projects
@@ -228,6 +243,13 @@ fn read_state(path: &Path) -> Option<StoredState> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
 
+fn normalized_project_path(path: &str) -> String {
+    strip_windows_verbatim_prefix(path)
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
 fn migration_candidates() -> Vec<PathBuf> {
     let Some(app_data) = std::env::var_os("APPDATA").map(PathBuf::from) else {
         return Vec::new();
@@ -261,6 +283,51 @@ mod tests {
     use crate::models::AuthorizedDevice;
     use std::{fs, path::PathBuf};
     use uuid::Uuid;
+
+    #[test]
+    fn duplicate_project_paths_are_collapsed_on_reload() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let state = serde_json::json!({
+            "host": { "id": "host-1", "name": "Workstation" },
+            "projects": [
+                {
+                    "id": "project-first",
+                    "name": "First name",
+                    "path": "C:\\Users\\edzch",
+                    "persistent": true,
+                    "createdAt": "2026-08-28T00:00:00Z"
+                },
+                {
+                    "id": "project-duplicate",
+                    "name": "Duplicate name",
+                    "path": "\\\\?\\c:\\Users\\edzch\\",
+                    "persistent": true,
+                    "createdAt": "2026-08-28T00:01:00Z"
+                }
+            ],
+            "devices": [],
+            "settings": { "defaultShellId": "powershell", "port": 47831 }
+        });
+        fs::write(
+            &state_path,
+            serde_json::to_vec(&state).expect("serialize test state"),
+        )
+        .expect("write test state");
+
+        let store = DesktopStore::load(state_path.clone()).expect("load duplicate state");
+        assert_eq!(store.projects().len(), 1);
+        assert_eq!(store.projects()[0].id, "project-first");
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).expect("read repaired state"))
+                .expect("parse repaired state");
+        assert_eq!(persisted["projects"].as_array().unwrap().len(), 1);
+        fs::remove_file(state_path).expect("remove test state");
+    }
 
     #[test]
     fn authorized_device_credentials_survive_a_store_reload() {

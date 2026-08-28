@@ -17,9 +17,26 @@ pub fn control_url() -> String {
 }
 
 pub fn embedded_node_auth_key() -> Option<String> {
+    // Desktop bootstrap only. This value is never serialized or sent to a
+    // paired device; mobile receives its own key from the provisioner.
     std::env::var("AGENT_TERMINAL_NODE_AUTH_KEY")
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+pub fn provisioning_url() -> String {
+    std::env::var("AGENT_TERMINAL_PROVISIONING_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .unwrap_or_else(|| format!("{}/api/provision", control_url()))
+}
+
+pub fn provisioning_token() -> Option<String> {
+    std::env::var("AGENT_TERMINAL_PROVISIONING_TOKEN")
+        .ok()
+        .filter(|value| value.trim().len() >= 32)
+        .map(|value| value.trim().to_string())
 }
 
 pub fn tailnet_domain() -> String {

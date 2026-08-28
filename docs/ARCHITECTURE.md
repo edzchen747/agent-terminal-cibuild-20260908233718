@@ -31,6 +31,8 @@ The QR payload always uses the desktop's direct LAN WebSocket for the first pair
 
 Headscale is the control plane in `server/relay`; its embedded DERP server supplies encrypted fallback relaying and UDP/3478 STUN-assisted NAT discovery. No application-level relay service is required.
 
+Caddy sends `/api/provision/*` to a narrow enrollment service and all normal node-control routes to Headscale. Headscale's administrative `/api/v1/*` surface is not public. The enrollment service alone holds its Headscale bearer key and can only create non-reusable, non-ephemeral pre-auth keys for the configured user/tag and expiry; callers cannot select or proxy Headscale operations.
+
 The desktop is single-instance. A second launch delegates focus to the existing tray host and exits before starting another runtime. In direct mode, the desktop refuses to issue a QR unless its process successfully owns the configured WebSocket port.
 
 The Rust tray process is the only authority. Tauri webviews and mobile clients request operations; they never access the file system or spawn processes directly. Terminal windows are disposable clients: closing every window does not disconnect paired phones or terminate PTYs, and the tray can create a fresh client later. Android's foreground service owns the user-visible connection status while the WebView owns the protocol client; the two are updated together, and a restarted service never claims the socket is connected until the WebView authenticates again.
@@ -43,8 +45,9 @@ The Rust tray process is the only authority. Tauri webviews and mobile clients r
 | Authorized devices | Persistent | Desktop JSON store |
 | Default shell | Persistent | Desktop JSON store |
 | Terminal processes and scrollback | Tauri tray-process lifetime | Rust session manager |
-| Paired host LAN/remote endpoints, transport, and credential | Persistent | Mobile Capacitor Preferences |
+| Paired host LAN/remote endpoints, transport, and device credential | Persistent | Mobile Capacitor Preferences |
 | Embedded node private key and network state | Persistent | Desktop JSON store / mobile Capacitor Preferences |
+| Mobile pre-auth key | Enrollment call only; never persisted by the web layer | Authorized LAN socket / native node process |
 | Current mobile screen, project snapshots, terminal output | In memory | Mobile app |
 
 Temporary projects are derived from live desktop sessions. They disappear when their final session closes unless the folder is explicitly saved as a project.
@@ -65,17 +68,19 @@ Temporary projects are derived from live desktop sessions. They disappear when t
 ## Pairing lifecycle
 
 1. The desktop creates a cryptographically random pairing grant with a five-minute expiry and refuses to issue pairing data unless its LAN listener is ready.
-2. The QR payload includes protocol version, host identity, LAN endpoint, remote endpoint/control URL, transport, grant, and expiry.
+2. The QR payload includes protocol version, host identity, LAN endpoint, remote endpoint/control URL, transport, grant, and expiry. It contains no Headscale credential.
 3. The phone submits its generated device ID, display name, platform, and token.
 4. The desktop consumes the grant once and returns a 256-bit device credential.
-5. The phone stores the host record. The desktop stores only a SHA-256 hash of the credential.
-6. Later connections authenticate with the device ID and credential through the LAN endpoint when available, otherwise through the embedded node. No new QR scan is needed. Revocation removes the hash and disconnects active sockets for that device.
+5. On that same authorized socket, the phone sends a fresh enrollment nonce. The desktop uses its scoped per-installation client credential to obtain a 60-second activation from the provisioner, then consumes the activation for one fixed-policy, single-use mobile pre-auth key.
+6. The desktop returns the mobile key to that client only. Mobile immediately enrolls its native node, persists the resulting node identity, and does not save the pre-auth key. The service retains only hashes/replay state, never the key.
+7. The phone stores the host record. The desktop stores only a SHA-256 hash of the device credential.
+8. Later connections authenticate with the device ID and credential through the LAN endpoint when available, otherwise through the persistent embedded node. No new QR scan is needed. Revocation removes the hash and disconnects active sockets for that device.
 
 ## Protocol
 
 `packages/protocol` is the canonical shared contract. Messages cover:
 
-- pairing and authentication;
+- pairing, authentication, and one-time node enrollment;
 - host snapshots;
 - project creation/removal;
 - session create/close/attach/detach;

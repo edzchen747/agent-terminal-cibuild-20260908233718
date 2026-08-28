@@ -30,6 +30,7 @@ use crate::{
     },
     network,
     path_utils::user_visible_path,
+    provisioning,
     shells::{command_for, detect_shells},
     store::{DesktopStore, NetworkState, random_token},
     window_clients::WindowClients,
@@ -58,6 +59,7 @@ pub enum ClientSink {
 
 struct RemoteClient {
     device_id: Option<String>,
+    enrollment_allowed: bool,
     attached_sessions: HashSet<String>,
     sink: ClientSink,
 }
@@ -109,22 +111,37 @@ impl Core {
     }
 
     pub fn initialize(self: &Arc<Self>) -> Result<()> {
-        let start_folder = std::env::var("USERPROFILE")
-            .map(PathBuf::from)
-            .unwrap_or(std::env::current_dir()?);
-        let project = Project {
-            id: format!("temporary-{}", Uuid::new_v4()),
-            name: folder_name(&start_folder),
-            path: start_folder.to_string_lossy().into_owned(),
-            persistent: false,
-            created_at: None,
+        let start_folder = canonical_directory(
+            std::env::var("USERPROFILE")
+                .map(PathBuf::from)
+                .unwrap_or(std::env::current_dir()?),
+        )?;
+        let project = {
+            let inner = self.inner.lock().expect("desktop state poisoned");
+            inner
+                .store
+                .projects()
+                .iter()
+                .find(|saved| {
+                    normalized_path(Path::new(&saved.path)) == normalized_path(&start_folder)
+                })
+                .cloned()
+                .unwrap_or_else(|| Project {
+                    id: format!("temporary-{}", Uuid::new_v4()),
+                    name: folder_name(&start_folder),
+                    path: start_folder.to_string_lossy().into_owned(),
+                    persistent: false,
+                    created_at: None,
+                })
         };
         {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             inner.store.ensure_network_identity()?;
-            inner
-                .temporary_projects
-                .insert(project.id.clone(), project.clone());
+            if !project.persistent {
+                inner
+                    .temporary_projects
+                    .insert(project.id.clone(), project.clone());
+            }
         }
         self.create_session(&project.id, None)?;
         Ok(())
@@ -961,7 +978,6 @@ impl Core {
             transport: "direct".into(),
             pairing_token: token,
             expires_at: expires_at.to_rfc3339(),
-            node_auth_key: network::embedded_node_auth_key(),
         })
     }
 
@@ -989,6 +1005,7 @@ impl Core {
                 id,
                 RemoteClient {
                     device_id: None,
+                    enrollment_allowed: false,
                     attached_sessions: HashSet::new(),
                     sink: ClientSink::Direct { messages, close },
                 },
@@ -1039,6 +1056,7 @@ impl Core {
                     .get_mut(client_id)
                 {
                     client.device_id = Some(device.id.clone());
+                    client.enrollment_allowed = true;
                 }
                 self.send_to_client(
                     client_id,
@@ -1050,6 +1068,76 @@ impl Core {
                 );
                 let _ = self.app.emit("pairing-succeeded", device.id);
                 self.broadcast();
+                return;
+            }
+            ClientMessage::NodeEnroll { request_id, nonce } => {
+                if nonce.len() < 32
+                    || nonce.len() > 128
+                    || !nonce.bytes().all(|value| {
+                        value.is_ascii_alphanumeric() || value == b'-' || value == b'_'
+                    })
+                {
+                    self.send_to_client(
+                        client_id,
+                        ServerMessage::Error {
+                            request_id: Some(request_id),
+                            code: "BAD_ENROLLMENT_NONCE".into(),
+                            message: "The enrollment request nonce is invalid.".into(),
+                        },
+                    );
+                    return;
+                }
+                let device_id = {
+                    let mut clients = self.clients.lock().expect("remote clients poisoned");
+                    clients.get_mut(client_id).and_then(|client| {
+                        if !client.enrollment_allowed {
+                            return None;
+                        }
+                        client.enrollment_allowed = false;
+                        client.device_id.clone()
+                    })
+                };
+                let Some(device_id) = device_id else {
+                    self.send_to_client(
+                        client_id,
+                        ServerMessage::Error {
+                            request_id: Some(request_id),
+                            code: "ENROLLMENT_DENIED".into(),
+                            message: "Complete trusted LAN pairing before requesting a mobile enrollment key.".into(),
+                        },
+                    );
+                    return;
+                };
+
+                let core = Arc::clone(self);
+                let client_id = client_id.to_string();
+                let host_id = self.snapshot().host.id;
+                tauri::async_runtime::spawn(async move {
+                    match provisioning::issue_mobile_key(&host_id, &device_id, &nonce).await {
+                        Ok(key) => core.send_to_client(
+                            &client_id,
+                            ServerMessage::NodeEnrollment {
+                                request_id,
+                                auth_key: key.auth_key,
+                                expires_at: key.expires_at,
+                            },
+                        ),
+                        Err(error) => {
+                            // The provisioning client never reads an error
+                            // response body, so this diagnostic cannot contain
+                            // a Headscale key or provisioning credential.
+                            eprintln!("Agent Terminal mobile enrollment failed: {error:#}");
+                            core.send_to_client(
+                                &client_id,
+                                ServerMessage::Error {
+                                    request_id: Some(request_id),
+                                    code: "ENROLLMENT_UNAVAILABLE".into(),
+                                    message: "A one-time mobile enrollment key could not be issued. Reopen pairing and try again.".into(),
+                                },
+                            );
+                        }
+                    }
+                });
                 return;
             }
             ClientMessage::Auth {
@@ -1250,7 +1338,9 @@ impl Core {
                 self.resize_session(&session_id, cols, rows, force.unwrap_or(false));
                 None
             }
-            ClientMessage::Pair { .. } | ClientMessage::Auth { .. } => None,
+            ClientMessage::Pair { .. }
+            | ClientMessage::Auth { .. }
+            | ClientMessage::NodeEnroll { .. } => None,
         })
     }
 
@@ -1622,12 +1712,20 @@ fn public_projects(inner: &Inner) -> Vec<Project> {
         .map(|session| session.metadata.project_id.as_str())
         .collect();
     let mut projects = inner.store.projects().to_vec();
+    let saved_paths = inner
+        .store
+        .projects()
+        .iter()
+        .map(|project| normalized_path(Path::new(&project.path)))
+        .collect::<HashSet<_>>();
     projects.extend(
         inner
             .temporary_projects
             .values()
             .filter(|project| {
-                active.contains(project.id.as_str()) || inner.windows.has_project(&project.id)
+                !saved_paths.contains(&normalized_path(Path::new(&project.path)))
+                    && (active.contains(project.id.as_str())
+                        || inner.windows.has_project(&project.id))
             })
             .cloned(),
     );

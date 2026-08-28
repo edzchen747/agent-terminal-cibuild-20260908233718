@@ -31,11 +31,33 @@ services:
       - "3478:3478/udp"
     restart: unless-stopped
 
+  # Narrow enrollment facade. Only this service can mint pre-auth keys; apps
+  # receive a separate scoped client credential, never the Headscale API key.
+  provisioner:
+    build: ../provisioning
+    depends_on:
+      - headscale
+    env_file: .env
+    environment:
+      HEADSCALE_INTERNAL_URL: http://headscale:8080
+      PORT: "8090"
+    expose:
+      - "8090"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
   # Public TLS termination for Headscale control, DERP, and STUN bootstrap.
   caddy:
     image: caddy:2.10-alpine
     depends_on:
       - headscale
+      - provisioner
     environment:
       NODE_DOMAIN: ${NODE_DOMAIN:-node.hopto.org}
       CADDY_EMAIL: ${CADDY_EMAIL:-}

@@ -1,5 +1,19 @@
 {$NODE_DOMAIN} {
     encode gzip
 
-    reverse_proxy headscale:8080
+    # The only public enrollment operation. handle_path removes the
+    # /api/provision prefix before forwarding to the narrow service.
+    handle_path /api/provision/* {
+        reverse_proxy provisioner:8090
+    }
+
+    # Headscale's administrative bearer-key API is internal-only. Normal
+    # Headscale node registration, Noise, DERP and health routes still use the
+    # root paths expected by Tailscale clients.
+    @headscale_admin path /api/v1 /api/v1/*
+    respond @headscale_admin 404
+
+    handle {
+        reverse_proxy headscale:8080
+    }
 }

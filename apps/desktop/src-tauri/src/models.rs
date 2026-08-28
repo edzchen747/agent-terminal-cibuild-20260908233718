@@ -117,8 +117,6 @@ pub struct PairingPayload {
     pub transport: String,
     pub pairing_token: String,
     pub expires_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_auth_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -143,6 +141,8 @@ pub enum ClientMessage {
         device_id: String,
         device_token: String,
     },
+    #[serde(rename = "node.enroll")]
+    NodeEnroll { request_id: String, nonce: String },
     #[serde(rename = "snapshot.request")]
     SnapshotRequest { request_id: String },
     #[serde(rename = "project.create")]
@@ -212,6 +212,7 @@ impl ClientMessage {
         match self {
             Self::Pair { request_id, .. }
             | Self::Auth { request_id, .. }
+            | Self::NodeEnroll { request_id, .. }
             | Self::SnapshotRequest { request_id }
             | Self::ProjectCreate { request_id, .. }
             | Self::ProjectRename { request_id, .. }
@@ -240,6 +241,12 @@ pub enum ServerMessage {
     AuthAccepted {
         request_id: String,
         snapshot: HostSnapshot,
+    },
+    #[serde(rename = "node.enrollment")]
+    NodeEnrollment {
+        request_id: String,
+        auth_key: String,
+        expires_at: String,
     },
     #[serde(rename = "snapshot")]
     Snapshot {
@@ -288,6 +295,12 @@ mod tests {
                 ..
             }
         ));
+
+        let enrollment: ClientMessage = serde_json::from_str(
+            r#"{"type":"node.enroll","requestId":"r2","nonce":"12345678901234567890123456789012"}"#,
+        )
+        .expect("enrollment message");
+        assert!(matches!(enrollment, ClientMessage::NodeEnroll { .. }));
 
         let json = serde_json::to_value(ServerMessage::Ok {
             request_id: "r1".into(),

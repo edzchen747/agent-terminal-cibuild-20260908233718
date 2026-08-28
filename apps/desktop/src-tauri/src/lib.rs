@@ -3,6 +3,7 @@ mod embedded_node;
 mod models;
 mod network;
 mod path_utils;
+mod provisioning;
 mod remote;
 mod shells;
 mod store;

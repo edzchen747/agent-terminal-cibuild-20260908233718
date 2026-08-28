@@ -20,7 +20,6 @@ export interface SavedHost {
   controlUrl?: string;
   transport?: "direct" | "overlay";
   remoteTransport?: "direct" | "overlay";
-  nodeAuthKey?: string;
   deviceId: string;
   deviceToken: string;
 }
@@ -57,7 +56,16 @@ export class HostConnection {
   static async saved(): Promise<SavedHost | null> {
     const { value } = await Preferences.get({ key: HOST_KEY });
     if (!value) return null;
-    try { return JSON.parse(value) as SavedHost; } catch { return null; }
+    try {
+      const parsed = JSON.parse(value) as SavedHost & { nodeAuthKey?: string };
+      if ("nodeAuthKey" in parsed) {
+        // Purge credentials persisted by builds that copied a shared key out
+        // of the QR. An enrolled node only needs its native persistent state.
+        delete parsed.nodeAuthKey;
+        await Preferences.set({ key: HOST_KEY, value: JSON.stringify(parsed) });
+      }
+      return parsed;
+    } catch { return null; }
   }
 
   static async forget(): Promise<void> {
@@ -78,7 +86,6 @@ export class HostConnection {
       controlUrl: payload.controlUrl ?? OVERLAY_CONTROL_URL,
       transport: "direct",
       remoteTransport: payload.remoteTransport ?? "overlay",
-      nodeAuthKey: payload.nodeAuthKey,
       deviceId: device.id,
       deviceToken: ""
     });
@@ -89,13 +96,21 @@ export class HostConnection {
       temporary.host.deviceToken = response.deviceToken;
       temporary.snapshot = response.snapshot;
       temporary.authenticated = true;
+      const enrollment = await temporary.request({
+        type: "node.enroll",
+        requestId: createRequestId(),
+        nonce: crypto.randomUUID()
+      });
+      if (enrollment.type !== "node.enrollment") {
+        throw new Error("The desktop did not issue a mobile enrollment key.");
+      }
       // Initialize and persist the overlay identity during pairing so a later
       // off-LAN reconnect does not create a new node after an app restart.
       await temporary.embeddedEngine.start(
         temporary.host.controlUrl ?? OVERLAY_CONTROL_URL,
         temporary.host.remoteEndpoint ?? defaultRemoteEndpoint(temporary.host.id),
         temporary.host.remoteTransport ?? "overlay",
-        temporary.host.nodeAuthKey
+        enrollment.authKey
       );
       // Commit the host only after both LAN pairing and native overlay
       // enrollment succeeded. A failed enrollment must not leave a half-paired
@@ -187,7 +202,7 @@ export class HostConnection {
       if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
         const remoteEndpoint = this.host.remoteEndpoint ?? defaultRemoteEndpoint(this.host.id);
         const remoteTransport = this.host.remoteTransport ?? "overlay";
-        const nodeState = await this.embeddedEngine.start(this.host.controlUrl ?? OVERLAY_CONTROL_URL, remoteEndpoint, remoteTransport, this.host.nodeAuthKey);
+        const nodeState = await this.embeddedEngine.start(this.host.controlUrl ?? OVERLAY_CONTROL_URL, remoteEndpoint, remoteTransport);
         if (remoteTransport === "overlay" && !nodeState.proxyEndpoint) {
           throw new Error("The embedded network node is unavailable for a remote connection.");
         }

@@ -149,13 +149,12 @@ export interface PairingPayload {
   remoteTransport?: "direct" | "overlay";
   pairingToken: string;
   expiresAt: string;
-  /** Optional first-enrollment key; never include a long-lived shared key. */
-  nodeAuthKey?: string;
 }
 
 export type ClientMessage =
   | { type: "pair"; requestId: string; token: string; device: DeviceIdentity }
   | { type: "auth"; requestId: string; deviceId: string; deviceToken: string }
+  | { type: "node.enroll"; requestId: string; nonce: string }
   | { type: "snapshot.request"; requestId: string }
   | { type: "project.create"; requestId: string; name: string; path: string }
   | { type: "project.rename"; requestId: string; projectId: string; name: string }
@@ -172,6 +171,7 @@ export type ClientMessage =
 export type ServerMessage =
   | { type: "pair.accepted"; requestId: string; deviceToken: string; snapshot: HostSnapshot }
   | { type: "auth.accepted"; requestId: string; snapshot: HostSnapshot }
+  | { type: "node.enrollment"; requestId: string; authKey: string; expiresAt: string }
   | { type: "snapshot"; requestId?: string; snapshot: HostSnapshot }
   | { type: "directory.listing"; requestId: string; listing: DirectoryListing }
   | { type: "session.output"; sessionId: string; data: string }
@@ -220,8 +220,6 @@ export function encodePairingPayload(payload: PairingPayload): string {
   if (payload.remoteEndpoint && payload.remoteEndpoint !== defaultRemoteEndpoint) compact.r = payload.remoteEndpoint;
   if (payload.controlUrl && payload.controlUrl !== OVERLAY_CONTROL_URL) compact.c = payload.controlUrl;
   if (payload.remoteTransport && payload.remoteTransport !== "overlay") compact.rt = payload.remoteTransport;
-  if (payload.nodeAuthKey) compact.k = payload.nodeAuthKey;
-
   return JSON.stringify(compact);
 }
 
@@ -242,10 +240,12 @@ export function parsePairingPayload(raw: string): PairingPayload {
         ...(typeof parsed.c === "string" ? { controlUrl: parsed.c } : {}),
         ...(parsed.rt === "direct" || parsed.rt === "overlay" ? { remoteTransport: parsed.rt } : {}),
         pairingToken: parsed.t as string,
-        expiresAt: typeof parsed.x === "number" ? new Date(parsed.x * 1_000).toISOString() : parsed.x as string,
-        ...(typeof parsed.k === "string" ? { nodeAuthKey: parsed.k } : {})
+        expiresAt: typeof parsed.x === "number" ? new Date(parsed.x * 1_000).toISOString() : parsed.x as string
       }
     : parsed as Partial<PairingPayload>;
+  // Old builds placed a Headscale key in this field. Never propagate it even
+  // when parsing a legacy, non-compact payload.
+  delete (payload as Partial<PairingPayload> & { nodeAuthKey?: unknown }).nodeAuthKey;
 
   if (
     payload.version !== PROTOCOL_VERSION ||

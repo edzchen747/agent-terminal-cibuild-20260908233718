@@ -33,6 +33,9 @@ go mod tidy
 go build -trimpath -ldflags='-s -w -H=windowsgui' -o embedded-node.exe ./
 ```
 
-The auth key is supplied only at enrollment time through
+An auth key is supplied only to the native process at enrollment time through
 `AGENT_TERMINAL_NODE_AUTH_KEY`; the long-lived node identity remains in the
-state directory and must be preserved across app restarts.
+state directory and must be preserved across app restarts. For mobile this is
+a separately provisioned, single-use key received after trusted LAN pairing,
+not a value from the QR or saved host record. The optional desktop bootstrap
+key is likewise desktop-only.
