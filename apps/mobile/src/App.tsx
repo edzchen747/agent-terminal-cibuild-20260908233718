@@ -110,7 +110,7 @@ export function App() {
         await startConnectionNotification(current.host.name);
         setStatus("connected");
       } catch (cause) {
-        if (disposed) return;
+        if (disposed || current.isClosed()) return;
         if (isAuthorizationError(cause)) {
           current.stopAutoReconnect();
           await stopConnectionNotification();
@@ -143,12 +143,18 @@ export function App() {
       setStatus("connecting");
       void updateConnectionNotification(connection.host.name, "reconnecting");
     });
+    const offReconnectFailed = connection.on("reconnectFailed", (cause) => {
+      setSnapshot(null);
+      setError(cause.message);
+      setStatus("error");
+      void stopConnectionNotification();
+    });
     const offDisconnect = connection.on("disconnected", () => {
       setError("The desktop connection was lost. Reconnecting…");
       setStatus("connecting");
       void updateConnectionNotification(connection.host.name, "reconnecting");
     });
-    return () => { offSnapshot(); offConnected(); offReconnecting(); offDisconnect(); };
+    return () => { offSnapshot(); offConnected(); offReconnecting(); offReconnectFailed(); offDisconnect(); };
   }, [connection]);
 
   async function pair(raw: string) {

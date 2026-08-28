@@ -8,6 +8,7 @@ const REQUEST_TIMEOUT_MS = 12_000;
 const HEARTBEAT_INTERVAL_MS = 20_000;
 const RECONNECT_BASE_DELAY_MS = 1_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
+const RECONNECT_TIMEOUT_MS = 5_000;
 
 export interface SavedHost {
   id: string;
@@ -30,6 +31,7 @@ type EventMap = {
   disconnected: undefined;
   connected: HostSnapshot;
   reconnecting: { attempt: number; delayMs: number };
+  reconnectFailed: Error;
 };
 
 export class HostConnection {
@@ -41,6 +43,7 @@ export class HostConnection {
   private heartbeatInFlight = false;
   private connectPromise?: Promise<HostSnapshot>;
   private reconnectTimer?: number;
+  private reconnectTimeoutTimer?: number;
   private reconnectAttempt = 0;
   private reconnectDelay = RECONNECT_BASE_DELAY_MS;
   private autoReconnect = false;
@@ -105,6 +108,7 @@ export class HostConnection {
     }
     if (this.connectPromise) return this.connectPromise;
 
+    this.startReconnectTimeout();
     let failed = false;
     const attempt = this.connectOnce()
       .catch((error) => {
@@ -126,6 +130,7 @@ export class HostConnection {
   stopAutoReconnect(): void {
     this.autoReconnect = false;
     this.clearReconnectTimer();
+    this.clearReconnectTimeout();
   }
 
   retryNow(): void {
@@ -141,6 +146,10 @@ export class HostConnection {
 
   isConnected(): boolean {
     return this.authenticated && this.socket?.readyState === WebSocket.OPEN;
+  }
+
+  isClosed(): boolean {
+    return this.closed;
   }
 
   private async connectOnce(): Promise<HostSnapshot> {
@@ -179,6 +188,7 @@ export class HostConnection {
       this.authenticated = true;
       this.reconnectAttempt = 0;
       this.reconnectDelay = RECONNECT_BASE_DELAY_MS;
+      this.clearReconnectTimeout();
       this.startHeartbeat();
       this.emit("connected", response.snapshot);
       return response.snapshot;
@@ -235,6 +245,7 @@ export class HostConnection {
     this.closed = true;
     this.autoReconnect = false;
     this.clearReconnectTimer();
+    this.clearReconnectTimeout();
     this.stopHeartbeat();
     this.authenticated = false;
     this.socketGeneration += 1;
@@ -325,6 +336,7 @@ export class HostConnection {
 
   private scheduleReconnect(delayOverride?: number): void {
     if (!this.autoReconnect || this.closed || this.reconnectTimer !== undefined || this.connectPromise) return;
+    this.startReconnectTimeout();
     const delayMs = delayOverride ?? this.reconnectDelay;
     this.reconnectAttempt += 1;
     this.emit("reconnecting", { attempt: this.reconnectAttempt, delayMs });
@@ -338,6 +350,22 @@ export class HostConnection {
   private clearReconnectTimer(): void {
     if (this.reconnectTimer !== undefined) window.clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
+  }
+
+  private startReconnectTimeout(): void {
+    if (!this.autoReconnect || this.closed || this.isConnected() || this.reconnectTimeoutTimer !== undefined) return;
+    this.reconnectTimeoutTimer = window.setTimeout(() => {
+      this.reconnectTimeoutTimer = undefined;
+      if (!this.autoReconnect || this.closed || this.isConnected()) return;
+      const error = new Error("Could not reach the desktop within 5 seconds.");
+      this.close();
+      this.emit("reconnectFailed", error);
+    }, RECONNECT_TIMEOUT_MS);
+  }
+
+  private clearReconnectTimeout(): void {
+    if (this.reconnectTimeoutTimer !== undefined) window.clearTimeout(this.reconnectTimeoutTimer);
+    this.reconnectTimeoutTimer = undefined;
   }
 
   private receive(raw: string): void {
