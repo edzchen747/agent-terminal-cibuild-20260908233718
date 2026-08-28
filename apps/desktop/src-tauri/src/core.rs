@@ -275,6 +275,17 @@ impl Core {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            // Do not let a console-subsystem node allocate a visible console
+            // when it is launched by the GUI application. The packaged node
+            // is also built as a GUI binary, but this keeps older/developer
+            // binaries from flashing a blank cmd window.
+            use std::os::windows::process::CommandExt;
+
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
         if let Some(auth_key) = network::embedded_node_auth_key() {
             command.env("AGENT_TERMINAL_NODE_AUTH_KEY", auth_key);
         }

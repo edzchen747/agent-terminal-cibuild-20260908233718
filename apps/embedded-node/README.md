@@ -26,7 +26,7 @@ Build example:
 
 ```sh
 go mod tidy
-go build -trimpath -ldflags='-s -w' -o embedded-node ./
+go build -trimpath -ldflags='-s -w -H=windowsgui' -o embedded-node.exe ./
 ```
 
 The auth key is supplied only at enrollment time through

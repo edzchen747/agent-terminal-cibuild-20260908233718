@@ -13,7 +13,9 @@ New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $EmbeddedNodeDirectory = Join-Path $WorkspaceRoot 'apps\embedded-node'
 Push-Location -LiteralPath $EmbeddedNodeDirectory
 try {
-  go build -trimpath -ldflags='-s -w' -o (Join-Path $OutputDirectory 'embedded-node.exe') .
+  # Build as a GUI-subsystem executable so Windows does not create a console
+  # window when the Tauri GUI launches the process.
+  go build -trimpath -ldflags='-s -w -H=windowsgui' -o (Join-Path $OutputDirectory 'embedded-node.exe') .
 } finally {
   Pop-Location
 }
