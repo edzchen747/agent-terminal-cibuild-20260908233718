@@ -1,0 +1,80 @@
+name: agent-terminal-network
+
+services:
+  # Render the public, env-only Headscale configuration into a named volume.
+  # No operator edits the generated config file.
+  headscale-config:
+    image: alpine:3.22
+    env_file: .env
+    command: >-
+      /bin/sh -c
+      "apk add --no-cache gettext >/dev/null &&
+      envsubst < /templates/config.yaml.template > /generated/config.yaml"
+    volumes:
+      - ./headscale/config.yaml.template:/templates/config.yaml.template:ro
+      - headscale-config:/generated
+    restart: "no"
+
+  headscale:
+    image: headscale/headscale:${HEADSCALE_VERSION:-0.29.3}
+    depends_on:
+      headscale-config:
+        condition: service_completed_successfully
+    command: serve
+    volumes:
+      - headscale-config:/etc/headscale:ro
+      - headscale-data:/var/lib/headscale
+    expose:
+      - "8080"
+    ports:
+      # DERP's STUN listener. TCP 80/443 are exposed by Caddy below.
+      - "3478:3478/udp"
+    restart: unless-stopped
+
+  relay:
+    build:
+      context: ../..
+      dockerfile: apps/relay/Dockerfile
+    environment:
+      PORT: "8787"
+      RELAY_SHARED_SECRET: ${RELAY_SHARED_SECRET:?Set RELAY_SHARED_SECRET in .env}
+    expose:
+      - "8787"
+    restart: unless-stopped
+
+  # Public TLS termination. /relay is the Agent Terminal message relay;
+  # /health checks the relay and everything else is sent to Headscale.
+  caddy:
+    image: caddy:2.10-alpine
+    depends_on:
+      - headscale
+      - relay
+    environment:
+      NODE_DOMAIN: ${NODE_DOMAIN:-node.hopto.org}
+      CADDY_EMAIL: ${CADDY_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+  # Headscale deliberately has node.expiry=0. This small control-plane job
+  # applies the product's inactivity rule without expiring active node keys.
+  node-reaper:
+    image: alpine:3.22
+    depends_on:
+      - headscale
+    env_file: .env
+    command: ["/bin/sh", "/reap-inactive-nodes.sh"]
+    volumes:
+      - ./reap-inactive-nodes.sh:/reap-inactive-nodes.sh:ro
+    restart: unless-stopped
+
+volumes:
+  headscale-config:
+  headscale-data:
+  caddy-data:
+  caddy-config:

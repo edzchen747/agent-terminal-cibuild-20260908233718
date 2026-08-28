@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PROTOCOL_VERSION, applyTerminalModifiers, encodeMessage, parsePairingPayload, parseTerminalWorkingDirectories } from "./index.js";
+import { LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_RELAY_URL, PROTOCOL_VERSION, applyTerminalModifiers, encodeMessage, parsePairingPayload, parseTerminalWorkingDirectories } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -12,6 +12,25 @@ test("pairing payloads round-trip", () => {
     expiresAt: new Date(Date.now() + 60_000).toISOString()
   };
   assert.deepEqual(parsePairingPayload(JSON.stringify(payload)), payload);
+});
+
+test("network defaults keep pairing local and remote control configurable", () => {
+  assert.equal(LAN_CONNECT_TIMEOUT_MS, 1_500);
+  assert.equal(OVERLAY_CONTROL_URL, "https://node.hopto.org");
+  assert.equal(OVERLAY_RELAY_URL, "wss://node.hopto.org/relay");
+  const payload = parsePairingPayload(JSON.stringify({
+    version: PROTOCOL_VERSION,
+    hostId: "host-1",
+    hostName: "Workstation",
+    endpoint: "ws://192.168.1.10:47831",
+    localEndpoint: "ws://192.168.1.10:47831",
+    remoteEndpoint: "ws://host-1.agent-terminal.internal:47831",
+    remoteTransport: "overlay",
+    pairingToken: "one-time-secret",
+    expiresAt: new Date(Date.now() + 60_000).toISOString()
+  }));
+  assert.equal(payload.remoteTransport, "overlay");
+  assert.equal(payload.localEndpoint, payload.endpoint);
 });
 
 test("messages encode as JSON", () => {

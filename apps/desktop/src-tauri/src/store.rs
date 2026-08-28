@@ -40,10 +40,27 @@ pub struct Settings {
     pub port: u16,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkState {
+    /// The node's long-lived private identity key. It is never sent to the
+    /// relay; the embedded engine consumes it from the local state store.
+    #[serde(default)]
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub tailnet_address: Option<String>,
+    #[serde(default)]
+    pub last_connected_at: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredState {
     host: StoredHost,
+    #[serde(default)]
+    network: NetworkState,
     #[serde(default)]
     projects: Vec<Project>,
     #[serde(default)]
@@ -84,6 +101,23 @@ impl DesktopStore {
     }
     pub fn settings(&self) -> &Settings {
         &self.state.settings
+    }
+
+    pub fn network(&self) -> &NetworkState {
+        &self.state.network
+    }
+
+    pub fn save_network(&mut self, network: NetworkState) -> Result<()> {
+        self.state.network = network;
+        self.write()
+    }
+
+    pub fn ensure_network_identity(&mut self) -> Result<NetworkState> {
+        if self.state.network.private_key.is_none() {
+            self.state.network.private_key = Some(random_token(32));
+            self.write()?;
+        }
+        Ok(self.state.network.clone())
     }
 
     pub fn save_project(&mut self, project: Project) -> Result<()> {
@@ -174,6 +208,7 @@ fn default_state() -> StoredState {
                 .into_owned(),
             relay_token: random_token(32),
         },
+        network: NetworkState::default(),
         projects: Vec::new(),
         devices: Vec::new(),
         settings: Settings {
@@ -216,7 +251,7 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::DesktopStore;
+    use super::{DesktopStore, NetworkState};
     use crate::models::AuthorizedDevice;
     use std::{fs, path::PathBuf};
     use uuid::Uuid;
@@ -245,6 +280,35 @@ mod tests {
         let reloaded = DesktopStore::load(state_path.clone()).expect("reloaded store");
         assert!(reloaded.authenticate("phone-1", "durable-device-credential"));
         assert!(!reloaded.authenticate("phone-1", "wrong-credential"));
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn embedded_network_identity_survives_a_store_reload() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
+        let identity = store.ensure_network_identity().expect("network identity");
+        let private_key = identity.private_key.clone().expect("private key");
+        store
+            .save_network(NetworkState {
+                private_key: Some(private_key.clone()),
+                node_id: Some("node-1".into()),
+                tailnet_address: Some("100.64.0.2".into()),
+                last_connected_at: Some("2026-08-28T00:00:00Z".into()),
+            })
+            .expect("save network state");
+        drop(store);
+
+        let reloaded = DesktopStore::load(state_path.clone()).expect("reloaded store");
+        assert_eq!(
+            reloaded.network().private_key.as_deref(),
+            Some(private_key.as_str())
+        );
+        assert_eq!(reloaded.network().node_id.as_deref(), Some("node-1"));
         fs::remove_file(state_path).expect("remove test state");
     }
 }

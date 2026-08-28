@@ -3,6 +3,7 @@ use std::{
     io::{Read, Write},
     net::UdpSocket,
     path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU16, Ordering},
@@ -26,9 +27,10 @@ use crate::{
         PairingPayload, Project, RelayMessage, ServerMessage, ShellProfile, TerminalDataEvent,
         TerminalSession,
     },
+    network,
     path_utils::user_visible_path,
     shells::{command_for, detect_shells},
-    store::{DesktopStore, random_token},
+    store::{DesktopStore, NetworkState, random_token},
     window_clients::WindowClients,
 };
 
@@ -80,6 +82,7 @@ pub struct Core {
     inner: Mutex<Inner>,
     clients: Mutex<HashMap<String, RemoteClient>>,
     relay_sender: Mutex<Option<mpsc::UnboundedSender<RelayMessage>>>,
+    embedded_node: Mutex<Option<Child>>,
     remote_port: AtomicU16,
     direct_server_ready: AtomicBool,
     exit_requested: AtomicBool,
@@ -100,6 +103,7 @@ impl Core {
             }),
             clients: Mutex::new(HashMap::new()),
             relay_sender: Mutex::new(None),
+            embedded_node: Mutex::new(None),
             remote_port: AtomicU16::new(remote_port),
             direct_server_ready: AtomicBool::new(false),
             exit_requested: AtomicBool::new(false),
@@ -119,6 +123,7 @@ impl Core {
         };
         {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            inner.store.ensure_network_identity()?;
             inner
                 .temporary_projects
                 .insert(project.id.clone(), project.clone());
@@ -128,6 +133,15 @@ impl Core {
     }
 
     pub fn shutdown(&self) {
+        if let Some(mut node) = self
+            .embedded_node
+            .lock()
+            .expect("embedded node poisoned")
+            .take()
+        {
+            let _ = node.kill();
+            let _ = node.wait();
+        }
         let sessions = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             inner
@@ -192,21 +206,118 @@ impl Core {
     }
 
     pub fn relay_endpoint(&self) -> Option<String> {
-        let value = std::env::var("AGENT_TERMINAL_RELAY_URL")
-            .ok()?
-            .trim()
-            .trim_end_matches('/')
-            .to_string();
-        if value.is_empty() {
-            return None;
+        Some(network::relay_url())
+    }
+
+    pub fn control_url(&self) -> String {
+        network::control_url()
+    }
+
+    pub fn remote_endpoint(&self) -> String {
+        if let Some(value) = std::env::var("AGENT_TERMINAL_REMOTE_ENDPOINT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        {
+            return value.trim().trim_end_matches('/').to_string();
         }
-        Some(if let Some(rest) = value.strip_prefix("http://") {
-            format!("ws://{rest}")
-        } else if let Some(rest) = value.strip_prefix("https://") {
-            format!("wss://{rest}")
-        } else {
-            value
-        })
+        if self.remote_transport() == "overlay" {
+            let inner = self.inner.lock().expect("desktop state poisoned");
+            let host_id = &inner.store.host().id;
+            let port = inner.store.settings().port;
+            return format!("ws://{host_id}.{}:{port}", network::tailnet_domain());
+        }
+        network::relay_url()
+    }
+
+    pub fn remote_transport(&self) -> String {
+        std::env::var("AGENT_TERMINAL_REMOTE_TRANSPORT")
+            .ok()
+            .filter(|value| matches!(value.as_str(), "relay" | "direct" | "overlay"))
+            .unwrap_or_else(|| "overlay".into())
+    }
+
+    pub fn network_state(&self) -> NetworkState {
+        self.inner
+            .lock()
+            .expect("desktop state poisoned")
+            .store
+            .network()
+            .clone()
+    }
+
+    pub fn start_embedded_node(&self) -> Result<bool> {
+        if std::env::var("AGENT_TERMINAL_DISABLE_EMBEDDED_NODE").as_deref() == Ok("1") {
+            return Ok(false);
+        }
+
+        {
+            let mut process = self.embedded_node.lock().expect("embedded node poisoned");
+            if let Some(child) = process.as_mut() {
+                if child.try_wait()?.is_none() {
+                    return Ok(true);
+                }
+                *process = None;
+            }
+        }
+
+        let binary = embedded_node_binary(&self.app);
+        let Some(binary) = binary.filter(|path| path.is_file()) else {
+            return Ok(false);
+        };
+        let (network_state, host_id) = {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let network_state = inner.store.ensure_network_identity()?;
+            let host_id = inner.store.host().id.clone();
+            (network_state, host_id)
+        };
+        let state_dir = std::env::var_os("AGENT_TERMINAL_EMBEDDED_NODE_STATE_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                self.app
+                    .path()
+                    .app_data_dir()
+                    .ok()
+                    .map(|path| path.join("embedded-node"))
+            })
+            .ok_or_else(|| anyhow!("Could not determine the embedded node state directory."))?;
+        std::fs::create_dir_all(&state_dir)
+            .with_context(|| format!("could not create {}", state_dir.display()))?;
+
+        let mut command = Command::new(&binary);
+        command
+            .arg("--state-dir")
+            .arg(&state_dir)
+            .arg("--control-url")
+            .arg(self.control_url())
+            .arg("--node-id")
+            .arg(host_id.clone())
+            // The embedded node establishes the overlay route; the Tauri
+            // process remains the only listener for the terminal WebSocket.
+            .arg("--target-port")
+            .arg(self.configured_port().to_string())
+            .env(
+                "AGENT_TERMINAL_NODE_PRIVATE_KEY",
+                network_state.private_key.unwrap_or_default(),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(auth_key) = network::embedded_node_auth_key() {
+            command.env("AGENT_TERMINAL_NODE_AUTH_KEY", auth_key);
+        }
+        let child = command
+            .spawn()
+            .with_context(|| format!("could not start embedded node {}", binary.display()))?;
+        let mut saved_network = self.network_state();
+        saved_network.node_id = Some(host_id);
+        saved_network.last_connected_at = Some(chrono::Utc::now().to_rfc3339());
+        self.inner
+            .lock()
+            .expect("desktop state poisoned")
+            .store
+            .save_network(saved_network)?;
+        *self.embedded_node.lock().expect("embedded node poisoned") = Some(child);
+        Ok(true)
     }
 
     pub fn relay_identity(&self) -> (String, String) {
@@ -707,25 +818,21 @@ impl Core {
             if session.metadata.shell_id == shell_id {
                 None
             } else {
-                Some((
-                    session.metadata.project_id.clone(),
-                    !session.has_user_input,
-                ))
+                Some((session.metadata.project_id.clone(), !session.has_user_input))
             }
         };
         let Some((project_id, replace_current)) = switch else {
             return Ok(None);
         };
         let replacement = self.create_session(&project_id, Some(shell_id))?;
-        if let Some(session_id) = session_id {
+        if replace_current {
             self.close_session(session_id);
         }
         Ok(Some(replacement))
     }
 
     pub fn start_pairing(&self) -> Result<PairingPayload> {
-        let relay = self.relay_endpoint();
-        if relay.is_none() && !self.direct_server_ready.load(Ordering::Acquire) {
+        if !self.direct_server_ready.load(Ordering::Acquire) {
             return Err(anyhow!(
                 "Local pairing is unavailable because this process does not own port {}. Another Agent Terminal instance may already be running in the tray. Exit every Agent Terminal tray instance, then reopen the latest build.",
                 self.configured_port()
@@ -746,24 +853,24 @@ impl Core {
                 inner.store.host().name.clone(),
             )
         };
+        let local_endpoint = format!(
+            "ws://{}:{}",
+            local_address(),
+            self.remote_port.load(Ordering::Relaxed)
+        );
         Ok(PairingPayload {
             version: PROTOCOL_VERSION,
             host_id,
             host_name,
-            endpoint: relay.clone().unwrap_or_else(|| {
-                format!(
-                    "ws://{}:{}",
-                    local_address(),
-                    self.remote_port.load(Ordering::Relaxed)
-                )
-            }),
-            transport: if relay.is_some() {
-                "relay".into()
-            } else {
-                "direct".into()
-            },
+            endpoint: local_endpoint.clone(),
+            local_endpoint: Some(local_endpoint),
+            remote_endpoint: Some(self.remote_endpoint()),
+            remote_transport: Some(self.remote_transport()),
+            control_url: Some(self.control_url()),
+            transport: "direct".into(),
             pairing_token: token,
             expires_at: expires_at.to_rfc3339(),
+            node_auth_key: network::embedded_node_auth_key(),
         })
     }
 
@@ -1546,6 +1653,39 @@ fn local_address() -> String {
             socket.local_addr().map(|address| address.ip().to_string())
         })
         .unwrap_or_else(|_| "127.0.0.1".into())
+}
+
+fn embedded_node_binary(app: &tauri::AppHandle) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("AGENT_TERMINAL_EMBEDDED_NODE_BIN") {
+        return Some(PathBuf::from(path));
+    }
+    if let Some(directory) = std::env::var_os("AGENT_TERMINAL_EMBEDDED_NODE_DIR") {
+        return Some(PathBuf::from(directory).join(if cfg!(windows) {
+            "embedded-node.exe"
+        } else {
+            "embedded-node"
+        }));
+    }
+    if let Some(path) = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from))
+    {
+        let bundled = path.join("embedded-node").join(if cfg!(windows) {
+            "embedded-node.exe"
+        } else {
+            "embedded-node"
+        });
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+    }
+    app.path().resource_dir().ok().map(|directory| {
+        directory.join("embedded-node").join(if cfg!(windows) {
+            "embedded-node.exe"
+        } else {
+            "embedded-node"
+        })
+    })
 }
 
 fn take_valid_pairing_grant(

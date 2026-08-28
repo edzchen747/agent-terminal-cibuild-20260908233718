@@ -12,8 +12,8 @@
     "dev": "npm run dev -w @agentterminal/desktop",
     "dev:mobile": "npm run dev -w @agentterminal/mobile",
     "build": "npm run build -w @agentterminal/protocol && npm run build -w @agentterminal/relay && npm run build -w @agentterminal/desktop && npm run build -w @agentterminal/mobile",
-    "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run build -w @agentterminal/protocol && npm run typecheck --workspaces --if-present",
+    "test": "npm run build -w @agentterminal/protocol && npm run test --workspaces --if-present",
     "android:sync": "npm run android:sync -w @agentterminal/mobile",
     "android:open": "npm run android:open -w @agentterminal/mobile",
     "desktop:portable": "npm run package:win -w @agentterminal/desktop"

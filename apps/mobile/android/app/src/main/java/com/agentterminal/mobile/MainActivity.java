@@ -9,6 +9,7 @@ import com.getcapacitor.BridgeActivity;
 public class MainActivity extends BridgeActivity {
     @Override
     public void onCreate(Bundle savedInstanceState) {
+        registerPlugin(EmbeddedNodePlugin.class);
         registerPlugin(ConnectionNotificationPlugin.class);
         super.onCreate(savedInstanceState);
         getBridge().getWebView().setLongClickable(true);

@@ -10,9 +10,13 @@ use tokio::{
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use uuid::Uuid;
 
-use crate::{core::Core, models::RelayMessage};
+use crate::{core::Core, embedded_node, models::RelayMessage};
 
 pub fn start(core: Arc<Core>) {
+    // Start the overlay node in its own process. The ordinary relay remains
+    // available as a transport fallback when a release does not ship an
+    // engine binary or when the node is still registering with Headscale.
+    embedded_node::start(&core);
     let direct_core = Arc::clone(&core);
     async_runtime::spawn(async move {
         run_direct_server(direct_core).await;

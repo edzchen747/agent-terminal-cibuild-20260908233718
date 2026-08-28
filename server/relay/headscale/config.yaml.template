@@ -1,0 +1,71 @@
+---
+# This file is rendered from .env by docker-compose. Keep deployment values
+# out of git and use the same Headscale version as HEADSCALE_VERSION.
+server_url: ${HEADSCALE_PUBLIC_URL}
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+
+# Headscale's embedded DERP server performs encrypted fallback relaying and
+# listens on UDP/3478 for STUN-assisted NAT discovery.
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: headscale
+    region_name: Agent Terminal Headscale DERP
+    verify_clients: true
+    stun_listen_addr: 0.0.0.0:3478
+    private_key_path: /var/lib/headscale/derp_server_private.key
+    automatically_add_embedded_derp_region: true
+    ipv4: ${HEADSCALE_PUBLIC_IPV4}
+    ipv6: ${HEADSCALE_PUBLIC_IPV6}
+  urls: []
+  paths: []
+  auto_update_enabled: false
+
+# Never age a node out merely because a key is old. The companion reaper
+# expires only nodes whose last activity is older than NODE_INACTIVITY_DAYS.
+node:
+  expiry: 0
+
+database:
+  type: sqlite
+  debug: false
+  gorm:
+    prepare_stmt: true
+    parameterized_queries: true
+    skip_err_record_not_found: true
+    slow_threshold: 1000
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+    write_ahead_log: true
+    wal_autocheckpoint: 1000
+
+disable_check_updates: true
+log:
+  level: info
+  format: text
+
+dns:
+  magic_dns: true
+  base_domain: ${TAILNET_BASE_DOMAIN}
+  override_local_dns: false
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 1.0.0.1
+  search_domains: []
+  extra_records: []
+
+unix_socket: /var/lib/headscale/headscale.sock
+unix_socket_permission: "0770"

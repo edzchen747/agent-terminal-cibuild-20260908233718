@@ -87,10 +87,22 @@ pub struct PairingPayload {
     pub version: u8,
     pub host_id: String,
     pub host_name: String,
+    /// The QR is intentionally issued with a LAN endpoint. Pairing never
+    /// sends the one-time grant through the public relay.
     pub endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_transport: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_url: Option<String>,
     pub transport: String,
     pub pairing_token: String,
     pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_auth_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

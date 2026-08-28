@@ -22,7 +22,7 @@ This repository is an end-to-end MVP, not a UI-only prototype.
 - Native folder picker for saved projects.
 - QR pairing that authorizes a phone once; ordinary reconnects use the saved device credential.
 - Persistent authorized-device registry with token hashing, last-seen timestamps, and immediate revocation.
-- Outbound relay support for connections across Wi-Fi, mobile data, NAT, and firewall boundaries.
+- Outbound Headscale/DERP node support for connections across Wi-Fi, mobile data, NAT, and firewall boundaries, with the WebSocket relay as a compatibility fallback.
 - Direct local WebSocket fallback on port `47831` for development without a relay.
 - Desktop-owned persistence for projects, devices, and the default shell.
 - Save or unsave the active project without closing its window or terminal sessions.
@@ -40,14 +40,15 @@ This repository is an end-to-end MVP, not a UI-only prototype.
 - Capacitor Android project checked into `apps/mobile/android` with minimum SDK 26.
 - A web-first codebase that can add the Capacitor iOS target without rewriting the UI or protocol.
 
-The mobile app persists only its host identity, endpoint, device ID, and device credential. Project data and authorization records remain on the desktop.
+The mobile app persists its host identity, LAN/remote endpoints, device credential, and embedded-node private key/network state. Project data and authorization records remain on the desktop.
 
 ## Repository layout
 
 ```text
 apps/
-  desktop/       Tauri/Rust tray host, ConPTY manager, connection server, React desktop UI
-  mobile/        React mobile UI and Capacitor Android project
+    desktop/       Tauri/Rust tray host, ConPTY manager, connection server, React desktop UI
+    mobile/        React mobile UI and Capacitor Android project
+    embedded-node/ Go tsnet userspace node used by the desktop/Android process bridge
 packages/
   protocol/      Shared typed wire protocol and data model
 scripts/         Workspace-local bootstrap and packaging helpers
@@ -61,13 +62,16 @@ docs/            Architecture and security notes
 - Rust stable and the Microsoft C++ desktop build tools for local desktop compilation.
 - Microsoft Edge WebView2 at runtime. Supported Windows 10/11 systems normally include it.
 - Android Studio with Java 21 and Android SDK 36 to build the Android APK.
-- A deployed WebSocket relay for cross-network use. The desktop connects to it with `AGENT_TERMINAL_RELAY_URL`.
+- Go 1.24 or newer when packaging the process-isolated embedded node runtime.
+- A deployed Headscale + DERP/relay stack for cross-network use. The stock build points at `https://node.hopto.org` and `wss://node.hopto.org/relay`.
 
 No Visual Studio C++ workload is required: the desktop uses a prebuilt ConPTY binding.
 
-## Run a relay
+## Run the Headscale/relay stack
 
-The relay is stateless with respect to projects and terminal sessions. It only forwards WebSocket messages between an online desktop and an already authorized phone. For local development:
+The public deployment bundle is in [`server/relay`](server/relay/README.md). It includes Headscale's embedded DERP/STUN server, Caddy TLS termination, the Agent Terminal WebSocket relay, and the 30-day inactive-node reaper. It is configured entirely through `.env`.
+
+For local development with only the WebSocket relay:
 
 ```powershell
 $env:AGENT_TERMINAL_RELAY_URL = "ws://127.0.0.1:8787"
@@ -77,17 +81,22 @@ npm run build -w @agentterminal/relay
 npm run start -w @agentterminal/relay
 ```
 
-For production, deploy `apps/relay/Dockerfile` behind a TLS reverse proxy and configure the desktop with the resulting `wss://` URL:
+For production, copy `server/relay/.env.example` to `.env`, set DNS/ports/secrets, and run `docker compose up -d --build` from that directory. Self-hosted client values are supplied through:
 
 ```powershell
 $env:AGENT_TERMINAL_RELAY_URL = "wss://relay.example.com"
 $env:AGENT_TERMINAL_RELAY_SECRET = "use-a-long-random-secret"
+$env:AGENT_TERMINAL_CONTROL_URL = "https://relay.example.com"
+$env:AGENT_TERMINAL_REMOTE_ENDPOINT = "wss://relay.example.com/relay"
+$env:AGENT_TERMINAL_REMOTE_TRANSPORT = "relay"
+$env:AGENT_TERMINAL_TAILNET_DOMAIN = "agent-terminal.internal"
+$env:AGENT_TERMINAL_NODE_AUTH_KEY = "<short-lived-headscale-preauth-key>"
 npm run dev
 ```
 
 Set `RELAY_SHARED_SECRET` to the same value in the relay deployment. The relay uses it only to authenticate the desktop's host registration; the desktop still authenticates every phone with its paired device credential.
 
-The desktop must be able to make an outbound connection to the relay. The phone does not need to discover or expose the desktop's LAN address.
+QR pairing is LAN-only: the QR contains the desktop's local WebSocket endpoint and the phone must be on the same network for the first authorization. After pairing, the phone probes that endpoint for 1.5 seconds; if it is unavailable, it starts its embedded node engine and uses the remote Headscale/DERP path, falling back to the `/relay` WebSocket route when the native engine is unavailable. Neither endpoint needs an inbound port-forwarding rule.
 
 ## Start the desktop app
 
@@ -108,7 +117,7 @@ To create the portable Windows executable:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 ```
 
-The self-contained application executable is written to `apps/desktop/src-tauri/target/release/agent-terminal.exe`. It embeds the desktop web assets and Rust backend. It relies on the system WebView2 runtime rather than bundling a second browser engine.
+The self-contained application executable is written to `apps/desktop/src-tauri/target/release/agent-terminal.exe`. It embeds the desktop web assets and Rust backend. Release packaging also places the signed process-isolated `embedded-node` executable in the Tauri resource directory; development builds fall back to the relay if that optional binary is absent. It relies on the system WebView2 runtime rather than bundling a second browser engine.
 
 ## Run and build Android
 
@@ -121,6 +130,7 @@ npm run dev:mobile
 To sync the production web bundle into the checked-in Android project:
 
 ```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-embedded-node-android.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sync-android.ps1
 npm run android:open
 ```
@@ -131,8 +141,8 @@ Then build/run from Android Studio. The QR scanner requires a physical device or
 
 1. Start Agent Terminal on Windows.
 2. Select the phone button in the title bar.
-3. Open the mobile app and scan the QR code once.
-4. The phone saves only that host connection. Future launches authenticate automatically from any network until the desktop revokes the phone.
+3. Put the phone on the same LAN, open the mobile app, and scan the QR code once.
+4. The phone saves the host connection and embedded-node identity. Future launches authenticate automatically from any network until the desktop revokes the phone.
 5. Open a project to see its live sessions, or create a terminal. A project without a current desktop window opens in a new window; another session in that project appears as a new tab.
 6. Close terminal windows to leave the host running in the tray. Use the tray's Exit menu item for a full shutdown.
 

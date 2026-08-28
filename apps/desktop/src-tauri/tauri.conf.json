@@ -17,6 +17,7 @@
   },
   "bundle": {
     "active": false,
-    "targets": []
+    "targets": [],
+    "resources": ["resources/embedded-node"]
   }
 }

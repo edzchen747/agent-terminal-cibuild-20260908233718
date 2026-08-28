@@ -1,5 +1,7 @@
 mod core;
+mod embedded_node;
 mod models;
+mod network;
 mod path_utils;
 mod remote;
 mod shells;

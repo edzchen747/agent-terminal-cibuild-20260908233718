@@ -1,5 +1,14 @@
 export const PROTOCOL_VERSION = 1 as const;
 
+// Keep the control-plane address in the shared protocol package so the
+// desktop and mobile clients use the same default. Deployments can override
+// it through their native app configuration/environment at build time.
+export const OVERLAY_CONTROL_URL = "https://node.hopto.org" as const;
+export const OVERLAY_RELAY_URL = "wss://node.hopto.org/relay" as const;
+export const OVERLAY_TAILNET_DOMAIN = "agent-terminal.internal" as const;
+export const LAN_CONNECT_TIMEOUT_MS = 1_500 as const;
+export const NODE_INACTIVITY_TIMEOUT_DAYS = 30 as const;
+
 export type Platform = "android" | "ios" | "web";
 export type TerminalModifier = "ctrl" | "alt" | "shift";
 
@@ -120,10 +129,18 @@ export interface PairingPayload {
   version: typeof PROTOCOL_VERSION;
   hostId: string;
   hostName: string;
+  /** LAN-only endpoint used for the first QR pairing. */
   endpoint: string;
-  transport?: "relay" | "direct";
+  localEndpoint?: string;
+  /** Endpoint used after the local probe fails. */
+  remoteEndpoint?: string;
+  controlUrl?: string;
+  transport?: "relay" | "direct" | "overlay";
+  remoteTransport?: "relay" | "direct" | "overlay";
   pairingToken: string;
   expiresAt: string;
+  /** Optional first-enrollment key; never include a long-lived shared key. */
+  nodeAuthKey?: string;
 }
 
 export type RelayMessage =
