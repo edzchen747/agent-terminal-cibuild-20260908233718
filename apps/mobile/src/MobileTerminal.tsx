@@ -15,6 +15,23 @@ interface AccessibilityKey {
   value?: string;
 }
 
+type NativeTerminalInputEvent = Pick<InputEvent, "data" | "inputType" | "isComposing">;
+
+function nativeTerminalInput(event: NativeTerminalInputEvent, textareaValue = ""): string {
+  const inputType = event.inputType ?? "";
+  if (inputType === "deleteContentBackward" || inputType === "deleteWordBackward" || inputType === "deleteSoftLineBackward") {
+    return inputType === "deleteWordBackward" ? "\x17" : "\x7f";
+  }
+  if (inputType === "deleteContentForward" || inputType === "deleteWordForward" || inputType === "deleteSoftLineForward") {
+    return "\x1b[3~";
+  }
+  if (inputType === "insertLineBreak") return "\r";
+  if ((!inputType || inputType.startsWith("insert")) && !event.isComposing && (event.data || textareaValue)) {
+    return event.data || textareaValue;
+  }
+  return "";
+}
+
 const ACCESSIBILITY_KEY_ROWS: AccessibilityKey[][] = [
   [
     { id: "esc", label: "Esc", value: "\x1b" },
@@ -144,45 +161,111 @@ export function MobileTerminal({ connection, session }: Props) {
     observer.observe(hostElement);
     const handlePointerActivity = () => resize(true);
     window.addEventListener("pointerdown", handlePointerActivity, true);
-    // Android WebViews may deliver a software-keyboard character as a native
-    // `input` event without a usable keydown/keypress pair. xterm deliberately
-    // ignores those events while screenReaderMode is enabled, so bridge them
-    // here while suppressing the matching onData event when both are emitted.
-    const recentTerminalData: Array<{ data: string; at: number }> = [];
-    const pendingNativeInput: string[] = [];
+    const textarea = terminal.textarea;
+    // Disable the IME's remembered text/autofill behavior. Android keyboards
+    // otherwise keep a history in the textarea and replay it on backspace or
+    // the first character after focus.
+    textarea?.setAttribute("autocomplete", "off");
+    textarea?.setAttribute("autocorrect", "off");
+    textarea?.setAttribute("autocapitalize", "off");
+    terminal.attachCustomKeyEventHandler((event) => {
+      // Android IMEs often report printable keys as keyCode 229. xterm's
+      // composition fallback then reads the textarea after the key has already
+      // been delivered by beforeinput/input, which can emit a stale value or a
+      // bell. Native IME events are handled below, so let xterm handle only
+      // real key events here.
+      if (event.type === "keydown" && event.keyCode === 229 && !event.isComposing &&
+        (event.key.length === 1 || event.key === "Backspace" || event.key === "Enter")) return false;
+      return true;
+    });
+
+    // Android WebViews may produce both an xterm key event and a native IME
+    // event for one key, or only the native event. Hold xterm events briefly so
+    // the native event can claim the input and prevent duplicate/phantom keys.
+    const pendingTerminalInput: Array<{ data: string; at: number }> = [];
+    const pendingNativeInput: Array<{ data: string; at: number }> = [];
     let nativeInputTimer: number | undefined;
+    let terminalInputTimer: number | undefined;
+    let lastNativeBeforeInput: { data: string; at: number } | undefined;
     const sendInput = (data: string) => {
       if (!data) return;
       resize(true);
       const output = consumeSelectedKeys(data);
       if (output) connection.send({ type: "session.input", sessionId: session.id, data: output });
     };
-    const input = terminal.onData((data) => {
+    const flushPendingInput = () => {
+      nativeInputTimer = undefined;
+      terminalInputTimer = undefined;
       const now = performance.now();
-      recentTerminalData.push({ data, at: now });
-      while (recentTerminalData.length > 12 || now - (recentTerminalData[0]?.at ?? now) > 250) recentTerminalData.shift();
-      sendInput(data);
+
+      for (const native of pendingNativeInput.splice(0)) {
+        const matchingTerminal = pendingTerminalInput.findIndex((item) => Math.abs(native.at - item.at) <= 120 && item.data === native.data);
+        if (matchingTerminal >= 0) {
+          pendingTerminalInput.splice(matchingTerminal, 1);
+        } else {
+          // A native IME event is authoritative. Discard an unmatched xterm
+          // event from the same key cycle (Android commonly emits a phantom
+          // event before insertText/deleteContentBackward).
+          for (let index = pendingTerminalInput.length - 1; index >= 0; index -= 1) {
+            const pending = pendingTerminalInput[index];
+            if (pending && Math.abs(native.at - pending.at) <= 120) pendingTerminalInput.splice(index, 1);
+          }
+          sendInput(native.data);
+        }
+      }
+
+      for (let index = pendingTerminalInput.length - 1; index >= 0; index -= 1) {
+        const pending = pendingTerminalInput[index];
+        if (pending && now - pending.at >= 35) {
+          pendingTerminalInput.splice(index, 1);
+          sendInput(pending.data);
+        }
+      }
+      if (pendingNativeInput.length || pendingTerminalInput.length) {
+        terminalInputTimer = window.setTimeout(flushPendingInput, 40);
+      }
+    };
+    const queueNativeInput = (data: string) => {
+      if (!data) return;
+      pendingNativeInput.push({ data, at: performance.now() });
+      if (nativeInputTimer !== undefined) return;
+      nativeInputTimer = window.setTimeout(flushPendingInput, 20);
+    };
+    const input = terminal.onData((data) => {
+      pendingTerminalInput.push({ data, at: performance.now() });
+      if (terminalInputTimer === undefined) terminalInputTimer = window.setTimeout(flushPendingInput, 40);
     });
-    const textarea = terminal.textarea;
+    const handleNativeBeforeInput = (event: Event) => {
+      const inputEvent = event as InputEvent;
+      const data = nativeTerminalInput(inputEvent, textarea?.value ?? "");
+      if (!data || inputEvent.inputType === "insertCompositionText") return;
+      lastNativeBeforeInput = { data, at: performance.now() };
+      if (inputEvent.cancelable) event.preventDefault();
+      queueNativeInput(data);
+      if (inputEvent.cancelable && textarea) textarea.value = "";
+    };
     const handleNativeInput = (event: Event) => {
       const inputEvent = event as InputEvent;
-      if (!inputEvent.data || inputEvent.isComposing || (inputEvent.inputType && inputEvent.inputType !== "insertText")) return;
-      pendingNativeInput.push(inputEvent.data);
-      if (nativeInputTimer !== undefined) return;
-      nativeInputTimer = window.setTimeout(() => {
-        nativeInputTimer = undefined;
-        const now = performance.now();
-        for (const data of pendingNativeInput.splice(0)) {
-          const matchingData = recentTerminalData.findIndex((item) => item.data === data && now - item.at <= 250);
-          if (matchingData >= 0) recentTerminalData.splice(matchingData, 1);
-          else sendInput(data);
-        }
-        // Keep the Android IME's hidden textarea from retaining the previous
-        // character and consuming the next character as a replacement.
-        if (!inputEvent.isComposing && textarea) textarea.value = "";
-      }, 0);
+      const now = performance.now();
+      const data = nativeTerminalInput(inputEvent, textarea?.value ?? "");
+      if (!data) return;
+      if (lastNativeBeforeInput && now - lastNativeBeforeInput.at <= 120 && lastNativeBeforeInput.data === data) {
+        lastNativeBeforeInput = undefined;
+        if (!inputEvent.isComposing && textarea) window.setTimeout(() => { textarea.value = ""; }, 0);
+        return;
+      }
+      queueNativeInput(data);
+      // Clear after the event chain has completed so xterm's composition
+      // handler can read committed text, but Android cannot retain it for the
+      // next character/backspace operation.
+      if (!inputEvent.isComposing && textarea) window.setTimeout(() => { textarea.value = ""; }, 0);
     };
+    const handleCompositionEnd = () => {
+      window.setTimeout(() => { if (textarea) textarea.value = ""; }, 0);
+    };
+    textarea?.addEventListener("beforeinput", handleNativeBeforeInput, true);
     textarea?.addEventListener("input", handleNativeInput);
+    textarea?.addEventListener("compositionend", handleCompositionEnd);
     let initialized = false;
     let disposed = false;
     const pendingOutput: string[] = [];
@@ -372,8 +455,11 @@ export function MobileTerminal({ connection, session }: Props) {
       observer.disconnect();
       if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
       window.removeEventListener("pointerdown", handlePointerActivity, true);
+      textarea?.removeEventListener("beforeinput", handleNativeBeforeInput, true);
       textarea?.removeEventListener("input", handleNativeInput);
+      textarea?.removeEventListener("compositionend", handleCompositionEnd);
       if (nativeInputTimer !== undefined) window.clearTimeout(nativeInputTimer);
+      if (terminalInputTimer !== undefined) window.clearTimeout(terminalInputTimer);
       hostElement.removeEventListener("touchstart", handleTouchStart);
       hostElement.removeEventListener("touchmove", handleTouchMove);
       hostElement.removeEventListener("touchend", handleTouchEnd);
