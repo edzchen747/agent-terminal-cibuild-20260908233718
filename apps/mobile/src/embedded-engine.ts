@@ -57,9 +57,12 @@ export class EmbeddedNodeEngine {
         state.tailnetAddress = result.tailnetAddress ?? state.tailnetAddress;
         state.proxyEndpoint = result.endpoint ?? state.proxyEndpoint;
         state.engineStarted = Boolean(result.endpoint);
-      } catch {
-        // Keep the persisted identity; the caller reports that the native
-        // engine is unavailable instead of silently using a second transport.
+      } catch (error) {
+        // Keep the persisted identity, but preserve the native error so the
+        // caller can explain whether the enrollment key or target hostname
+        // needs attention.
+        await this.save(state);
+        throw asError(error);
       }
     }
 
@@ -114,4 +117,12 @@ function randomKey(): string {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function asError(value: unknown): Error {
+  if (value instanceof Error) return value;
+  if (value && typeof value === "object" && "message" in value && typeof value.message === "string") {
+    return new Error(value.message);
+  }
+  return new Error("The embedded network node is unavailable.");
 }

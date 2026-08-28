@@ -31,7 +31,7 @@ public class ConnectionNotificationService extends Service {
     private static final String PREFS = "connection-notification";
     private static final String PREF_HOST_NAME = "hostName";
     private static final String PREF_STATE = "state";
-    private static final long RECONNECT_TIMEOUT_MS = 5_000L;
+    private static final long RECONNECT_TIMEOUT_MS = 30_000L;
     private Handler reconnectTimeoutHandler;
     private boolean reconnectTimeoutScheduled;
     private final Runnable reconnectTimeout = () -> {

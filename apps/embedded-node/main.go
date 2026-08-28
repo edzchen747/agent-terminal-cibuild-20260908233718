@@ -16,6 +16,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"tailscale.com/tsnet"
@@ -25,6 +26,8 @@ type status struct {
 	NodeID         string `json:"nodeId"`
 	TailnetAddress string `json:"tailnetAddress,omitempty"`
 	ProxyAddress   string `json:"proxyAddress,omitempty"`
+	ErrorCode      string `json:"errorCode,omitempty"`
+	ErrorMessage   string `json:"errorMessage,omitempty"`
 }
 
 func main() {
@@ -51,6 +54,7 @@ func main() {
 		Logf:       func(string, ...any) {},
 	}
 	if err := node.Start(); err != nil {
+		writeFailure(*stateDir, *nodeID, err)
 		log.Fatal(err)
 	}
 	defer node.Close()
@@ -61,6 +65,10 @@ func main() {
 	}
 
 	if *remoteAddress != "" {
+		if err := waitForRemote(node, *remoteAddress); err != nil {
+			writeFailure(*stateDir, *nodeID, err)
+			log.Fatal(err)
+		}
 		if *proxyListen == "" {
 			*proxyListen = "127.0.0.1:0"
 		}
@@ -82,6 +90,58 @@ func main() {
 	defer listener.Close()
 	writeStatus(*stateDir, result)
 	serve(listener, func() (net.Conn, error) { return net.DialTimeout("tcp", "127.0.0.1:"+*targetPort, 2*time.Second) })
+}
+
+func waitForRemote(node *tsnet.Server, address string) error {
+	deadline := time.Now().Add(10 * time.Second)
+	var lastError error
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		connection, err := node.Dial(ctx, "tcp", address)
+		cancel()
+		if err == nil {
+			_ = connection.Close()
+			return nil
+		}
+		lastError = err
+		if isHostNameNotFound(err) || time.Now().After(deadline) {
+			return lastError
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func writeFailure(stateDir, nodeID string, err error) {
+	code, message := explainError(err)
+	writeStatus(stateDir, status{NodeID: nodeID, ErrorCode: code, ErrorMessage: message})
+}
+
+func explainError(err error) (string, string) {
+	text := strings.ToLower(err.Error())
+	if isHostNameNotFound(err) {
+		return "tsnet_host_not_found", "The tsnet desktop host name could not be found. Update the mobile app and pair again."
+	}
+	if strings.Contains(text, "authkey") ||
+		strings.Contains(text, "auth key") ||
+		strings.Contains(text, "preauth") ||
+		strings.Contains(text, "unauthorized") ||
+		strings.Contains(text, "not authorized") ||
+		strings.Contains(text, "invalid key") ||
+		strings.Contains(text, "expired") ||
+		strings.Contains(text, "already been used") {
+		return "preauth_rejected", "The desktop preauth key was rejected or has expired. Update the desktop app and pair again."
+	}
+	if strings.Contains(text, "connection refused") || strings.Contains(text, "i/o timeout") {
+		return "remote_host_unavailable", "The desktop overlay host is unavailable. Check that the desktop app is running and try again."
+	}
+	return "embedded_node_start_failed", "The embedded network node could not start. Try pairing again."
+}
+
+func isHostNameNotFound(err error) bool {
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "no such host") ||
+		strings.Contains(text, "host not found") ||
+		strings.Contains(text, "unknown host")
 }
 
 func serve(listener net.Listener, dial func() (net.Conn, error)) {

@@ -92,7 +92,12 @@ export class HostConnection {
       await Preferences.set({ key: HOST_KEY, value: JSON.stringify(temporary.host) });
       // Initialize and persist the overlay identity during pairing so a later
       // off-LAN reconnect does not create a new node after an app restart.
-      await temporary.embeddedEngine.start(temporary.host.controlUrl ?? OVERLAY_CONTROL_URL);
+      await temporary.embeddedEngine.start(
+        temporary.host.controlUrl ?? OVERLAY_CONTROL_URL,
+        temporary.host.remoteEndpoint ?? defaultRemoteEndpoint(temporary.host.id),
+        temporary.host.remoteTransport ?? "overlay",
+        temporary.host.nodeAuthKey
+      );
       temporary.startHeartbeat();
       return temporary;
     } catch (error) {
@@ -113,6 +118,12 @@ export class HostConnection {
     const attempt = this.connectOnce()
       .catch((error) => {
         failed = true;
+        if (isEmbeddedNodeConfigurationError(error)) {
+          this.autoReconnect = false;
+          this.clearReconnectTimer();
+          this.clearReconnectTimeout();
+          this.emit("reconnectFailed", error instanceof Error ? error : new Error("The embedded network node is unavailable."));
+        }
         throw error;
       })
       .finally(() => {
@@ -415,4 +426,8 @@ export class HostConnection {
 
 function defaultRemoteEndpoint(hostId: string): string {
   return `ws://${hostId}.${OVERLAY_TAILNET_DOMAIN}:47831`;
+}
+
+function isEmbeddedNodeConfigurationError(error: unknown): boolean {
+  return error instanceof Error && /update the (desktop|mobile) app|enrollment key was rejected|tsnet desktop host name/i.test(error.message);
 }

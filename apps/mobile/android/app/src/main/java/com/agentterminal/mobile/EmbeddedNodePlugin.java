@@ -40,13 +40,20 @@ public class EmbeddedNodePlugin extends Plugin {
             return;
         }
         if (nodeProcess != null && nodeProcess.isAlive()) {
-            call.resolve(readStatus(new File(getContext().getFilesDir(), "embedded-node-state"), nodeId));
+            JSObject result = readStatus(new File(getContext().getFilesDir(), "embedded-node-state"), nodeId);
+            if (rejectForStatus(call, result)) return;
+            call.resolve(result);
             return;
         }
         try {
             File stateDir = new File(getContext().getFilesDir(), "embedded-node-state");
             if (!stateDir.exists() && !stateDir.mkdirs()) {
                 call.reject("Could not create embedded node state directory.");
+                return;
+            }
+            File statusFile = new File(stateDir, "status.json");
+            if (statusFile.exists() && !statusFile.delete()) {
+                call.reject("Could not reset the embedded node status.");
                 return;
             }
             URI remote = new URI(remoteEndpoint);
@@ -69,9 +76,25 @@ public class EmbeddedNodePlugin extends Plugin {
                 builder.environment().put("AGENT_TERMINAL_NODE_AUTH_KEY", authKey);
             }
             builder.redirectError(ProcessBuilder.Redirect.appendTo(new File(getContext().getFilesDir(), "embedded-node.log")));
-            nodeProcess = builder.start();
-            watchProcess(nodeProcess);
-            call.resolve(readStatus(stateDir, nodeId));
+            Process process = builder.start();
+            nodeProcess = process;
+            watchProcess(process);
+            JSObject result = readStatus(stateDir, nodeId);
+            if (rejectForStatus(call, result)) {
+                process.destroy();
+                nodeProcess = null;
+                return;
+            }
+            if (result.optString("endpoint", "").isEmpty()) {
+                String message = process.isAlive()
+                    ? "The embedded network node did not become ready."
+                    : "The embedded network node stopped before becoming ready.";
+                process.destroy();
+                nodeProcess = null;
+                call.reject(message);
+                return;
+            }
+            call.resolve(result);
         } catch (Exception error) {
             call.reject("Could not start the embedded node engine.", error);
         }
@@ -132,12 +155,16 @@ public class EmbeddedNodePlugin extends Plugin {
         JSObject result = new JSObject();
         result.put("nodeId", nodeId);
         File status = new File(stateDir, "status.json");
-        for (int attempt = 0; attempt < 100; attempt++) {
+        for (int attempt = 0; attempt < 300; attempt++) {
             if (status.isFile()) {
                 try {
                     JSONObject json = new JSONObject(new String(java.nio.file.Files.readAllBytes(status.toPath()), StandardCharsets.UTF_8));
                     result.put("nodeId", json.optString("nodeId", nodeId));
                     result.put("tailnetAddress", json.optString("tailnetAddress", null));
+                    String errorCode = json.optString("errorCode", "");
+                    String errorMessage = json.optString("errorMessage", "");
+                    if (!errorCode.isEmpty()) result.put("errorCode", errorCode);
+                    if (!errorMessage.isEmpty()) result.put("errorMessage", errorMessage);
                     String proxyAddress = json.optString("proxyAddress", "");
                     if (!proxyAddress.isEmpty()) {
                         result.put("endpoint", "ws://" + proxyAddress);
@@ -148,12 +175,20 @@ public class EmbeddedNodePlugin extends Plugin {
                 }
             }
             try {
-                Thread.sleep(25L);
+                Thread.sleep(50L);
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 return result;
             }
         }
         return result;
+    }
+
+    private boolean rejectForStatus(PluginCall call, JSObject result) {
+        String errorCode = result.optString("errorCode", "");
+        if (errorCode.isEmpty()) return false;
+        String message = result.optString("errorMessage", "The embedded network node could not start.");
+        call.reject(message);
+        return true;
     }
 }

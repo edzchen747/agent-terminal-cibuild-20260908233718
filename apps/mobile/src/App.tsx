@@ -83,7 +83,7 @@ export function App() {
     void ConnectionNotification.addListener("reconnectTimedOut", () => {
       connectionRef.current?.close();
       setSnapshot(null);
-      setError("Could not reach the desktop within 5 seconds.");
+      setError("Could not reach the desktop within 30 seconds.");
       setStatus("error");
       void stopConnectionNotification();
     }).then((handle) => {
@@ -128,7 +128,7 @@ export function App() {
         setStatus("connected");
       } catch (cause) {
         if (disposed || current.isClosed()) return;
-        if (isAuthorizationError(cause)) {
+        if (isAuthorizationError(cause) || isEmbeddedNodeConfigurationError(cause)) {
           current.stopAutoReconnect();
           await stopConnectionNotification();
           setError(cause instanceof Error ? cause.message : "Could not connect to the saved desktop.");
@@ -278,6 +278,10 @@ function isAuthorizationError(cause: unknown): boolean {
   return cause instanceof Error && /not authorized|no longer authorized/i.test(cause.message);
 }
 
+function isEmbeddedNodeConfigurationError(cause: unknown): boolean {
+  return cause instanceof Error && /update the (desktop|mobile) app|enrollment key was rejected|tsnet desktop host name/i.test(cause.message);
+}
+
 function ProjectScreen({ project, snapshot, connection, onBack, onRename, onOpen }: { project: Project; snapshot: HostSnapshot; connection: HostConnection; onBack: () => void; onRename: () => void; onOpen: (session: TerminalSession) => void }) {
   const sessions = snapshot.sessions.filter((session) => session.projectId === project.id);
   const [changingPersistence, setChangingPersistence] = useState(false);
@@ -303,14 +307,14 @@ function ProjectScreen({ project, snapshot, connection, onBack, onRename, onOpen
     <MobileHeader title={project.name} subtitle={project.path} onBack={onBack} trailing={<><button className="header-edit-button" onClick={onRename} aria-label="Rename project"><EditIcon /></button>{project.persistent ? <BookmarkIcon className="saved-icon" /> : <ClockIcon className="temp-icon" />}</>} />
     <section className="project-hero"><div className="large-folder"><FolderIcon /></div><span>{project.persistent ? "Saved project" : "Temporary project"}</span><h1>{project.name}</h1><p>{project.path}</p><div className="project-actions"><button className="mobile-primary" onClick={() => void createSession()}><PlusIcon /> New terminal</button><button className="mobile-secondary" disabled={changingPersistence} onClick={() => void togglePersistence()}>{project.persistent ? <ClockIcon /> : <BookmarkIcon />}{changingPersistence ? "Updating…" : project.persistent ? "Make temporary" : "Save project"}</button></div>{persistenceError && <div className="form-error project-error">{persistenceError}</div>}</section>
     <section className="session-section"><div className="section-title"><span>Sessions</span><small>{sessions.length}</small></div>
-      {sessions.length ? <div className="session-list">{sessions.map((session, index) => <button key={session.id} onClick={() => onOpen(session)}><span className="session-icon"><TerminalIcon /></span><span><strong>{session.title} {index + 1}</strong><small>{session.status === "running" ? "Active now" : `Exited · ${session.exitCode ?? "—"}`}</small></span><i className={session.status} /><ChevronIcon /></button>)}</div> : <div className="inline-empty">No open terminal sessions.</div>}
+      {sessions.length ? <div className="session-list">{sessions.map((session) => <button key={session.id} onClick={() => onOpen(session)}><span className="session-icon"><TerminalIcon /></span><span><strong>{session.title}</strong><small>{session.status === "running" ? "Active now" : `Exited · ${session.exitCode ?? "—"}`}</small></span><i className={session.status} /><ChevronIcon /></button>)}</div> : <div className="inline-empty">No open terminal sessions.</div>}
     </section>
   </div>;
 }
 
 function ProjectCard({ project, sessions, onClick, onSession }: { project: Project; sessions: TerminalSession[]; onClick: () => void; onSession: (session: TerminalSession) => void }) {
   return <article className="project-card"><button className="project-card-main" onClick={onClick}><span className="card-folder"><FolderIcon /></span><span className="card-copy"><strong>{project.name}</strong><small>{project.path}</small></span><span className="card-persist">{project.persistent ? <BookmarkIcon /> : <ClockIcon />}</span><ChevronIcon /></button>
-    {!!sessions.length && <div className="card-sessions">{sessions.slice(0, 3).map((session, index) => <button key={session.id} onClick={() => onSession(session)}><TerminalIcon /><span>{session.title} {index + 1}</span><i className={session.status} /></button>)}{sessions.length > 3 && <span className="more-sessions">+{sessions.length - 3}</span>}</div>}
+    {!!sessions.length && <div className="card-sessions">{sessions.slice(0, 3).map((session) => <button key={session.id} onClick={() => onSession(session)}><TerminalIcon /><span>{session.title}</span><i className={session.status} /></button>)}{sessions.length > 3 && <span className="more-sessions">+{sessions.length - 3}</span>}</div>}
   </article>;
 }
 
