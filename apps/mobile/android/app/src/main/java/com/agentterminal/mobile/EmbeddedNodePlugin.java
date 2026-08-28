@@ -6,6 +6,10 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.PluginMethod;
 
+import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.LinkProperties;
+import android.net.Network;
 import android.util.Log;
 
 import java.io.File;
@@ -76,6 +80,10 @@ public class EmbeddedNodePlugin extends Plugin {
                 "--proxy-listen", "127.0.0.1:0"
             );
             builder.environment().put("AGENT_TERMINAL_NODE_PRIVATE_KEY", privateKey == null ? "" : privateKey);
+            String dnsServers = activeDnsServers();
+            if (!dnsServers.isEmpty()) {
+                builder.environment().put("AGENT_TERMINAL_DNS_SERVERS", dnsServers);
+            }
             if (authKey != null && !authKey.isEmpty()) {
                 builder.environment().put("AGENT_TERMINAL_NODE_AUTH_KEY", authKey);
             }
@@ -142,6 +150,21 @@ public class EmbeddedNodePlugin extends Plugin {
 
     private File bundledExecutable() {
         return new File(getContext().getApplicationInfo().nativeLibraryDir, "libembedded-node.so");
+    }
+
+    private String activeDnsServers() {
+        ConnectivityManager manager = (ConnectivityManager) getContext().getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (manager == null) return "";
+        Network network = manager.getActiveNetwork();
+        if (network == null) return "";
+        LinkProperties properties = manager.getLinkProperties(network);
+        if (properties == null || properties.getDnsServers().isEmpty()) return "";
+        StringBuilder result = new StringBuilder();
+        for (java.net.InetAddress address : properties.getDnsServers()) {
+            if (result.length() > 0) result.append(',');
+            result.append(address.getHostAddress());
+        }
+        return result.toString();
     }
 
     private JSObject readStatus(File stateDir, String nodeId) {
