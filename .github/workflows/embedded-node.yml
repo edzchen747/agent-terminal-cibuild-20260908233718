@@ -37,6 +37,10 @@ jobs:
           cache: true
           cache-dependency-path: apps/embedded-node/go.mod
 
+      - name: Download Go dependencies
+        working-directory: apps/embedded-node
+        run: go mod download
+
       - name: Build embedded-node.exe
         shell: pwsh
         run: ./scripts/build-embedded-node.ps1
