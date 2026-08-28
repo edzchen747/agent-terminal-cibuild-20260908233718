@@ -20,7 +20,7 @@ try {
   $env:CGO_ENABLED = '0'
   Push-Location -LiteralPath $EmbeddedNodeDirectory
   try {
-    go build -trimpath -ldflags='-s -w' -o (Join-Path $OutputDirectory 'libembedded-node.so') .
+    go build -trimpath -ldflags='-s -w -checklinkname=0' -o (Join-Path $OutputDirectory 'libembedded-node.so') .
   } finally {
     Pop-Location
   }

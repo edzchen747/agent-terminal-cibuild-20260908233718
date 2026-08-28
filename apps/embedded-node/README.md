@@ -6,6 +6,11 @@ gets a private userspace node and its own persistent state directory. It does
 not install `tailscaled`, create a system VPN, or require a user-installed
 Tailscale client.
 
+On Android, it uses `github.com/wlynxg/anet` for network-interface discovery.
+Android 11 and newer restrict the netlink calls used by Go's standard
+`net.Interfaces`; the Android build therefore requires the
+`-checklinkname=0` linker flag.
+
 Build signed binaries for each release target and place them at:
 
 - Desktop: `apps/desktop/src-tauri/resources/embedded-node/embedded-node.exe`

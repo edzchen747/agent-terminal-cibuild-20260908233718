@@ -46,6 +46,7 @@ func main() {
 	if err := os.MkdirAll(*stateDir, 0700); err != nil {
 		log.Fatal(err)
 	}
+	configureNetworkInterfaceGetter()
 
 	node := &tsnet.Server{
 		Dir:        *stateDir,
