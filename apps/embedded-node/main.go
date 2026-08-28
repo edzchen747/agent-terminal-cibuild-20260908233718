@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -78,7 +79,8 @@ func main() {
 	}
 
 	if *remoteAddress != "" {
-		if err := waitForRemote(node, *remoteAddress); err != nil {
+		remoteDialAddress, err := waitForRemote(node, *remoteAddress)
+		if err != nil {
 			writeFailure(*stateDir, *nodeID, err, true)
 			log.Fatal(err)
 		}
@@ -92,7 +94,7 @@ func main() {
 		defer listener.Close()
 		result.ProxyAddress = listener.Addr().String()
 		writeStatus(*stateDir, result)
-		serve(listener, func() (net.Conn, error) { return node.Dial(context.Background(), "tcp", *remoteAddress) })
+		serve(listener, func() (net.Conn, error) { return node.Dial(context.Background(), "tcp", remoteDialAddress) })
 		return
 	}
 
@@ -146,23 +148,81 @@ func waitForNode(node *tsnet.Server) error {
 	}
 }
 
-func waitForRemote(node *tsnet.Server, address string) error {
+func waitForRemote(node *tsnet.Server, address string) (string, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", fmt.Errorf("tsnet: invalid remote address %q: %w", address, err)
+	}
+
 	deadline := time.Now().Add(10 * time.Second)
 	var lastError error
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		connection, err := node.Dial(ctx, "tcp", address)
-		cancel()
-		if err == nil {
-			_ = connection.Close()
-			return nil
+		target, resolveErr := resolveRemoteAddress(node, host, port)
+		if resolveErr != nil {
+			lastError = resolveErr
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			connection, dialErr := node.Dial(ctx, "tcp", target)
+			cancel()
+			if dialErr == nil {
+				_ = connection.Close()
+				return target, nil
+			}
+			lastError = dialErr
 		}
-		lastError = err
-		if isHostNameNotFound(err) || time.Now().After(deadline) {
-			return lastError
+		if time.Now().After(deadline) {
+			return "", lastError
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+// Android's system resolver can resolve the public control URL, but the
+// desktop's *.agent-terminal.internal name is a tailnet-only MagicDNS name.
+// Resolve it from tsnet's peer map and dial the peer IP directly so this works
+// in userspace networking without relying on a system DNS stub or TUN device.
+func resolveRemoteAddress(node *tsnet.Server, host, port string) (string, error) {
+	if net.ParseIP(host) != nil {
+		return net.JoinHostPort(host, port), nil
+	}
+
+	client, err := node.LocalClient()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	current, err := client.Status(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	wanted := strings.TrimSuffix(strings.ToLower(host), ".")
+	for _, peer := range current.Peer {
+		peerName := strings.TrimSuffix(strings.ToLower(peer.DNSName), ".")
+		if peerName != wanted {
+			continue
+		}
+
+		var fallback string
+		for _, ip := range peer.TailscaleIPs {
+			if !ip.IsValid() {
+				continue
+			}
+			if ip.Is4() {
+				return net.JoinHostPort(ip.String(), port), nil
+			}
+			if fallback == "" {
+				fallback = net.JoinHostPort(ip.String(), port)
+			}
+		}
+		if fallback != "" {
+			return fallback, nil
+		}
+		return "", fmt.Errorf("tsnet: peer %q has no tailnet IP", host)
+	}
+
+	return "", fmt.Errorf("tsnet: peer %q not found in netmap", host)
 }
 
 func writeFailure(stateDir, nodeID string, err error, remote bool) {
@@ -222,6 +282,7 @@ func isHostNameNotFound(err error) bool {
 		strings.Contains(text, "host not found") ||
 		strings.Contains(text, "unknown host") ||
 		strings.Contains(text, "name or service not known") ||
+		strings.Contains(text, "not found in netmap") ||
 		strings.Contains(text, "cannot resolve") ||
 		(strings.Contains(text, "lookup ") && (strings.Contains(text, "not found") || strings.Contains(text, "server misbehaving")))
 }
