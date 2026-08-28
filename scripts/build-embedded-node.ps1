@@ -10,4 +10,10 @@ if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
 $OutputDirectory = Join-Path $WorkspaceRoot 'apps\desktop\src-tauri\resources\embedded-node'
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
-go build -trimpath -ldflags='-s -w' -o (Join-Path $OutputDirectory 'embedded-node.exe') .\apps\embedded-node
+$EmbeddedNodeDirectory = Join-Path $WorkspaceRoot 'apps\embedded-node'
+Push-Location -LiteralPath $EmbeddedNodeDirectory
+try {
+  go build -trimpath -ldflags='-s -w' -o (Join-Path $OutputDirectory 'embedded-node.exe') .
+} finally {
+  Pop-Location
+}
