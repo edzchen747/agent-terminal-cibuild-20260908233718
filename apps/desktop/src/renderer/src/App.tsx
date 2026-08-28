@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import QRCode from "qrcode";
 import { encodePairingPayload } from "@agentterminal/protocol";
 import type { DesktopState } from "../../shared/api";
@@ -6,6 +7,17 @@ import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, Pho
 import { TerminalPane } from "./TerminalPane";
 
 type Modal = "pair" | "settings" | "rename" | null;
+
+interface TabDragState {
+  sessionId: string;
+  pointerId: number;
+  startX: number;
+  deltaX: number;
+  startIndex: number;
+  targetIndex: number;
+  didMove: boolean;
+  centers: number[];
+}
 
 export function App() {
   const [state, setState] = useState<DesktopState | null>(null);
@@ -19,8 +31,12 @@ export function App() {
   const [renameError, setRenameError] = useState("");
   const [renaming, setRenaming] = useState(false);
   const [sessionOrder, setSessionOrder] = useState<string[]>([]);
-  const [draggedSessionId, setDraggedSessionId] = useState<string | null>(null);
+  const [tabDrag, setTabDrag] = useState<TabDragState | null>(null);
   const [closingSessionIds, setClosingSessionIds] = useState<Set<string>>(() => new Set());
+  const tabDragRef = useRef<TabDragState | null>(null);
+  const tabElementsRef = useRef(new Map<string, HTMLButtonElement>());
+  const pendingTabPositionsRef = useRef<Map<string, number> | null>(null);
+  const suppressTabClickRef = useRef(false);
 
   useEffect(() => {
     void window.agentTerminal.getState().then(setState);
@@ -53,6 +69,23 @@ export function App() {
     const available = new Set(ids);
     setSessionOrder((current) => [...current.filter((id) => available.has(id)), ...ids.filter((id) => !current.includes(id))]);
   }, [state?.sessions]);
+
+  useLayoutEffect(() => {
+    const previousPositions = pendingTabPositionsRef.current;
+    if (!previousPositions) return;
+    pendingTabPositionsRef.current = null;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    for (const [sessionId, previousLeft] of previousPositions) {
+      const element = tabElementsRef.current.get(sessionId);
+      if (!element) continue;
+      const delta = previousLeft - element.getBoundingClientRect().left;
+      if (Math.abs(delta) < 1) continue;
+      element.animate(
+        [{ transform: `translate3d(${delta}px,0,0)` }, { transform: "translate3d(0,0,0)" }],
+        { duration: 180, easing: "cubic-bezier(.2,.8,.2,1)" }
+      );
+    }
+  }, [sessionOrder, tabDrag]);
 
   useEffect(() => {
     if (!projectSessions.some((session) => session.id === activeSessionId)) {
@@ -137,6 +170,11 @@ export function App() {
   function reorderSession(draggedId: string, targetId: string) {
     if (!state || draggedId === targetId) return;
     const projectIds = new Set(unorderedProjectSessions.map((session) => session.id));
+    const orderedProjectIds = projectSessions.map((session) => session.id);
+    const projectFrom = orderedProjectIds.indexOf(draggedId);
+    const projectTo = orderedProjectIds.indexOf(targetId);
+    if (projectFrom < 0 || projectTo < 0) return;
+    orderedProjectIds.splice(projectTo, 0, ...orderedProjectIds.splice(projectFrom, 1));
     setSessionOrder((current) => {
       const allIds = state.sessions.map((session) => session.id);
       const available = new Set(allIds);
@@ -149,6 +187,90 @@ export function App() {
       let visibleIndex = 0;
       return reconciled.map((id) => projectIds.has(id) ? visible[visibleIndex++]! : id);
     });
+    void window.agentTerminal.reorderSessions(state.currentProjectId, orderedProjectIds).catch(() => {
+      void window.agentTerminal.getState().then((nextState) => {
+        setState(nextState);
+        setSessionOrder(nextState.sessions.map((session) => session.id));
+      });
+    });
+  }
+
+  function beginTabDrag(event: ReactPointerEvent<HTMLButtonElement>, sessionId: string, index: number) {
+    if (event.button !== 0 || closingSessionIds.has(sessionId)) return;
+    const centers = projectSessions.map((session) => {
+      const bounds = tabElementsRef.current.get(session.id)?.getBoundingClientRect();
+      return bounds ? bounds.left + bounds.width / 2 : 0;
+    });
+    if (centers.some((center) => center === 0)) return;
+    const next: TabDragState = {
+      sessionId,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      deltaX: 0,
+      startIndex: index,
+      targetIndex: index,
+      didMove: false,
+      centers
+    };
+    suppressTabClickRef.current = false;
+    tabDragRef.current = next;
+    setTabDrag(next);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function moveTabDrag(event: ReactPointerEvent<HTMLButtonElement>) {
+    const current = tabDragRef.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    const deltaX = event.clientX - current.startX;
+    const didMove = current.didMove || Math.abs(deltaX) > 4;
+    const draggedCenter = current.centers[current.startIndex]! + deltaX;
+    let targetIndex = current.startIndex;
+    if (didMove) {
+      let nearestDistance = Number.POSITIVE_INFINITY;
+      current.centers.forEach((center, index) => {
+        const distance = Math.abs(center - draggedCenter);
+        if (distance < nearestDistance) {
+          nearestDistance = distance;
+          targetIndex = index;
+        }
+      });
+      event.preventDefault();
+    }
+    const next = { ...current, deltaX, didMove, targetIndex };
+    tabDragRef.current = next;
+    setTabDrag(next);
+  }
+
+  function finishTabDrag(event: ReactPointerEvent<HTMLButtonElement>, commit: boolean) {
+    const current = tabDragRef.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    if (current.didMove) {
+      suppressTabClickRef.current = true;
+      window.setTimeout(() => { suppressTabClickRef.current = false; }, 0);
+      if (commit && current.targetIndex !== current.startIndex) {
+        pendingTabPositionsRef.current = new Map(
+          projectSessions.map((session) => [session.id, tabElementsRef.current.get(session.id)?.getBoundingClientRect().left ?? 0])
+        );
+        reorderSession(current.sessionId, projectSessions[current.targetIndex]!.id);
+      }
+    }
+    tabDragRef.current = null;
+    setTabDrag(null);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  function tabDragTransform(sessionId: string, index: number): string | undefined {
+    if (!tabDrag) return undefined;
+    if (sessionId === tabDrag.sessionId) return `translate3d(${tabDrag.deltaX}px,0,0)`;
+    if (tabDrag.startIndex < tabDrag.targetIndex && index > tabDrag.startIndex && index <= tabDrag.targetIndex) {
+      return "translate3d(-100%,0,0)";
+    }
+    if (tabDrag.startIndex > tabDrag.targetIndex && index >= tabDrag.targetIndex && index < tabDrag.startIndex) {
+      return "translate3d(100%,0,0)";
+    }
+    return undefined;
   }
 
   async function selectShell(shellId: string) {
@@ -200,9 +322,9 @@ export function App() {
         <section className="terminal-workspace">
           <div className="tabbar">
             <div className="tabs">
-              {projectSessions.map((session, index) => <button key={session.id} draggable={!closingSessionIds.has(session.id)} className={`terminal-tab ${session.id === activeSessionId ? "active" : ""} ${session.id === draggedSessionId ? "is-dragging" : ""} ${closingSessionIds.has(session.id) ? "is-closing" : ""}`} onClick={() => { if (!draggedSessionId) setActiveSessionId(session.id); }} onDragStart={(event) => { setDraggedSessionId(session.id); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", session.id); }} onDragEnter={(event) => { event.preventDefault(); if (draggedSessionId) reorderSession(draggedSessionId, session.id); }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }} onDrop={(event) => { event.preventDefault(); setDraggedSessionId(null); }} onDragEnd={() => setDraggedSessionId(null)}>
-                <TerminalIcon /><span>{session.title} {index + 1}</span>{session.status === "exited" && <i className="exit-dot" title={`Exited (${session.exitCode ?? "unknown"})`} />}
-                <span className="tab-close" role="button" onClick={(event) => { event.stopPropagation(); void closeTab(session.id); }}><CloseIcon /></span>
+              {projectSessions.map((session, index) => <button key={session.id} ref={(element) => { if (element) tabElementsRef.current.set(session.id, element); else tabElementsRef.current.delete(session.id); }} className={`terminal-tab ${session.id === activeSessionId ? "active" : ""} ${session.id === tabDrag?.sessionId ? "is-dragging" : ""} ${closingSessionIds.has(session.id) ? "is-closing" : ""}`} style={{ transform: tabDragTransform(session.id, index) }} onClick={() => { if (!suppressTabClickRef.current) setActiveSessionId(session.id); }} onPointerDown={(event) => beginTabDrag(event, session.id, index)} onPointerMove={moveTabDrag} onPointerUp={(event) => finishTabDrag(event, true)} onPointerCancel={(event) => finishTabDrag(event, false)}>
+                <TerminalIcon /><span>{session.title}</span>{session.status === "exited" && <i className="exit-dot" title={`Exited (${session.exitCode ?? "unknown"})`} />}
+                <span className="tab-close" role="button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void closeTab(session.id); }}><CloseIcon /></span>
               </button>)}
               <button className="add-tab" onClick={() => void addTab()} title="New terminal tab"><PlusIcon /></button>
             </div>

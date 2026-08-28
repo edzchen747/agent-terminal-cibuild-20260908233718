@@ -114,6 +114,17 @@ fn close_session(state: State<'_, Arc<Core>>, session_id: String) {
 }
 
 #[tauri::command]
+fn reorder_sessions(
+    state: State<'_, Arc<Core>>,
+    project_id: String,
+    session_ids: Vec<String>,
+) -> Result<(), String> {
+    state
+        .reorder_project_sessions(&project_id, &session_ids)
+        .map_err(error_string)
+}
+
+#[tauri::command]
 fn write_session(
     state: State<'_, Arc<Core>>,
     session_id: String,
@@ -229,6 +240,7 @@ pub fn run() {
             open_project,
             create_session,
             close_session,
+            reorder_sessions,
             write_session,
             resize_session,
             attach_session,

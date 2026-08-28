@@ -37,6 +37,7 @@ const api: DesktopApi = {
   openProject: (projectId) => invoke("open_project", { projectId }),
   createSession: (projectId, shellId) => invoke("create_session", { projectId, shellId }),
   closeSession: (sessionId) => invoke("close_session", { sessionId }),
+  reorderSessions: (projectId, sessionIds) => invoke("reorder_sessions", { projectId, sessionIds }),
   write: (sessionId, data, cols, rows) => { void invoke("write_session", { sessionId, data, cols, rows }); },
   resize: (sessionId, cols, rows, force) => { void invoke("resize_session", { sessionId, cols, rows, force }); },
   attachSession: async (sessionId) => {

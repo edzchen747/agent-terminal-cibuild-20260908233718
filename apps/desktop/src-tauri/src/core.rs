@@ -71,6 +71,7 @@ struct Inner {
     shells: Vec<ShellProfile>,
     temporary_projects: HashMap<String, Project>,
     sessions: HashMap<String, ManagedSession>,
+    session_order: Vec<String>,
     windows: WindowClients,
     pairing_grants: HashMap<String, PairingGrant>,
 }
@@ -95,6 +96,7 @@ impl Core {
                 shells: detect_shells(),
                 temporary_projects: HashMap::new(),
                 sessions: HashMap::new(),
+                session_order: Vec::new(),
                 windows: WindowClients::default(),
                 pairing_grants: HashMap::new(),
             }),
@@ -559,25 +561,26 @@ impl Core {
         if name.chars().count() > 100 || name.chars().any(char::is_control) {
             return Err(anyhow!("Project name must be 100 characters or fewer."));
         }
-        let project = {
+        let (project, window_label) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
-            if let Some(mut project) = inner
-                .store
-                .projects()
-                .iter()
-                .find(|project| project.id == project_id)
-                .cloned()
-            {
-                project.name = name.to_string();
-                inner.store.save_project(project.clone())?;
-                project
-            } else if let Some(project) = inner.temporary_projects.get_mut(project_id) {
-                project.name = name.to_string();
-                project.clone()
-            } else {
-                return Err(anyhow!("Project not found."));
+            let mut project =
+                project_by_id(&inner, project_id).ok_or_else(|| anyhow!("Project not found."))?;
+            project.name = name.to_string();
+            project.persistent = true;
+            if project.created_at.is_none() {
+                project.created_at = Some(Utc::now().to_rfc3339());
             }
+            inner.store.save_project(project.clone())?;
+            inner.temporary_projects.remove(project_id);
+            let window_label = inner
+                .windows
+                .window_for_project(project_id)
+                .map(str::to_owned);
+            (project, window_label)
         };
+        if let Some(window) = window_label.and_then(|label| self.app.get_webview_window(&label)) {
+            let _ = window.set_title(&format!("{} — Agent Terminal", project.name));
+        }
         self.broadcast();
         Ok(project)
     }
@@ -617,7 +620,7 @@ impl Core {
     }
 
     pub fn set_project_persistence(&self, project_id: &str, persistent: bool) -> Result<Project> {
-        let project = {
+        let (project, window_label) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let current =
                 project_by_id(&inner, project_id).ok_or_else(|| anyhow!("Project not found."))?;
@@ -634,12 +637,21 @@ impl Core {
                 inner.temporary_projects.remove(project_id);
             } else {
                 inner.store.remove_project(project_id)?;
+                project.name = folder_name(Path::new(&project.path));
+                project.created_at = None;
                 inner
                     .temporary_projects
                     .insert(project_id.to_string(), project.clone());
             }
-            project
+            let window_label = inner
+                .windows
+                .window_for_project(project_id)
+                .map(str::to_owned);
+            (project, window_label)
         };
+        if let Some(window) = window_label.and_then(|label| self.app.get_webview_window(&label)) {
+            let _ = window.set_title(&format!("{} — Agent Terminal", project.name));
+        }
         self.broadcast();
         Ok(project)
     }
@@ -702,6 +714,7 @@ impl Core {
                     has_run_command: false,
                 },
             );
+            inner.session_order.push(id.clone());
         }
 
         let reader_core = Arc::clone(self);
@@ -740,11 +753,44 @@ impl Core {
             let Some(mut session) = inner.sessions.remove(session_id) else {
                 return;
             };
+            inner.session_order.retain(|id| id != session_id);
             let _ = session.killer.kill();
             session.metadata.project_id
         };
         self.cleanup_empty_temporary_project(&project_id);
         self.broadcast();
+    }
+
+    pub fn reorder_project_sessions(&self, project_id: &str, session_ids: &[String]) -> Result<()> {
+        {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let project_session_ids = inner
+                .sessions
+                .values()
+                .filter(|session| session.metadata.project_id == project_id)
+                .map(|session| session.metadata.id.clone())
+                .collect::<HashSet<_>>();
+            let requested_ids = session_ids.iter().cloned().collect::<HashSet<_>>();
+            if requested_ids.len() != session_ids.len() || requested_ids != project_session_ids {
+                return Err(anyhow!("Tab order does not match the project's sessions."));
+            }
+            let mut requested = session_ids.iter();
+            let project_slots = inner
+                .session_order
+                .iter()
+                .map(|id| project_session_ids.contains(id))
+                .collect::<Vec<_>>();
+            for (id, belongs_to_project) in inner.session_order.iter_mut().zip(project_slots) {
+                if belongs_to_project {
+                    *id = requested
+                        .next()
+                        .expect("validated project session order")
+                        .clone();
+                }
+            }
+        }
+        self.broadcast();
+        Ok(())
     }
 
     pub fn write_session(&self, session_id: &str, data: &str) {
@@ -1292,7 +1338,7 @@ impl Core {
     }
 
     fn on_terminal_data(self: &Arc<Self>, session_id: &str, data: String) {
-        let (reported_cwd, window_clients) = {
+        let (reported_cwd, title_changed, window_clients) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
@@ -1307,7 +1353,21 @@ impl Core {
                 .filter(|cwd| {
                     normalize_text_path(cwd) != normalize_text_path(&session.metadata.cwd)
                 });
-            (reported, inner.windows.subscribers(session_id))
+            let reported_title = parse_terminal_titles(&session.control_tail)
+                .into_iter()
+                .last();
+            let title_changed = reported_title.is_some_and(|title| {
+                if title == session.metadata.title {
+                    return false;
+                }
+                session.metadata.title = title;
+                true
+            });
+            (
+                reported,
+                title_changed,
+                inner.windows.subscribers(session_id),
+            )
         };
         let event = TerminalDataEvent {
             session_id: session_id.to_string(),
@@ -1323,6 +1383,8 @@ impl Core {
         self.send_terminal_output(session_id, &data);
         if let Some(cwd) = reported_cwd {
             self.handle_session_working_directory(session_id, &cwd);
+        } else if title_changed {
+            self.broadcast();
         }
     }
 
@@ -1510,16 +1572,29 @@ fn snapshot_from_inner(inner: &Inner) -> HostSnapshot {
             .map(|shell| shell.id.clone())
             .unwrap_or_else(|| "cmd".into())
     };
+    let mut ordered_ids = HashSet::new();
     let mut sessions = inner
+        .session_order
+        .iter()
+        .filter_map(|id| {
+            inner.sessions.get(id).map(|session| {
+                ordered_ids.insert(id.clone());
+                session.metadata.clone()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut missing_sessions = inner
         .sessions
         .values()
+        .filter(|session| !ordered_ids.contains(&session.metadata.id))
         .map(|session| session.metadata.clone())
         .collect::<Vec<_>>();
-    sessions.sort_by(|left, right| {
+    missing_sessions.sort_by(|left, right| {
         left.created_at
             .cmp(&right.created_at)
             .then_with(|| left.id.cmp(&right.id))
     });
+    sessions.extend(missing_sessions);
 
     HostSnapshot {
         host: HostInfo {
@@ -1658,6 +1733,27 @@ fn parse_working_directories(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_terminal_titles(value: &str) -> Vec<String> {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    let regex = PATTERN.get_or_init(|| {
+        Regex::new(r"\x1b\](?:0|2);([^\x07\x1b]*?)(?:\x07|\x1b\\)")
+            .expect("valid terminal title pattern")
+    });
+    regex
+        .captures_iter(value)
+        .filter_map(|capture| {
+            let title = capture
+                .get(1)?
+                .as_str()
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(256)
+                .collect::<String>();
+            (!title.is_empty()).then_some(title)
+        })
+        .collect()
+}
+
 fn local_address() -> String {
     UdpSocket::bind("0.0.0.0:0")
         .and_then(|socket| {
@@ -1713,7 +1809,8 @@ fn take_valid_pairing_grant(
 #[cfg(test)]
 mod tests {
     use super::{
-        PairingGrant, is_within_project, parse_working_directories, take_valid_pairing_grant,
+        PairingGrant, is_within_project, parse_terminal_titles, parse_working_directories,
+        take_valid_pairing_grant,
     };
     use std::{collections::HashMap, path::Path};
 
@@ -1723,6 +1820,15 @@ mod tests {
         assert_eq!(
             parse_working_directories(output),
             vec!["C:\\Users\\edzch\\Project", "C:/Users/edzch/Other Project"]
+        );
+    }
+
+    #[test]
+    fn parses_shell_provided_terminal_titles() {
+        let output = "before\x1b]0;PowerShell — build\x07middle\x1b]2;npm test\x1b\\after";
+        assert_eq!(
+            parse_terminal_titles(output),
+            vec!["PowerShell — build", "npm test"]
         );
     }
 
