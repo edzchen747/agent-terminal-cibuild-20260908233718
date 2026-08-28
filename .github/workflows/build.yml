@@ -29,11 +29,20 @@ jobs:
           java-version: '21'
           cache: gradle
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+
       - name: Install JavaScript dependencies
         run: npm ci
 
       - name: Build shared protocol
         run: npm run build -w @agentterminal/protocol
+
+      - name: Build Android embedded node
+        shell: pwsh
+        run: ./scripts/build-embedded-node-android.ps1
 
       - name: Build and sync Capacitor Android project
         run: npm run android:sync

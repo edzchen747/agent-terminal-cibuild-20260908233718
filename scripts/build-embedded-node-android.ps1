@@ -13,11 +13,17 @@ New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $previousGoOs = $env:GOOS
 $previousGoArch = $env:GOARCH
 $previousCgo = $env:CGO_ENABLED
+$EmbeddedNodeDirectory = Join-Path $WorkspaceRoot 'apps\embedded-node'
 try {
   $env:GOOS = 'android'
   $env:GOARCH = 'arm64'
   $env:CGO_ENABLED = '0'
-  go build -trimpath -ldflags='-s -w' -o (Join-Path $OutputDirectory 'embedded-node') .\apps\embedded-node
+  Push-Location -LiteralPath $EmbeddedNodeDirectory
+  try {
+    go build -trimpath -ldflags='-s -w' -o (Join-Path $OutputDirectory 'embedded-node') .
+  } finally {
+    Pop-Location
+  }
 } finally {
   $env:GOOS = $previousGoOs
   $env:GOARCH = $previousGoArch
