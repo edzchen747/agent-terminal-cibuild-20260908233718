@@ -44,7 +44,7 @@ struct ManagedSession {
     killer: Box<dyn ChildKiller + Send + Sync>,
     buffer: String,
     control_tail: String,
-    has_user_input: bool,
+    has_run_command: bool,
 }
 
 #[derive(Clone)]
@@ -657,7 +657,7 @@ impl Core {
                     killer,
                     buffer: String::new(),
                     control_tail: String::new(),
-                    has_user_input: false,
+                    has_run_command: false,
                 },
             );
         }
@@ -711,8 +711,8 @@ impl Core {
             return;
         };
         if session.metadata.status == "running" {
-            if !data.is_empty() {
-                session.has_user_input = true;
+            if data.contains('\r') || data.contains('\n') {
+                session.has_run_command = true;
             }
             let _ = session.writer.write_all(data.as_bytes());
             let _ = session.writer.flush();
@@ -818,7 +818,7 @@ impl Core {
             if session.metadata.shell_id == shell_id {
                 None
             } else {
-                Some((session.metadata.project_id.clone(), !session.has_user_input))
+                Some((session.metadata.project_id.clone(), !session.has_run_command))
             }
         };
         let Some((project_id, replace_current)) = switch else {
