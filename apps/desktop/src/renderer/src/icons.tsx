@@ -15,3 +15,9 @@ export const CloseIcon = (props: IconProps) => <svg {...base} {...props}><path d
 export const TrashIcon = (props: IconProps) => <svg {...base} {...props}><path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14"/></svg>;
 export const EditIcon = (props: IconProps) => <svg {...base} {...props}><path d="M4 20h4l11-11-4-4L4 16v4Z"/><path d="m13.5 6.5 4 4"/></svg>;
 export const WifiIcon = (props: IconProps) => <svg {...base} {...props}><path d="M5 12.5a10 10 0 0 1 14 0M8 16a6 6 0 0 1 8 0M11 19.5a2 2 0 0 1 2 0"/></svg>;
+export const MoreIcon = (props: IconProps) => <svg {...base} {...props}><circle cx="5" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1" fill="currentColor" stroke="none"/></svg>;
+export const SplitViewIcon = (props: IconProps) => <svg {...base} {...props}><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M12 4v16"/></svg>;
+export const SideBySideIcon = (props: IconProps) => <svg {...base} {...props}><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M12 5v14"/></svg>;
+export const StackedIcon = (props: IconProps) => <svg {...base} {...props}><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 12h18"/></svg>;
+export const SwapIcon = (props: IconProps) => <svg {...base} {...props}><path d="M7 7h12l-3-3M19 17H5l3 3"/></svg>;
+export const SeparateIcon = (props: IconProps) => <svg {...base} {...props}><rect x="2.5" y="5" width="7" height="14" rx="1.5"/><rect x="14.5" y="5" width="7" height="14" rx="1.5"/><path d="M12 9v6m-2-2 2 2 2-2"/></svg>;

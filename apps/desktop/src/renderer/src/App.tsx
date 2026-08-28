@@ -1,9 +1,11 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { PointerEvent as ReactPointerEvent } from "react";
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import QRCode from "qrcode";
 import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH } from "@agentterminal/protocol";
 import type { DesktopState } from "../../shared/api";
-import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, PhoneIcon, PlusIcon, SettingsIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
+import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
+import { clampSplitRatio, findSplitGroup, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
+import type { SplitGroup, SplitLayout } from "./split-tabs";
 import { TerminalPane } from "./TerminalPane";
 
 type Modal = "pair" | "settings" | "rename" | null;
@@ -17,6 +19,18 @@ interface TabDragState {
   targetIndex: number;
   didMove: boolean;
   centers: number[];
+}
+
+type SplitDropSide = "left" | "right" | null;
+
+type SplitMenu =
+  | { kind: "picker"; x: number; y: number; anchorId: string; replaceId?: string }
+  | { kind: "manage"; x: number; y: number; groupId: string }
+  | { kind: "tab"; x: number; y: number; sessionId: string };
+
+interface SplitResizeState {
+  groupId: string;
+  pointerId: number;
 }
 
 interface ProjectDragState {
@@ -45,12 +59,22 @@ export function App() {
   const [tabDrag, setTabDrag] = useState<TabDragState | null>(null);
   const [closingSessionIds, setClosingSessionIds] = useState<Set<string>>(() => new Set());
   const [projectDrag, setProjectDrag] = useState<ProjectDragState | null>(null);
+  const [splitGroups, setSplitGroups] = useState<SplitGroup[]>(() => loadSplitPreferences().groups);
+  const [allowSplitEdgeDrop, setAllowSplitEdgeDrop] = useState(() => loadSplitPreferences().allowEdgeDrop);
+  const [splitMenu, setSplitMenu] = useState<SplitMenu | null>(null);
+  const [splitDropSide, setSplitDropSide] = useState<SplitDropSide>(null);
+  const [resizingSplitId, setResizingSplitId] = useState<string | null>(null);
   const tabDragRef = useRef<TabDragState | null>(null);
   const tabElementsRef = useRef(new Map<string, HTMLButtonElement>());
   const pendingTabPositionsRef = useRef<Map<string, number> | null>(null);
   const suppressTabClickRef = useRef(false);
   const projectDragRef = useRef<ProjectDragState | null>(null);
   const projectElementsRef = useRef(new Map<string, HTMLDivElement>());
+  const terminalStackRef = useRef<HTMLDivElement>(null);
+  const splitButtonRef = useRef<HTMLButtonElement>(null);
+  const splitMenuRef = useRef<HTMLDivElement>(null);
+  const splitDropSideRef = useRef<SplitDropSide>(null);
+  const splitResizeRef = useRef<SplitResizeState | null>(null);
 
   useEffect(() => {
     void window.agentTerminal.getState().then(setState);
@@ -75,14 +99,64 @@ export function App() {
     );
   }, [unorderedProjectSessions, sessionOrder]);
   const activeSession = projectSessions.find((session) => session.id === activeSessionId);
+  const activeSplit = findSplitGroup(splitGroups, activeSessionId);
+  const splitBySession = useMemo(() => {
+    const groups = new Map<string, SplitGroup>();
+    for (const group of splitGroups) for (const sessionId of group.sessionIds) groups.set(sessionId, group);
+    return groups;
+  }, [splitGroups]);
   const renamingProject = state?.projects.find((project) => project.id === renamingProjectId);
 
   useEffect(() => {
     if (!state) return;
     const ids = state.sessions.map((session) => session.id);
     const available = new Set(ids);
-    setSessionOrder((current) => [...current.filter((id) => available.has(id)), ...ids.filter((id) => !current.includes(id))]);
+    setSessionOrder((current) => normalizeSplitOrder(
+      [...current.filter((id) => available.has(id)), ...ids.filter((id) => !current.includes(id))],
+      splitGroups
+    ));
   }, [state?.sessions]);
+
+  useEffect(() => {
+    if (!state) return;
+    setSplitGroups((current) => reconcileSplitGroups(current, state.sessions));
+  }, [state?.sessions]);
+
+  useEffect(() => {
+    saveSplitPreferences({ groups: splitGroups, allowEdgeDrop: allowSplitEdgeDrop });
+  }, [splitGroups, allowSplitEdgeDrop]);
+
+  useEffect(() => {
+    if (!splitMenu) return;
+    const focusFrame = window.requestAnimationFrame(() => splitMenuRef.current?.querySelector<HTMLElement>("[role='menuitem']")?.focus());
+    const closeMenu = (event: PointerEvent) => {
+      if (!splitMenuRef.current?.contains(event.target as Node)) setSplitMenu(null);
+    };
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSplitMenu(null);
+    };
+    window.addEventListener("pointerdown", closeMenu, true);
+    window.addEventListener("keydown", handleKey, true);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      window.removeEventListener("pointerdown", closeMenu, true);
+      window.removeEventListener("keydown", handleKey, true);
+    };
+  }, [splitMenu]);
+
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== "n" || !event.shiftKey || !event.altKey || event.ctrlKey || event.metaKey || !activeSessionId) return;
+      event.preventDefault();
+      const bounds = splitButtonRef.current?.getBoundingClientRect();
+      const group = findSplitGroup(splitGroups, activeSessionId);
+      setSplitMenu(group
+        ? { kind: "manage", groupId: group.id, x: bounds?.left ?? window.innerWidth - 250, y: bounds?.bottom ?? 84 }
+        : { kind: "picker", anchorId: activeSessionId, x: bounds?.left ?? window.innerWidth - 250, y: bounds?.bottom ?? 84 });
+    };
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, [activeSessionId, splitGroups]);
 
   useLayoutEffect(() => {
     const previousPositions = pendingTabPositionsRef.current;
@@ -130,6 +204,142 @@ export function App() {
     }
   }
 
+  function commitProjectSessionOrder(projectId: string, orderedProjectIds: string[]) {
+    if (!state) return;
+    const projectIds = new Set(state.sessions.filter((session) => session.projectId === projectId).map((session) => session.id));
+    setSessionOrder((current) => {
+      const allIds = state.sessions.map((session) => session.id);
+      const available = new Set(allIds);
+      const reconciled = [...current.filter((id) => available.has(id)), ...allIds.filter((id) => !current.includes(id))];
+      let visibleIndex = 0;
+      return reconciled.map((id) => projectIds.has(id) ? orderedProjectIds[visibleIndex++] ?? id : id);
+    });
+    void window.agentTerminal.reorderSessions(projectId, orderedProjectIds).catch(() => {
+      void window.agentTerminal.getState().then((nextState) => {
+        setState(nextState);
+        setSessionOrder(nextState.sessions.map((session) => session.id));
+      });
+    });
+  }
+
+  function createSplit(anchorId: string, companionId: string, companionSide: "first" | "second" = "second", activateId = anchorId) {
+    if (!state || anchorId === companionId || findSplitGroup(splitGroups, anchorId) || findSplitGroup(splitGroups, companionId)) return;
+    const anchor = state.sessions.find((session) => session.id === anchorId);
+    const companion = state.sessions.find((session) => session.id === companionId);
+    if (!anchor || !companion || anchor.projectId !== companion.projectId) return;
+    const firstId = companionSide === "first" ? companionId : anchorId;
+    const secondId = companionSide === "first" ? anchorId : companionId;
+    const group: SplitGroup = {
+      id: crypto.randomUUID(),
+      projectId: anchor.projectId,
+      sessionIds: [firstId, secondId],
+      layout: "side-by-side",
+      ratio: 0.5
+    };
+    const orderedIds = state.sessions
+      .filter((session) => session.projectId === anchor.projectId)
+      .sort((left, right) => projectSessions.findIndex((session) => session.id === left.id) - projectSessions.findIndex((session) => session.id === right.id))
+      .map((session) => session.id);
+    const nextOrder = pairSessionsInOrder(orderedIds, anchorId, firstId, secondId);
+    setSplitGroups((current) => [...current, group]);
+    commitProjectSessionOrder(anchor.projectId, nextOrder);
+    setActiveSessionId(activateId);
+    setSplitMenu(null);
+  }
+
+  async function createTerminalInSplit(anchorId: string) {
+    if (!state) return;
+    const anchor = state.sessions.find((session) => session.id === anchorId);
+    if (!anchor) return;
+    const session = await window.agentTerminal.createSession(anchor.projectId);
+    const nextState = await window.agentTerminal.getState();
+    setState(nextState);
+    const group: SplitGroup = {
+      id: crypto.randomUUID(),
+      projectId: anchor.projectId,
+      sessionIds: [anchorId, session.id],
+      layout: "side-by-side",
+      ratio: 0.5
+    };
+    const order = pairSessionsInOrder(
+      nextState.sessions.filter((item) => item.projectId === anchor.projectId).map((item) => item.id),
+      anchorId,
+      anchorId,
+      session.id
+    );
+    setSplitGroups((current) => [...current, group]);
+    const projectSessionIds = new Set(order);
+    let projectIndex = 0;
+    setSessionOrder(nextState.sessions.map((item) => projectSessionIds.has(item.id) ? order[projectIndex++]! : item.id));
+    void window.agentTerminal.reorderSessions(anchor.projectId, order);
+    setActiveSessionId(anchorId);
+    setSplitMenu(null);
+  }
+
+  function separateSplit(groupId: string) {
+    setSplitGroups((current) => current.filter((group) => group.id !== groupId));
+    setSplitMenu(null);
+  }
+
+  function setSplitLayout(groupId: string, layout: SplitLayout) {
+    setSplitGroups((current) => current.map((group) => group.id === groupId ? { ...group, layout } : group));
+    setSplitMenu(null);
+  }
+
+  function swapSplit(groupId: string) {
+    const group = splitGroups.find((item) => item.id === groupId);
+    if (!group) return;
+    const [firstId, secondId] = group.sessionIds;
+    const nextGroups = splitGroups.map((item): SplitGroup => item.id === groupId ? { ...item, sessionIds: [secondId, firstId] } : item);
+    setSplitGroups(nextGroups);
+    const projectOrder = projectSessions.map((session) => session.id);
+    const firstIndex = projectOrder.indexOf(firstId);
+    const secondIndex = projectOrder.indexOf(secondId);
+    if (firstIndex >= 0 && secondIndex >= 0) {
+      projectOrder[firstIndex] = secondId;
+      projectOrder[secondIndex] = firstId;
+      commitProjectSessionOrder(group.projectId, projectOrder);
+    }
+    setSplitMenu(null);
+  }
+
+  function replaceSplitSession(groupId: string, outgoingId: string, incomingId: string) {
+    const group = splitGroups.find((item) => item.id === groupId);
+    const incoming = state?.sessions.find((session) => session.id === incomingId);
+    if (!group || !incoming || incoming.projectId !== group.projectId || findSplitGroup(splitGroups, incomingId)) return;
+    const nextSessionIds: [string, string] = group.sessionIds[0] === outgoingId
+      ? [incomingId, group.sessionIds[1]]
+      : [group.sessionIds[0], incomingId];
+    setSplitGroups((current) => current.map((item) => item.id === groupId ? { ...item, sessionIds: nextSessionIds } : item));
+    commitProjectSessionOrder(group.projectId, replaceSessionInOrder(projectSessions.map((session) => session.id), outgoingId, incomingId));
+    if (activeSessionId === outgoingId) setActiveSessionId(incomingId);
+    setSplitMenu(null);
+  }
+
+  function openSplitMenuForButton() {
+    if (!activeSessionId) return;
+    const bounds = splitButtonRef.current?.getBoundingClientRect();
+    const x = bounds?.left ?? window.innerWidth - 250;
+    const y = bounds?.bottom ?? 84;
+    setSplitMenu(activeSplit
+      ? { kind: "manage", groupId: activeSplit.id, x, y }
+      : { kind: "picker", anchorId: activeSessionId, x, y });
+  }
+
+  function navigateSplitMenu(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    const items = [...event.currentTarget.querySelectorAll<HTMLElement>("[role='menuitem']:not(:disabled)")];
+    if (!items.length) return;
+    const currentIndex = items.indexOf(document.activeElement as HTMLElement);
+    let nextIndex = currentIndex;
+    if (event.key === "ArrowDown") nextIndex = currentIndex < 0 ? 0 : (currentIndex + 1) % items.length;
+    if (event.key === "ArrowUp") nextIndex = currentIndex < 0 ? items.length - 1 : (currentIndex - 1 + items.length) % items.length;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = items.length - 1;
+    event.preventDefault();
+    items[nextIndex]?.focus();
+  }
+
   async function addTab() {
     if (!state) return;
     const session = await window.agentTerminal.createSession(state.currentProjectId);
@@ -139,9 +349,13 @@ export function App() {
   async function closeTab(sessionId: string) {
     if (closingSessionIds.has(sessionId)) return;
     const index = projectSessions.findIndex((session) => session.id === sessionId);
+    const split = findSplitGroup(splitGroups, sessionId);
     if (sessionId === activeSessionId) {
-      setActiveSessionId(projectSessions[index + 1]?.id ?? projectSessions[index - 1]?.id ?? null);
+      const partnerId = split?.sessionIds.find((id) => id !== sessionId);
+      setActiveSessionId(partnerId ?? projectSessions[index + 1]?.id ?? projectSessions[index - 1]?.id ?? null);
     }
+    if (split) setSplitGroups((current) => current.filter((group) => group.id !== split.id));
+    setSplitMenu(null);
     setClosingSessionIds((current) => new Set(current).add(sessionId));
     await new Promise((resolve) => window.setTimeout(resolve, 180));
     try {
@@ -182,30 +396,9 @@ export function App() {
 
   function reorderSession(draggedId: string, targetId: string) {
     if (!state || draggedId === targetId) return;
-    const projectIds = new Set(unorderedProjectSessions.map((session) => session.id));
-    const orderedProjectIds = projectSessions.map((session) => session.id);
-    const projectFrom = orderedProjectIds.indexOf(draggedId);
-    const projectTo = orderedProjectIds.indexOf(targetId);
-    if (projectFrom < 0 || projectTo < 0) return;
-    orderedProjectIds.splice(projectTo, 0, ...orderedProjectIds.splice(projectFrom, 1));
-    setSessionOrder((current) => {
-      const allIds = state.sessions.map((session) => session.id);
-      const available = new Set(allIds);
-      const reconciled = [...current.filter((id) => available.has(id)), ...allIds.filter((id) => !current.includes(id))];
-      const visible = reconciled.filter((id) => projectIds.has(id));
-      const from = visible.indexOf(draggedId);
-      const to = visible.indexOf(targetId);
-      if (from < 0 || to < 0) return current;
-      visible.splice(to, 0, ...visible.splice(from, 1));
-      let visibleIndex = 0;
-      return reconciled.map((id) => projectIds.has(id) ? visible[visibleIndex++]! : id);
-    });
-    void window.agentTerminal.reorderSessions(state.currentProjectId, orderedProjectIds).catch(() => {
-      void window.agentTerminal.getState().then((nextState) => {
-        setState(nextState);
-        setSessionOrder(nextState.sessions.map((session) => session.id));
-      });
-    });
+    const orderedProjectIds = moveSessionBlock(projectSessions.map((session) => session.id), draggedId, targetId, splitGroups);
+    if (orderedProjectIds.every((id, index) => id === projectSessions[index]?.id)) return;
+    commitProjectSessionOrder(state.currentProjectId, orderedProjectIds);
   }
 
   function beginTabDrag(event: ReactPointerEvent<HTMLButtonElement>, sessionId: string, index: number) {
@@ -249,6 +442,20 @@ export function App() {
       });
       event.preventDefault();
     }
+    let dropSide: SplitDropSide = null;
+    const stackBounds = terminalStackRef.current?.getBoundingClientRect();
+    const canSplit = allowSplitEdgeDrop
+      && activeSessionId
+      && activeSessionId !== current.sessionId
+      && !findSplitGroup(splitGroups, activeSessionId)
+      && !findSplitGroup(splitGroups, current.sessionId);
+    if (canSplit && stackBounds && event.clientY >= stackBounds.top && event.clientY <= stackBounds.bottom) {
+      const edgeWidth = Math.min(150, Math.max(72, stackBounds.width * 0.18));
+      if (event.clientX <= stackBounds.left + edgeWidth) dropSide = "left";
+      else if (event.clientX >= stackBounds.right - edgeWidth) dropSide = "right";
+    }
+    splitDropSideRef.current = dropSide;
+    setSplitDropSide(dropSide);
     const next = { ...current, deltaX, didMove, targetIndex };
     tabDragRef.current = next;
     setTabDrag(next);
@@ -260,7 +467,9 @@ export function App() {
     if (current.didMove) {
       suppressTabClickRef.current = true;
       window.setTimeout(() => { suppressTabClickRef.current = false; }, 0);
-      if (commit && current.targetIndex !== current.startIndex) {
+      if (commit && splitDropSideRef.current && activeSessionId && activeSessionId !== current.sessionId) {
+        createSplit(activeSessionId, current.sessionId, splitDropSideRef.current === "left" ? "first" : "second", current.sessionId);
+      } else if (commit && current.targetIndex !== current.startIndex) {
         pendingTabPositionsRef.current = new Map(
           projectSessions.map((session) => [session.id, tabElementsRef.current.get(session.id)?.getBoundingClientRect().left ?? 0])
         );
@@ -269,6 +478,8 @@ export function App() {
     }
     tabDragRef.current = null;
     setTabDrag(null);
+    splitDropSideRef.current = null;
+    setSplitDropSide(null);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
@@ -276,7 +487,8 @@ export function App() {
 
   function tabDragTransform(sessionId: string, index: number): string | undefined {
     if (!tabDrag) return undefined;
-    if (sessionId === tabDrag.sessionId) return `translate3d(${tabDrag.deltaX}px,0,0)`;
+    const draggedGroup = findSplitGroup(splitGroups, tabDrag.sessionId);
+    if (sessionId === tabDrag.sessionId || draggedGroup?.sessionIds.includes(sessionId)) return `translate3d(${tabDrag.deltaX}px,0,0)`;
     if (tabDrag.startIndex < tabDrag.targetIndex && index > tabDrag.startIndex && index <= tabDrag.targetIndex) {
       return "translate3d(-100%,0,0)";
     }
@@ -345,9 +557,67 @@ export function App() {
     return undefined;
   }
 
+  function beginSplitResize(event: ReactPointerEvent<HTMLDivElement>, groupId: string) {
+    if (event.button !== 0) return;
+    splitResizeRef.current = { groupId, pointerId: event.pointerId };
+    setResizingSplitId(groupId);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  }
+
+  function resizeSplit(event: ReactPointerEvent<HTMLDivElement>) {
+    const current = splitResizeRef.current;
+    const bounds = terminalStackRef.current?.getBoundingClientRect();
+    const group = splitGroups.find((item) => item.id === current?.groupId);
+    if (!current || current.pointerId !== event.pointerId || !bounds || !group) return;
+    const dimension = group.layout === "side-by-side" ? bounds.width : bounds.height;
+    const position = group.layout === "side-by-side" ? event.clientX - bounds.left : event.clientY - bounds.top;
+    const minimum = dimension > 0 ? Math.min(0.42, Math.max(0.18, 180 / dimension)) : 0.18;
+    const ratio = clampSplitRatio(position / dimension, minimum);
+    setSplitGroups((groups) => groups.map((item) => item.id === group.id ? { ...item, ratio } : item));
+    event.preventDefault();
+  }
+
+  function finishSplitResize(event: ReactPointerEvent<HTMLDivElement>) {
+    const current = splitResizeRef.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    splitResizeRef.current = null;
+    setResizingSplitId(null);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  }
+
+  function resizeSplitWithKeyboard(groupId: string, event: ReactKeyboardEvent<HTMLDivElement>) {
+    const group = splitGroups.find((item) => item.id === groupId);
+    if (!group) return;
+    const decreaseKey = group.layout === "side-by-side" ? "ArrowLeft" : "ArrowUp";
+    const increaseKey = group.layout === "side-by-side" ? "ArrowRight" : "ArrowDown";
+    let ratio: number | undefined;
+    if (event.key === decreaseKey) ratio = clampSplitRatio(group.ratio - (event.shiftKey ? 0.1 : 0.025));
+    if (event.key === increaseKey) ratio = clampSplitRatio(group.ratio + (event.shiftKey ? 0.1 : 0.025));
+    if (event.key === "Home") ratio = 0.18;
+    if (event.key === "End") ratio = 0.82;
+    if (ratio === undefined) return;
+    event.preventDefault();
+    setSplitGroups((groups) => groups.map((item) => item.id === groupId ? { ...item, ratio: ratio! } : item));
+  }
+
   async function selectShell(shellId: string) {
-    const replacement = await window.agentTerminal.selectShell(activeSessionId, shellId);
-    if (replacement) setActiveSessionId(replacement.id);
+    const outgoingId = activeSessionId;
+    const outgoingSplit = findSplitGroup(splitGroups, outgoingId);
+    const replacement = await window.agentTerminal.selectShell(outgoingId, shellId);
+    if (!replacement) return;
+    setActiveSessionId(replacement.id);
+    if (!outgoingId) return;
+    setSessionOrder((current) => current.map((id) => id === outgoingId ? replacement.id : id));
+    if (outgoingSplit) {
+      setSplitGroups((current) => {
+        const withoutOutgoing = current.filter((group) => group.id !== outgoingSplit.id && !group.sessionIds.includes(replacement.id));
+        const sessionIds: [string, string] = outgoingSplit.sessionIds[0] === outgoingId
+          ? [replacement.id, outgoingSplit.sessionIds[1]]
+          : [outgoingSplit.sessionIds[0], replacement.id];
+        return [...withoutOutgoing, { ...outgoingSplit, sessionIds }];
+      });
+    }
   }
 
   async function toggleProjectPersistence() {
@@ -364,6 +634,14 @@ export function App() {
       : state.remoteRegistration.status === "failed"
         ? "Remote registration failed"
         : "LAN access ready";
+  const menuGroup = splitMenu && (splitMenu.kind === "manage"
+    ? splitGroups.find((group) => group.id === splitMenu.groupId)
+    : splitMenu.kind === "tab"
+      ? findSplitGroup(splitGroups, splitMenu.sessionId)
+      : findSplitGroup(splitGroups, splitMenu.anchorId));
+  const pickerCandidates = splitMenu?.kind === "picker"
+    ? projectSessions.filter((session) => session.id !== splitMenu.anchorId && !findSplitGroup(splitGroups, session.id))
+    : [];
 
   return (
     <main className="app-shell">
@@ -405,24 +683,101 @@ export function App() {
 
         <section className="terminal-workspace">
           <div className="tabbar">
-            <div className="tabs">
-              {projectSessions.map((session, index) => <button key={session.id} ref={(element) => { if (element) tabElementsRef.current.set(session.id, element); else tabElementsRef.current.delete(session.id); }} className={`terminal-tab ${session.id === activeSessionId ? "active" : ""} ${session.id === tabDrag?.sessionId ? "is-dragging" : ""} ${closingSessionIds.has(session.id) ? "is-closing" : ""}`} style={{ transform: tabDragTransform(session.id, index) }} onClick={() => { if (!suppressTabClickRef.current) setActiveSessionId(session.id); }} onPointerDown={(event) => beginTabDrag(event, session.id, index)} onPointerMove={moveTabDrag} onPointerUp={(event) => finishTabDrag(event, true)} onPointerCancel={(event) => finishTabDrag(event, false)}>
-                <TerminalIcon /><span className="terminal-tab-label display-name" title={session.title}>{session.title}</span>{session.status === "exited" && <i className="exit-dot" title={`Exited (${session.exitCode ?? "unknown"})`} />}
-                <span className="tab-close" role="button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void closeTab(session.id); }}><CloseIcon /></span>
-              </button>)}
+            <div className="tabs" role="tablist" aria-label="Terminal tabs">
+              {projectSessions.map((session, index) => {
+                const sessionSplit = splitBySession.get(session.id);
+                const splitIndex = sessionSplit?.sessionIds.indexOf(session.id) ?? -1;
+                const selectedSplit = activeSplit?.id === sessionSplit?.id;
+                const draggedSplit = findSplitGroup(splitGroups, tabDrag?.sessionId);
+                const isDragging = tabDrag?.sessionId === session.id || draggedSplit?.sessionIds.includes(session.id);
+                return <button key={session.id} ref={(element) => { if (element) tabElementsRef.current.set(session.id, element); else tabElementsRef.current.delete(session.id); }} role="tab" aria-selected={session.id === activeSessionId} className={`terminal-tab ${session.id === activeSessionId ? "active" : ""} ${selectedSplit ? "is-split-selected" : ""} ${sessionSplit ? "is-split" : ""} ${splitIndex === 0 ? "split-first" : splitIndex === 1 ? "split-second" : ""} ${isDragging ? "is-dragging" : ""} ${closingSessionIds.has(session.id) ? "is-closing" : ""}`} style={{ transform: tabDragTransform(session.id, index) }} onClick={() => { if (!suppressTabClickRef.current) setActiveSessionId(session.id); }} onContextMenu={(event) => { event.preventDefault(); setSplitMenu({ kind: "tab", sessionId: session.id, x: event.clientX, y: event.clientY }); }} onPointerDown={(event) => beginTabDrag(event, session.id, index)} onPointerMove={moveTabDrag} onPointerUp={(event) => finishTabDrag(event, true)} onPointerCancel={(event) => finishTabDrag(event, false)}>
+                  <TerminalIcon /><span className="terminal-tab-label display-name" title={session.title}>{session.title}</span>{session.status === "exited" && <i className="exit-dot" title={`Exited (${session.exitCode ?? "unknown"})`} />}
+                  <span className="tab-close" role="button" aria-label={`Close ${session.title}`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void closeTab(session.id); }}><CloseIcon /></span>
+                </button>;
+              })}
               <button className="add-tab" onClick={() => void addTab()} title="New terminal tab"><PlusIcon /></button>
             </div>
+            <button ref={splitButtonRef} className={`split-toolbar-button ${activeSplit ? "is-active" : ""}`} disabled={!activeSessionId} onClick={openSplitMenuForButton} title={activeSplit ? "Manage split view (Shift+Alt+N)" : "New split view (Shift+Alt+N)"} aria-label={activeSplit ? "Manage split view" : "New split view"}><SplitViewIcon /></button>
             <select className="shell-picker" value={activeSession?.shellId ?? state.defaultShellId} onChange={(event) => void selectShell(event.target.value)} title="Terminal shell">
               {state.shells.map((shell) => <option key={shell.id} value={shell.id}>{shell.name}</option>)}
             </select>
           </div>
-          <div className="terminal-stack">
-            {projectSessions.map((session) => <TerminalPane key={session.id} sessionId={session.id} active={session.id === activeSessionId} />)}
+          <div ref={terminalStackRef} className={`terminal-stack ${resizingSplitId ? "is-resizing" : ""}`}>
+            {projectSessions.map((session) => {
+              const splitIndex = activeSplit?.sessionIds.indexOf(session.id) ?? -1;
+              const visible = activeSplit ? splitIndex >= 0 : session.id === activeSessionId;
+              const paneActive = visible && session.id === activeSessionId;
+              let surfaceStyle: CSSProperties | undefined;
+              if (activeSplit && splitIndex >= 0) {
+                const percentage = activeSplit.ratio * 100;
+                if (activeSplit.layout === "side-by-side") {
+                  surfaceStyle = splitIndex === 0
+                    ? { left: 0, right: `${100 - percentage}%`, top: 0, bottom: 0 }
+                    : { left: `${percentage}%`, right: 0, top: 0, bottom: 0 };
+                } else {
+                  surfaceStyle = splitIndex === 0
+                    ? { left: 0, right: 0, top: 0, bottom: `${100 - percentage}%` }
+                    : { left: 0, right: 0, top: `${percentage}%`, bottom: 0 };
+                }
+              }
+              return <div key={session.id} className={`terminal-surface ${visible ? "is-visible" : ""} ${paneActive ? "is-active" : "is-inactive"} ${activeSplit ? `is-split ${activeSplit.layout}` : ""}`} style={surfaceStyle} onPointerDown={() => { if (visible && !paneActive) setActiveSessionId(session.id); }}>
+                <TerminalPane sessionId={session.id} visible={visible} active={paneActive} />
+                {visible && activeSplit && !paneActive && <div className="split-mini-toolbar" onPointerDown={(event) => event.stopPropagation()}>
+                  <TerminalIcon /><span className="display-name" title={session.title}>{session.title}</span>
+                  <button title="Manage split view" aria-label="Manage split view" onClick={(event) => { const bounds = event.currentTarget.getBoundingClientRect(); setSplitMenu({ kind: "manage", groupId: activeSplit.id, x: bounds.right, y: bounds.top }); }}><MoreIcon /></button>
+                  <button title={`Close ${session.title}`} aria-label={`Close ${session.title}`} onClick={() => void closeTab(session.id)}><CloseIcon /></button>
+                </div>}
+              </div>;
+            })}
+            {activeSplit && <div role="separator" tabIndex={0} aria-label="Resize split view" aria-orientation={activeSplit.layout === "side-by-side" ? "vertical" : "horizontal"} aria-valuemin={18} aria-valuemax={82} aria-valuenow={Math.round(activeSplit.ratio * 100)} className={`split-divider ${activeSplit.layout}`} style={activeSplit.layout === "side-by-side" ? { left: `calc(${activeSplit.ratio * 100}% - 4px)` } : { top: `calc(${activeSplit.ratio * 100}% - 4px)` }} onPointerDown={(event) => beginSplitResize(event, activeSplit.id)} onPointerMove={resizeSplit} onPointerUp={finishSplitResize} onPointerCancel={finishSplitResize} onDoubleClick={() => setSplitGroups((groups) => groups.map((group) => group.id === activeSplit.id ? { ...group, ratio: 0.5 } : group))} onKeyDown={(event) => resizeSplitWithKeyboard(activeSplit.id, event)}><i /></div>}
+            {splitDropSide && <div className={`split-drop-target is-${splitDropSide}`}><span><SplitViewIcon /> Drop to split {splitDropSide}</span></div>}
             {!projectSessions.length && <div className="empty-terminal"><TerminalIcon /><h2>No open terminals</h2><p className="display-name" title={`Start a session in ${currentProject?.name}.`}>Start a session in {currentProject?.name}.</p><button className="primary" onClick={() => void addTab()}><PlusIcon /> New terminal</button></div>}
           </div>
           <footer className="statusbar"><span><i className="status-dot" /> {projectSessions.filter((session) => session.status === "running").length} running</span><span>{currentProject?.path}</span><span>UTF-8</span></footer>
         </section>
       </div>
+
+      {splitMenu && <div ref={splitMenuRef} className="split-menu" role="menu" style={{ left: Math.max(8, Math.min(splitMenu.x, window.innerWidth - 276)), top: Math.max(50, Math.min(splitMenu.y, window.innerHeight - 420)) }} onPointerDown={(event) => event.stopPropagation()} onKeyDown={navigateSplitMenu}>
+        {splitMenu.kind === "picker" && <>
+          <div className="split-menu-heading"><SplitViewIcon /><span><strong>{splitMenu.replaceId ? "Replace split pane" : "Add to split view"}</strong><small>{splitMenu.replaceId ? "Choose another terminal" : "Choose a terminal to show alongside this one"}</small></span></div>
+          <div className="split-menu-list">
+            {pickerCandidates.map((session) => <button key={session.id} role="menuitem" onClick={() => {
+              if (splitMenu.replaceId && menuGroup) replaceSplitSession(menuGroup.id, splitMenu.replaceId, session.id);
+              else createSplit(splitMenu.anchorId, session.id);
+            }}><TerminalIcon /><span className="display-name" title={session.title}>{session.title}</span></button>)}
+            {!pickerCandidates.length && <div className="split-menu-empty">No other unsplit terminal tabs</div>}
+          </div>
+          {!splitMenu.replaceId && <button className="split-menu-item" role="menuitem" onClick={() => void createTerminalInSplit(splitMenu.anchorId)}><PlusIcon /><span>New terminal</span></button>}
+          <div className="split-menu-hint"><span>Shortcut</span><kbd>Shift</kbd><b>+</b><kbd>Alt</kbd><b>+</b><kbd>N</kbd></div>
+        </>}
+
+        {splitMenu.kind === "manage" && menuGroup && <>
+          <div className="split-menu-heading"><SplitViewIcon /><span><strong>Split view</strong><small>{menuGroup.layout === "side-by-side" ? "Side by side" : "Stacked"} · {Math.round(menuGroup.ratio * 100)} / {Math.round((1 - menuGroup.ratio) * 100)}</small></span></div>
+          <button className="split-menu-item" role="menuitem" onClick={() => setSplitLayout(menuGroup.id, menuGroup.layout === "side-by-side" ? "stacked" : "side-by-side")}>{menuGroup.layout === "side-by-side" ? <StackedIcon /> : <SideBySideIcon />}<span>{menuGroup.layout === "side-by-side" ? "Stacked layout" : "Side-by-side layout"}</span></button>
+          <button className="split-menu-item" role="menuitem" onClick={() => swapSplit(menuGroup.id)}><SwapIcon /><span>Reverse positions</span></button>
+          <button className="split-menu-item" role="menuitem" onClick={() => { const replaceId = menuGroup.sessionIds.includes(activeSessionId ?? "") ? activeSessionId! : menuGroup.sessionIds[0]; setSplitMenu({ kind: "picker", anchorId: replaceId, replaceId, x: splitMenu.x, y: splitMenu.y }); }}><TerminalIcon /><span>Replace active pane</span></button>
+          <button className="split-menu-item" role="menuitem" onClick={() => separateSplit(menuGroup.id)}><SeparateIcon /><span>Separate split view</span></button>
+          <div className="split-menu-separator" />
+          {menuGroup.sessionIds.map((sessionId, index) => {
+            const session = projectSessions.find((item) => item.id === sessionId);
+            const position = menuGroup.layout === "side-by-side" ? (index === 0 ? "left" : "right") : (index === 0 ? "top" : "bottom");
+            return <button key={sessionId} className="split-menu-item is-danger" role="menuitem" onClick={() => void closeTab(sessionId)}><CloseIcon /><span className="display-name" title={session?.title}>Close {position} pane{session ? ` · ${session.title}` : ""}</span></button>;
+          })}
+        </>}
+
+        {splitMenu.kind === "tab" && <>
+          <div className="split-menu-heading compact"><TerminalIcon /><span><strong className="display-name" title={projectSessions.find((session) => session.id === splitMenu.sessionId)?.title}>{projectSessions.find((session) => session.id === splitMenu.sessionId)?.title ?? "Terminal tab"}</strong></span></div>
+          {menuGroup ? <>
+            <button className="split-menu-item" role="menuitem" onClick={() => setSplitMenu({ kind: "manage", groupId: menuGroup.id, x: splitMenu.x, y: splitMenu.y })}><SplitViewIcon /><span>Manage split view</span></button>
+            <button className="split-menu-item" role="menuitem" onClick={() => separateSplit(menuGroup.id)}><SeparateIcon /><span>Separate split view</span></button>
+          </> : <>
+            {activeSessionId && activeSessionId !== splitMenu.sessionId && !activeSplit && <button className="split-menu-item" role="menuitem" onClick={() => createSplit(activeSessionId, splitMenu.sessionId)}><SplitViewIcon /><span>New split view with current tab</span></button>}
+            <button className="split-menu-item" role="menuitem" onClick={() => setSplitMenu({ kind: "picker", anchorId: splitMenu.sessionId, x: splitMenu.x, y: splitMenu.y })}><SplitViewIcon /><span>Add tab to new split view</span></button>
+          </>}
+          <div className="split-menu-separator" />
+          <button className="split-menu-item is-danger" role="menuitem" onClick={() => void closeTab(splitMenu.sessionId)}><CloseIcon /><span>Close tab</span></button>
+        </>}
+      </div>}
 
       {modal === "pair" && <div className="modal-backdrop" onMouseDown={() => setModal(null)}><section className="modal pair-modal" onMouseDown={(event) => event.stopPropagation()}>
         <button className="modal-close icon-button" onClick={() => setModal(null)}><CloseIcon /></button>
@@ -439,6 +794,7 @@ export function App() {
         <h1>Desktop host</h1>
         <div className="settings-row"><span><strong>Default terminal</strong><small>Used for new tabs and projects</small></span><select value={state.defaultShellId} onChange={(event) => void selectShell(event.target.value)}>{state.shells.map((shell) => <option key={shell.id} value={shell.id}>{shell.name}</option>)}</select></div>
         <label className="settings-row settings-toggle"><span><strong>Open each project in a new window</strong><small>Turn off to switch projects like tabs in this window</small></span><input type="checkbox" checked={state.openProjectsInNewWindows} onChange={(event) => void window.agentTerminal.setOpenProjectsInNewWindows(event.target.checked)} /><i /></label>
+        <label className="settings-row settings-toggle"><span><strong>Drag tabs to split</strong><small>Drop a tab on the left or right edge of the terminal</small></span><input type="checkbox" checked={allowSplitEdgeDrop} onChange={(event) => setAllowSplitEdgeDrop(event.target.checked)} /><i /></label>
         <div className="section-label">Authorized devices</div>
         <div className="device-list">
           {state.devices.length ? state.devices.map((device) => <div className="device-row" key={device.id}><span className="device-avatar"><PhoneIcon /></span><span><strong>{device.name}</strong><small>{device.platform} · Last connected {new Date(device.lastSeenAt).toLocaleString()}</small></span><button className="danger-icon" title="Revoke device" onClick={() => void window.agentTerminal.revokeDevice(device.id)}><TrashIcon /></button></div>) : <div className="empty-devices">No mobile devices have been paired.</div>}

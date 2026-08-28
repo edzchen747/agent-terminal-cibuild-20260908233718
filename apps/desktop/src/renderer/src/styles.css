@@ -75,22 +75,62 @@ button { color: inherit; }
 .terminal-tab::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: transparent; }
 .terminal-tab.active { background: #090b10; color: #d7dce6; }
 .terminal-tab.active::after { background: #78d9c4; }
+.terminal-tab.is-split { background: #121b1c; }
+.terminal-tab.is-split-selected { background: #0b1214; color: #aebbb9; }
+.terminal-tab.is-split-selected.active { color: #eef5f3; }
+.terminal-tab.split-first { border-right-color: #31554e; }
+.terminal-tab.split-first::before, .terminal-tab.split-second::before { content: ""; width: 1px; position: absolute; top: 5px; bottom: 5px; background: #4d897d; opacity: .7; }
+.terminal-tab.split-first::before { right: 0; }
+.terminal-tab.split-second::before { left: 0; }
+.terminal-tab.is-split-selected.split-first::before, .terminal-tab.is-split-selected.split-second::before { background: #78d9c4; opacity: 1; }
 .terminal-tab > svg { width: 15px; flex: none; }
 .terminal-tab-label { flex: 1; font-size: 11.5px; text-align: left; }
 .tab-close { width: 20px; height: 20px; flex: none; display: grid; place-items: center; border-radius: 4px; opacity: 0; }
-.terminal-tab:hover .tab-close, .terminal-tab.active .tab-close { opacity: 1; }
+.terminal-tab:hover .tab-close, .terminal-tab.active .tab-close, .terminal-tab.is-split-selected .tab-close { opacity: 1; }
 .tab-close:hover { background: #2a2f3a; }
 .tab-close svg { width: 12px; }
 .exit-dot { width: 6px; height: 6px; flex: none; background: #e5a56a; border-radius: 50%; }
 .add-tab { width: 40px; height: 36px; flex: none; border: 0; background: transparent; color: #6f7787; display: grid; place-items: center; cursor: pointer; }
 .add-tab:hover { color: #d9deea; background: #171b23; }
 .add-tab svg { width: 15px; }
+.split-toolbar-button { width: 36px; height: 30px; align-self: center; flex: none; margin-left: 5px; padding: 0; display: grid; place-items: center; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #6f7787; cursor: pointer; }
+.split-toolbar-button:hover:not(:disabled) { border-color: #2e3d3a; background: #17201f; color: #a3ded2; }
+.split-toolbar-button.is-active { border-color: #345c54; background: #192724; color: #83ddca; }
+.split-toolbar-button:disabled { opacity: .35; cursor: default; }
+.split-toolbar-button svg { width: 16px; }
 .shell-picker { align-self: center; margin: 0 10px; max-width: 150px; border: 1px solid #292e39; background: #141820; color: #8d95a4; border-radius: 6px; padding: 4px 24px 4px 8px; font-size: 10.5px; outline: none; }
 .terminal-stack { position: relative; min-height: 0; background: #090b10; }
+.terminal-stack.is-resizing { user-select: none; cursor: col-resize; }
+.terminal-surface { position: absolute; inset: 0; min-width: 0; min-height: 0; visibility: hidden; pointer-events: none; background: #090b10; overflow: hidden; }
+.terminal-surface.is-visible { visibility: visible; pointer-events: auto; }
+.terminal-surface.is-split { box-shadow: inset 0 0 0 1px #2a313c; }
+.terminal-surface.is-split.is-active { z-index: 2; box-shadow: inset 0 0 0 3px #65cdb8; }
+.terminal-surface.is-split.is-inactive { z-index: 1; box-shadow: inset 0 0 0 1px #3c4653; }
 .terminal-pane { position: absolute; inset: 0; padding: 10px 13px 4px; visibility: hidden; }
-.terminal-pane.is-active { visibility: visible; }
+.terminal-pane.is-visible { visibility: visible; }
 .terminal-pane .xterm { height: 100%; }
 .terminal-pane .xterm-viewport { scrollbar-width: thin; scrollbar-color: #323846 transparent; }
+.split-mini-toolbar { max-width: min(280px,calc(100% - 18px)); height: 29px; position: absolute; z-index: 8; right: 9px; bottom: 9px; display: flex; align-items: center; gap: 7px; padding: 0 4px 0 9px; border: 1px solid #3b4653; border-radius: 8px; background: #171c24ed; box-shadow: 0 7px 24px #0009; color: #9da6b4; font-size: 10.5px; backdrop-filter: blur(8px); }
+.split-mini-toolbar > svg { width: 13px; flex: none; color: #75cdbc; }
+.split-mini-toolbar > span { flex: 1; }
+.split-mini-toolbar button { width: 23px; height: 23px; flex: none; padding: 0; display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent; color: #7e8795; cursor: pointer; }
+.split-mini-toolbar button:hover { background: #2a313c; color: #e3e7ed; }
+.split-mini-toolbar button:last-child:hover { background: #392027; color: #f399a4; }
+.split-mini-toolbar button svg { width: 12px; }
+.split-divider { position: absolute; z-index: 10; touch-action: none; outline: none; }
+.split-divider.side-by-side { width: 8px; top: 0; bottom: 0; cursor: col-resize; }
+.split-divider.stacked { height: 8px; left: 0; right: 0; cursor: row-resize; }
+.split-divider i { position: absolute; display: block; border-radius: 999px; background: #53616e; transition: background .12s ease, box-shadow .12s ease; }
+.split-divider.side-by-side i { width: 2px; top: 8px; bottom: 8px; left: 3px; }
+.split-divider.stacked i { height: 2px; left: 8px; right: 8px; top: 3px; }
+.split-divider:hover i, .split-divider:focus-visible i, .terminal-stack.is-resizing .split-divider i { background: #8ce4d1; box-shadow: 0 0 10px #78d9c488; }
+.terminal-stack.is-resizing .terminal-surface { pointer-events: none; }
+.terminal-stack.is-resizing .split-divider { pointer-events: auto; }
+.split-drop-target { width: 50%; position: absolute; z-index: 12; top: 0; bottom: 0; display: grid; place-items: center; padding: 18px; pointer-events: none; background: #315f5770; border: 2px solid #79dbc6; box-shadow: inset 0 0 70px #6dd5bf1f; }
+.split-drop-target.is-left { left: 0; border-radius: 0 12px 12px 0; }
+.split-drop-target.is-right { right: 0; border-radius: 12px 0 0 12px; }
+.split-drop-target span { padding: 9px 12px; display: flex; align-items: center; gap: 7px; border: 1px solid #85e6d1; border-radius: 8px; background: #13241fe8; color: #b8f5e8; box-shadow: 0 8px 30px #0008; font-size: 11px; font-weight: 700; }
+.split-drop-target svg { width: 15px; }
 .terminal-copy-toast { position: absolute; z-index: 5; padding: 5px 8px; border: 1px solid #3d655d; border-radius: 6px; background: #162a25ed; box-shadow: 0 7px 24px #0008; color: #a1ead9; font: 700 10px/1 "Segoe UI", sans-serif; letter-spacing: .02em; pointer-events: none; opacity: 0; transform: translateY(4px) scale(.97); transition: opacity .12s ease, transform .12s ease; }
 .terminal-copy-toast.is-visible { opacity: 1; transform: translateY(0) scale(1); }
 .statusbar { display: grid; grid-template-columns: 140px 1fr 70px; align-items: center; gap: 10px; padding: 0 10px; border-top: 1px solid #181c24; color: #565e6d; background: #0c0f14; font-size: 9.5px; }
@@ -100,6 +140,28 @@ button { color: inherit; }
 .empty-terminal > svg { width: 38px; height: 38px; margin-bottom: 8px; }
 .empty-terminal h2 { margin: 6px 0 0; color: #bbc1cc; font-size: 17px; }
 .empty-terminal p { max-width: 80%; margin: 6px 0 18px; font-size: 12px; }
+.split-menu { width: 268px; max-height: calc(100vh - 62px); position: fixed; z-index: 30; padding: 6px; overflow-y: auto; border: 1px solid #333b47; border-radius: 11px; background: #171b22f7; box-shadow: 0 18px 55px #000b; color: #c8cdd7; backdrop-filter: blur(13px); }
+.split-menu-heading { min-width: 0; min-height: 51px; padding: 8px 9px 9px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #292f39; }
+.split-menu-heading.compact { min-height: 39px; }
+.split-menu-heading > svg { width: 17px; flex: none; color: #7bdbc7; }
+.split-menu-heading > span { min-width: 0; display: flex; flex: 1; flex-direction: column; gap: 3px; }
+.split-menu-heading strong { min-width: 0; color: #edf0f5; font-size: 11.5px; font-weight: 650; }
+.split-menu-heading small { color: #717988; font-size: 9.5px; line-height: 1.35; }
+.split-menu-list { max-height: 182px; margin: 5px 0; overflow-y: auto; }
+.split-menu-list button, .split-menu-item { width: 100%; min-width: 0; height: 34px; padding: 0 9px; display: flex; align-items: center; gap: 9px; border: 0; border-radius: 7px; background: transparent; color: #b8bec9; text-align: left; cursor: pointer; font-size: 10.5px; }
+.split-menu-list button:hover, .split-menu-item:hover { background: #252c34; color: #edf1f5; }
+.split-menu-list button > svg, .split-menu-item > svg { width: 14px; flex: none; color: #7f8998; }
+.split-menu-list button:hover > svg, .split-menu-item:hover > svg { color: #8cdecf; }
+.split-menu-list button > span, .split-menu-item > span { min-width: 0; flex: 1; }
+.split-menu-item.is-danger { color: #bd8b92; }
+.split-menu-item.is-danger:hover { background: #342127; color: #f1a8b2; }
+.split-menu-item.is-danger:hover > svg { color: #ef929f; }
+.split-menu-empty { padding: 14px 9px; color: #646d7a; text-align: center; font-size: 10px; }
+.split-menu-separator { height: 1px; margin: 5px 7px; background: #2a3039; }
+.split-menu-hint { min-height: 29px; margin: 5px 4px 0; padding: 6px 5px 2px; display: flex; align-items: center; gap: 4px; border-top: 1px solid #292f39; color: #646c78; font-size: 9px; }
+.split-menu-hint > span { flex: 1; }
+.split-menu-hint kbd { min-width: 19px; padding: 2px 4px; border: 1px solid #363d48; border-bottom-color: #49515e; border-radius: 4px; background: #20252d; color: #9ba3af; text-align: center; font: 8.5px/1.2 inherit; }
+.split-menu-hint b { font-weight: 400; color: #4f5661; }
 .primary { min-height: 38px; padding: 0 16px; border: 0; border-radius: 8px; background: #78d9c4; color: #0b1714; font-weight: 700; font-size: 12px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; cursor: pointer; }
 .primary:hover { background: #91e5d3; }
 .primary svg { width: 15px; }

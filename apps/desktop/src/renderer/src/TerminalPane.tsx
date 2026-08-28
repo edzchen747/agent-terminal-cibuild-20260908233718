@@ -4,9 +4,9 @@ import { FitAddon } from "@xterm/addon-fit";
 import { applyTerminalModifiers, type TerminalModifier } from "@agentterminal/protocol";
 import "@xterm/xterm/css/xterm.css";
 
-interface Props { sessionId: string; active: boolean; }
+interface Props { sessionId: string; visible: boolean; active: boolean; }
 
-export function TerminalPane({ sessionId, active }: Props) {
+export function TerminalPane({ sessionId, visible, active }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const activeRef = useRef(active);
@@ -178,5 +178,11 @@ export function TerminalPane({ sessionId, active }: Props) {
     terminalRef.current?.focus();
   }, [active]);
 
-  return <div ref={hostRef} className={`terminal-pane ${active ? "is-active" : ""}`} />;
+  useEffect(() => {
+    if (!visible) return;
+    const frame = window.requestAnimationFrame(() => resizeRef.current());
+    return () => window.cancelAnimationFrame(frame);
+  }, [visible]);
+
+  return <div ref={hostRef} className={`terminal-pane ${visible ? "is-visible" : ""} ${active ? "is-active" : ""}`} />;
 }
