@@ -255,6 +255,9 @@ export class HostConnection {
       if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
         const remoteEndpoint = this.host.remoteEndpoint ?? defaultRemoteEndpoint(this.host.id);
         const remoteTransport = this.host.remoteTransport ?? "overlay";
+        if (remoteTransport === "overlay" && !this.host.remoteEnrolled) {
+          throw new Error("Remote registration is still pending. Reconnect to the desktop on LAN and retry remote registration.");
+        }
         const nodeState = await this.embeddedEngine.start(this.host.controlUrl ?? OVERLAY_CONTROL_URL, remoteEndpoint, remoteTransport);
         if (remoteTransport === "overlay" && !nodeState.proxyEndpoint) {
           throw new Error("The embedded network node is unavailable for a remote connection.");
@@ -497,5 +500,5 @@ function defaultRemoteEndpoint(hostId: string): string {
 }
 
 function isEmbeddedNodeConfigurationError(error: unknown): boolean {
-  return error instanceof Error && /update the (desktop|mobile) app|enrollment key was rejected|tsnet desktop host name/i.test(error.message);
+  return error instanceof Error && /update the (desktop|mobile) app|enrollment key was rejected|tsnet desktop host name|remote registration is still pending/i.test(error.message);
 }

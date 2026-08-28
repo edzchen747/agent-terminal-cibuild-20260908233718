@@ -49,12 +49,19 @@ func main() {
 		log.Fatal(err)
 	}
 	configureNetworkInterfaceGetter()
+	authKey := strings.TrimSpace(os.Getenv("AGENT_TERMINAL_NODE_AUTH_KEY"))
+	if authKey != "" {
+		// tsnet otherwise ignores a supplied auth key when the state directory
+		// exists but contains no enrolled state (for example after a failed
+		// first attempt). Force the one-time provisioning key to be consumed.
+		_ = os.Setenv("TSNET_FORCE_LOGIN", "1")
+	}
 
 	node := &tsnet.Server{
 		Dir:        *stateDir,
 		Hostname:   *nodeID,
 		ControlURL: *controlURL,
-		AuthKey:    os.Getenv("AGENT_TERMINAL_NODE_AUTH_KEY"),
+		AuthKey:    authKey,
 		// Native logs are persisted on Android. Suppress tsnet's verbose log
 		// callback so an enrollment capability can never be written to disk.
 		Logf: func(string, ...any) {},
