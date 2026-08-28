@@ -10,7 +10,9 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.ServiceCompat;
@@ -29,10 +31,21 @@ public class ConnectionNotificationService extends Service {
     private static final String PREFS = "connection-notification";
     private static final String PREF_HOST_NAME = "hostName";
     private static final String PREF_STATE = "state";
+    private static final long RECONNECT_TIMEOUT_MS = 5_000L;
+    private Handler reconnectTimeoutHandler;
+    private boolean reconnectTimeoutScheduled;
+    private final Runnable reconnectTimeout = () -> {
+        reconnectTimeoutScheduled = false;
+        sendBroadcast(new Intent(ConnectionNotificationPlugin.ACTION_RECONNECT_TIMED_OUT).setPackage(getPackageName()));
+        clearStoredState(this);
+        stopForeground(true);
+        stopSelf();
+    };
 
     @Override
     public void onCreate() {
         super.onCreate();
+        reconnectTimeoutHandler = new Handler(Looper.getMainLooper());
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             manager.createNotificationChannel(new NotificationChannel(CHANNEL_ID, "Terminal connection", NotificationManager.IMPORTANCE_LOW));
@@ -42,6 +55,7 @@ public class ConnectionNotificationService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_DISCONNECT.equals(intent.getAction())) {
+            cancelReconnectTimeout();
             sendBroadcast(new Intent(ConnectionNotificationPlugin.ACTION_DISCONNECT_REQUESTED).setPackage(getPackageName()));
             clearStoredState(this);
             stopForeground(true);
@@ -91,7 +105,20 @@ public class ConnectionNotificationService extends Service {
         } else {
             startForeground(NOTIFICATION_ID, notification);
         }
+        if (STATE_RECONNECTING.equals(state)) scheduleReconnectTimeout();
+        else cancelReconnectTimeout();
         return START_STICKY;
+    }
+
+    private void scheduleReconnectTimeout() {
+        if (reconnectTimeoutScheduled) return;
+        reconnectTimeoutScheduled = true;
+        reconnectTimeoutHandler.postDelayed(reconnectTimeout, RECONNECT_TIMEOUT_MS);
+    }
+
+    private void cancelReconnectTimeout() {
+        if (reconnectTimeoutHandler != null) reconnectTimeoutHandler.removeCallbacks(reconnectTimeout);
+        reconnectTimeoutScheduled = false;
     }
 
     public static void markReconnecting(Context context) {
@@ -124,5 +151,11 @@ public class ConnectionNotificationService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    @Override
+    public void onDestroy() {
+        cancelReconnectTimeout();
+        super.onDestroy();
     }
 }

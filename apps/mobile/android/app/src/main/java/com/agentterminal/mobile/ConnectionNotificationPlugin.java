@@ -18,18 +18,23 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 @CapacitorPlugin(name = "ConnectionNotification")
 public class ConnectionNotificationPlugin extends Plugin {
     public static final String ACTION_DISCONNECT_REQUESTED = "com.agentterminal.mobile.DISCONNECT_REQUESTED";
+    public static final String ACTION_RECONNECT_TIMED_OUT = "com.agentterminal.mobile.RECONNECT_TIMED_OUT";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 4201;
-    private BroadcastReceiver disconnectReceiver;
+    private BroadcastReceiver connectionReceiver;
 
     @Override
     public void load() {
-        disconnectReceiver = new BroadcastReceiver() {
+        connectionReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
-                notifyListeners("disconnectRequested", null);
+                if (ACTION_RECONNECT_TIMED_OUT.equals(intent.getAction())) notifyListeners("reconnectTimedOut", null);
+                else notifyListeners("disconnectRequested", null);
             }
         };
-        ContextCompat.registerReceiver(getContext(), disconnectReceiver, new IntentFilter(ACTION_DISCONNECT_REQUESTED), ContextCompat.RECEIVER_NOT_EXPORTED);
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(ACTION_DISCONNECT_REQUESTED);
+        filter.addAction(ACTION_RECONNECT_TIMED_OUT);
+        ContextCompat.registerReceiver(getContext(), connectionReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
     }
 
     @PluginMethod
@@ -87,9 +92,9 @@ public class ConnectionNotificationPlugin extends Plugin {
 
     @Override
     protected void handleOnDestroy() {
-        if (disconnectReceiver != null) {
-            getContext().unregisterReceiver(disconnectReceiver);
-            disconnectReceiver = null;
+        if (connectionReceiver != null) {
+            getContext().unregisterReceiver(connectionReceiver);
+            connectionReceiver = null;
         }
         super.handleOnDestroy();
     }

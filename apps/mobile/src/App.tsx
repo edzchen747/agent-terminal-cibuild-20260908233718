@@ -63,7 +63,8 @@ export function App() {
   useEffect(() => {
     if (Capacitor.getPlatform() !== "android") return;
     let disposed = false;
-    let listener: PluginListenerHandle | undefined;
+    let disconnectListener: PluginListenerHandle | undefined;
+    let timeoutListener: PluginListenerHandle | undefined;
     void ConnectionNotification.addListener("disconnectRequested", () => {
       connectionRef.current?.close();
       void stopConnectionNotification();
@@ -72,11 +73,22 @@ export function App() {
       setStatus("error");
     }).then((handle) => {
       if (disposed) void handle.remove();
-      else listener = handle;
+      else disconnectListener = handle;
+    });
+    void ConnectionNotification.addListener("reconnectTimedOut", () => {
+      connectionRef.current?.close();
+      setSnapshot(null);
+      setError("Could not reach the desktop within 5 seconds.");
+      setStatus("error");
+      void stopConnectionNotification();
+    }).then((handle) => {
+      if (disposed) void handle.remove();
+      else timeoutListener = handle;
     });
     return () => {
       disposed = true;
-      void listener?.remove();
+      void disconnectListener?.remove();
+      void timeoutListener?.remove();
     };
   }, []);
 
