@@ -9,6 +9,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
+import android.net.ConnectivityManager;
+import android.net.Network;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -26,14 +28,21 @@ public class ConnectionNotificationService extends Service {
     public static final String EXTRA_STATE = "state";
     public static final String STATE_CONNECTED = "connected";
     public static final String STATE_RECONNECTING = "reconnecting";
-    private static final String CHANNEL_ID = "agent-terminal-connection";
+    // Use a new channel id so devices that already created the old muted
+    // channel get the new importance instead of keeping its user-visible
+    // settings forever.
+    private static final String CHANNEL_ID = "agent-terminal-connection-v2";
     private static final int NOTIFICATION_ID = 9001;
     private static final String PREFS = "connection-notification";
     private static final String PREF_HOST_NAME = "hostName";
     private static final String PREF_STATE = "state";
     private static final long RECONNECT_TIMEOUT_MS = 30_000L;
+    private static final long NETWORK_LOSS_DEBOUNCE_MS = 750L;
     private Handler reconnectTimeoutHandler;
     private boolean reconnectTimeoutScheduled;
+    private ConnectivityManager connectivityManager;
+    private ConnectivityManager.NetworkCallback networkCallback;
+    private final Runnable networkUnavailable = () -> markNetworkUnavailable();
     private final Runnable reconnectTimeout = () -> {
         reconnectTimeoutScheduled = false;
         sendBroadcast(new Intent(ConnectionNotificationPlugin.ACTION_RECONNECT_TIMED_OUT).setPackage(getPackageName()));
@@ -48,8 +57,9 @@ public class ConnectionNotificationService extends Service {
         reconnectTimeoutHandler = new Handler(Looper.getMainLooper());
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            manager.createNotificationChannel(new NotificationChannel(CHANNEL_ID, "Terminal connection", NotificationManager.IMPORTANCE_LOW));
+            manager.createNotificationChannel(new NotificationChannel(CHANNEL_ID, "Terminal connection", NotificationManager.IMPORTANCE_DEFAULT));
         }
+        registerNetworkCallback();
     }
 
     @Override
@@ -79,6 +89,11 @@ public class ConnectionNotificationService extends Service {
         if (restoredAfterProcessDeath) state = STATE_RECONNECTING;
         preferences.edit().putString(PREF_HOST_NAME, hostName).putString(PREF_STATE, state).apply();
 
+        renderNotification(hostName, state);
+        return START_STICKY;
+    }
+
+    private void renderNotification(String hostName, String state) {
         Intent openIntent = new Intent(this, MainActivity.class)
             .setAction(Intent.ACTION_MAIN)
             .addCategory(Intent.CATEGORY_LAUNCHER)
@@ -96,7 +111,7 @@ public class ConnectionNotificationService extends Service {
             .setShowWhen(false)
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .addAction(new NotificationCompat.Action.Builder(0, "Disconnect", disconnectPendingIntent).build())
             .build();
@@ -107,7 +122,44 @@ public class ConnectionNotificationService extends Service {
         }
         if (STATE_RECONNECTING.equals(state)) scheduleReconnectTimeout();
         else cancelReconnectTimeout();
-        return START_STICKY;
+    }
+
+    private void registerNetworkCallback() {
+        connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (connectivityManager == null) return;
+        networkCallback = new ConnectivityManager.NetworkCallback() {
+            @Override
+            public void onAvailable(Network network) {
+                // Avoid showing a reconnect during a quick Wi-Fi-to-cellular
+                // handoff. JavaScript still has to authenticate or complete
+                // a heartbeat before the notification returns to connected.
+                reconnectTimeoutHandler.removeCallbacks(networkUnavailable);
+            }
+
+            @Override
+            public void onLost(Network network) {
+                // A WebSocket can remain OPEN after the underlying route is
+                // gone. Update the service-owned notification after a short
+                // handoff grace period; the WebView will move it back to
+                // connected after auth or a successful heartbeat.
+                reconnectTimeoutHandler.removeCallbacks(networkUnavailable);
+                reconnectTimeoutHandler.postDelayed(networkUnavailable, NETWORK_LOSS_DEBOUNCE_MS);
+            }
+        };
+        try {
+            connectivityManager.registerDefaultNetworkCallback(networkCallback);
+        } catch (RuntimeException ignored) {
+            connectivityManager = null;
+            networkCallback = null;
+        }
+    }
+
+    private void markNetworkUnavailable() {
+        SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String hostName = preferences.getString(PREF_HOST_NAME, null);
+        if (hostName == null || hostName.trim().isEmpty()) return;
+        preferences.edit().putString(PREF_STATE, STATE_RECONNECTING).apply();
+        renderNotification(hostName, STATE_RECONNECTING);
     }
 
     private void scheduleReconnectTimeout() {
@@ -156,6 +208,12 @@ public class ConnectionNotificationService extends Service {
     @Override
     public void onDestroy() {
         cancelReconnectTimeout();
+        if (reconnectTimeoutHandler != null) reconnectTimeoutHandler.removeCallbacks(networkUnavailable);
+        if (connectivityManager != null && networkCallback != null) {
+            try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (RuntimeException ignored) { }
+        }
+        connectivityManager = null;
+        networkCallback = null;
         super.onDestroy();
     }
 }

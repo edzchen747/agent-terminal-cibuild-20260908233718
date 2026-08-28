@@ -161,10 +161,18 @@ export function App() {
       if (isActive) connectionRef.current?.retryNow();
     });
     const handleOnline = () => connectionRef.current?.retryNow();
+    const handleOffline = () => {
+      const current = connectionRef.current;
+      if (!current) return;
+      current.notifyNetworkLost();
+      void updateConnectionNotification(current.host.name, "reconnecting");
+    };
     window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
     return () => {
       void listener.then((handle) => handle.remove());
       window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
     };
   }, []);
 
@@ -215,6 +223,14 @@ export function App() {
       setStatus("connected");
       void startConnectionNotification(connection.host.name);
     });
+    const offHeartbeat = connection.on("heartbeat", () => {
+      // The native service can detect a route loss while the WebSocket still
+      // reports OPEN. A successful heartbeat is the authoritative recovery
+      // signal for the notification in that case.
+      setError("");
+      setStatus("connected");
+      void updateConnectionNotification(connection.host.name, "connected");
+    });
     const offReconnecting = connection.on("reconnecting", ({ attempt }) => {
       setError(attempt === 1 ? "The desktop connection was lost. Reconnecting…" : "Still trying to reach the desktop…");
       setStatus("connecting");
@@ -233,7 +249,7 @@ export function App() {
     });
     const offRemoteRegistration = connection.on("remoteRegistration", setRemoteRegistration);
     setRemoteRegistration(connection.remoteRegistrationState());
-    return () => { offSnapshot(); offConnected(); offReconnecting(); offReconnectFailed(); offDisconnect(); offRemoteRegistration(); };
+    return () => { offSnapshot(); offConnected(); offHeartbeat(); offReconnecting(); offReconnectFailed(); offDisconnect(); offRemoteRegistration(); };
   }, [connection]);
 
   async function pair(raw: string) {

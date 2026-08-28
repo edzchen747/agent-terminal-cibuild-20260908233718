@@ -37,6 +37,7 @@ type EventMap = {
   output: { sessionId: string; data: string };
   disconnected: undefined;
   connected: HostSnapshot;
+  heartbeat: HostSnapshot;
   reconnecting: { attempt: number; delayMs: number };
   reconnectFailed: Error;
   remoteRegistration: RemoteRegistrationState;
@@ -167,6 +168,16 @@ export class HostConnection {
     }
     this.clearReconnectTimer();
     this.reconnectDelay = RECONNECT_BASE_DELAY_MS;
+    this.scheduleReconnect(0);
+  }
+
+  notifyNetworkLost(): void {
+    if (!this.autoReconnect || this.closed) return;
+    if (this.socket?.readyState === WebSocket.OPEN || this.socket?.readyState === WebSocket.CONNECTING) {
+      this.socket.close();
+      return;
+    }
+    this.clearReconnectTimer();
     this.scheduleReconnect(0);
   }
 
@@ -432,7 +443,8 @@ export class HostConnection {
     if (this.heartbeatInFlight || !this.isConnected()) return;
     this.heartbeatInFlight = true;
     try {
-      await this.request({ type: "snapshot.request", requestId: createRequestId() });
+      const response = await this.request({ type: "snapshot.request", requestId: createRequestId() });
+      if (response.type === "snapshot") this.emit("heartbeat", response.snapshot);
     } catch {
       if (!this.closed) this.forceSocketClose();
     } finally {
