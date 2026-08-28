@@ -7,7 +7,7 @@ if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
   throw 'Go 1.24 or newer is required to build the Android embedded node.'
 }
 
-$OutputDirectory = Join-Path $WorkspaceRoot 'apps\mobile\android\app\src\main\assets\embedded-node\arm64-v8a'
+$OutputDirectory = Join-Path $WorkspaceRoot 'apps\mobile\android\app\src\main\jniLibs\arm64-v8a'
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
 $previousGoOs = $env:GOOS
@@ -20,7 +20,7 @@ try {
   $env:CGO_ENABLED = '0'
   Push-Location -LiteralPath $EmbeddedNodeDirectory
   try {
-    go build -trimpath -ldflags='-s -w' -o (Join-Path $OutputDirectory 'embedded-node') .
+    go build -trimpath -ldflags='-s -w' -o (Join-Path $OutputDirectory 'libembedded-node.so') .
   } finally {
     Pop-Location
   }

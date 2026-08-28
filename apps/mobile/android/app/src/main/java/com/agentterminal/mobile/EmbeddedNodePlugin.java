@@ -9,9 +9,6 @@ import com.getcapacitor.PluginMethod;
 import android.util.Log;
 
 import java.io.File;
-import java.io.FileOutputStream;
-import java.io.InputStream;
-import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
@@ -37,9 +34,13 @@ public class EmbeddedNodePlugin extends Plugin {
         String nodeId = call.getString("nodeId");
         String remoteEndpoint = call.getString("remoteEndpoint");
         String authKey = call.getString("authKey");
-        File executable = installBundledExecutable();
-        if (!executable.isFile() || !executable.canExecute()) {
+        File executable = bundledExecutable();
+        if (!executable.isFile()) {
             call.reject("The embedded node engine is not included in this build.");
+            return;
+        }
+        if (!executable.canExecute()) {
+            call.reject("The embedded node engine is not executable in this build.");
             return;
         }
         if (nodeProcess != null && nodeProcess.isAlive()) {
@@ -139,23 +140,8 @@ public class EmbeddedNodePlugin extends Plugin {
         super.handleOnDestroy();
     }
 
-    private File installBundledExecutable() {
-        File executable = new File(getContext().getFilesDir(), "embedded-node");
-        if (executable.isFile() && executable.canExecute()) return executable;
-        for (String abi : android.os.Build.SUPPORTED_ABIS) {
-            String asset = "embedded-node/" + abi + "/embedded-node";
-            try (InputStream input = getContext().getAssets().open(asset);
-                 FileOutputStream output = new FileOutputStream(executable)) {
-                byte[] buffer = new byte[16 * 1024];
-                int read;
-                while ((read = input.read(buffer)) >= 0) output.write(buffer, 0, read);
-                executable.setExecutable(true, true);
-                return executable;
-            } catch (IOException ignored) {
-                // Try the next ABI. Development APKs may contain no engine.
-            }
-        }
-        return executable;
+    private File bundledExecutable() {
+        return new File(getContext().getApplicationInfo().nativeLibraryDir, "libembedded-node.so");
     }
 
     private JSObject readStatus(File stateDir, String nodeId) {

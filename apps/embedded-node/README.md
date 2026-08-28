@@ -9,9 +9,8 @@ Tailscale client.
 Build signed binaries for each release target and place them at:
 
 - Desktop: `apps/desktop/src-tauri/resources/embedded-node/embedded-node.exe`
-- Android: app-private files directory as `embedded-node` (the release build
-  includes the ABI asset; the Capacitor bridge copies it into app-private
-  storage before invoking it)
+- Android: packaged native library `libembedded-node.so` (Android extracts it
+  into the app's executable native-library directory before invoking it)
 
 The desktop launcher uses the `--state-dir`, `--control-url`, `--node-id`, and
 `--target-port` flags. The Android bridge adds `--remote-address` and
