@@ -1200,7 +1200,7 @@ impl Core {
         }
     }
 
-    pub fn resize_session(&self, session_id: &str, cols: u16, rows: u16, force: bool) {
+    pub fn resize_session(&self, session_id: &str, cols: u16, rows: u16, _force: bool) {
         let inner = self.inner.lock().expect("desktop state poisoned");
         let Some(session) = inner.sessions.get(session_id) else {
             return;
@@ -1210,15 +1210,10 @@ impl Core {
         }
         let cols = cols.clamp(2, 500);
         let rows = rows.clamp(1, 200);
-        if force {
-            let pulse_rows = if rows > 1 { rows - 1 } else { rows + 1 };
-            let _ = session.master.resize(PtySize {
-                rows: pulse_rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
-        }
+        // A resize is already a PTY notification.  Do not pulse through a
+        // second row count for `force`: ConPTY can make a focused line editor
+        // beep or lose the key being entered when it sees the synthetic
+        // rows-1 -> rows transition.
         let _ = session.master.resize(PtySize {
             rows,
             cols,

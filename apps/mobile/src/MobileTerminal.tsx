@@ -55,8 +55,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       terminalRef.current?.blur();
       return;
     }
-    resizeRef.current(true);
     terminalRef.current?.focus();
+    resizeRef.current(true);
   }, [active, fontWidthScale]);
 
   const activeModifiers = (keys = selectedKeysRef.current) => new Set(keys.flatMap((key) => key.modifier ? [key.modifier] : []));
@@ -166,8 +166,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     resizeRef.current = resize;
     const observer = new ResizeObserver(() => resize());
     observer.observe(hostElement);
-    const handlePointerActivity = () => {
-      if (activeRef.current) resize(true);
+    const handlePointerActivity = (event: PointerEvent) => {
+      if (!activeRef.current || !(event.target instanceof Node) || !hostElement.contains(event.target)) return;
+      terminal.focus();
+      resize(true);
     };
     window.addEventListener("pointerdown", handlePointerActivity, true);
     const textarea = terminal.textarea;
@@ -187,6 +189,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     let lastNativeBeforeInput: { data: string; at: number } | undefined;
     const sendInput = (data: string) => {
       if (!data || !activeRef.current) return;
+      terminal.focus();
       resize(true);
       const output = consumeSelectedKeys(data);
       if (output) connection.send({ type: "session.input", sessionId: session.id, data: output });
@@ -505,6 +508,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const isSelected = current.some((item) => item.id === key.id);
     const next = isSelected ? current.filter((item) => item.id !== key.id) : [...current, key];
     if (!current.length && !isSelected && key.value) {
+      terminalRef.current?.focus();
       resizeRef.current(true);
       connection.send({ type: "session.input", sessionId: session.id, data: key.value });
     }

@@ -8,6 +8,7 @@ interface Props { sessionId: string; active: boolean; }
 
 export function TerminalPane({ sessionId, active }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const terminalRef = useRef<Terminal | null>(null);
   const activeRef = useRef(active);
   const resizeRef = useRef<() => void>(() => undefined);
   activeRef.current = active;
@@ -34,6 +35,7 @@ export function TerminalPane({ sessionId, active }: Props) {
         brightBlue: "#9ab7ff", brightMagenta: "#d5b3ff", brightCyan: "#9ce6e6", brightWhite: "#ffffff"
       }
     });
+    terminalRef.current = terminal;
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(hostRef.current);
@@ -98,6 +100,7 @@ export function TerminalPane({ sessionId, active }: Props) {
     };
 
     terminal.attachCustomKeyEventHandler((event) => {
+      if (!activeRef.current) return false;
       if (event.type !== "keydown") return true;
       const isCopy = event.ctrlKey && !event.altKey && event.key.toLowerCase() === "c";
       if (isCopy && terminal.hasSelection()) {
@@ -126,6 +129,7 @@ export function TerminalPane({ sessionId, active }: Props) {
     };
     window.addEventListener("pointerdown", handlePointerActivity, true);
     const dataSubscription = terminal.onData((data) => {
+      if (!activeRef.current) return;
       try { fit.fit(); } catch { /* hidden pane */ }
       window.agentTerminal.write(sessionId, data, terminal.cols, terminal.rows);
     });
@@ -147,7 +151,7 @@ export function TerminalPane({ sessionId, active }: Props) {
       pendingData.length = 0;
       initialized = true;
       resize();
-      if (active) terminal.focus();
+      if (activeRef.current) terminal.focus();
     }).catch((cause) => {
       if (!disposed) terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
     });
@@ -160,15 +164,18 @@ export function TerminalPane({ sessionId, active }: Props) {
       void attachment.then(() => window.agentTerminal.detachSession(sessionId));
       if (copyToastTimer) window.clearTimeout(copyToastTimer);
       terminal.dispose();
+      terminalRef.current = null;
       resizeRef.current = () => undefined;
     };
   }, [sessionId]);
 
   useEffect(() => {
-    if (active) {
-      resizeRef.current();
-      hostRef.current?.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea")?.focus();
+    if (!active) {
+      terminalRef.current?.blur();
+      return;
     }
+    resizeRef.current();
+    terminalRef.current?.focus();
   }, [active]);
 
   return <div ref={hostRef} className={`terminal-pane ${active ? "is-active" : ""}`} />;
