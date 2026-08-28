@@ -89,19 +89,19 @@ button { color: inherit; }
 .inline-empty { margin-top: 6px; padding: 30px; border: 1px dashed #282e38; border-radius: 12px; color: #616b79; text-align: center; font-size: 11px; }
 .terminal-view { background: #080b0f; }
 .mobile-terminal-shell { flex: 1; min-height: 0; display: grid; grid-template-rows: 1fr auto; }
-.mobile-terminal { min-height: 0; padding: 8px 5px 4px 8px; overflow: hidden; }
+.mobile-terminal { min-height: 0; padding: 8px 0 4px 8px; overflow: hidden; }
 .mobile-terminal .xterm { height: 100%; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
 .mobile-terminal .xterm-viewport, .mobile-terminal .xterm-screen { touch-action: none; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
 .mobile-terminal .xterm-viewport { overflow: hidden !important; }
 .mobile-terminal .xterm .xterm-accessibility:not(.debug) { pointer-events: auto; }
 .mobile-terminal .xterm .xterm-accessibility-tree { -webkit-user-select: text !important; user-select: text !important; -webkit-touch-callout: default; touch-action: auto; }
 .mobile-terminal .xterm-viewport, .mobile-terminal .xterm-scrollable-element > .scrollbar { -ms-overflow-style: none !important; scrollbar-width: none !important; scrollbar-color: transparent transparent !important; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
-.mobile-terminal .xterm-scrollable-element > .scrollbar.vertical { width: 28px !important; touch-action: none; border: 0 !important; background: #080b0f !important; background-image: none !important; isolation: isolate; }
+.mobile-terminal .xterm-scrollable-element > .scrollbar.vertical { width: 28px !important; right: -20px !important; touch-action: none; border: 0 !important; background: #080b0f !important; background-image: none !important; isolation: isolate; }
 .mobile-terminal .xterm-viewport::-webkit-scrollbar, .mobile-terminal .xterm-viewport::-webkit-scrollbar-track, .mobile-terminal .xterm-viewport::-webkit-scrollbar-thumb, .mobile-terminal .xterm-viewport::-webkit-scrollbar-corner { display: none !important; width: 0 !important; height: 0 !important; background: transparent !important; border: 0 !important; }
 .mobile-terminal .xterm-scrollable-element > .scrollbar::-webkit-scrollbar, .mobile-terminal .xterm-scrollable-element > .scrollbar::-webkit-scrollbar-track, .mobile-terminal .xterm-scrollable-element > .scrollbar::-webkit-scrollbar-thumb, .mobile-terminal .xterm-scrollable-element > .scrollbar::-webkit-scrollbar-corner { display: none !important; width: 0 !important; height: 0 !important; background: transparent !important; border: 0 !important; }
 .mobile-terminal .xterm-scrollable-element > .shadow { display: none !important; box-shadow: none !important; }
 .mobile-terminal .xterm-scrollable-element > .scrollbar.vertical > .slider { background: transparent !important; }
-.mobile-terminal .xterm-scrollable-element > .scrollbar.vertical > .slider::after { content: ""; position: absolute; inset: 0 3px 0 auto; width: 5px; border-radius: 999px; background: #68738280; transition: background 120ms ease, width 120ms ease; }
+.mobile-terminal .xterm-scrollable-element > .scrollbar.vertical > .slider::after { content: ""; position: absolute; inset: 0 0 0 auto; width: 5px; border-radius: 999px; background: #68738280; transition: background 120ms ease, width 120ms ease; }
 .mobile-terminal .xterm-scrollable-element > .scrollbar.vertical > .slider.active::after { width: 7px; background: #91f0dacc; }
 .extra-keys { padding: 6px 5px calc(7px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: 5px; border-top: 1px solid #222832; background: #0e1218; overflow: hidden; }
 .key-row { display: flex; gap: 5px; overflow-x: auto; scrollbar-width: none; }

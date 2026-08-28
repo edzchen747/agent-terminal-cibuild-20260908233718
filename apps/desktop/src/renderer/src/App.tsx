@@ -44,7 +44,15 @@ export function App() {
     setPairError("");
     try {
       const payload = await window.agentTerminal.startPairing();
-      setQr(await QRCode.toDataURL(JSON.stringify(payload), { width: 320, margin: 2, color: { dark: "#0a1015", light: "#ffffff" } }));
+      setQr(await QRCode.toDataURL(JSON.stringify(payload), {
+        width: 320,
+        margin: 4,
+        // The pairing payload is intentionally text-heavy. Lowering the QR
+        // redundancy gives camera decoders larger, cleaner modules while the
+        // on-screen code still retains the standard quiet zone.
+        errorCorrectionLevel: "L",
+        color: { dark: "#0a1015", light: "#ffffff" }
+      }));
     } catch (cause) {
       setPairError(cause instanceof Error ? cause.message : String(cause));
     }

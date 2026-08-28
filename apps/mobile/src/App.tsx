@@ -3,6 +3,7 @@ import { App as CapacitorApp } from "@capacitor/app";
 import { Capacitor, type PluginListenerHandle } from "@capacitor/core";
 import {
   CapacitorBarcodeScanner,
+  CapacitorBarcodeScannerAndroidScanningLibrary,
   CapacitorBarcodeScannerCameraDirection,
   CapacitorBarcodeScannerScanOrientation,
   CapacitorBarcodeScannerTypeHint
@@ -127,9 +128,17 @@ export function App() {
         scanInstructions: "Scan the QR code shown in Agent Terminal",
         cameraDirection: CapacitorBarcodeScannerCameraDirection.BACK,
         scanOrientation: CapacitorBarcodeScannerScanOrientation.ADAPTIVE,
-        cancelButtonAccessibilityLabel: "Cancel QR scan"
+        cancelButtonAccessibilityLabel: "Cancel QR scan",
+        // ZXing handles long, text-heavy QR payloads without requiring a
+        // model download. Keep it explicit so Android does not silently
+        // choose a decoder that fails on some camera/device combinations.
+        android: Capacitor.getPlatform() === "android"
+          ? { scanningLibrary: CapacitorBarcodeScannerAndroidScanningLibrary.ZXING }
+          : undefined
       });
-      if (result.ScanResult) await pair(result.ScanResult);
+      const raw = result.ScanResult?.trim();
+      if (!raw) throw new Error("No QR code was detected. Move the phone closer and keep the entire code in the frame.");
+      await pair(raw);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "The camera could not scan the code.");
     }
