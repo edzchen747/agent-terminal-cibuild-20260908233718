@@ -40,6 +40,10 @@ jobs:
       - name: Build shared protocol
         run: npm run build -w @agentterminal/protocol
 
+      - name: Prepare embedded node dependencies
+        working-directory: apps/embedded-node
+        run: go mod tidy
+
       - name: Build Android embedded node
         shell: pwsh
         run: ./scripts/build-embedded-node-android.ps1
