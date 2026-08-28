@@ -120,8 +120,16 @@ impl DesktopStore {
     }
 
     pub fn save_project(&mut self, project: Project) -> Result<()> {
-        self.state.projects.retain(|item| item.id != project.id);
-        self.state.projects.push(project);
+        if let Some(existing) = self
+            .state
+            .projects
+            .iter_mut()
+            .find(|item| item.id == project.id)
+        {
+            *existing = project;
+        } else {
+            self.state.projects.push(project);
+        }
         self.write()
     }
 

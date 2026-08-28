@@ -93,6 +93,17 @@ export interface Project {
   createdAt?: string;
 }
 
+export interface DirectoryEntry {
+  name: string;
+  path: string;
+}
+
+export interface DirectoryListing {
+  path: string;
+  parentPath?: string;
+  directories: DirectoryEntry[];
+}
+
 export interface TerminalSession {
   id: string;
   projectId: string;
@@ -147,8 +158,10 @@ export type ClientMessage =
   | { type: "auth"; requestId: string; deviceId: string; deviceToken: string }
   | { type: "snapshot.request"; requestId: string }
   | { type: "project.create"; requestId: string; name: string; path: string }
+  | { type: "project.rename"; requestId: string; projectId: string; name: string }
   | { type: "project.remove"; requestId: string; projectId: string }
   | { type: "project.persistence"; requestId: string; projectId: string; persistent: boolean }
+  | { type: "directory.list"; requestId: string; path?: string }
   | { type: "session.create"; requestId: string; projectId: string; shellId?: string }
   | { type: "session.close"; requestId: string; sessionId: string }
   | { type: "session.attach"; requestId: string; sessionId: string; cols: number; rows: number }
@@ -160,6 +173,7 @@ export type ServerMessage =
   | { type: "pair.accepted"; requestId: string; deviceToken: string; snapshot: HostSnapshot }
   | { type: "auth.accepted"; requestId: string; snapshot: HostSnapshot }
   | { type: "snapshot"; requestId?: string; snapshot: HostSnapshot }
+  | { type: "directory.listing"; requestId: string; listing: DirectoryListing }
   | { type: "session.output"; sessionId: string; data: string }
   | { type: "session.buffer"; requestId: string; sessionId: string; data: string }
   | { type: "ok"; requestId: string }

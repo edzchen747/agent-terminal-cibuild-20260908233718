@@ -7,6 +7,7 @@ export interface DesktopState extends HostSnapshot {
 export interface DesktopApi {
   getState(): Promise<DesktopState>;
   createProject(): Promise<Project | null>;
+  renameProject(projectId: string, name: string): Promise<Project>;
   removeProject(projectId: string): Promise<void>;
   setProjectPersistent(projectId: string, persistent: boolean): Promise<Project>;
   openProject(projectId: string): Promise<void>;

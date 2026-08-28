@@ -31,6 +31,22 @@ pub struct Project {
     pub created_at: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryListing {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_path: Option<String>,
+    pub directories: Vec<DirectoryEntry>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalSession {
@@ -135,6 +151,12 @@ pub enum ClientMessage {
         name: String,
         path: String,
     },
+    #[serde(rename = "project.rename")]
+    ProjectRename {
+        request_id: String,
+        project_id: String,
+        name: String,
+    },
     #[serde(rename = "project.remove")]
     ProjectRemove {
         request_id: String,
@@ -145,6 +167,11 @@ pub enum ClientMessage {
         request_id: String,
         project_id: String,
         persistent: bool,
+    },
+    #[serde(rename = "directory.list")]
+    DirectoryList {
+        request_id: String,
+        path: Option<String>,
     },
     #[serde(rename = "session.create")]
     SessionCreate {
@@ -187,8 +214,10 @@ impl ClientMessage {
             | Self::Auth { request_id, .. }
             | Self::SnapshotRequest { request_id }
             | Self::ProjectCreate { request_id, .. }
+            | Self::ProjectRename { request_id, .. }
             | Self::ProjectRemove { request_id, .. }
             | Self::ProjectPersistence { request_id, .. }
+            | Self::DirectoryList { request_id, .. }
             | Self::SessionCreate { request_id, .. }
             | Self::SessionClose { request_id, .. }
             | Self::SessionAttach { request_id, .. }
@@ -217,6 +246,11 @@ pub enum ServerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
         snapshot: HostSnapshot,
+    },
+    #[serde(rename = "directory.listing")]
+    DirectoryListing {
+        request_id: String,
+        listing: DirectoryListing,
     },
     #[serde(rename = "session.output")]
     SessionOutput { session_id: String, data: String },

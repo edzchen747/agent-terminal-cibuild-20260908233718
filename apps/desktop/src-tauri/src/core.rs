@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     io::{Read, Write},
     net::UdpSocket,
     path::{Path, PathBuf},
@@ -23,8 +24,9 @@ use uuid::Uuid;
 
 use crate::{
     models::{
-        AuthorizedDevice, ClientMessage, DesktopState, HostInfo, HostSnapshot, PROTOCOL_VERSION,
-        PairingPayload, Project, ServerMessage, ShellProfile, TerminalDataEvent, TerminalSession,
+        AuthorizedDevice, ClientMessage, DesktopState, DirectoryEntry, DirectoryListing, HostInfo,
+        HostSnapshot, PROTOCOL_VERSION, PairingPayload, Project, ServerMessage, ShellProfile,
+        TerminalDataEvent, TerminalSession,
     },
     network,
     path_utils::user_visible_path,
@@ -549,6 +551,71 @@ impl Core {
         Ok(project)
     }
 
+    pub fn rename_project(&self, project_id: &str, name: &str) -> Result<Project> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("Project name cannot be empty."));
+        }
+        if name.chars().count() > 100 || name.chars().any(char::is_control) {
+            return Err(anyhow!("Project name must be 100 characters or fewer."));
+        }
+        let project = {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            if let Some(mut project) = inner
+                .store
+                .projects()
+                .iter()
+                .find(|project| project.id == project_id)
+                .cloned()
+            {
+                project.name = name.to_string();
+                inner.store.save_project(project.clone())?;
+                project
+            } else if let Some(project) = inner.temporary_projects.get_mut(project_id) {
+                project.name = name.to_string();
+                project.clone()
+            } else {
+                return Err(anyhow!("Project not found."));
+            }
+        };
+        self.broadcast();
+        Ok(project)
+    }
+
+    pub fn list_directories(&self, folder: Option<&str>) -> Result<DirectoryListing> {
+        let requested = folder
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+            .unwrap_or(std::env::current_dir()?);
+        let current = canonical_directory(requested)?;
+        let mut directories = fs::read_dir(&current)
+            .with_context(|| format!("Could not read desktop folder: {}", current.display()))?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                entry
+                    .file_type()
+                    .ok()
+                    .filter(|kind| kind.is_dir())
+                    .map(|_| DirectoryEntry {
+                        name: entry.file_name().to_string_lossy().into_owned(),
+                        path: user_visible_path(entry.path())
+                            .to_string_lossy()
+                            .into_owned(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        directories.sort_by_cached_key(|entry| entry.name.to_lowercase());
+        Ok(DirectoryListing {
+            path: current.to_string_lossy().into_owned(),
+            parent_path: current
+                .parent()
+                .map(user_visible_path)
+                .map(|path| path.to_string_lossy().into_owned()),
+            directories,
+        })
+    }
+
     pub fn set_project_persistence(&self, project_id: &str, persistent: bool) -> Result<Project> {
         let project = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
@@ -1052,6 +1119,17 @@ impl Core {
                     snapshot: self.snapshot(),
                 })
             }
+            ClientMessage::ProjectRename {
+                request_id,
+                project_id,
+                name,
+            } => {
+                self.rename_project(&project_id, &name)?;
+                Some(ServerMessage::Snapshot {
+                    request_id: Some(request_id),
+                    snapshot: self.snapshot(),
+                })
+            }
             ClientMessage::ProjectRemove {
                 request_id,
                 project_id,
@@ -1071,6 +1149,12 @@ impl Core {
                 Some(ServerMessage::Snapshot {
                     request_id: Some(request_id),
                     snapshot: self.snapshot(),
+                })
+            }
+            ClientMessage::DirectoryList { request_id, path } => {
+                Some(ServerMessage::DirectoryListing {
+                    request_id,
+                    listing: self.list_directories(path.as_deref())?,
                 })
             }
             ClientMessage::SessionCreate {

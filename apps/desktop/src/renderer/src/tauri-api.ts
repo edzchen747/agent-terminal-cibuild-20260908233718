@@ -31,6 +31,7 @@ void pairingBridgeReady;
 const api: DesktopApi = {
   getState: () => invoke("get_state"),
   createProject: () => invoke("create_project"),
+  renameProject: (projectId, name) => invoke("rename_project", { projectId, name }),
   removeProject: (projectId) => invoke("remove_project", { projectId }),
   setProjectPersistent: (projectId, persistent) => invoke("set_project_persistent", { projectId, persistent }),
   openProject: (projectId) => invoke("open_project", { projectId }),

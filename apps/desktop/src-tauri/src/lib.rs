@@ -61,6 +61,17 @@ async fn create_project(state: State<'_, Arc<Core>>) -> Result<Option<Project>, 
 }
 
 #[tauri::command]
+fn rename_project(
+    state: State<'_, Arc<Core>>,
+    project_id: String,
+    name: String,
+) -> Result<Project, String> {
+    state
+        .rename_project(&project_id, &name)
+        .map_err(error_string)
+}
+
+#[tauri::command]
 fn remove_project(state: State<'_, Arc<Core>>, project_id: String) -> Result<(), String> {
     state
         .set_project_persistence(&project_id, false)
@@ -212,6 +223,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             create_project,
+            rename_project,
             remove_project,
             set_project_persistent,
             open_project,

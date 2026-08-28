@@ -4,6 +4,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import { applyTerminalModifiers, createRequestId } from "@agentterminal/protocol";
 import type { TerminalModifier, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
+import { androidImeKeydownInput, claimNativeInput, nativeTerminalInput, shouldDeferToNativeInput } from "./terminalInput";
+import type { TimedTerminalInput } from "./terminalInput";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { connection: HostConnection; session: TerminalSession; }
@@ -13,23 +15,6 @@ interface AccessibilityKey {
   label: string;
   modifier?: TerminalModifier;
   value?: string;
-}
-
-type NativeTerminalInputEvent = Pick<InputEvent, "data" | "inputType" | "isComposing">;
-
-function nativeTerminalInput(event: NativeTerminalInputEvent, textareaValue = ""): string {
-  const inputType = event.inputType ?? "";
-  if (inputType === "deleteContentBackward" || inputType === "deleteWordBackward" || inputType === "deleteSoftLineBackward") {
-    return inputType === "deleteWordBackward" ? "\x17" : "\x7f";
-  }
-  if (inputType === "deleteContentForward" || inputType === "deleteWordForward" || inputType === "deleteSoftLineForward") {
-    return "\x1b[3~";
-  }
-  if (inputType === "insertLineBreak") return "\r";
-  if ((!inputType || inputType.startsWith("insert")) && !event.isComposing && (event.data || textareaValue)) {
-    return event.data || textareaValue;
-  }
-  return "";
 }
 
 const ACCESSIBILITY_KEY_ROWS: AccessibilityKey[][] = [
@@ -168,22 +153,11 @@ export function MobileTerminal({ connection, session }: Props) {
     textarea?.setAttribute("autocomplete", "off");
     textarea?.setAttribute("autocorrect", "off");
     textarea?.setAttribute("autocapitalize", "off");
-    terminal.attachCustomKeyEventHandler((event) => {
-      // Android IMEs often report printable keys as keyCode 229. xterm's
-      // composition fallback then reads the textarea after the key has already
-      // been delivered by beforeinput/input, which can emit a stale value or a
-      // bell. Native IME events are handled below, so let xterm handle only
-      // real key events here.
-      if (event.type === "keydown" && event.keyCode === 229 && !event.isComposing &&
-        (event.key.length === 1 || event.key === "Backspace" || event.key === "Enter")) return false;
-      return true;
-    });
-
     // Android WebViews may produce both an xterm key event and a native IME
     // event for one key, or only the native event. Hold xterm events briefly so
     // the native event can claim the input and prevent duplicate/phantom keys.
-    const pendingTerminalInput: Array<{ data: string; at: number }> = [];
-    const pendingNativeInput: Array<{ data: string; at: number }> = [];
+    const pendingTerminalInput: TimedTerminalInput[] = [];
+    const pendingNativeInput: TimedTerminalInput[] = [];
     let nativeInputTimer: number | undefined;
     let terminalInputTimer: number | undefined;
     let lastNativeBeforeInput: { data: string; at: number } | undefined;
@@ -199,19 +173,7 @@ export function MobileTerminal({ connection, session }: Props) {
       const now = performance.now();
 
       for (const native of pendingNativeInput.splice(0)) {
-        const matchingTerminal = pendingTerminalInput.findIndex((item) => Math.abs(native.at - item.at) <= 120 && item.data === native.data);
-        if (matchingTerminal >= 0) {
-          pendingTerminalInput.splice(matchingTerminal, 1);
-        } else {
-          // A native IME event is authoritative. Discard an unmatched xterm
-          // event from the same key cycle (Android commonly emits a phantom
-          // event before insertText/deleteContentBackward).
-          for (let index = pendingTerminalInput.length - 1; index >= 0; index -= 1) {
-            const pending = pendingTerminalInput[index];
-            if (pending && Math.abs(native.at - pending.at) <= 120) pendingTerminalInput.splice(index, 1);
-          }
-          sendInput(native.data);
-        }
+        sendInput(claimNativeInput(native, pendingTerminalInput));
       }
 
       for (let index = pendingTerminalInput.length - 1; index >= 0; index -= 1) {
@@ -231,10 +193,26 @@ export function MobileTerminal({ connection, session }: Props) {
       if (nativeInputTimer !== undefined) return;
       nativeInputTimer = window.setTimeout(flushPendingInput, 20);
     };
-    const input = terminal.onData((data) => {
+    const queueTerminalInput = (data: string) => {
+      if (!data) return;
       pendingTerminalInput.push({ data, at: performance.now() });
       if (terminalInputTimer === undefined) terminalInputTimer = window.setTimeout(flushPendingInput, 40);
+    };
+    terminal.attachCustomKeyEventHandler((event) => {
+      const directInput = androidImeKeydownInput(event);
+      if (directInput) {
+        // xterm cannot decode keyCode 229 as Backspace/Enter, and an empty
+        // textarea may not emit beforeinput. Queue the key here; if a native
+        // event still follows, the normal deduplicator will claim it.
+        event.preventDefault();
+        queueTerminalInput(directInput);
+        return false;
+      }
+      // Printable keyCode 229 events are delivered by beforeinput/input. Let
+      // the native IME path own them to avoid xterm's stale-value fallback.
+      return !shouldDeferToNativeInput(event);
     });
+    const input = terminal.onData(queueTerminalInput);
     const handleNativeBeforeInput = (event: Event) => {
       const inputEvent = event as InputEvent;
       const data = nativeTerminalInput(inputEvent, textarea?.value ?? "");

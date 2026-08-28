@@ -8,11 +8,11 @@ import {
   CapacitorBarcodeScannerScanOrientation,
   CapacitorBarcodeScannerTypeHint
 } from "@capacitor/barcode-scanner";
-import type { HostSnapshot, PairingPayload, Platform, Project, TerminalSession } from "@agentterminal/protocol";
+import type { DirectoryListing, HostSnapshot, PairingPayload, Platform, Project, TerminalSession } from "@agentterminal/protocol";
 import { createRequestId, parsePairingPayload } from "@agentterminal/protocol";
 import { HostConnection } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
-import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, TerminalIcon, WifiIcon } from "./icons";
+import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, TerminalIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
 
 type View = { type: "home" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
@@ -27,16 +27,21 @@ export function App() {
   const [showManual, setShowManual] = useState(false);
   const [view, setView] = useState<View>({ type: "home" });
   const [showCreateProject, setShowCreateProject] = useState(false);
+  const [projectToRename, setProjectToRename] = useState<Project | null>(null);
   const [sessionToClose, setSessionToClose] = useState<TerminalSession | null>(null);
   const connectionRef = useRef<HostConnection | null>(null);
   connectionRef.current = connection;
-  const navigationRef = useRef({ view, status, showCreateProject, sessionToClose });
-  navigationRef.current = { view, status, showCreateProject, sessionToClose };
+  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose });
+  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose };
 
   useEffect(() => {
     if (Capacitor.getPlatform() !== "android") return;
     const listener = CapacitorApp.addListener("backButton", () => {
       const navigation = navigationRef.current;
+      if (navigation.projectToRename) {
+        setProjectToRename(null);
+        return;
+      }
       if (navigation.sessionToClose) {
         setSessionToClose(null);
         return;
@@ -235,7 +240,7 @@ export function App() {
     </div>;
   }
   if (view.type === "project" && activeProject) {
-    return <ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={() => setView({ type: "home" })} onOpen={(session) => setView({ type: "terminal", sessionId: session.id, projectId: session.projectId })} />;
+    return <><ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={() => setView({ type: "home" })} onRename={() => setProjectToRename(activeProject)} onOpen={(session) => setView({ type: "terminal", sessionId: session.id, projectId: session.projectId })} />{projectToRename?.id === activeProject.id && <RenameProjectSheet project={activeProject} connection={connection} onClose={() => setProjectToRename(null)} />}</>;
   }
   return <div className="mobile-app home-view">
     <header className="home-header">
@@ -273,7 +278,7 @@ function isAuthorizationError(cause: unknown): boolean {
   return cause instanceof Error && /not authorized|no longer authorized/i.test(cause.message);
 }
 
-function ProjectScreen({ project, snapshot, connection, onBack, onOpen }: { project: Project; snapshot: HostSnapshot; connection: HostConnection; onBack: () => void; onOpen: (session: TerminalSession) => void }) {
+function ProjectScreen({ project, snapshot, connection, onBack, onRename, onOpen }: { project: Project; snapshot: HostSnapshot; connection: HostConnection; onBack: () => void; onRename: () => void; onOpen: (session: TerminalSession) => void }) {
   const sessions = snapshot.sessions.filter((session) => session.projectId === project.id);
   const [changingPersistence, setChangingPersistence] = useState(false);
   const [persistenceError, setPersistenceError] = useState("");
@@ -295,7 +300,7 @@ function ProjectScreen({ project, snapshot, connection, onBack, onOpen }: { proj
     }
   }
   return <div className="mobile-app project-view">
-    <MobileHeader title={project.name} subtitle={project.path} onBack={onBack} trailing={project.persistent ? <BookmarkIcon className="saved-icon" /> : <ClockIcon className="temp-icon" />} />
+    <MobileHeader title={project.name} subtitle={project.path} onBack={onBack} trailing={<><button className="header-edit-button" onClick={onRename} aria-label="Rename project"><EditIcon /></button>{project.persistent ? <BookmarkIcon className="saved-icon" /> : <ClockIcon className="temp-icon" />}</>} />
     <section className="project-hero"><div className="large-folder"><FolderIcon /></div><span>{project.persistent ? "Saved project" : "Temporary project"}</span><h1>{project.name}</h1><p>{project.path}</p><div className="project-actions"><button className="mobile-primary" onClick={() => void createSession()}><PlusIcon /> New terminal</button><button className="mobile-secondary" disabled={changingPersistence} onClick={() => void togglePersistence()}>{project.persistent ? <ClockIcon /> : <BookmarkIcon />}{changingPersistence ? "Updating…" : project.persistent ? "Make temporary" : "Save project"}</button></div>{persistenceError && <div className="form-error project-error">{persistenceError}</div>}</section>
     <section className="session-section"><div className="section-title"><span>Sessions</span><small>{sessions.length}</small></div>
       {sessions.length ? <div className="session-list">{sessions.map((session, index) => <button key={session.id} onClick={() => onOpen(session)}><span className="session-icon"><TerminalIcon /></span><span><strong>{session.title} {index + 1}</strong><small>{session.status === "running" ? "Active now" : `Exited · ${session.exitCode ?? "—"}`}</small></span><i className={session.status} /><ChevronIcon /></button>)}</div> : <div className="inline-empty">No open terminal sessions.</div>}
@@ -310,13 +315,48 @@ function ProjectCard({ project, sessions, onClick, onSession }: { project: Proje
 }
 
 function CreateProjectSheet({ connection, onClose }: { connection: HostConnection; onClose: () => void }) {
-  const [name, setName] = useState(""); const [folderPath, setFolderPath] = useState(""); const [error, setError] = useState("");
+  const [name, setName] = useState("");
+  const [listing, setListing] = useState<DirectoryListing | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  async function openFolder(path?: string) {
+    setLoading(true); setError("");
+    try {
+      const response = await connection.request({ type: "directory.list", requestId: createRequestId(), ...(path ? { path } : {}) });
+      if (response.type !== "directory.listing") throw new Error("The desktop did not return a folder listing.");
+      setListing(response.listing);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not browse desktop folders.");
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => { void openFolder(); }, []);
   async function submit() {
-    if (!folderPath.trim()) { setError("Enter the full path of a folder on the desktop."); return; }
-    try { await connection.request({ type: "project.create", requestId: createRequestId(), name: name.trim() || folderPath.split(/[\\/]/).filter(Boolean).at(-1) || "Project", path: folderPath.trim() }); onClose(); }
+    if (!listing) { setError("Choose a folder on the desktop."); return; }
+    try { await connection.request({ type: "project.create", requestId: createRequestId(), name: name.trim() || listing.path.split(/[\\/]/).filter(Boolean).at(-1) || "Project", path: listing.path }); onClose(); }
     catch (cause) { setError(cause instanceof Error ? cause.message : "Could not create the project."); }
   }
-  return <div className="sheet-backdrop" onClick={onClose}><section className="bottom-sheet" onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Desktop project</span><h2>Add a project</h2><p>Projects point directly to an existing folder on {connection.host.name}.</p><label>Project name<input value={name} onChange={(event) => setName(event.target.value)} placeholder="My project" /></label><label>Desktop folder path<input value={folderPath} onChange={(event) => setFolderPath(event.target.value)} placeholder="C:\Users\you\Projects\app" autoCapitalize="none" autoCorrect="off" /></label>{error && <div className="form-error">{error}</div>}<button className="mobile-primary full" onClick={() => void submit()}>Add project</button><button className="text-button" onClick={onClose}>Cancel</button></section></div>;
+  return <div className="sheet-backdrop" onClick={onClose}><section className="bottom-sheet folder-picker-sheet" onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Desktop project</span><h2>Choose a folder</h2><p>Browse folders on {connection.host.name}, then add the current folder as a project.</p><label>Project name (optional)<input maxLength={100} value={name} onChange={(event) => setName(event.target.value)} placeholder={listing?.path.split(/[\\/]/).filter(Boolean).at(-1) || "Project name"} /></label><div className="folder-location"><button disabled={!listing?.parentPath || loading} onClick={() => void openFolder(listing?.parentPath)} aria-label="Parent folder"><BackIcon /></button><span>{listing?.path ?? "Opening desktop folders…"}</span></div><div className="folder-list" aria-busy={loading}>{loading ? <div className="folder-loading"><i className="loader" />Loading folders…</div> : listing?.directories.length ? listing.directories.map((directory) => <button key={directory.path} onClick={() => void openFolder(directory.path)}><FolderIcon /><span>{directory.name}</span><ChevronIcon /></button>) : <div className="folder-empty">This folder has no subfolders.</div>}</div>{error && <div className="form-error">{error}</div>}<button className="mobile-primary full" disabled={!listing || loading} onClick={() => void submit()}>Add this folder</button><button className="text-button" onClick={onClose}>Cancel</button></section></div>;
+}
+
+function RenameProjectSheet({ project, connection, onClose }: { project: Project; connection: HostConnection; onClose: () => void }) {
+  const [name, setName] = useState(project.name);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  async function submit() {
+    const nextName = name.trim();
+    if (!nextName) { setError("Enter a project name."); return; }
+    setSaving(true); setError("");
+    try {
+      await connection.request({ type: "project.rename", requestId: createRequestId(), projectId: project.id, name: nextName });
+      onClose();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not rename the project.");
+      setSaving(false);
+    }
+  }
+  return <div className="sheet-backdrop" onClick={saving ? undefined : onClose}><section className="bottom-sheet" onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Project name</span><h2>Rename project</h2><p>The desktop folder stays at {project.path}.</p><label>Name<input autoFocus maxLength={100} value={name} onChange={(event) => setName(event.target.value)} /></label>{error && <div className="form-error">{error}</div>}<button className="mobile-primary full" disabled={saving} onClick={() => void submit()}>{saving ? "Renaming…" : "Save name"}</button><button className="text-button" disabled={saving} onClick={onClose}>Cancel</button></section></div>;
 }
 
 function CloseSessionSheet({ session, onClose, onConfirm }: { session: TerminalSession; onClose: () => void; onConfirm: () => Promise<void> }) {

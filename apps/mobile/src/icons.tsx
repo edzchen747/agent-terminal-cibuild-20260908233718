@@ -11,4 +11,5 @@ export const ClockIcon = (p: Props) => <svg {...base} {...p}><circle cx="12" cy=
 export const BackIcon = (p: Props) => <svg {...base} {...p}><path d="m15 18-6-6 6-6"/></svg>;
 export const CloseIcon = (p: Props) => <svg {...base} {...p}><path d="M6 6l12 12M18 6 6 18"/></svg>;
 export const MoreIcon = (p: Props) => <svg {...base} {...p}><circle cx="5" cy="12" r="1" fill="currentColor"/><circle cx="12" cy="12" r="1" fill="currentColor"/><circle cx="19" cy="12" r="1" fill="currentColor"/></svg>;
+export const EditIcon = (p: Props) => <svg {...base} {...p}><path d="M4 20h4l11-11-4-4L4 16v4Z"/><path d="m13.5 6.5 4 4"/></svg>;
 export const WifiIcon = (p: Props) => <svg {...base} {...p}><path d="M5 12.5a10 10 0 0 1 14 0M8 16a6 6 0 0 1 8 0M11 19.5a2 2 0 0 1 2 0"/></svg>;

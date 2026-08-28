@@ -70,6 +70,14 @@ test("messages encode as JSON", () => {
     encodeMessage({ type: "project.persistence", requestId: "r2", projectId: "p1", persistent: false }),
     '{"type":"project.persistence","requestId":"r2","projectId":"p1","persistent":false}'
   );
+  assert.equal(
+    encodeMessage({ type: "project.rename", requestId: "r3", projectId: "p1", name: "New name" }),
+    '{"type":"project.rename","requestId":"r3","projectId":"p1","name":"New name"}'
+  );
+  assert.equal(
+    encodeMessage({ type: "directory.list", requestId: "r4", path: "C:\\Users\\Ada" }),
+    '{"type":"directory.list","requestId":"r4","path":"C:\\\\Users\\\\Ada"}'
+  );
 });
 
 test("mobile terminal modifiers encode control characters", () => {

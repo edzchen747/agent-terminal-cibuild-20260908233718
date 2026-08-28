@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "vite build --configLoader runner",
+    "test": "node --test src/*.test.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "android:add": "cap add android",
     "android:sync": "npm run build && cap sync android",
