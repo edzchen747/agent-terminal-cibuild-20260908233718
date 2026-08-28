@@ -90,12 +90,14 @@ button { color: inherit; }
 .terminal-view { background: #080b0f; }
 .mobile-terminal-shell { flex: 1; min-height: 0; display: grid; grid-template-rows: 1fr auto; }
 .mobile-terminal { min-height: 0; padding: 8px 5px 4px 8px; overflow: hidden; }
-.mobile-terminal .xterm { height: 100%; }
-.mobile-terminal .xterm-viewport, .mobile-terminal .xterm-screen { touch-action: none; }
+.mobile-terminal .xterm { height: 100%; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
+.mobile-terminal .xterm-viewport, .mobile-terminal .xterm-screen { touch-action: none; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
 .mobile-terminal .xterm .xterm-accessibility:not(.debug) { pointer-events: auto; }
 .mobile-terminal .xterm .xterm-accessibility-tree { -webkit-user-select: text !important; user-select: text !important; -webkit-touch-callout: default; touch-action: auto; }
-.mobile-terminal .xterm-viewport, .mobile-terminal .xterm-scrollable-element > .scrollbar { scrollbar-width: none; }
-.mobile-terminal .xterm-scrollable-element > .scrollbar.vertical { touch-action: none; }
+.mobile-terminal .xterm-viewport, .mobile-terminal .xterm-scrollable-element > .scrollbar { scrollbar-width: none; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
+.mobile-terminal .xterm-scrollable-element > .scrollbar.vertical { width: 28px !important; touch-action: none; border: 0 !important; background: transparent !important; }
+.mobile-terminal .xterm-viewport::-webkit-scrollbar, .mobile-terminal .xterm-scrollable-element > .scrollbar::-webkit-scrollbar { width: 0 !important; height: 0 !important; background: transparent !important; }
+.mobile-terminal .xterm-scrollable-element > .shadow { display: none !important; box-shadow: none !important; }
 .mobile-terminal .xterm-scrollable-element > .scrollbar.vertical > .slider { background: transparent !important; }
 .mobile-terminal .xterm-scrollable-element > .scrollbar.vertical > .slider::after { content: ""; position: absolute; inset: 0 3px 0 auto; width: 5px; border-radius: 999px; background: #68738280; transition: background 120ms ease, width 120ms ease; }
 .mobile-terminal .xterm-scrollable-element > .scrollbar.vertical > .slider.active::after { width: 7px; background: #91f0dacc; }

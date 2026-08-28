@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { applyTerminalModifiers, type TerminalModifier } from "@agentterminal/protocol";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { sessionId: string; active: boolean; }
@@ -65,19 +66,59 @@ export function TerminalPane({ sessionId, active }: Props) {
       copyToastTimer = window.setTimeout(() => copyToast.classList.remove("is-visible"), 900);
     };
 
-    terminal.attachCustomKeyEventHandler((event) => {
-      const isCopy = event.ctrlKey && event.key.toLowerCase() === "c";
-      if (!isCopy || !terminal.hasSelection()) return true;
-      if (event.type === "keydown" && !event.repeat) {
-        const selectedText = terminal.getSelection();
-        void window.agentTerminal.copyText(selectedText).then(showCopyToast).catch(() => undefined);
-      }
-      return false;
-    });
     const resize = (force = false) => {
       try { fit.fit(); window.agentTerminal.resize(sessionId, terminal.cols, terminal.rows, force); } catch { /* hidden pane */ }
     };
     resizeRef.current = resize;
+
+    const sendKeyboardInput = (data: string) => {
+      if (!data) return;
+      try { fit.fit(); } catch { /* hidden pane */ }
+      window.agentTerminal.write(sessionId, data, terminal.cols, terminal.rows);
+    };
+    const keyInput = (event: KeyboardEvent): string | undefined => {
+      if (!event.ctrlKey || event.metaKey) return undefined;
+      const baseInput = ({
+        Backspace: "\x7f",
+        Delete: "\x1b[3~",
+        Enter: "\r",
+        Tab: "\t",
+        ArrowUp: "\x1b[A",
+        ArrowDown: "\x1b[B",
+        ArrowRight: "\x1b[C",
+        ArrowLeft: "\x1b[D",
+        Home: "\x1b[H",
+        End: "\x1b[F"
+      } as Record<string, string>)[event.key] ?? (event.key.length === 1 ? event.key : undefined);
+      if (!baseInput) return undefined;
+      const modifiers = new Set<TerminalModifier>(["ctrl"]);
+      if (event.altKey) modifiers.add("alt");
+      if (event.shiftKey) modifiers.add("shift");
+      return applyTerminalModifiers(baseInput, modifiers);
+    };
+
+    terminal.attachCustomKeyEventHandler((event) => {
+      if (event.type !== "keydown") return true;
+      const isCopy = event.ctrlKey && !event.altKey && event.key.toLowerCase() === "c";
+      if (isCopy && terminal.hasSelection()) {
+        event.preventDefault();
+        if (!event.repeat) {
+          const selectedText = terminal.getSelection();
+          void window.agentTerminal.copyText(selectedText).then(showCopyToast).catch(() => undefined);
+        }
+        return false;
+      }
+
+      // WebView2 can consume Ctrl shortcuts before xterm emits onData. Forward
+      // the control sequence ourselves so Ctrl+D, Ctrl+C, Ctrl+Backspace, and
+      // Ctrl+Arrow work consistently in every Windows shell.
+      const data = keyInput(event);
+      if (!data || (event.key.toLowerCase() === "v" && !event.altKey)) return true;
+      event.preventDefault();
+      sendKeyboardInput(data);
+      return false;
+    });
+
     const observer = new ResizeObserver(() => resize());
     observer.observe(hostRef.current);
     const handlePointerActivity = () => {

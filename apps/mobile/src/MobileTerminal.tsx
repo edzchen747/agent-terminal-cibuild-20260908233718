@@ -96,14 +96,14 @@ export function MobileTerminal({ connection, session }: Props) {
       lineHeight: 1.18,
       scrollback: 5000,
       screenReaderMode: true,
-      overviewRuler: { width: 28 },
       smoothScrollDuration: 75,
-      theme: { background: "#080b0f", foreground: "#d7dce6", cursor: "#79ddc7", selectionBackground: "#315b64aa", overviewRulerBorder: "transparent" }
+      theme: { background: "#080b0f", foreground: "#d7dce6", cursor: "#79ddc7", selectionBackground: "#315b64aa" }
     });
     terminalRef.current = terminal;
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(hostElement);
+    terminal.focus();
     fit.fit();
 
     let resizeFrame: number | undefined;
@@ -258,6 +258,7 @@ export function MobileTerminal({ connection, session }: Props) {
       }
       const touch = event.touches.item(0);
       if (!touch) return;
+      terminal.focus();
       suppressTap = tapTimer !== undefined;
       if (tapTimer !== undefined) window.clearTimeout(tapTimer);
       tapTimer = undefined;

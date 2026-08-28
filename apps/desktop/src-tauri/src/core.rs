@@ -696,20 +696,24 @@ impl Core {
         shell_id: &str,
     ) -> Result<Option<TerminalSession>> {
         self.set_default_shell(shell_id)?;
-        let replace_project = {
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let switch = {
             let inner = self.inner.lock().expect("desktop state poisoned");
-            let Some(session_id) = session_id else {
-                return Ok(None);
-            };
             let Some(session) = inner.sessions.get(session_id) else {
                 return Ok(None);
             };
-            (session.metadata.status == "running"
-                && !session.has_user_input
-                && session.metadata.shell_id != shell_id)
-                .then(|| session.metadata.project_id.clone())
+            if session.metadata.shell_id == shell_id {
+                None
+            } else {
+                Some((
+                    session.metadata.project_id.clone(),
+                    !session.has_user_input,
+                ))
+            }
         };
-        let Some(project_id) = replace_project else {
+        let Some((project_id, replace_current)) = switch else {
             return Ok(None);
         };
         let replacement = self.create_session(&project_id, Some(shell_id))?;
@@ -1387,6 +1391,17 @@ fn snapshot_from_inner(inner: &Inner) -> HostSnapshot {
             .map(|shell| shell.id.clone())
             .unwrap_or_else(|| "cmd".into())
     };
+    let mut sessions = inner
+        .sessions
+        .values()
+        .map(|session| session.metadata.clone())
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
     HostSnapshot {
         host: HostInfo {
             id: inner.store.host().id.clone(),
@@ -1394,11 +1409,7 @@ fn snapshot_from_inner(inner: &Inner) -> HostSnapshot {
             version: env!("CARGO_PKG_VERSION").into(),
         },
         projects: public_projects(inner),
-        sessions: inner
-            .sessions
-            .values()
-            .map(|session| session.metadata.clone())
-            .collect(),
+        sessions,
         devices: inner
             .store
             .devices()
