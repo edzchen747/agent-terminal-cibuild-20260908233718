@@ -47,7 +47,7 @@ public class MainActivity extends BridgeActivity {
     }
 
     @Override
-    protected void onDestroy() {
+    public void onDestroy() {
         if (getBridge() != null && rendererListener != null) {
             getBridge().removeWebViewListener(rendererListener);
             rendererListener = null;
