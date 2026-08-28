@@ -24,8 +24,7 @@ use uuid::Uuid;
 use crate::{
     models::{
         AuthorizedDevice, ClientMessage, DesktopState, HostInfo, HostSnapshot, PROTOCOL_VERSION,
-        PairingPayload, Project, RelayMessage, ServerMessage, ShellProfile, TerminalDataEvent,
-        TerminalSession,
+        PairingPayload, Project, ServerMessage, ShellProfile, TerminalDataEvent, TerminalSession,
     },
     network,
     path_utils::user_visible_path,
@@ -53,9 +52,6 @@ pub enum ClientSink {
         messages: mpsc::UnboundedSender<String>,
         close: mpsc::UnboundedSender<()>,
     },
-    Relay {
-        connection_id: String,
-    },
 }
 
 struct RemoteClient {
@@ -81,7 +77,6 @@ pub struct Core {
     app: AppHandle,
     inner: Mutex<Inner>,
     clients: Mutex<HashMap<String, RemoteClient>>,
-    relay_sender: Mutex<Option<mpsc::UnboundedSender<RelayMessage>>>,
     embedded_node: Mutex<Option<Child>>,
     remote_port: AtomicU16,
     direct_server_ready: AtomicBool,
@@ -102,7 +97,6 @@ impl Core {
                 pairing_grants: HashMap::new(),
             }),
             clients: Mutex::new(HashMap::new()),
-            relay_sender: Mutex::new(None),
             embedded_node: Mutex::new(None),
             remote_port: AtomicU16::new(remote_port),
             direct_server_ready: AtomicBool::new(false),
@@ -161,23 +155,9 @@ impl Core {
             .map(|(_, client)| client)
             .collect::<Vec<_>>();
         for client in clients {
-            match client.sink {
-                ClientSink::Direct { close, .. } => {
-                    let _ = close.send(());
-                }
-                ClientSink::Relay { connection_id } => {
-                    if let Some(sender) = self
-                        .relay_sender
-                        .lock()
-                        .expect("relay sender poisoned")
-                        .as_ref()
-                    {
-                        let _ = sender.send(RelayMessage::Disconnect { connection_id });
-                    }
-                }
-            }
+            let ClientSink::Direct { close, .. } = client.sink;
+            let _ = close.send(());
         }
-        self.set_relay_sender(None);
     }
 
     pub fn configured_port(&self) -> u16 {
@@ -205,10 +185,6 @@ impl Core {
         self.exit_requested.load(Ordering::Acquire)
     }
 
-    pub fn relay_endpoint(&self) -> Option<String> {
-        Some(network::relay_url())
-    }
-
     pub fn control_url(&self) -> String {
         network::control_url()
     }
@@ -220,19 +196,16 @@ impl Core {
         {
             return value.trim().trim_end_matches('/').to_string();
         }
-        if self.remote_transport() == "overlay" {
-            let inner = self.inner.lock().expect("desktop state poisoned");
-            let host_id = &inner.store.host().id;
-            let port = inner.store.settings().port;
-            return format!("ws://{host_id}.{}:{port}", network::tailnet_domain());
-        }
-        network::relay_url()
+        let inner = self.inner.lock().expect("desktop state poisoned");
+        let host_id = &inner.store.host().id;
+        let port = inner.store.settings().port;
+        format!("ws://{host_id}.{}:{port}", network::tailnet_domain())
     }
 
     pub fn remote_transport(&self) -> String {
         std::env::var("AGENT_TERMINAL_REMOTE_TRANSPORT")
             .ok()
-            .filter(|value| matches!(value.as_str(), "relay" | "direct" | "overlay"))
+            .filter(|value| matches!(value.as_str(), "direct" | "overlay"))
             .unwrap_or_else(|| "overlay".into())
     }
 
@@ -318,15 +291,6 @@ impl Core {
             .save_network(saved_network)?;
         *self.embedded_node.lock().expect("embedded node poisoned") = Some(child);
         Ok(true)
-    }
-
-    pub fn relay_identity(&self) -> (String, String) {
-        let inner = self.inner.lock().expect("desktop state poisoned");
-        let token = std::env::var("AGENT_TERMINAL_RELAY_SECRET")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| inner.store.host().relay_token.clone());
-        (inner.store.host().id.clone(), token)
     }
 
     pub fn state_for_window(&self, label: &str) -> DesktopState {
@@ -818,7 +782,10 @@ impl Core {
             if session.metadata.shell_id == shell_id {
                 None
             } else {
-                Some((session.metadata.project_id.clone(), !session.has_run_command))
+                Some((
+                    session.metadata.project_id.clone(),
+                    !session.has_run_command,
+                ))
             }
         };
         let Some((project_id, replace_current)) = switch else {
@@ -904,35 +871,11 @@ impl Core {
             );
     }
 
-    pub fn ensure_relay_client(&self, connection_id: &str) {
-        let mut clients = self.clients.lock().expect("remote clients poisoned");
-        clients
-            .entry(connection_id.to_string())
-            .or_insert_with(|| RemoteClient {
-                device_id: None,
-                attached_sessions: HashSet::new(),
-                sink: ClientSink::Relay {
-                    connection_id: connection_id.to_string(),
-                },
-            });
-    }
-
     pub fn remove_client(&self, id: &str) {
         self.clients
             .lock()
             .expect("remote clients poisoned")
             .remove(id);
-    }
-
-    pub fn clear_relay_clients(&self) {
-        self.clients
-            .lock()
-            .expect("remote clients poisoned")
-            .retain(|_, client| !matches!(client.sink, ClientSink::Relay { .. }));
-    }
-
-    pub fn set_relay_sender(&self, sender: Option<mpsc::UnboundedSender<RelayMessage>>) {
-        *self.relay_sender.lock().expect("relay sender poisoned") = sender;
     }
 
     pub fn handle_client_raw(self: &Arc<Self>, client_id: &str, raw: &str) {
@@ -1209,19 +1152,6 @@ impl Core {
             Some(ClientSink::Direct { messages, .. }) => {
                 let _ = messages.send(payload);
             }
-            Some(ClientSink::Relay { connection_id }) => {
-                if let Some(sender) = self
-                    .relay_sender
-                    .lock()
-                    .expect("relay sender poisoned")
-                    .as_ref()
-                {
-                    let _ = sender.send(RelayMessage::Message {
-                        connection_id,
-                        payload,
-                    });
-                }
-            }
             None => {}
         }
     }
@@ -1261,21 +1191,8 @@ impl Core {
                 .collect::<Vec<_>>()
         };
         for client in removed {
-            match client.sink {
-                ClientSink::Direct { close, .. } => {
-                    let _ = close.send(());
-                }
-                ClientSink::Relay { connection_id } => {
-                    if let Some(sender) = self
-                        .relay_sender
-                        .lock()
-                        .expect("relay sender poisoned")
-                        .as_ref()
-                    {
-                        let _ = sender.send(RelayMessage::Disconnect { connection_id });
-                    }
-                }
-            }
+            let ClientSink::Direct { close, .. } = client.sink;
+            let _ = close.send(());
         }
     }
 

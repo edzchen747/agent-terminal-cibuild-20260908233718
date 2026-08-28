@@ -9,7 +9,7 @@ This repository is an end-to-end MVP, not a UI-only prototype.
 ### Windows desktop
 
 - One portable `agent-terminal.exe`; there is no installer, Electron runtime, Node sidecar, or separate connection process.
-- A single native tray host owns every PTY and direct/relay connection. Terminal windows are disposable clients that attach to tray-owned sessions and may all be closed without interrupting the host.
+- A single native tray host owns every PTY and direct/overlay connection. Terminal windows are disposable clients that attach to tray-owned sessions and may all be closed without interrupting the host.
 - Left-clicking the tray icon restores the terminal. Right-clicking opens a menu with Exit.
 - Interactive ConPTY terminal sessions with Command Prompt, Windows PowerShell, PowerShell 7, WSL, and Git Bash detection.
 - A collapsible project sidebar. Opening a different project creates/focuses a dedicated desktop window.
@@ -22,15 +22,15 @@ This repository is an end-to-end MVP, not a UI-only prototype.
 - Native folder picker for saved projects.
 - QR pairing that authorizes a phone once; ordinary reconnects use the saved device credential.
 - Persistent authorized-device registry with token hashing, last-seen timestamps, and immediate revocation.
-- Outbound Headscale/DERP node support for connections across Wi-Fi, mobile data, NAT, and firewall boundaries, with the WebSocket relay as a compatibility fallback.
-- Direct local WebSocket fallback on port `47831` for development without a relay.
+- Outbound Headscale/DERP node support for connections across Wi-Fi, mobile data, NAT, and firewall boundaries.
+- Direct local WebSocket fallback on port `47831` for development without the overlay node.
 - Desktop-owned persistence for projects, devices, and the default shell.
 - Save or unsave the active project without closing its window or terminal sessions.
 
 ### Android-first mobile app
 
 - Native QR scanning with a manual pairing-code fallback.
-- Automatic reconnect to the one saved desktop host through the configured relay or direct fallback.
+- Automatic reconnect to the one saved desktop host through the embedded overlay node or direct fallback.
 - Live project/session discovery whenever the app connects.
 - Saved-project marker and automatic temporary projects for open desktop folders that were not saved.
 - Project creation against an existing absolute folder path on the desktop.
@@ -63,40 +63,26 @@ docs/            Architecture and security notes
 - Microsoft Edge WebView2 at runtime. Supported Windows 10/11 systems normally include it.
 - Android Studio with Java 21 and Android SDK 36 to build the Android APK.
 - Go 1.24 or newer when packaging the process-isolated embedded node runtime.
-- A deployed Headscale + DERP/relay stack for cross-network use. The stock build points at `https://node.hopto.org` and `wss://node.hopto.org/relay`.
+- A deployed Headscale + embedded DERP/STUN stack for cross-network use. The stock build points at `https://node.hopto.org`.
 
 No Visual Studio C++ workload is required: the desktop uses a prebuilt ConPTY binding.
 
-## Run the Headscale/relay stack
+## Run the Headscale stack
 
-The public deployment bundle is in [`server/relay`](server/relay/README.md). It includes Headscale's embedded DERP/STUN server, Caddy TLS termination, the Agent Terminal WebSocket relay, and the 30-day inactive-node reaper. It is configured entirely through `.env`.
-
-For local development with only the WebSocket relay:
-
-```powershell
-$env:AGENT_TERMINAL_RELAY_URL = "ws://127.0.0.1:8787"
-$env:AGENT_TERMINAL_RELAY_SECRET = "local-development-secret"
-$env:RELAY_SHARED_SECRET = "local-development-secret"
-npm run build -w @agentterminal/relay
-npm run start -w @agentterminal/relay
-```
+The public deployment bundle is in [`server/relay`](server/relay/README.md). It includes Headscale's embedded DERP/STUN server, Caddy TLS termination, and the 30-day inactive-node reaper. It is configured entirely through `.env`.
 
 For production, copy `server/relay/.env.example` to `.env`, set DNS/ports/secrets, and run `docker compose up -d --build` from that directory. Self-hosted client values are supplied through:
 
 ```powershell
-$env:AGENT_TERMINAL_RELAY_URL = "wss://relay.example.com"
-$env:AGENT_TERMINAL_RELAY_SECRET = "use-a-long-random-secret"
-$env:AGENT_TERMINAL_CONTROL_URL = "https://relay.example.com"
-$env:AGENT_TERMINAL_REMOTE_ENDPOINT = "wss://relay.example.com/relay"
-$env:AGENT_TERMINAL_REMOTE_TRANSPORT = "relay"
+$env:AGENT_TERMINAL_CONTROL_URL = "https://headscale.example.com"
+$env:AGENT_TERMINAL_REMOTE_ENDPOINT = "ws://desktop-host-id.agent-terminal.internal:47831"
+$env:AGENT_TERMINAL_REMOTE_TRANSPORT = "overlay"
 $env:AGENT_TERMINAL_TAILNET_DOMAIN = "agent-terminal.internal"
 $env:AGENT_TERMINAL_NODE_AUTH_KEY = "<short-lived-headscale-preauth-key>"
 npm run dev
 ```
 
-Set `RELAY_SHARED_SECRET` to the same value in the relay deployment. The relay uses it only to authenticate the desktop's host registration; the desktop still authenticates every phone with its paired device credential.
-
-QR pairing is LAN-only: the QR contains the desktop's local WebSocket endpoint and the phone must be on the same network for the first authorization. After pairing, the phone probes that endpoint for 1.5 seconds; if it is unavailable, it starts its embedded node engine and uses the remote Headscale/DERP path, falling back to the `/relay` WebSocket route when the native engine is unavailable. Neither endpoint needs an inbound port-forwarding rule.
+QR pairing is LAN-only: the QR contains the desktop's local WebSocket endpoint and the phone must be on the same network for the first authorization. After pairing, the phone probes that endpoint for 1.5 seconds; if it is unavailable, it starts its embedded node engine and uses the remote Headscale/DERP path. Neither endpoint needs an inbound port-forwarding rule.
 
 ## Start the desktop app
 
@@ -117,7 +103,7 @@ To create the portable Windows executable:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1
 ```
 
-The self-contained application executable is written to `apps/desktop/src-tauri/target/release/agent-terminal.exe`. It embeds the desktop web assets and Rust backend. Release packaging also places the signed process-isolated `embedded-node` executable in the Tauri resource directory; development builds fall back to the relay if that optional binary is absent. It relies on the system WebView2 runtime rather than bundling a second browser engine.
+The self-contained application executable is written to `apps/desktop/src-tauri/target/release/agent-terminal.exe`. It embeds the desktop web assets and Rust backend. Release packaging also places the signed process-isolated `embedded-node` executable in the Tauri resource directory; development builds require the embedded node for off-LAN connections. It relies on the system WebView2 runtime rather than bundling a second browser engine.
 
 ## Run and build Android
 

@@ -1,9 +1,13 @@
 import { Preferences } from "@capacitor/preferences";
-import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, RelayMessage, ServerMessage } from "@agentterminal/protocol";
-import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_RELAY_URL } from "@agentterminal/protocol";
+import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage } from "@agentterminal/protocol";
+import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN } from "@agentterminal/protocol";
 import { EmbeddedNodeEngine } from "./embedded-engine";
 
 const HOST_KEY = "agent-terminal-host";
+const REQUEST_TIMEOUT_MS = 12_000;
+const HEARTBEAT_INTERVAL_MS = 20_000;
+const RECONNECT_BASE_DELAY_MS = 1_000;
+const RECONNECT_MAX_DELAY_MS = 30_000;
 
 export interface SavedHost {
   id: string;
@@ -13,8 +17,8 @@ export interface SavedHost {
   localEndpoint?: string;
   remoteEndpoint?: string;
   controlUrl?: string;
-  transport?: "relay" | "direct" | "overlay";
-  remoteTransport?: "relay" | "direct" | "overlay";
+  transport?: "direct" | "overlay";
+  remoteTransport?: "direct" | "overlay";
   nodeAuthKey?: string;
   deviceId: string;
   deviceToken: string;
@@ -24,13 +28,22 @@ type EventMap = {
   snapshot: HostSnapshot;
   output: { sessionId: string; data: string };
   disconnected: undefined;
+  connected: HostSnapshot;
+  reconnecting: { attempt: number; delayMs: number };
 };
 
 export class HostConnection {
   private socket?: WebSocket;
-  private activeTransport: "relay" | "direct" | "overlay" = "direct";
-  private intentionalClose = false;
-  private readonly connectionId = crypto.randomUUID();
+  private socketGeneration = 0;
+  private closed = false;
+  private authenticated = false;
+  private heartbeatTimer?: number;
+  private heartbeatInFlight = false;
+  private connectPromise?: Promise<HostSnapshot>;
+  private reconnectTimer?: number;
+  private reconnectAttempt = 0;
+  private reconnectDelay = RECONNECT_BASE_DELAY_MS;
+  private autoReconnect = false;
   private readonly embeddedEngine = new EmbeddedNodeEngine();
   private pending = new Map<string, { resolve: (message: ServerMessage) => void; reject: (error: Error) => void }>();
   private listeners = new Map<keyof EventMap, Set<(value: never) => void>>();
@@ -58,24 +71,26 @@ export class HostConnection {
       name: payload.hostName,
       endpoint: localEndpoint,
       localEndpoint,
-      remoteEndpoint: payload.remoteEndpoint ?? OVERLAY_RELAY_URL,
+      remoteEndpoint: payload.remoteEndpoint ?? defaultRemoteEndpoint(payload.hostId),
       controlUrl: payload.controlUrl ?? OVERLAY_CONTROL_URL,
       transport: "direct",
-      remoteTransport: payload.remoteTransport ?? "relay",
+      remoteTransport: payload.remoteTransport ?? "overlay",
       nodeAuthKey: payload.nodeAuthKey,
       deviceId: device.id,
       deviceToken: ""
     });
     try {
-      await temporary.open(localEndpoint, "direct", LAN_CONNECT_TIMEOUT_MS);
+      await temporary.open(localEndpoint, LAN_CONNECT_TIMEOUT_MS);
       const response = await temporary.request({ type: "pair", requestId: createRequestId(), token: payload.pairingToken, device });
       if (response.type !== "pair.accepted") throw new Error("The desktop rejected the pairing request.");
       temporary.host.deviceToken = response.deviceToken;
       temporary.snapshot = response.snapshot;
+      temporary.authenticated = true;
       await Preferences.set({ key: HOST_KEY, value: JSON.stringify(temporary.host) });
       // Initialize and persist the overlay identity during pairing so a later
       // off-LAN reconnect does not create a new node after an app restart.
       await temporary.embeddedEngine.start(temporary.host.controlUrl ?? OVERLAY_CONTROL_URL);
+      temporary.startHeartbeat();
       return temporary;
     } catch (error) {
       temporary.close();
@@ -84,46 +99,93 @@ export class HostConnection {
   }
 
   async connect(): Promise<HostSnapshot> {
+    if (this.closed) throw new Error("Connection closed.");
+    if (this.socket?.readyState === WebSocket.OPEN && this.snapshot && this.authenticated) {
+      return this.snapshot;
+    }
+    if (this.connectPromise) return this.connectPromise;
+
+    let failed = false;
+    const attempt = this.connectOnce()
+      .catch((error) => {
+        failed = true;
+        throw error;
+      })
+      .finally(() => {
+        this.connectPromise = undefined;
+        if (failed && this.autoReconnect) this.scheduleReconnect();
+      });
+    this.connectPromise = attempt;
+    return attempt;
+  }
+
+  startAutoReconnect(): void {
+    this.autoReconnect = true;
+  }
+
+  stopAutoReconnect(): void {
+    this.autoReconnect = false;
+    this.clearReconnectTimer();
+  }
+
+  retryNow(): void {
+    if (!this.autoReconnect || this.closed) return;
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      void this.checkHeartbeat();
+      return;
+    }
+    this.clearReconnectTimer();
+    this.reconnectDelay = RECONNECT_BASE_DELAY_MS;
+    this.scheduleReconnect(0);
+  }
+
+  isConnected(): boolean {
+    return this.authenticated && this.socket?.readyState === WebSocket.OPEN;
+  }
+
+  private async connectOnce(): Promise<HostSnapshot> {
+    this.authenticated = false;
+    this.stopHeartbeat();
+    this.clearReconnectTimer();
+    if (this.socket) this.abortSocket();
+
     const localEndpoint = this.host.localEndpoint ?? (this.host.transport === "direct" ? this.host.endpoint : undefined);
     let connectedLocally = false;
-    if (localEndpoint) {
-      try {
-        await this.open(localEndpoint, "direct", LAN_CONNECT_TIMEOUT_MS);
-        connectedLocally = true;
-      } catch {
-        this.abortSocket();
-      }
-    }
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      const hasExplicitRemoteEndpoint = Boolean(this.host.remoteEndpoint);
-      const remoteEndpoint = this.host.remoteEndpoint ?? (this.host.transport === "relay" ? this.host.endpoint : OVERLAY_RELAY_URL);
-      const remoteTransport = this.host.remoteTransport ?? (this.host.transport === "relay" || !hasExplicitRemoteEndpoint ? "relay" : "overlay");
-      const nodeState = await this.embeddedEngine.start(this.host.controlUrl ?? OVERLAY_CONTROL_URL, remoteEndpoint, remoteTransport, this.host.nodeAuthKey);
-      if (remoteTransport === "overlay" && !nodeState.proxyEndpoint && !nodeState.engineStarted) {
-        await this.open(OVERLAY_RELAY_URL, "relay", 8_000);
-      } else {
+    try {
+      if (localEndpoint) {
         try {
-          await this.open(
-            nodeState.proxyEndpoint ?? remoteEndpoint,
-            nodeState.proxyEndpoint ? "direct" : remoteTransport,
-            8_000
-          );
-        } catch (remoteError) {
+          await this.open(localEndpoint, LAN_CONNECT_TIMEOUT_MS);
+          connectedLocally = true;
+        } catch {
           this.abortSocket();
-          if (remoteTransport !== "overlay") throw remoteError;
-          // Keep the protocol relay as a compatibility path while a native
-          // engine is unavailable or still being enrolled with Headscale.
-          await this.open(OVERLAY_RELAY_URL, "relay", 8_000);
         }
       }
-    } else if (connectedLocally) {
-      // Persist the node identity even when this launch happens on the LAN.
-      await this.embeddedEngine.start(this.host.controlUrl ?? OVERLAY_CONTROL_URL);
+
+      if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+        const remoteEndpoint = this.host.remoteEndpoint ?? defaultRemoteEndpoint(this.host.id);
+        const remoteTransport = this.host.remoteTransport ?? "overlay";
+        const nodeState = await this.embeddedEngine.start(this.host.controlUrl ?? OVERLAY_CONTROL_URL, remoteEndpoint, remoteTransport, this.host.nodeAuthKey);
+        if (remoteTransport === "overlay" && !nodeState.proxyEndpoint) {
+          throw new Error("The embedded network node is unavailable for a remote connection.");
+        }
+        await this.open(nodeState.proxyEndpoint ?? remoteEndpoint, 8_000);
+      } else if (connectedLocally) {
+        // Persist the node identity even when this launch happens on the LAN.
+        await this.embeddedEngine.start(this.host.controlUrl ?? OVERLAY_CONTROL_URL);
+      }
+      const response = await this.request({ type: "auth", requestId: createRequestId(), deviceId: this.host.deviceId, deviceToken: this.host.deviceToken });
+      if (response.type !== "auth.accepted") throw new Error("This phone is not authorized by the desktop.");
+      this.snapshot = response.snapshot;
+      this.authenticated = true;
+      this.reconnectAttempt = 0;
+      this.reconnectDelay = RECONNECT_BASE_DELAY_MS;
+      this.startHeartbeat();
+      this.emit("connected", response.snapshot);
+      return response.snapshot;
+    } catch (error) {
+      this.abortSocket();
+      throw error;
     }
-    const response = await this.request({ type: "auth", requestId: createRequestId(), deviceId: this.host.deviceId, deviceToken: this.host.deviceToken });
-    if (response.type !== "auth.accepted") throw new Error("This phone is not authorized by the desktop.");
-    this.snapshot = response.snapshot;
-    return response.snapshot;
   }
 
   async request(message: ClientMessage): Promise<ServerMessage> {
@@ -133,17 +195,33 @@ export class HostConnection {
       return { type: "ok", requestId: "" };
     }
     return new Promise((resolve, reject) => {
-      const timeout = window.setTimeout(() => { this.pending.delete(message.requestId); reject(new Error("The desktop did not respond.")); }, 12_000);
+      const timeout = window.setTimeout(() => {
+        this.pending.delete(message.requestId);
+        reject(new Error("The desktop did not respond."));
+        if (this.authenticated) this.forceSocketClose();
+      }, REQUEST_TIMEOUT_MS);
       this.pending.set(message.requestId, {
         resolve: (response) => { window.clearTimeout(timeout); resolve(response); },
         reject: (error) => { window.clearTimeout(timeout); reject(error); }
       });
-      this.sendPayload(encodeMessage(message));
+      try {
+        this.sendPayload(encodeMessage(message));
+      } catch (error) {
+        this.pending.delete(message.requestId);
+        window.clearTimeout(timeout);
+        reject(error instanceof Error ? error : new Error("The desktop connection is unavailable."));
+        this.forceSocketClose();
+      }
     });
   }
 
   send(message: ClientMessage): void {
-    if (this.socket?.readyState === WebSocket.OPEN) this.sendPayload(encodeMessage(message));
+    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    try {
+      this.sendPayload(encodeMessage(message));
+    } catch {
+      this.forceSocketClose();
+    }
   }
 
   on<K extends keyof EventMap>(event: K, callback: (value: EventMap[K]) => void): () => void {
@@ -154,7 +232,12 @@ export class HostConnection {
   }
 
   close(): void {
-    this.intentionalClose = true;
+    this.closed = true;
+    this.autoReconnect = false;
+    this.clearReconnectTimer();
+    this.stopHeartbeat();
+    this.authenticated = false;
+    this.socketGeneration += 1;
     const socket = this.socket;
     this.socket = undefined;
     socket?.close();
@@ -162,38 +245,102 @@ export class HostConnection {
     void this.embeddedEngine.stop();
   }
 
-  private open(endpoint: string, transport: "relay" | "direct" | "overlay", timeoutMs: number): Promise<void> {
+  private open(endpoint: string, timeoutMs: number): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.intentionalClose = false;
-      this.activeTransport = transport;
+      const generation = ++this.socketGeneration;
       const socket = new WebSocket(endpoint);
-      const timeout = window.setTimeout(() => { socket.close(); reject(new Error("The desktop connection attempt timed out.")); }, timeoutMs);
+      let opened = false;
+      let settled = false;
+      const timeout = window.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        socket.close();
+        reject(new Error("The desktop connection attempt timed out."));
+      }, timeoutMs);
       socket.onopen = () => {
-        window.clearTimeout(timeout);
-        this.socket = socket;
-        if (this.activeTransport === "relay") {
-          socket.send(JSON.stringify({ type: "relay.connect", hostId: this.host.id, connectionId: this.connectionId } satisfies RelayMessage));
+        if (generation !== this.socketGeneration || this.closed) {
+          socket.close();
+          return;
         }
+        window.clearTimeout(timeout);
+        opened = true;
+        settled = true;
+        this.socket = socket;
         resolve();
       };
-      socket.onerror = () => { window.clearTimeout(timeout); reject(new Error("Could not reach the desktop host.")); };
-      socket.onclose = () => {
-        if (this.socket === socket) this.socket = undefined;
-        this.rejectAll(new Error("Desktop disconnected."));
-        if (!this.intentionalClose) this.emit("disconnected", undefined);
+      socket.onerror = () => {
+        if (opened || settled) return;
+        window.clearTimeout(timeout);
+        settled = true;
+        reject(new Error("Could not reach the desktop host."));
       };
-      socket.onmessage = (event) => this.receive(String(event.data));
+      socket.onclose = () => {
+        window.clearTimeout(timeout);
+        if (this.socket === socket) this.socket = undefined;
+        if (generation !== this.socketGeneration) return;
+        if (!opened) {
+          if (!settled) {
+            settled = true;
+            reject(new Error("The desktop connection closed during setup."));
+          }
+          return;
+        }
+        this.authenticated = false;
+        this.stopHeartbeat();
+        this.rejectAll(new Error("Desktop disconnected."));
+        if (!this.closed) {
+          this.emit("disconnected", undefined);
+          this.scheduleReconnect();
+        }
+      };
+      socket.onmessage = (event) => {
+        if (generation === this.socketGeneration) this.receive(String(event.data));
+      };
     });
   }
 
-  private receive(raw: string): void {
-    if (this.activeTransport === "relay") {
-      let relay: RelayMessage;
-      try { relay = JSON.parse(raw) as RelayMessage; } catch { return; }
-      if (relay.type === "relay.message") raw = relay.payload;
-      else if (relay.type === "relay.disconnect") { this.emit("disconnected", undefined); return; }
-      else return;
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    if (!this.authenticated) return;
+    this.heartbeatTimer = window.setInterval(() => void this.checkHeartbeat(), HEARTBEAT_INTERVAL_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer !== undefined) window.clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
+    this.heartbeatInFlight = false;
+  }
+
+  private async checkHeartbeat(): Promise<void> {
+    if (this.heartbeatInFlight || !this.isConnected()) return;
+    this.heartbeatInFlight = true;
+    try {
+      await this.request({ type: "snapshot.request", requestId: createRequestId() });
+    } catch {
+      if (!this.closed) this.forceSocketClose();
+    } finally {
+      this.heartbeatInFlight = false;
     }
+  }
+
+  private scheduleReconnect(delayOverride?: number): void {
+    if (!this.autoReconnect || this.closed || this.reconnectTimer !== undefined || this.connectPromise) return;
+    const delayMs = delayOverride ?? this.reconnectDelay;
+    this.reconnectAttempt += 1;
+    this.emit("reconnecting", { attempt: this.reconnectAttempt, delayMs });
+    this.reconnectDelay = Math.min(RECONNECT_MAX_DELAY_MS, Math.max(RECONNECT_BASE_DELAY_MS, this.reconnectDelay * 2));
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = undefined;
+      void this.connect().catch(() => undefined);
+    }, delayMs);
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer !== undefined) window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+  }
+
+  private receive(raw: string): void {
     let message: ServerMessage;
     try { message = decodeServerMessage(raw); } catch { return; }
     if (message.type === "session.output") { this.emit("output", { sessionId: message.sessionId, data: message.data }); return; }
@@ -219,19 +366,25 @@ export class HostConnection {
   }
 
   private sendPayload(payload: string): void {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-    if (this.activeTransport === "relay") {
-      this.socket.send(JSON.stringify({ type: "relay.message", connectionId: this.connectionId, payload } satisfies RelayMessage));
-    } else {
-      this.socket.send(payload);
-    }
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) throw new Error("The desktop is not connected.");
+    this.socket.send(payload);
+  }
+
+  private forceSocketClose(): void {
+    if (this.socket?.readyState === WebSocket.OPEN) this.socket.close();
   }
 
   private abortSocket(): void {
+    this.socketGeneration += 1;
     const socket = this.socket;
     this.socket = undefined;
-    this.intentionalClose = true;
+    this.authenticated = false;
+    this.stopHeartbeat();
     socket?.close();
     this.rejectAll(new Error("Connection attempt was replaced."));
   }
+}
+
+function defaultRemoteEndpoint(hostId: string): string {
+  return `ws://${hostId}.${OVERLAY_TAILNET_DOMAIN}:47831`;
 }

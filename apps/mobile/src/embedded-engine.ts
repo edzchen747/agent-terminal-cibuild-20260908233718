@@ -28,12 +28,13 @@ const NativeEmbeddedNode = registerPlugin<EmbeddedNodePlugin>("EmbeddedNode");
 /**
  * Keeps the mobile node identity independent from the WebView lifecycle.
  * Native builds may provide the process-isolated engine plugin; browser
- * builds still retain the identity and use the relay transport.
+ * builds still retain the identity and report that an embedded node is
+ * required for off-LAN connections.
  */
 export class EmbeddedNodeEngine {
   private state?: EmbeddedNodeState;
 
-  async start(controlUrl: string = OVERLAY_CONTROL_URL, remoteEndpoint?: string, transport: "relay" | "direct" | "overlay" = "overlay", authKey?: string): Promise<EmbeddedNodeState> {
+  async start(controlUrl: string = OVERLAY_CONTROL_URL, remoteEndpoint?: string, transport: "direct" | "overlay" = "overlay", authKey?: string): Promise<EmbeddedNodeState> {
     const current = await this.load();
     const state: EmbeddedNodeState = {
       ...current,
@@ -57,8 +58,8 @@ export class EmbeddedNodeEngine {
         state.proxyEndpoint = result.endpoint ?? state.proxyEndpoint;
         state.engineStarted = Boolean(result.endpoint);
       } catch {
-        // The app can still use the configured relay if the optional native
-        // engine is not present in a development build.
+        // Keep the persisted identity; the caller reports that the native
+        // engine is unavailable instead of silently using a second transport.
       }
     }
 

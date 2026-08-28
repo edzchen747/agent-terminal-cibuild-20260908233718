@@ -22,7 +22,6 @@ use crate::{
 pub struct StoredHost {
     pub id: String,
     pub name: String,
-    pub relay_token: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,7 +43,7 @@ pub struct Settings {
 #[serde(rename_all = "camelCase")]
 pub struct NetworkState {
     /// The node's long-lived private identity key. It is never sent to the
-    /// relay; the embedded engine consumes it from the local state store.
+    /// network; the embedded engine consumes its local state directory.
     #[serde(default)]
     pub private_key: Option<String>,
     #[serde(default)]
@@ -206,7 +205,6 @@ fn default_state() -> StoredState {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned(),
-            relay_token: random_token(32),
         },
         network: NetworkState::default(),
         projects: Vec::new(),

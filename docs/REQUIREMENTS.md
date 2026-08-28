@@ -5,7 +5,7 @@
 - The Windows desktop runtime uses Tauri 2 with a Rust authority process; Electron, Electron Builder, Node PTY, and a Node desktop WebSocket process are not shipped.
 - The desktop web UI, Rust backend, ConPTY integration, connection host, and tray behavior compile into one portable `agent-terminal.exe` with no installation step or sidecar process.
 - The portable executable uses the WebView2 runtime provided by supported Windows 10 and Windows 11 systems.
-- The Tauri process creates a system-tray icon and remains the sole owner of terminal sessions, pairing, direct WebSockets, relay connections, authorization, and desktop state independently of terminal-window lifetimes.
+- The Tauri process creates a system-tray icon and remains the sole owner of terminal sessions, pairing, direct/overlay WebSockets, authorization, and desktop state independently of terminal-window lifetimes.
 - Only one desktop host process may run at a time. Launching the executable again focuses the existing terminal window so every QR grant is issued by the process that owns the connection port.
 - Every terminal window is a disposable client of the tray host. It explicitly attaches to visible sessions, receives an atomic scrollback-plus-live-output stream, and sends all terminal input and resize operations back to the tray authority.
 - Left-clicking the tray icon opens or restores the terminal application.
@@ -26,13 +26,11 @@
 
 - After pairing, a phone can reconnect when the desktop and phone are on different Wi-Fi networks, mobile data, or behind separate NAT/firewall boundaries.
 - Neither endpoint requires an inbound port-forwarding rule.
-- The desktop and phone each make outbound connections to the configured relay or their process-isolated Headscale node.
-- The relay routes an authenticated phone connection to the paired desktop host ID and does not own project or terminal state.
-- The relay must use wss:// in a production deployment.
+- The desktop and phone each use their process-isolated Headscale node for cross-network connections.
 - The default control plane is `https://node.hopto.org`; Headscale's embedded DERP/STUN service coordinates process-isolated nodes for direct NAT traversal and encrypted relay fallback.
 - The first QR pairing uses the desktop's LAN endpoint only. On reconnect, mobile gives the saved LAN endpoint a 1.5-second timeout, then starts the embedded node and uses the saved remote endpoint.
 - Desktop and mobile persist their embedded-node private key and network state across restarts. Node keys have no age expiry; the deployment reaper expires nodes after 30 days of inactivity.
-- Direct LAN WebSocket is used for first pairing and remains available as a trusted-network fallback.
+- Direct LAN WebSocket is used for first pairing and remains available as a trusted-network fast path.
 - The desktop QR modal and mobile onboarding must describe pairing as a one-time device binding, not a one-time reconnect code.
 - Pairing UI must not label the QR as a one-time code or present its setup-grant expiry as the lifetime of the device pairing.
 - The confirmation language must state that the phone remains authorized until explicitly revoked.
@@ -59,7 +57,7 @@
 - Mobile accessibility keys form animated three-second chords; mobile keyboard input consumes armed modifiers immediately.
 - The mobile terminal supports native long-press and double-tap text selection with draggable Android selection handles, while terminal taps move the shell input cursor without overriding alternate-screen TUI mouse handling.
 - The mobile terminal scrollbar uses a forgiving touch target while retaining a slim visual thumb.
-- Android keeps the existing paired terminal connection alive in a remote-messaging foreground service while the app is backgrounded, with a non-dismissible ongoing notification and explicit Disconnect action; returning to the app does not trigger a reconnect.
+- Android keeps the existing paired terminal connection alive in a remote-messaging foreground service while the app is backgrounded, with a non-dismissible ongoing notification and explicit Disconnect action. The mobile client sends application heartbeats, reconnects after a dropped path with backoff, and retries promptly after network/app resume; the notification reports reconnecting until authentication succeeds again.
 - The mobile utility row places Esc before Ctrl and does not duplicate the software keyboard's Backspace key; an armed Ctrl converts software-keyboard Backspace into a previous-word erase.
 - Desktop Ctrl+C copies when terminal text is selected; with no selection it must continue to send the shell interrupt signal.
 - A successful selection copy displays a brief toast positioned above the selected terminal text.

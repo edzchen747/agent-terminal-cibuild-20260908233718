@@ -31,24 +31,11 @@ services:
       - "3478:3478/udp"
     restart: unless-stopped
 
-  relay:
-    build:
-      context: ../..
-      dockerfile: apps/relay/Dockerfile
-    environment:
-      PORT: "8787"
-      RELAY_SHARED_SECRET: ${RELAY_SHARED_SECRET:?Set RELAY_SHARED_SECRET in .env}
-    expose:
-      - "8787"
-    restart: unless-stopped
-
-  # Public TLS termination. /relay is the Agent Terminal message relay;
-  # /health checks the relay and everything else is sent to Headscale.
+  # Public TLS termination for Headscale control, DERP, and STUN bootstrap.
   caddy:
     image: caddy:2.10-alpine
     depends_on:
       - headscale
-      - relay
     environment:
       NODE_DOMAIN: ${NODE_DOMAIN:-node.hopto.org}
       CADDY_EMAIL: ${CADDY_EMAIL:-}

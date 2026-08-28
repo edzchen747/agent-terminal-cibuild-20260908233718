@@ -38,8 +38,12 @@ public class ConnectionNotificationPlugin extends Plugin {
         Intent intent = new Intent(getContext(), ConnectionNotificationService.class)
             .setAction(ConnectionNotificationService.ACTION_START)
             .putExtra(ConnectionNotificationService.EXTRA_HOST_NAME, hostName);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ContextCompat.startForegroundService(getContext(), intent);
-        else getContext().startService(intent);
+        try {
+            startService(intent);
+        } catch (RuntimeException error) {
+            call.reject("Could not start the connection service.", error);
+            return;
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             getActivity().checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
@@ -49,9 +53,36 @@ public class ConnectionNotificationPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void update(PluginCall call) {
+        String hostName = call.getString("hostName", "Agent Terminal");
+        String state = call.getString("state", ConnectionNotificationService.STATE_RECONNECTING);
+        if (!ConnectionNotificationService.STATE_CONNECTED.equals(state) &&
+            !ConnectionNotificationService.STATE_RECONNECTING.equals(state)) {
+            call.reject("The connection notification state is invalid.");
+            return;
+        }
+        Intent intent = new Intent(getContext(), ConnectionNotificationService.class)
+            .setAction(ConnectionNotificationService.ACTION_UPDATE)
+            .putExtra(ConnectionNotificationService.EXTRA_HOST_NAME, hostName)
+            .putExtra(ConnectionNotificationService.EXTRA_STATE, state);
+        try {
+            startService(intent);
+            call.resolve();
+        } catch (RuntimeException error) {
+            call.reject("Could not update the connection notification.", error);
+        }
+    }
+
+    @PluginMethod
     public void stop(PluginCall call) {
         getContext().stopService(new Intent(getContext(), ConnectionNotificationService.class));
+        ConnectionNotificationService.clearStoredState(getContext());
         call.resolve();
+    }
+
+    private void startService(Intent intent) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ContextCompat.startForegroundService(getContext(), intent);
+        else getContext().startService(intent);
     }
 
     @Override

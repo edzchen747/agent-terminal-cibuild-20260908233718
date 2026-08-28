@@ -1,15 +1,12 @@
-# Agent Terminal Headscale + relay
+# Agent Terminal Headscale deployment
 
 This directory is the public deployment bundle for `node.hopto.org`. It runs
-two separate services behind one HTTPS hostname:
+Headscale and its embedded DERP server behind one HTTPS hostname:
 
 - Headscale is the control plane for the embedded desktop/mobile nodes. Its
   embedded DERP server provides encrypted relay fallback and UDP/3478 STUN for
   NAT discovery; direct node-to-node paths are selected by the node engine
   when ICE/NAT probing succeeds.
-- Agent Terminal's small WebSocket relay is exposed at `/relay`. It remains a
-  protocol-level fallback while a node is registering or when a release does
-  not include the native node engine.
 
 The QR flow is intentionally LAN-only. The desktop publishes its local
 WebSocket endpoint in the QR payload, and the phone must reach that endpoint
@@ -21,8 +18,8 @@ credential and node identity; it does not need another QR scan.
 1. Point an A/AAAA record for `node.hopto.org` (or your chosen
    `NODE_DOMAIN`) at the server. Open TCP 80 and 443 and UDP 3478 in the
    firewall.
-2. Copy `.env.example` to `.env` and set `RELAY_SHARED_SECRET`, the public
-   address, and a private `HEADSCALE_API_KEY` after the first start. No source
+2. Copy `.env.example` to `.env` and set the public address and a private
+   `HEADSCALE_API_KEY` after the first start. No source
    file needs editing.
 3. Start the stack:
 
@@ -66,16 +63,13 @@ job intentionally does nothing.
 The stock desktop and mobile builds use `https://node.hopto.org` as the
 control-plane default and the Headscale name
 `ws://<desktop-host-id>.agent-terminal.internal:47831` as the remote endpoint.
-`wss://node.hopto.org/relay` is used as a compatibility fallback. Self-hosted
-values are supplied through the native build/runtime settings:
+Self-hosted values are supplied through the native build/runtime settings:
 
 ```text
 AGENT_TERMINAL_CONTROL_URL=https://your-domain.example
-AGENT_TERMINAL_RELAY_URL=wss://your-domain.example/relay
-AGENT_TERMINAL_REMOTE_ENDPOINT=wss://your-domain.example/relay
-AGENT_TERMINAL_REMOTE_TRANSPORT=relay
+AGENT_TERMINAL_REMOTE_ENDPOINT=ws://desktop-host-id.agent-terminal.internal:47831
+AGENT_TERMINAL_REMOTE_TRANSPORT=overlay
 AGENT_TERMINAL_TAILNET_DOMAIN=agent-terminal.internal
-AGENT_TERMINAL_RELAY_SECRET=<same value as RELAY_SHARED_SECRET>
 ```
 
 Release packages must contain the signed process-isolated `embedded-node`
@@ -88,7 +82,7 @@ directory.
 ## Operations
 
 ```sh
-docker compose logs -f headscale relay caddy node-reaper
+docker compose logs -f headscale caddy node-reaper
 docker compose exec headscale headscale nodes list
 docker compose exec headscale headscale configtest
 ```

@@ -1,31 +1,24 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use tauri::async_runtime;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc,
-    time::sleep,
 };
-use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
+use tokio_tungstenite::{accept_async, tungstenite::Message};
 use uuid::Uuid;
 
-use crate::{core::Core, embedded_node, models::RelayMessage};
+use crate::{core::Core, embedded_node};
 
 pub fn start(core: Arc<Core>) {
-    // Start the overlay node in its own process. The ordinary relay remains
-    // available as a transport fallback when a release does not ship an
-    // engine binary or when the node is still registering with Headscale.
+    // Start the overlay node in its own process. Headscale's embedded DERP
+    // service is the encrypted fallback when a direct NAT path is unavailable.
     embedded_node::start(&core);
     let direct_core = Arc::clone(&core);
     async_runtime::spawn(async move {
         run_direct_server(direct_core).await;
     });
-    if let Some(endpoint) = core.relay_endpoint() {
-        async_runtime::spawn(async move {
-            run_relay(core, endpoint).await;
-        });
-    }
 }
 
 async fn run_direct_server(core: Arc<Core>) {
@@ -89,50 +82,4 @@ async fn handle_direct_client(core: Arc<Core>, stream: TcpStream) {
         }
     }
     core.remove_client(&id);
-}
-
-async fn run_relay(core: Arc<Core>, endpoint: String) {
-    loop {
-        let socket = match connect_async(&endpoint).await {
-            Ok((socket, _)) => socket,
-            Err(error) => {
-                eprintln!("Agent Terminal relay connection failed: {error}");
-                sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-        };
-        let (mut writer, mut reader) = socket.split();
-        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<RelayMessage>();
-        core.set_relay_sender(Some(outgoing_tx.clone()));
-        let (host_id, host_token) = core.relay_identity();
-        let _ = outgoing_tx.send(RelayMessage::Register {
-            host_id,
-            host_token,
-        });
-
-        loop {
-            tokio::select! {
-                Some(message) = outgoing_rx.recv() => {
-                    let Ok(payload) = serde_json::to_string(&message) else { continue; };
-                    if writer.send(Message::Text(payload.into())).await.is_err() { break; }
-                }
-                incoming = reader.next() => {
-                    let Some(Ok(Message::Text(payload))) = incoming else { break; };
-                    let Ok(message) = serde_json::from_str::<RelayMessage>(payload.as_ref()) else { continue; };
-                    match message {
-                        RelayMessage::Message { connection_id, payload } => {
-                            core.ensure_relay_client(&connection_id);
-                            core.handle_client_raw(&connection_id, &payload);
-                        }
-                        RelayMessage::Disconnect { connection_id } => core.remove_client(&connection_id),
-                        RelayMessage::Error { message } => eprintln!("Agent Terminal relay error: {message}"),
-                        _ => {}
-                    }
-                }
-            }
-        }
-        core.set_relay_sender(None);
-        core.clear_relay_clients();
-        sleep(Duration::from_secs(5)).await;
-    }
 }

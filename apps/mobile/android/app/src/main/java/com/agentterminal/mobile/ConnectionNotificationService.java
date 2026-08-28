@@ -5,20 +5,30 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.IBinder;
 
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.ServiceCompat;
+import androidx.core.content.ContextCompat;
 
 public class ConnectionNotificationService extends Service {
     public static final String ACTION_START = "com.agentterminal.mobile.START_CONNECTION_NOTIFICATION";
+    public static final String ACTION_UPDATE = "com.agentterminal.mobile.UPDATE_CONNECTION_NOTIFICATION";
     public static final String ACTION_DISCONNECT = "com.agentterminal.mobile.DISCONNECT_CONNECTION";
     public static final String EXTRA_HOST_NAME = "hostName";
+    public static final String EXTRA_STATE = "state";
+    public static final String STATE_CONNECTED = "connected";
+    public static final String STATE_RECONNECTING = "reconnecting";
     private static final String CHANNEL_ID = "agent-terminal-connection";
     private static final int NOTIFICATION_ID = 9001;
+    private static final String PREFS = "connection-notification";
+    private static final String PREF_HOST_NAME = "hostName";
+    private static final String PREF_STATE = "state";
 
     @Override
     public void onCreate() {
@@ -33,13 +43,28 @@ public class ConnectionNotificationService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_DISCONNECT.equals(intent.getAction())) {
             sendBroadcast(new Intent(ConnectionNotificationPlugin.ACTION_DISCONNECT_REQUESTED).setPackage(getPackageName()));
+            clearStoredState(this);
             stopForeground(true);
             stopSelf();
             return START_NOT_STICKY;
         }
 
-        String hostName = intent == null ? "Agent Terminal" : intent.getStringExtra(EXTRA_HOST_NAME);
+        SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
+        boolean restoredAfterProcessDeath = intent == null;
+        String hostName = intent == null ? preferences.getString(PREF_HOST_NAME, null) : intent.getStringExtra(EXTRA_HOST_NAME);
+        if (restoredAfterProcessDeath && (hostName == null || hostName.trim().isEmpty())) {
+            stopSelf();
+            return START_NOT_STICKY;
+        }
         if (hostName == null || hostName.trim().isEmpty()) hostName = "Agent Terminal";
+        String state = intent == null ? preferences.getString(PREF_STATE, STATE_RECONNECTING) : intent.getStringExtra(EXTRA_STATE);
+        if (!STATE_CONNECTED.equals(state) && !STATE_RECONNECTING.equals(state)) state = STATE_CONNECTED;
+        // A sticky service restart means the WebView and its socket may have
+        // died with the old process. Never recreate a notification claiming
+        // that the desktop is connected until the WebView authenticates again.
+        if (restoredAfterProcessDeath) state = STATE_RECONNECTING;
+        preferences.edit().putString(PREF_HOST_NAME, hostName).putString(PREF_STATE, state).apply();
+
         Intent openIntent = new Intent(this, MainActivity.class)
             .setAction(Intent.ACTION_MAIN)
             .addCategory(Intent.CATEGORY_LAUNCHER)
@@ -50,7 +75,7 @@ public class ConnectionNotificationService extends Service {
         Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_terminal)
             .setContentTitle("Agent Terminal")
-            .setContentText("Connected to " + hostName)
+            .setContentText(notificationText(hostName, state))
             .setContentIntent(openPendingIntent)
             .setOngoing(true)
             .setAutoCancel(false)
@@ -67,6 +92,33 @@ public class ConnectionNotificationService extends Service {
             startForeground(NOTIFICATION_ID, notification);
         }
         return START_STICKY;
+    }
+
+    public static void markReconnecting(Context context) {
+        SharedPreferences preferences = context.getSharedPreferences(PREFS, MODE_PRIVATE);
+        String hostName = preferences.getString(PREF_HOST_NAME, null);
+        if (hostName == null || hostName.trim().isEmpty()) return;
+        Intent intent = new Intent(context, ConnectionNotificationService.class)
+            .setAction(ACTION_UPDATE)
+            .putExtra(EXTRA_HOST_NAME, hostName)
+            .putExtra(EXTRA_STATE, STATE_RECONNECTING);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ContextCompat.startForegroundService(context, intent);
+            else context.startService(intent);
+        } catch (RuntimeException ignored) {
+            // The Activity may be in the middle of being recreated. The next
+            // successful WebView connection will update the notification.
+        }
+    }
+
+    public static void clearStoredState(Context context) {
+        context.getSharedPreferences(PREFS, MODE_PRIVATE).edit().clear().apply();
+    }
+
+    private static String notificationText(String hostName, String state) {
+        return STATE_RECONNECTING.equals(state)
+            ? "Reconnecting to " + hostName + "…"
+            : "Connected to " + hostName;
     }
 
     @Override

@@ -16,6 +16,7 @@ import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, FolderIcon, 
 import { MobileTerminal } from "./MobileTerminal";
 
 type View = { type: "home" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
+type ConnectionNotificationState = "connected" | "reconnecting";
 
 export function App() {
   const [connection, setConnection] = useState<HostConnection | null>(null);
@@ -53,6 +54,7 @@ export function App() {
         setView({ type: "home" });
         return;
       }
+      void stopConnectionNotification();
       void CapacitorApp.exitApp();
     });
     return () => { void listener.then((handle) => handle.remove()); };
@@ -79,31 +81,74 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    const listener = CapacitorApp.addListener("appStateChange", ({ isActive }) => {
+      if (isActive) connectionRef.current?.retryNow();
+    });
+    const handleOnline = () => connectionRef.current?.retryNow();
+    window.addEventListener("online", handleOnline);
+    return () => {
+      void listener.then((handle) => handle.remove());
+      window.removeEventListener("online", handleOnline);
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
     let current: HostConnection | null = null;
     void HostConnection.saved().then(async (host) => {
+      if (disposed) return;
       if (!host) { setStatus("pairing"); return; }
       setStatus("connecting");
       current = new HostConnection(host);
+      current.startAutoReconnect();
+      setConnection(current);
+      void updateConnectionNotification(current.host.name, "reconnecting");
       try {
         const nextSnapshot = await current.connect();
+        if (disposed) return;
         setSnapshot(nextSnapshot);
-        setConnection(current);
         await startConnectionNotification(current.host.name);
         setStatus("connected");
       } catch (cause) {
-        await stopConnectionNotification();
-        setError(cause instanceof Error ? cause.message : "Could not connect to the saved desktop.");
-        setStatus("error");
+        if (disposed) return;
+        if (isAuthorizationError(cause)) {
+          current.stopAutoReconnect();
+          await stopConnectionNotification();
+          setError(cause instanceof Error ? cause.message : "Could not connect to the saved desktop.");
+          setStatus("error");
+          return;
+        }
+        void updateConnectionNotification(current.host.name, "reconnecting");
+        setError("The desktop connection could not be opened. Retrying…");
+        setStatus("connecting");
       }
     });
-    return () => current?.close();
+    return () => {
+      disposed = true;
+      current?.close();
+    };
   }, []);
 
   useEffect(() => {
     if (!connection) return;
     const offSnapshot = connection.on("snapshot", setSnapshot);
-    const offDisconnect = connection.on("disconnected", () => { setError("The desktop connection was lost."); setStatus("error"); });
-    return () => { offSnapshot(); offDisconnect(); };
+    const offConnected = connection.on("connected", (nextSnapshot) => {
+      setSnapshot(nextSnapshot);
+      setError("");
+      setStatus("connected");
+      void startConnectionNotification(connection.host.name);
+    });
+    const offReconnecting = connection.on("reconnecting", ({ attempt }) => {
+      setError(attempt === 1 ? "The desktop connection was lost. Reconnecting…" : "Still trying to reach the desktop…");
+      setStatus("connecting");
+      void updateConnectionNotification(connection.host.name, "reconnecting");
+    });
+    const offDisconnect = connection.on("disconnected", () => {
+      setError("The desktop connection was lost. Reconnecting…");
+      setStatus("connecting");
+      void updateConnectionNotification(connection.host.name, "reconnecting");
+    });
+    return () => { offSnapshot(); offConnected(); offReconnecting(); offDisconnect(); };
   }, [connection]);
 
   async function pair(raw: string) {
@@ -113,6 +158,7 @@ export function App() {
       const platform = (Capacitor.getPlatform() === "ios" ? "ios" : Capacitor.getPlatform() === "android" ? "android" : "web") as Platform;
       const next = await HostConnection.pair(payload, { id: crypto.randomUUID(), name: mobileName(), platform });
       connection?.close();
+      next.startAutoReconnect();
       setConnection(next); setSnapshot(next.snapshot ?? null); setStatus("connected"); setView({ type: "home" });
       await startConnectionNotification(next.host.name);
     } catch (cause) {
@@ -156,7 +202,7 @@ export function App() {
     setView({ type: "project", projectId: session.projectId });
   }
 
-  if (status === "loading" || status === "connecting") return <Splash label={status === "loading" ? "Opening Agent Terminal" : "Connecting to desktop"} />;
+  if (status === "loading" || status === "connecting") return <Splash label={status === "loading" ? "Opening Agent Terminal" : error || "Connecting to desktop"} />;
   if (status === "pairing") return <PairScreen error={error} manualCode={manualCode} showManual={showManual} onManualCode={setManualCode} onShowManual={() => setShowManual(true)} onScan={() => void scan()} onPair={() => void pair(manualCode)} />;
   if (status === "error") return <ErrorScreen message={error} onRetry={() => window.location.reload()} onForget={() => void forgetHost()} />;
   if (!connection || !snapshot) return null;
@@ -196,9 +242,18 @@ async function startConnectionNotification(hostName: string) {
   try { await ConnectionNotification.start({ hostName }); } catch { /* The connection still works if notifications are denied. */ }
 }
 
+async function updateConnectionNotification(hostName: string, state: ConnectionNotificationState) {
+  if (Capacitor.getPlatform() !== "android") return;
+  try { await ConnectionNotification.update({ hostName, state }); } catch { /* The service may be unavailable while Android recreates the app process. */ }
+}
+
 async function stopConnectionNotification() {
   if (Capacitor.getPlatform() !== "android") return;
   try { await ConnectionNotification.stop(); } catch { /* Native plugin is unavailable on non-release web shells. */ }
+}
+
+function isAuthorizationError(cause: unknown): boolean {
+  return cause instanceof Error && /not authorized|no longer authorized/i.test(cause.message);
 }
 
 function ProjectScreen({ project, snapshot, connection, onBack, onOpen }: { project: Project; snapshot: HostSnapshot; connection: HostConnection; onBack: () => void; onOpen: (session: TerminalSession) => void }) {

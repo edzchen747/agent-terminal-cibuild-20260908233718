@@ -8,7 +8,7 @@ Android / future iOS client
         ▼
 Headscale at node.hopto.org
         ├── STUN/ICE-assisted direct path
-        └── embedded DERP / Agent Terminal relay fallback
+        └── embedded DERP encrypted fallback
                  │
                  │ outbound encrypted node path
         ▼
@@ -16,7 +16,7 @@ Tauri 2 Rust process (desktop and tray authority)
         ├── pairing and device authorization
         ├── project/device JSON persistence
         ├── project-window and session-tab routing
-        ├── direct, overlay, and relay connection host
+        ├── direct and overlay connection host
         ├── native system tray
         └── portable-pty / Windows ConPTY session manager
                  │
@@ -27,13 +27,13 @@ Tauri WebView2 windows
         └── React + xterm.js views over allowlisted Tauri commands/events
 ```
 
-The QR payload always uses the desktop's direct LAN WebSocket for the first pairing. It also carries the remote endpoint and `https://node.hopto.org` control-plane address for later launches. On reconnect, mobile gives the saved LAN endpoint a 1.5-second probe; a successful probe uses the standard direct WebSocket. A failed probe starts the process-isolated embedded node and opens the saved tailnet endpoint. The stock endpoint is the desktop's Headscale DNS name on `agent-terminal.internal`; `wss://node.hopto.org/relay` remains the compatibility fallback.
+The QR payload always uses the desktop's direct LAN WebSocket for the first pairing. It also carries the remote endpoint and `https://node.hopto.org` control-plane address for later launches. On reconnect, mobile gives the saved LAN endpoint a 1.5-second probe; a successful probe uses the standard direct WebSocket. A failed probe starts the process-isolated embedded node and opens the saved tailnet endpoint. The live client sends application heartbeats and retries with backoff after a path loss, re-running the LAN probe before falling back to the overlay path. The stock endpoint is the desktop's Headscale DNS name on `agent-terminal.internal`; Headscale's embedded DERP handles encrypted fallback when direct NAT traversal is unavailable.
 
-The relay matches the desktop's host ID to the phone's temporary connection ID and forwards opaque protocol payloads. It has no project, device, or terminal state. Headscale is a separate control plane in `server/relay`; its embedded DERP server supplies encrypted fallback relaying and UDP/3478 STUN-assisted NAT discovery.
+Headscale is the control plane in `server/relay`; its embedded DERP server supplies encrypted fallback relaying and UDP/3478 STUN-assisted NAT discovery. No application-level relay service is required.
 
 The desktop is single-instance. A second launch delegates focus to the existing tray host and exits before starting another runtime. In direct mode, the desktop refuses to issue a QR unless its process successfully owns the configured WebSocket port.
 
-The Rust tray process is the only authority. Tauri webviews and mobile clients request operations; they never access the file system or spawn processes directly. Terminal windows are disposable clients: closing every window does not disconnect paired phones or terminate PTYs, and the tray can create a fresh client later.
+The Rust tray process is the only authority. Tauri webviews and mobile clients request operations; they never access the file system or spawn processes directly. Terminal windows are disposable clients: closing every window does not disconnect paired phones or terminate PTYs, and the tray can create a fresh client later. Android's foreground service owns the user-visible connection status while the WebView owns the protocol client; the two are updated together, and a restarted service never claims the socket is connected until the WebView authenticates again.
 
 ## State ownership
 
@@ -69,9 +69,7 @@ Temporary projects are derived from live desktop sessions. They disappear when t
 3. The phone submits its generated device ID, display name, platform, and token.
 4. The desktop consumes the grant once and returns a 256-bit device credential.
 5. The phone stores the host record. The desktop stores only a SHA-256 hash of the credential.
-6. Later connections authenticate with the device ID and credential through the LAN endpoint when available, otherwise through the embedded node/remote relay. No new QR scan is needed. Revocation removes the hash and disconnects active sockets for that device.
-
-The relay connection is deliberately separate from authorization: the relay routes by host ID, while the desktop remains the authority that accepts or rejects the device credential.
+6. Later connections authenticate with the device ID and credential through the LAN endpoint when available, otherwise through the embedded node. No new QR scan is needed. Revocation removes the hash and disconnects active sockets for that device.
 
 ## Protocol
 

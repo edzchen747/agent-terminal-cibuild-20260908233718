@@ -12,17 +12,20 @@ import java.io.InputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import org.json.JSONObject;
 
 /**
  * Process-isolated bridge for the signed embedded node shipped in a release.
  * Development APKs can omit the optional executable; the web layer then uses
- * the configured relay after retaining the same node identity.
+ * the embedded node is unavailable after retaining the same node identity.
  */
 @CapacitorPlugin(name = "EmbeddedNode")
 public class EmbeddedNodePlugin extends Plugin {
     private Process nodeProcess;
+    private final ExecutorService processWatcher = Executors.newSingleThreadExecutor();
 
     @PluginMethod
     public synchronized void start(PluginCall call) {
@@ -67,6 +70,7 @@ public class EmbeddedNodePlugin extends Plugin {
             }
             builder.redirectError(ProcessBuilder.Redirect.appendTo(new File(getContext().getFilesDir(), "embedded-node.log")));
             nodeProcess = builder.start();
+            watchProcess(nodeProcess);
             call.resolve(readStatus(stateDir, nodeId));
         } catch (Exception error) {
             call.reject("Could not start the embedded node engine.", error);
@@ -80,6 +84,29 @@ public class EmbeddedNodePlugin extends Plugin {
             nodeProcess = null;
         }
         call.resolve();
+    }
+
+    private void watchProcess(Process process) {
+        processWatcher.execute(() -> {
+            try {
+                process.waitFor();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            synchronized (EmbeddedNodePlugin.this) {
+                if (nodeProcess == process) nodeProcess = null;
+            }
+        });
+    }
+
+    @Override
+    protected synchronized void handleOnDestroy() {
+        if (nodeProcess != null) {
+            nodeProcess.destroy();
+            nodeProcess = null;
+        }
+        processWatcher.shutdownNow();
+        super.handleOnDestroy();
     }
 
     private File installBundledExecutable() {

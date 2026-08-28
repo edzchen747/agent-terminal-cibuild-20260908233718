@@ -1,9 +1,5 @@
 {$NODE_DOMAIN} {
     encode gzip
 
-    @agentRelay path /relay /relay/*
-    @relayHealth path /health
-    reverse_proxy @agentRelay relay:8787
-    reverse_proxy @relayHealth relay:8787
     reverse_proxy headscale:8080
 }

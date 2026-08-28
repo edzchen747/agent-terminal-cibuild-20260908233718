@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_RELAY_URL, PROTOCOL_VERSION, applyTerminalModifiers, encodeMessage, parsePairingPayload, parseTerminalWorkingDirectories } from "./index.js";
+import { LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, PROTOCOL_VERSION, applyTerminalModifiers, encodeMessage, parsePairingPayload, parseTerminalWorkingDirectories } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -17,7 +17,6 @@ test("pairing payloads round-trip", () => {
 test("network defaults keep pairing local and remote control configurable", () => {
   assert.equal(LAN_CONNECT_TIMEOUT_MS, 1_500);
   assert.equal(OVERLAY_CONTROL_URL, "https://node.hopto.org");
-  assert.equal(OVERLAY_RELAY_URL, "wss://node.hopto.org/relay");
   const payload = parsePairingPayload(JSON.stringify({
     version: PROTOCOL_VERSION,
     hostId: "host-1",

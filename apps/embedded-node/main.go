@@ -92,15 +92,26 @@ func serve(listener net.Listener, dial func() (net.Conn, error)) {
 		}
 		go func(in net.Conn) {
 			defer in.Close()
+			setKeepAlive(in)
 			outgoing, err := dial()
 			if err != nil {
 				return
 			}
 			defer outgoing.Close()
+			setKeepAlive(outgoing)
 			go io.Copy(outgoing, in)
 			_, _ = io.Copy(in, outgoing)
 		}(incoming)
 	}
+}
+
+func setKeepAlive(conn net.Conn) {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcp.SetKeepAlive(true)
+	_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 }
 
 func writeStatus(stateDir string, value status) {

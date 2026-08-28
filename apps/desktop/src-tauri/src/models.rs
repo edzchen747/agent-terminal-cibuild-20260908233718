@@ -88,7 +88,7 @@ pub struct PairingPayload {
     pub host_id: String,
     pub host_name: String,
     /// The QR is intentionally issued with a LAN endpoint. Pairing never
-    /// sends the one-time grant through the public relay.
+    /// sends the one-time grant through the public network.
     pub endpoint: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_endpoint: Option<String>,
@@ -235,31 +235,6 @@ pub enum ServerMessage {
         code: String,
         message: String,
     },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all_fields = "camelCase")]
-pub enum RelayMessage {
-    #[serde(rename = "relay.register")]
-    Register { host_id: String, host_token: String },
-    #[serde(rename = "relay.registered")]
-    Registered { host_id: String },
-    #[serde(rename = "relay.connect")]
-    Connect {
-        host_id: String,
-        connection_id: String,
-    },
-    #[serde(rename = "relay.connected")]
-    Connected { connection_id: String },
-    #[serde(rename = "relay.message")]
-    Message {
-        connection_id: String,
-        payload: String,
-    },
-    #[serde(rename = "relay.disconnect")]
-    Disconnect { connection_id: String },
-    #[serde(rename = "relay.error")]
-    Error { message: String },
 }
 
 #[cfg(test)]

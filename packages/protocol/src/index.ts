@@ -4,7 +4,6 @@ export const PROTOCOL_VERSION = 1 as const;
 // desktop and mobile clients use the same default. Deployments can override
 // it through their native app configuration/environment at build time.
 export const OVERLAY_CONTROL_URL = "https://node.hopto.org" as const;
-export const OVERLAY_RELAY_URL = "wss://node.hopto.org/relay" as const;
 export const OVERLAY_TAILNET_DOMAIN = "agent-terminal.internal" as const;
 export const LAN_CONNECT_TIMEOUT_MS = 1_500 as const;
 export const NODE_INACTIVITY_TIMEOUT_DAYS = 30 as const;
@@ -135,22 +134,13 @@ export interface PairingPayload {
   /** Endpoint used after the local probe fails. */
   remoteEndpoint?: string;
   controlUrl?: string;
-  transport?: "relay" | "direct" | "overlay";
-  remoteTransport?: "relay" | "direct" | "overlay";
+  transport?: "direct" | "overlay";
+  remoteTransport?: "direct" | "overlay";
   pairingToken: string;
   expiresAt: string;
   /** Optional first-enrollment key; never include a long-lived shared key. */
   nodeAuthKey?: string;
 }
-
-export type RelayMessage =
-  | { type: "relay.register"; hostId: string; hostToken: string }
-  | { type: "relay.registered"; hostId: string }
-  | { type: "relay.connect"; hostId: string; connectionId: string }
-  | { type: "relay.connected"; connectionId: string }
-  | { type: "relay.message"; connectionId: string; payload: string }
-  | { type: "relay.disconnect"; connectionId: string }
-  | { type: "relay.error"; message: string };
 
 export type ClientMessage =
   | { type: "pair"; requestId: string; token: string; device: DeviceIdentity }
