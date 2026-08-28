@@ -4,7 +4,7 @@ html, body, #root { width: 100%; min-width: 320px; height: 100%; margin: 0; over
 .mobile-pager { width: 100%; height: 100%; overflow: hidden; touch-action: pan-y; background: #07090d; }
 .mobile-page-track { width: 100%; height: 100%; display: flex; will-change: transform; transition: transform 280ms cubic-bezier(.22,.78,.2,1); }
 .mobile-page-track.is-dragging { transition: none; }
-.mobile-page { height: 100%; min-width: 0; flex: 0 0 100%; position: relative; overflow: hidden; background: #090c11; box-shadow: -12px 0 28px #0008; }
+.mobile-page { height: 100%; min-width: 0; flex: 0 0 100%; position: relative; overflow: hidden; touch-action: pan-y; background: #090c11; box-shadow: -12px 0 28px #0008; }
 button, input, textarea { font: inherit; }
 button { color: inherit; }
 .display-name { min-width: 0; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
@@ -23,13 +23,13 @@ button { color: inherit; }
 .home-header h1 { margin: 5px 0 7px; color: #f2f4f8; font-size: 27px; letter-spacing: -.04em; }
 .connection-label { display: flex; align-items: center; gap: 6px; color: #697383; font-size: 11px; }
 .connection-label i { width: 6px; height: 6px; border-radius: 50%; background: #64d487; box-shadow: 0 0 8px #64d48799; }
-.home-content { flex: 1; min-height: 0; padding: 21px 16px 100px; overflow-y: auto; }
+.home-content { flex: 1; min-height: 0; padding: 21px 16px 100px; overflow-y: auto; touch-action: pan-y; }
 .section-title { min-height: 35px; padding: 0 4px; display: flex; align-items: center; justify-content: space-between; color: #8891a0; font-size: 11px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
 .section-title > button { height: 31px; padding: 0 11px; border: 1px solid #29443e; border-radius: 9px; background: #15231f; color: #82dbc8; display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; letter-spacing: 0; text-transform: none; }
 .section-title > button svg { width: 14px; }
 .section-title small { padding: 2px 7px; border-radius: 9px; background: #1a1e26; color: #6c7482; font-size: 10px; }
 .project-cards { display: flex; flex-direction: column; gap: 10px; margin-top: 7px; }
-.project-card { position: relative; overflow: hidden; border: 1px solid #232934; border-radius: 14px; background: linear-gradient(150deg,#131820,#0f1319); box-shadow: 0 8px 28px #00000021; transition: transform 150ms cubic-bezier(.2,.8,.2,1), border-color 150ms ease; }
+.project-card { position: relative; overflow: hidden; touch-action: pan-y; border: 1px solid #232934; border-radius: 14px; background: linear-gradient(150deg,#131820,#0f1319); box-shadow: 0 8px 28px #00000021; transition: transform 150ms cubic-bezier(.2,.8,.2,1), border-color 150ms ease; }
 .project-card.is-dragging, .project-card.is-reordering { transition: none; }
 .project-card.is-dragging { z-index: 5; overflow: visible; border-color: #47786d; box-shadow: 0 14px 38px #000a; }
 .project-card-main { width: 100%; min-height: 77px; padding: 12px 10px 12px 13px; display: grid; grid-template-columns: 42px minmax(0,1fr) 18px 22px 16px; gap: 8px; align-items: center; text-align: left; border: 0; background: transparent; }
@@ -43,7 +43,7 @@ button { color: inherit; }
 .project-card-main > svg { width: 16px; color: #545d6c; }
 .mobile-project-drag { width: 22px; height: 38px; display: grid; place-items: center; color: #65707f; font-size: 17px; cursor: grab; touch-action: none; user-select: none; }
 .mobile-project-drag:active { color: #8de0ce; cursor: grabbing; }
-.card-sessions { min-height: 40px; padding: 6px 10px; display: flex; gap: 5px; align-items: center; border-top: 1px solid #222832; overflow-x: auto; }
+.card-sessions { min-height: 40px; padding: 6px 10px; display: flex; gap: 5px; align-items: center; border-top: 1px solid #222832; overflow-x: auto; touch-action: pan-y; }
 .card-sessions button { min-width: 0; flex: 0 0 auto; height: 29px; max-width: 125px; padding: 0 9px; display: flex; align-items: center; gap: 6px; overflow: hidden; border: 1px solid #29303b; border-radius: 7px; background: #161b23; color: #87909f; font-size: 10px; }
 .card-sessions button svg { width: 13px; flex: none; }
 .card-sessions button i { flex: none; }
@@ -76,7 +76,7 @@ button { color: inherit; }
 .terminal-settings-button { width: 32px; height: 32px; padding: 0; display: grid; place-items: center; border: 1px solid #2b3b3a; border-radius: 9px; background: #141d1d; color: #79bfb3; }
 .terminal-settings-button:active { background: #1c2b29; transform: scale(.96); }
 .terminal-settings-button svg { width: 16px; height: 16px; }
-.project-view { overflow-y: auto; }
+.project-view { overflow-y: auto; touch-action: pan-y; }
 .project-hero { padding: 26px 20px 22px; display: flex; flex-direction: column; align-items: center; border-bottom: 1px solid #1f242c; background: radial-gradient(circle at 50% 0,#172d2a,#0b0e13 55%); }
 .large-folder { width: 65px; height: 65px; display: grid; place-items: center; border: 1px solid #2b4b44; border-radius: 18px; color: #87dcc9; background: linear-gradient(145deg,#213832,#152420); box-shadow: 0 14px 45px #64c4b01c; }
 .large-folder svg { width: 34px; height: 34px; }
@@ -96,7 +96,7 @@ button { color: inherit; }
 .mobile-secondary svg { width: 15px; height: 15px; }
 .project-error { width: min(100%,390px); margin: 10px 0 0; text-align: left; }
 .session-section { padding: 17px 15px 35px; }
-.session-list { margin-top: 5px; overflow: hidden; border: 1px solid #232934; border-radius: 13px; }
+.session-list { margin-top: 5px; overflow: hidden; touch-action: pan-y; border: 1px solid #232934; border-radius: 13px; }
 .session-list button { width: 100%; min-height: 63px; padding: 8px 11px; display: grid; grid-template-columns: 37px minmax(0,1fr) 8px 18px; gap: 9px; align-items: center; border: 0; border-bottom: 1px solid #212630; background: #11151c; text-align: left; }
 .session-list button:last-child { border-bottom: 0; }
 .session-icon { width: 36px; height: 36px; display: grid; place-items: center; border-radius: 9px; background: #1b222b; color: #7f8999; }

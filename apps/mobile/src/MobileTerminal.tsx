@@ -4,6 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { applyTerminalModifiers, createRequestId } from "@agentterminal/protocol";
 import type { TerminalModifier, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
+import { classifyGestureAxis, type GestureAxis } from "./gesture";
 import { androidImeKeydownInput, claimNativeInput, nativeTerminalInput, shouldDeferToNativeInput } from "./terminalInput";
 import type { TimedTerminalInput } from "./terminalInput";
 import "@xterm/xterm/css/xterm.css";
@@ -285,6 +286,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     let touchStartY: number | undefined;
     let touchStartedAt = 0;
     let touchMoved = false;
+    let touchAxis: GestureAxis = "pending";
     let selectionGesture = false;
     let scrollbarGesture = false;
     let suppressTap = false;
@@ -303,6 +305,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       touchStartX = undefined;
       touchStartY = undefined;
       touchMoved = false;
+      touchAxis = "pending";
       selectionGesture = false;
       scrollbarGesture = false;
       suppressTap = false;
@@ -393,6 +396,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       touchStartY = touch.clientY;
       touchStartedAt = performance.now();
       touchMoved = false;
+      touchAxis = "pending";
       selectionGesture = terminal.hasSelection();
       scrollbarGesture = event.target instanceof Element && Boolean(event.target.closest(".scrollbar.vertical"));
       clearLongPressTimer();
@@ -416,19 +420,21 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       if (!touch) return;
       if (scrollbarGesture) return;
       const deltaX = touchStartX === undefined ? 0 : touch.clientX - touchStartX;
+      const totalDeltaY = touchStartY === undefined ? 0 : touch.clientY - touchStartY;
       const deltaY = touch.clientY - previousTouchY;
-      // Leave predominantly horizontal motion to the pager. Previously this
-      // handler prevented the native touch sequence for every move, which
-      // meant the pager could only see swipes that started above the terminal.
-      if (Math.abs(deltaX) > 7 && Math.abs(deltaX) > Math.abs(deltaY)) {
+      if (touchAxis === "pending") {
+        // Lock intent once using total movement. A small accumulated sideways
+        // drift must not turn a vertical terminal scroll into page navigation.
+        touchAxis = classifyGestureAxis(deltaX, totalDeltaY);
+      }
+      if (touchAxis !== "pending" && !touchMoved) {
         touchMoved = true;
         clearLongPressTimer();
+      }
+      if (touchAxis === "pending") return;
+      if (touchAxis === "horizontal") {
         previousTouchY = touch.clientY;
         return;
-      }
-      if (touchStartX !== undefined && touchStartY !== undefined && Math.hypot(deltaX, touch.clientY - touchStartY) > 7) {
-        touchMoved = true;
-        clearLongPressTimer();
       }
       if (selectionGesture || terminal.hasSelection()) return;
       previousTouchY = touch.clientY;

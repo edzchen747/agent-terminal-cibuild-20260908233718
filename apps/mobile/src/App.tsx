@@ -14,6 +14,7 @@ import type { DirectoryListing, HostSnapshot, PairingPayload, Platform, Project,
 import { createRequestId, MAX_PROJECT_NAME_LENGTH, parsePairingPayload } from "@agentterminal/protocol";
 import { HostConnection, type RemoteRegistrationState } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
+import { classifyGestureAxis } from "./gesture";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, SettingsIcon, TerminalIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
 
@@ -397,7 +398,7 @@ export function App() {
     // Session cards and terminal accessibility text are part of the swipeable
     // surface. Controls that would be unsafe to drag from (inputs, selectors,
     // utility buttons and scrollbars) opt out explicitly.
-    if (!event.isPrimary || event.pointerType === "mouse" || (event.target instanceof Element && event.target.closest("input,textarea,select,[data-no-swipe],.scrollbar"))) return;
+    if (swipeRef.current || event.pointerType === "mouse" || (event.target instanceof Element && event.target.closest("input,textarea,select,[data-no-swipe],.scrollbar"))) return;
     const next: SwipeState = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startedAt: performance.now(), deltaX: 0, horizontal: false };
     swipeRef.current = next;
     setSwipe(next);
@@ -405,16 +406,18 @@ export function App() {
   }
 
   function moveSwipe(event: ReactPointerEvent<HTMLDivElement>) {
-    if (!event.isPrimary) return;
     const current = swipeRef.current;
     if (!current || current.pointerId !== event.pointerId) return;
     const rawX = event.clientX - current.startX;
     const deltaY = event.clientY - current.startY;
-    if (!current.horizontal && Math.abs(rawX) < 7) return;
-    if (!current.horizontal && Math.abs(rawX) <= Math.abs(deltaY)) {
-      swipeRef.current = null;
-      setSwipe(null);
-      return;
+    if (!current.horizontal) {
+      const axis = classifyGestureAxis(rawX, deltaY);
+      if (axis === "pending") return;
+      if (axis === "vertical") {
+        swipeRef.current = null;
+        setSwipe(null);
+        return;
+      }
     }
     const hasTarget = rawX > 0 ? currentPage > 0 : currentPage < pageCount - 1;
     const deltaX = hasTarget ? rawX : rawX * .14;
@@ -426,7 +429,6 @@ export function App() {
   }
 
   function finishSwipe(event: ReactPointerEvent<HTMLDivElement>, cancelled = false) {
-    if (!event.isPrimary) return;
     const current = swipeRef.current;
     if (!current || current.pointerId !== event.pointerId) return;
     const velocity = Math.abs(current.deltaX) / Math.max(1, performance.now() - current.startedAt);
