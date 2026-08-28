@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"log"
@@ -60,6 +61,10 @@ func main() {
 		log.Fatal(err)
 	}
 	defer node.Close()
+	if err := waitForNode(node); err != nil {
+		writeFailure(*stateDir, *nodeID, err, false)
+		log.Fatal(err)
+	}
 
 	result := status{NodeID: *nodeID}
 	if ipv4, _ := node.TailscaleIPs(); ipv4.IsValid() {
@@ -92,6 +97,47 @@ func main() {
 	defer listener.Close()
 	writeStatus(*stateDir, result)
 	serve(listener, func() (net.Conn, error) { return net.DialTimeout("tcp", "127.0.0.1:"+*targetPort, 2*time.Second) })
+}
+
+// Start returns once the tsnet backend has been initialized, which is not the
+// same as being enrolled and connected. Waiting for the backend state here
+// prevents a mobile enrollment failure from being misreported as a remote
+// desktop connectivity failure.
+func waitForNode(node *tsnet.Server) error {
+	client, err := node.LocalClient()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	lastState := ""
+	for {
+		current, statusErr := client.Status(ctx)
+		if statusErr == nil {
+			lastState = current.BackendState
+			switch current.BackendState {
+			case "Running":
+				return nil
+			case "NeedsMachineAuth":
+				return errors.New("tsnet: backend needs machine auth")
+			case "Stopped":
+				return errors.New("tsnet: backend stopped")
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			if lastState == "NeedsLogin" {
+				if os.Getenv("AGENT_TERMINAL_NODE_AUTH_KEY") != "" {
+					return errors.New("tsnet: preauth authentication did not complete")
+				}
+				return errors.New("tsnet: backend needs login")
+			}
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 func waitForRemote(node *tsnet.Server, address string) error {
@@ -155,6 +201,9 @@ func isAuthFailure(text string) bool {
 		strings.Contains(text, "expired") ||
 		strings.Contains(text, "already been used") ||
 		strings.Contains(text, "authentication failed") ||
+		strings.Contains(text, "needs login") ||
+		strings.Contains(text, "needs machine auth") ||
+		strings.Contains(text, "preauth authentication") ||
 		strings.Contains(text, "access denied") ||
 		strings.Contains(text, "registration failed")
 }
