@@ -1,0 +1,64 @@
+name: Build Agent Terminal Desktop
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/desktop/**'
+      - 'packages/protocol/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.base.json'
+      - '.github/workflows/desktop.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/desktop/**'
+      - 'packages/protocol/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.base.json'
+      - '.github/workflows/desktop.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows portable executable and verification
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Build shared protocol
+        run: npm run build -w @agentterminal/protocol
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run protocol tests
+        run: npm run test
+
+      - name: Build portable Windows executable
+        run: npm run package:win -w @agentterminal/desktop
+
+      - name: Upload portable Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-terminal-windows-portable
+          path: apps/desktop/src-tauri/target/release/agent-terminal.exe
+          if-no-files-found: error
