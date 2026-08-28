@@ -90,13 +90,14 @@ button { color: inherit; }
 .terminal-view { background: #080b0f; }
 .mobile-terminal-shell { flex: 1; min-height: 0; display: grid; grid-template-rows: 1fr auto; }
 .mobile-terminal { min-height: 0; padding: 8px 0 4px 8px; overflow: hidden; }
+.mobile-terminal .xterm, .mobile-terminal .xterm-scrollable-element { width: 100%; min-width: 0; }
 .mobile-terminal .xterm { height: 100%; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
 .mobile-terminal .xterm-viewport, .mobile-terminal .xterm-screen { touch-action: none; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
 .mobile-terminal .xterm-viewport { overflow: hidden !important; }
 .mobile-terminal .xterm .xterm-accessibility:not(.debug) { pointer-events: auto; }
 .mobile-terminal .xterm .xterm-accessibility-tree { -webkit-user-select: text !important; user-select: text !important; -webkit-touch-callout: default; touch-action: auto; }
 .mobile-terminal .xterm-viewport, .mobile-terminal .xterm-scrollable-element > .scrollbar { -ms-overflow-style: none !important; scrollbar-width: none !important; scrollbar-color: transparent transparent !important; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
-.mobile-terminal .xterm-scrollable-element > .scrollbar.vertical { width: 28px !important; right: -20px !important; touch-action: none; border: 0 !important; background: #080b0f !important; background-image: none !important; isolation: isolate; }
+.mobile-terminal .xterm-scrollable-element > .scrollbar.vertical { width: 28px !important; right: 0 !important; touch-action: none; border: 0 !important; background: #080b0f !important; background-image: none !important; isolation: isolate; }
 .mobile-terminal .xterm-viewport::-webkit-scrollbar, .mobile-terminal .xterm-viewport::-webkit-scrollbar-track, .mobile-terminal .xterm-viewport::-webkit-scrollbar-thumb, .mobile-terminal .xterm-viewport::-webkit-scrollbar-corner { display: none !important; width: 0 !important; height: 0 !important; background: transparent !important; border: 0 !important; }
 .mobile-terminal .xterm-scrollable-element > .scrollbar::-webkit-scrollbar, .mobile-terminal .xterm-scrollable-element > .scrollbar::-webkit-scrollbar-track, .mobile-terminal .xterm-scrollable-element > .scrollbar::-webkit-scrollbar-thumb, .mobile-terminal .xterm-scrollable-element > .scrollbar::-webkit-scrollbar-corner { display: none !important; width: 0 !important; height: 0 !important; background: transparent !important; border: 0 !important; }
 .mobile-terminal .xterm-scrollable-element > .shadow { display: none !important; box-shadow: none !important; }
