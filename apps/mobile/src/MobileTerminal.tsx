@@ -415,12 +415,22 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       const touch = findTouch(event.touches, activeTouchId);
       if (!touch) return;
       if (scrollbarGesture) return;
-      if (touchStartX !== undefined && touchStartY !== undefined && Math.hypot(touch.clientX - touchStartX, touch.clientY - touchStartY) > 7) {
+      const deltaX = touchStartX === undefined ? 0 : touch.clientX - touchStartX;
+      const deltaY = touch.clientY - previousTouchY;
+      // Leave predominantly horizontal motion to the pager. Previously this
+      // handler prevented the native touch sequence for every move, which
+      // meant the pager could only see swipes that started above the terminal.
+      if (Math.abs(deltaX) > 7 && Math.abs(deltaX) > Math.abs(deltaY)) {
+        touchMoved = true;
+        clearLongPressTimer();
+        previousTouchY = touch.clientY;
+        return;
+      }
+      if (touchStartX !== undefined && touchStartY !== undefined && Math.hypot(deltaX, touch.clientY - touchStartY) > 7) {
         touchMoved = true;
         clearLongPressTimer();
       }
       if (selectionGesture || terminal.hasSelection()) return;
-      const deltaY = touch.clientY - previousTouchY;
       previousTouchY = touch.clientY;
       if (Math.abs(deltaY) < 0.5) return;
 
@@ -516,7 +526,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
 
   return <div className="mobile-terminal-shell">
     <div ref={hostRef} className="mobile-terminal" style={{ width: `${100 / fontWidthScale}%`, transform: `scaleX(${fontWidthScale})`, transformOrigin: "left center" }} />
-    <div className="extra-keys" aria-label="Terminal function keys">
+    <div className="extra-keys" data-no-swipe aria-label="Terminal function keys">
       {ACCESSIBILITY_KEY_ROWS.map((row, rowIndex) => <div className="key-row" key={rowIndex}>{row.map((key) => {
         const selected = selectedKeyIds.has(key.id);
         return <button

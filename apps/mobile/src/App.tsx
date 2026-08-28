@@ -68,6 +68,7 @@ export function App() {
   const projectDragRef = useRef<ProjectDragState | null>(null);
   const projectElementsRef = useRef(new Map<string, HTMLElement>());
   const swipeRef = useRef<SwipeState | null>(null);
+  const suppressSwipeClickRef = useRef(false);
 
   useEffect(() => {
     void Preferences.get({ key: TERMINAL_FONT_WIDTH_KEY }).then(({ value }) => {
@@ -392,7 +393,11 @@ export function App() {
   const currentPage = Math.min(view.type === "terminal" ? 2 : view.type === "project" ? 1 : 0, pageCount - 1);
 
   function beginSwipe(event: ReactPointerEvent<HTMLDivElement>) {
-    if (event.pointerType === "mouse" || (event.target instanceof Element && event.target.closest("button,input,textarea,select,[data-no-swipe],.xterm-accessibility-tree,.scrollbar"))) return;
+    suppressSwipeClickRef.current = false;
+    // Session cards and terminal accessibility text are part of the swipeable
+    // surface. Controls that would be unsafe to drag from (inputs, selectors,
+    // utility buttons and scrollbars) opt out explicitly.
+    if (!event.isPrimary || event.pointerType === "mouse" || (event.target instanceof Element && event.target.closest("input,textarea,select,[data-no-swipe],.scrollbar"))) return;
     const next: SwipeState = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startedAt: performance.now(), deltaX: 0, horizontal: false };
     swipeRef.current = next;
     setSwipe(next);
@@ -400,6 +405,7 @@ export function App() {
   }
 
   function moveSwipe(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!event.isPrimary) return;
     const current = swipeRef.current;
     if (!current || current.pointerId !== event.pointerId) return;
     const rawX = event.clientX - current.startX;
@@ -413,12 +419,14 @@ export function App() {
     const hasTarget = rawX > 0 ? currentPage > 0 : currentPage < pageCount - 1;
     const deltaX = hasTarget ? rawX : rawX * .14;
     const next = { ...current, horizontal: true, deltaX };
+    suppressSwipeClickRef.current = true;
     swipeRef.current = next;
     setSwipe(next);
     event.preventDefault();
   }
 
   function finishSwipe(event: ReactPointerEvent<HTMLDivElement>, cancelled = false) {
+    if (!event.isPrimary) return;
     const current = swipeRef.current;
     if (!current || current.pointerId !== event.pointerId) return;
     const velocity = Math.abs(current.deltaX) / Math.max(1, performance.now() - current.startedAt);
@@ -426,13 +434,21 @@ export function App() {
     const targetPage = commit ? currentPage + (current.deltaX < 0 ? 1 : -1) : currentPage;
     swipeRef.current = null;
     setSwipe(null);
+    suppressSwipeClickRef.current = !cancelled && current.horizontal;
     if (targetPage === 0) setView({ type: "home" });
     else if (targetPage === 1 && activeProject) setView({ type: "project", projectId: activeProject.id });
     else if (targetPage === 2 && activeProject && activeSession) setView({ type: "terminal", projectId: activeProject.id, sessionId: activeSession.id });
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   }
 
-  return <div className="mobile-pager" onPointerDown={beginSwipe} onPointerMove={moveSwipe} onPointerUp={(event) => finishSwipe(event)} onPointerCancel={(event) => finishSwipe(event, true)}>
+  function suppressSwipeClick(event: React.MouseEvent<HTMLDivElement>) {
+    if (!suppressSwipeClickRef.current) return;
+    suppressSwipeClickRef.current = false;
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  return <div className="mobile-pager" onPointerDown={beginSwipe} onPointerMove={moveSwipe} onPointerUp={(event) => finishSwipe(event)} onPointerCancel={(event) => finishSwipe(event, true)} onLostPointerCapture={(event) => finishSwipe(event, true)} onClickCapture={suppressSwipeClick}>
     <div className={`mobile-page-track ${swipe?.horizontal ? "is-dragging" : ""}`} style={{ transform: `translate3d(calc(${-currentPage * 100}% + ${swipe?.deltaX ?? 0}px),0,0)` }}>
       <div className="mobile-page"><div className="mobile-app home-view">
         <RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} />

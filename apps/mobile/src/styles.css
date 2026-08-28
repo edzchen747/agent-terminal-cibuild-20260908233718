@@ -166,7 +166,7 @@ button { color: inherit; }
 .font-width-control output { color: #83d8c6; font-family: "Roboto Mono", monospace; }
 .font-width-control input[type="range"] { height: 28px; padding: 0; accent-color: #78d2bf; background: transparent; }
 .font-width-preview { width: 100%; margin: 0 0 18px; padding: 13px 12px; transform-origin: left center; border: 1px solid #242b34; border-radius: 9px; background: #080b0f; color: #b7c0cc; font-family: "Roboto Mono", monospace; font-size: 11px; white-space: nowrap; }
-.onboarding { min-height: 100%; position: relative; padding: calc(22px + env(safe-area-inset-top)) 24px calc(17px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; overflow-y: auto; background: radial-gradient(circle at 75% 15%,#17312d,#090c11 42%); }
+.onboarding { min-height: 100%; position: relative; padding: calc(22px + env(safe-area-inset-top)) 24px calc(17px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; overflow-y: auto; touch-action: pan-y; overscroll-behavior-x: none; background: radial-gradient(circle at 75% 15%,#17312d,#090c11 42%); }
 .ambient { position: absolute; border-radius: 50%; filter: blur(70px); pointer-events: none; }
 .ambient.one { width: 220px; height: 220px; top: -90px; right: -100px; background: #52b7a226; }
 .ambient.two { width: 140px; height: 140px; bottom: 20%; left: -90px; background: #476eaa17; }
@@ -190,7 +190,7 @@ button { color: inherit; }
 .manual-pair textarea { flex: 1; height: 43px; resize: none; padding: 9px; border: 1px solid #2b333e; border-radius: 9px; background: #0d1117; color: #cfd5df; font-size: 9px; }
 .manual-pair button { width: 74px; border: 0; border-radius: 9px; background: #203e37; color: #8ddcca; font-size: 10px; font-weight: 700; }
 .pair-error { margin: 0 0 10px; text-align: center; }
-.splash, .error-screen { height: 100%; padding: 35px; display: flex; flex-direction: column; align-items: center; justify-content: center; background: radial-gradient(circle at 50% 35%,#17312d,#090c11 38%); }
+.splash, .error-screen { height: 100%; padding: 35px; display: flex; flex-direction: column; align-items: center; justify-content: center; touch-action: pan-y; overscroll-behavior-x: none; background: radial-gradient(circle at 50% 35%,#17312d,#090c11 38%); }
 .splash > strong { margin-top: 14px; font-size: 17px; }.splash > small { margin-top: 6px; color: #65707e; font-size: 10px; }
 .loader { width: 18px; height: 18px; margin-top: 25px; border: 2px solid #27332f; border-top-color: #7bd5c2; border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }

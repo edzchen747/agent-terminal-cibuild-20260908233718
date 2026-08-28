@@ -104,7 +104,7 @@ button { color: inherit; }
 .primary:hover { background: #91e5d3; }
 .primary svg { width: 15px; }
 .primary.wide { width: 100%; margin-top: 18px; }
-.modal-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; background: #030509b8; backdrop-filter: blur(5px); }
+.modal-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; touch-action: pan-y; overscroll-behavior-x: none; background: #030509b8; backdrop-filter: blur(5px); }
 .modal { width: 430px; max-height: calc(100vh - 70px); overflow-y: auto; position: relative; padding: 28px; border: 1px solid #2a303b; border-radius: 16px; background: linear-gradient(160deg,#141820,#0f1218); box-shadow: 0 24px 80px #000a; }
 .modal-close { position: absolute; top: 14px; right: 14px; }
 .modal-kicker { display: flex; align-items: center; gap: 8px; color: #79d8c4; text-transform: uppercase; letter-spacing: .1em; font-size: 10px; font-weight: 800; }
