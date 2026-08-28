@@ -5,7 +5,11 @@ services:
   # No operator edits the generated config file.
   headscale-config:
     image: alpine:3.22
-    env_file: .env
+    environment:
+      HEADSCALE_PUBLIC_URL: ${HEADSCALE_PUBLIC_URL}
+      HEADSCALE_PUBLIC_IPV4: ${HEADSCALE_PUBLIC_IPV4:-}
+      HEADSCALE_PUBLIC_IPV6: ${HEADSCALE_PUBLIC_IPV6:-}
+      TAILNET_BASE_DOMAIN: ${TAILNET_BASE_DOMAIN:-agent-terminal.internal}
     command: >-
       /bin/sh -c
       "apk add --no-cache gettext >/dev/null &&
@@ -23,6 +27,7 @@ services:
     command: serve
     volumes:
       - headscale-config:/etc/headscale:ro
+      - ./headscale/policy.hujson:/etc/headscale/policy.hujson:ro
       - headscale-data:/var/lib/headscale
     expose:
       - "8080"
@@ -31,16 +36,30 @@ services:
       - "3478:3478/udp"
     restart: unless-stopped
 
-  # Narrow enrollment facade. Only this service can mint pre-auth keys; apps
-  # receive a separate scoped client credential, never the Headscale API key.
+  # Narrow public enrollment facade. Only this service can mint pre-auth keys;
+  # the Headscale API credential never leaves this container environment.
   provisioner:
     build: ../provisioning
     depends_on:
       - headscale
-    env_file: .env
     environment:
       HEADSCALE_INTERNAL_URL: http://headscale:8080
+      HEADSCALE_PROVISION_API_KEY: ${HEADSCALE_PROVISION_API_KEY:?HEADSCALE_PROVISION_API_KEY must be set}
       PORT: "8090"
+      PROVISIONING_KEY_TTL_SECONDS: ${PROVISIONING_KEY_TTL_SECONDS:-300}
+      PROVISIONING_ACTIVATION_TTL_SECONDS: ${PROVISIONING_ACTIVATION_TTL_SECONDS:-45}
+      PROVISIONING_RATE_WINDOW_SECONDS: ${PROVISIONING_RATE_WINDOW_SECONDS:-60}
+      PROVISIONING_NONCE_RETENTION_SECONDS: ${PROVISIONING_NONCE_RETENTION_SECONDS:-3600}
+      PROVISIONING_SOURCE_RATE_LIMIT: ${PROVISIONING_SOURCE_RATE_LIMIT:-12}
+      PROVISIONING_SUBNET_RATE_LIMIT: ${PROVISIONING_SUBNET_RATE_LIMIT:-32}
+      PROVISIONING_HOST_RATE_LIMIT: ${PROVISIONING_HOST_RATE_LIMIT:-12}
+      PROVISIONING_DESKTOP_RATE_LIMIT: ${PROVISIONING_DESKTOP_RATE_LIMIT:-4}
+      PROVISIONING_MOBILE_RATE_LIMIT: ${PROVISIONING_MOBILE_RATE_LIMIT:-6}
+      PROVISIONING_GLOBAL_RATE_LIMIT: ${PROVISIONING_GLOBAL_RATE_LIMIT:-500}
+      PROVISIONING_MAX_CONCURRENT_ENROLLMENTS: ${PROVISIONING_MAX_CONCURRENT_ENROLLMENTS:-4}
+      PROVISIONING_MAX_CONNECTIONS: ${PROVISIONING_MAX_CONNECTIONS:-128}
+      PROVISIONING_MAX_ACTIVE_ACTIVATIONS: ${PROVISIONING_MAX_ACTIVE_ACTIVATIONS:-10000}
+      PROVISIONING_UPSTREAM_TIMEOUT_MS: ${PROVISIONING_UPSTREAM_TIMEOUT_MS:-8000}
     expose:
       - "8090"
     read_only: true
@@ -76,7 +95,11 @@ services:
     image: alpine:3.22
     depends_on:
       - headscale
-    env_file: .env
+    environment:
+      HEADSCALE_INTERNAL_URL: http://headscale:8080
+      HEADSCALE_REAPER_API_KEY: ${HEADSCALE_REAPER_API_KEY:-}
+      NODE_INACTIVITY_DAYS: ${NODE_INACTIVITY_DAYS:-30}
+      NODE_REAPER_INTERVAL_SECONDS: ${NODE_REAPER_INTERVAL_SECONDS:-3600}
     command: ["/bin/sh", "/reap-inactive-nodes.sh"]
     volumes:
       - ./reap-inactive-nodes.sh:/reap-inactive-nodes.sh:ro

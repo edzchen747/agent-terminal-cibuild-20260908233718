@@ -10,7 +10,7 @@ import {
 } from "@capacitor/barcode-scanner";
 import type { DirectoryListing, HostSnapshot, PairingPayload, Platform, Project, TerminalSession } from "@agentterminal/protocol";
 import { createRequestId, parsePairingPayload } from "@agentterminal/protocol";
-import { HostConnection } from "./connection";
+import { HostConnection, type RemoteRegistrationState } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, TerminalIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
@@ -23,6 +23,7 @@ export function App() {
   const [snapshot, setSnapshot] = useState<HostSnapshot | null>(null);
   const [status, setStatus] = useState<"loading" | "pairing" | "connecting" | "connected" | "error">("loading");
   const [error, setError] = useState("");
+  const [remoteRegistration, setRemoteRegistration] = useState<RemoteRegistrationState>({ status: "unregistered" });
   const [manualCode, setManualCode] = useState("");
   const [showManual, setShowManual] = useState(false);
   const [view, setView] = useState<View>({ type: "home" });
@@ -117,6 +118,7 @@ export function App() {
       if (!host) { setStatus("pairing"); return; }
       setStatus("connecting");
       current = new HostConnection(host);
+      setRemoteRegistration(current.remoteRegistrationState());
       current.startAutoReconnect();
       setConnection(current);
       void updateConnectionNotification(current.host.name, "reconnecting");
@@ -171,7 +173,9 @@ export function App() {
       setStatus("connecting");
       void updateConnectionNotification(connection.host.name, "reconnecting");
     });
-    return () => { offSnapshot(); offConnected(); offReconnecting(); offReconnectFailed(); offDisconnect(); };
+    const offRemoteRegistration = connection.on("remoteRegistration", setRemoteRegistration);
+    setRemoteRegistration(connection.remoteRegistrationState());
+    return () => { offSnapshot(); offConnected(); offReconnecting(); offReconnectFailed(); offDisconnect(); offRemoteRegistration(); };
   }, [connection]);
 
   async function pair(raw: string) {
@@ -182,7 +186,7 @@ export function App() {
       const next = await HostConnection.pair(payload, { id: crypto.randomUUID(), name: mobileName(), platform });
       connection?.close();
       next.startAutoReconnect();
-      setConnection(next); setSnapshot(next.snapshot ?? null); setStatus("connected"); setView({ type: "home" });
+      setConnection(next); setSnapshot(next.snapshot ?? null); setRemoteRegistration(next.remoteRegistrationState()); setStatus("connected"); setView({ type: "home" });
       await startConnectionNotification(next.host.name);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Pairing failed."); setStatus("pairing");
@@ -214,7 +218,7 @@ export function App() {
 
   async function forgetHost() {
     connection?.close(); await stopConnectionNotification(); await HostConnection.forget();
-    setConnection(null); setSnapshot(null); setError(""); setStatus("pairing"); setView({ type: "home" });
+    setConnection(null); setSnapshot(null); setRemoteRegistration({ status: "unregistered" }); setError(""); setStatus("pairing"); setView({ type: "home" });
   }
 
   async function closeSession(session: TerminalSession) {
@@ -234,15 +238,17 @@ export function App() {
   if (view.type === "terminal" && activeSession) {
     const project = snapshot.projects.find((item) => item.id === activeSession.projectId);
     return <div className="mobile-app terminal-view">
+      <RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} />
       <MobileHeader title={activeSession.title} subtitle={project?.name ?? activeSession.cwd} onBack={() => setView({ type: "project", projectId: activeSession.projectId })} trailing={<div className="session-actions"><span className={`session-state ${activeSession.status}`}>{activeSession.status}</span><button className="close-session-button" onClick={() => setSessionToClose(activeSession)} aria-label="Close terminal session" title="Close terminal session"><CloseIcon /></button></div>} />
       <MobileTerminal key={activeSession.id} connection={connection} session={activeSession} />
       {sessionToClose?.id === activeSession.id && <CloseSessionSheet session={activeSession} onClose={() => setSessionToClose(null)} onConfirm={() => closeSession(activeSession)} />}
     </div>;
   }
   if (view.type === "project" && activeProject) {
-    return <><ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={() => setView({ type: "home" })} onRename={() => setProjectToRename(activeProject)} onOpen={(session) => setView({ type: "terminal", sessionId: session.id, projectId: session.projectId })} />{projectToRename?.id === activeProject.id && <RenameProjectSheet project={activeProject} connection={connection} onClose={() => setProjectToRename(null)} />}</>;
+    return <><RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} /><ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={() => setView({ type: "home" })} onRename={() => setProjectToRename(activeProject)} onOpen={(session) => setView({ type: "terminal", sessionId: session.id, projectId: session.projectId })} />{projectToRename?.id === activeProject.id && <RenameProjectSheet project={activeProject} connection={connection} onClose={() => setProjectToRename(null)} />}</>;
   }
   return <div className="mobile-app home-view">
+    <RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} />
     <header className="home-header">
       <div><span className="eyebrow">Connected desktop</span><h1>{snapshot.host.name}</h1><span className="connection-label"><i /> Online · {snapshot.sessions.filter((s) => s.status === "running").length} sessions</span></div>
       <button className="round-button" onClick={() => void forgetHost()} title="Host options"><MoreIcon /></button>
@@ -257,6 +263,14 @@ export function App() {
     <nav className="bottom-nav"><button className="active"><FolderIcon /><span>Projects</span></button><button onClick={() => void scan()}><ScanIcon /><span>Pair</span></button><button onClick={() => void forgetHost()}><WifiIcon /><span>Host</span></button></nav>
     {showCreateProject && <CreateProjectSheet connection={connection} onClose={() => setShowCreateProject(false)} />}
   </div>;
+}
+
+function RemoteRegistrationBanner({ state, onRetry }: { state: RemoteRegistrationState; onRetry: () => void }) {
+  if (state.status !== "failed") return null;
+  return <aside className="mobile-registration-banner" role="status">
+    <span>{state.error ?? "Remote connection registration failed. LAN access is still available."}</span>
+    <button onClick={onRetry}>Retry</button>
+  </aside>;
 }
 
 async function startConnectionNotification(hostName: string) {

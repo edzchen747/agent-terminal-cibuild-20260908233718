@@ -9,12 +9,13 @@ use tokio::{
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use uuid::Uuid;
 
-use crate::{core::Core, embedded_node};
+use crate::core::Core;
 
 pub fn start(core: Arc<Core>) {
-    // Start the overlay node in its own process. Headscale's embedded DERP
-    // service is the encrypted fallback when a direct NAT path is unavailable.
-    embedded_node::start(&core);
+    // First launch exposes only the LAN pairing listener. An already enrolled
+    // identity reconnects here; a previous failure gets one automatic retry
+    // on this launch and no retry loop during the session.
+    core.resume_remote_node();
     let direct_core = Arc::clone(&core);
     async_runtime::spawn(async move {
         run_direct_server(direct_core).await;

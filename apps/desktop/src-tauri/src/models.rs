@@ -95,6 +95,15 @@ pub struct DesktopState {
     #[serde(flatten)]
     pub snapshot: HostSnapshot,
     pub current_project_id: String,
+    pub remote_registration: RemoteRegistration,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteRegistration {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

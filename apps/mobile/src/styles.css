@@ -4,6 +4,9 @@ html, body, #root { width: 100%; min-width: 320px; height: 100%; margin: 0; over
 button, input, textarea { font: inherit; }
 button { color: inherit; }
 .mobile-app { height: 100%; display: flex; flex-direction: column; padding-top: env(safe-area-inset-top); background: #090c11; }
+.mobile-registration-banner { position: fixed; z-index: 18; top: calc(9px + env(safe-area-inset-top)); left: 12px; right: 12px; min-height: 36px; padding: 7px 8px 7px 11px; display: flex; align-items: center; justify-content: space-between; gap: 9px; border: 1px solid #663943; border-radius: 10px; background: #29181dee; box-shadow: 0 9px 28px #0009; color: #e0a0aa; font-size: 10px; line-height: 1.35; }
+.mobile-registration-banner button { flex: none; height: 25px; padding: 0 10px; border: 1px solid #81515d; border-radius: 6px; background: #45242d; color: #f4c1c8; font-size: 10px; font-weight: 800; }
+.mobile-registration-banner button:active { background: #5a2c37; transform: scale(.97); }
 .logo { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 11px; color: #09110f; background: linear-gradient(135deg,#9be8d7,#63bdb5); box-shadow: inset 0 1px #ffffff55,0 9px 30px #6ed0bd22; }
 .logo svg { width: 21px; }
 .logo.large { width: 58px; height: 58px; border-radius: 16px; }

@@ -6,6 +6,7 @@ use crate::network;
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EnrollmentRequest<'a> {
+    role: &'a str,
     nonce: &'a str,
     host_id: &'a str,
     device_id: &'a str,
@@ -24,24 +25,25 @@ struct Activation {
     activation_token: String,
 }
 
-pub async fn issue_mobile_key(
+pub async fn issue_node_key(
+    role: &str,
     host_id: &str,
     device_id: &str,
     nonce: &str,
 ) -> Result<EnrollmentKey> {
-    let token = network::provisioning_token().ok_or_else(|| {
-        anyhow!("Mobile enrollment is not configured on this desktop installation.")
-    })?;
+    if role != "desktop" && role != "mobile" {
+        return Err(anyhow!("invalid enrollment role"));
+    }
     let client = reqwest::Client::new();
     let base_url = network::provisioning_url();
     let request = EnrollmentRequest {
+        role,
         nonce,
         host_id,
         device_id,
     };
     let activation_response = client
         .post(format!("{base_url}/v1/activate"))
-        .bearer_auth(token)
         .header(reqwest::header::CACHE_CONTROL, "no-store")
         .json(&request)
         .timeout(std::time::Duration::from_secs(10))

@@ -15,6 +15,13 @@ button { color: inherit; }
 .titlebar-actions { margin-left: auto; display: flex; align-items: center; gap: 4px; }
 .host-online { display: flex; align-items: center; gap: 7px; margin-right: 8px; padding: 4px 9px; border: 1px solid #263129; border-radius: 99px; color: #89918f; font-size: 11px; }
 .host-online i, .status-dot, .pair-details i { width: 6px; height: 6px; border-radius: 50%; background: #69d58a; box-shadow: 0 0 8px #69d58a88; }
+.host-online.is-unregistered i { background: #778294; box-shadow: none; }
+.host-online.is-pending i { background: #e2b66d; box-shadow: 0 0 8px #e2b66d66; }
+.host-online.is-failed i { background: #e27682; box-shadow: 0 0 8px #e2768266; }
+.remote-registration-banner { position: fixed; z-index: 12; top: 50px; right: 14px; max-width: 370px; min-height: 34px; padding: 7px 8px 7px 11px; display: flex; align-items: center; gap: 10px; border: 1px solid #59353c; border-radius: 8px; background: #25171bed; box-shadow: 0 8px 26px #0008; color: #dca0a8; font-size: 10.5px; }
+.remote-registration-banner span { line-height: 1.35; }
+.remote-registration-banner button { flex: none; height: 23px; padding: 0 9px; border: 1px solid #76515a; border-radius: 5px; background: #392228; color: #f0bdc4; cursor: pointer; font-size: 10px; font-weight: 700; }
+.remote-registration-banner button:hover { background: #4a2931; }
 .project-persistence-action { height: 30px; padding: 0 9px; display: flex; align-items: center; gap: 6px; border: 1px solid #34303a; border-radius: 7px; background: #17151b; color: #9990a0; cursor: pointer; font-size: 10.5px; }
 .project-persistence-action:hover { border-color: #4d685f; background: #17211e; color: #a6ded2; }
 .project-persistence-action.is-saved { border-color: #30463f; background: #14201d; color: #81cbbb; }

@@ -22,7 +22,13 @@ export interface SavedHost {
   remoteTransport?: "direct" | "overlay";
   deviceId: string;
   deviceToken: string;
+  remoteEnrolled?: boolean;
 }
+
+export type RemoteRegistrationState = {
+  status: "unregistered" | "pending" | "enrolled" | "failed";
+  error?: string;
+};
 
 type EventMap = {
   snapshot: HostSnapshot;
@@ -31,6 +37,7 @@ type EventMap = {
   connected: HostSnapshot;
   reconnecting: { attempt: number; delayMs: number };
   reconnectFailed: Error;
+  remoteRegistration: RemoteRegistrationState;
 };
 
 export class HostConnection {
@@ -47,11 +54,15 @@ export class HostConnection {
   private reconnectDelay = RECONNECT_BASE_DELAY_MS;
   private autoReconnect = false;
   private readonly embeddedEngine = new EmbeddedNodeEngine();
+  private enrollmentPromise?: Promise<void>;
+  private remoteRegistration: RemoteRegistrationState;
   private pending = new Map<string, { resolve: (message: ServerMessage) => void; reject: (error: Error) => void }>();
   private listeners = new Map<keyof EventMap, Set<(value: never) => void>>();
   snapshot?: HostSnapshot;
 
-  constructor(public readonly host: SavedHost) {}
+  constructor(public readonly host: SavedHost) {
+    this.remoteRegistration = { status: host.remoteEnrolled ? "enrolled" : "unregistered" };
+  }
 
   static async saved(): Promise<SavedHost | null> {
     const { value } = await Preferences.get({ key: HOST_KEY });
@@ -96,27 +107,11 @@ export class HostConnection {
       temporary.host.deviceToken = response.deviceToken;
       temporary.snapshot = response.snapshot;
       temporary.authenticated = true;
-      const enrollment = await temporary.request({
-        type: "node.enroll",
-        requestId: createRequestId(),
-        nonce: crypto.randomUUID()
-      });
-      if (enrollment.type !== "node.enrollment") {
-        throw new Error("The desktop did not issue a mobile enrollment key.");
-      }
-      // Initialize and persist the overlay identity during pairing so a later
-      // off-LAN reconnect does not create a new node after an app restart.
-      await temporary.embeddedEngine.start(
-        temporary.host.controlUrl ?? OVERLAY_CONTROL_URL,
-        temporary.host.remoteEndpoint ?? defaultRemoteEndpoint(temporary.host.id),
-        temporary.host.remoteTransport ?? "overlay",
-        enrollment.authKey
-      );
-      // Commit the host only after both LAN pairing and native overlay
-      // enrollment succeeded. A failed enrollment must not leave a half-paired
-      // host that prevents the QR screen from appearing on the next launch.
+      // Trusted LAN pairing is the commit point. Overlay registration happens
+      // independently so provisioning outages never block terminal streaming.
       await Preferences.set({ key: HOST_KEY, value: JSON.stringify(temporary.host) });
       temporary.startHeartbeat();
+      queueMicrotask(() => { void temporary.retryRemoteRegistration(); });
       return temporary;
     } catch (error) {
       temporary.close();
@@ -181,6 +176,66 @@ export class HostConnection {
     return this.closed;
   }
 
+  remoteRegistrationState(): RemoteRegistrationState {
+    return { ...this.remoteRegistration };
+  }
+
+  retryRemoteRegistration(): Promise<void> {
+    if (this.enrollmentPromise) return this.enrollmentPromise;
+    if (this.closed || !this.authenticated || this.socket?.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("Reconnect to the paired desktop before retrying remote registration."));
+    }
+    this.setRemoteRegistration({ status: "pending" });
+    const attempt = this.enrollMobile()
+      .catch((cause) => {
+        const error = cause instanceof Error ? cause : new Error("Remote connection registration failed.");
+        this.setRemoteRegistration({
+          status: "failed",
+          error: "Remote connection registration failed. LAN access is still available."
+        });
+        throw error;
+      })
+      .finally(() => { this.enrollmentPromise = undefined; });
+    // Enrollment is intentionally background work. Attach a rejection handler
+    // here so the automatic attempt cannot become an unhandled promise.
+    attempt.catch(() => undefined);
+    this.enrollmentPromise = attempt;
+    return attempt;
+  }
+
+  private async enrollMobile(): Promise<void> {
+    const response = await this.request({
+      type: "node.enroll",
+      requestId: createRequestId(),
+      nonce: crypto.randomUUID()
+    });
+    if (response.type !== "node.enrollment") throw new Error("The desktop did not issue a mobile enrollment key.");
+
+    let authKey: string | undefined = response.authKey;
+    response.authKey = "";
+    try {
+      const state = await this.embeddedEngine.start(
+        this.host.controlUrl ?? OVERLAY_CONTROL_URL,
+        this.host.remoteEndpoint ?? defaultRemoteEndpoint(this.host.id),
+        this.host.remoteTransport ?? "overlay",
+        authKey
+      );
+      if ((this.host.remoteTransport ?? "overlay") === "overlay" && !state.engineStarted) {
+        throw new Error("The native embedded network node is unavailable.");
+      }
+      this.host.remoteEnrolled = true;
+      await Preferences.set({ key: HOST_KEY, value: JSON.stringify(this.host) });
+      this.setRemoteRegistration({ status: "enrolled" });
+    } finally {
+      authKey = undefined;
+    }
+  }
+
+  private setRemoteRegistration(state: RemoteRegistrationState): void {
+    this.remoteRegistration = state;
+    this.emit("remoteRegistration", { ...state });
+  }
+
   private async connectOnce(): Promise<HostSnapshot> {
     this.authenticated = false;
     this.stopHeartbeat();
@@ -188,12 +243,10 @@ export class HostConnection {
     if (this.socket) this.abortSocket();
 
     const localEndpoint = this.host.localEndpoint ?? (this.host.transport === "direct" ? this.host.endpoint : undefined);
-    let connectedLocally = false;
     try {
       if (localEndpoint) {
         try {
           await this.open(localEndpoint, LAN_CONNECT_TIMEOUT_MS);
-          connectedLocally = true;
         } catch {
           this.abortSocket();
         }
@@ -207,9 +260,6 @@ export class HostConnection {
           throw new Error("The embedded network node is unavailable for a remote connection.");
         }
         await this.open(nodeState.proxyEndpoint ?? remoteEndpoint, 8_000);
-      } else if (connectedLocally) {
-        // Persist the node identity even when this launch happens on the LAN.
-        await this.embeddedEngine.start(this.host.controlUrl ?? OVERLAY_CONTROL_URL);
       }
       const response = await this.request({ type: "auth", requestId: createRequestId(), deviceId: this.host.deviceId, deviceToken: this.host.deviceToken });
       if (response.type !== "auth.accepted") throw new Error("This phone is not authorized by the desktop.");

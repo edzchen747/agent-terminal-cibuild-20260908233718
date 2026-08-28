@@ -2,6 +2,10 @@ import type { HostSnapshot, PairingPayload, Project, TerminalSession } from "@ag
 
 export interface DesktopState extends HostSnapshot {
   currentProjectId: string;
+  remoteRegistration: {
+    status: "unregistered" | "pending" | "enrolled" | "failed";
+    error?: string;
+  };
 }
 
 export interface DesktopApi {
@@ -20,6 +24,7 @@ export interface DesktopApi {
   detachSession(sessionId: string): void;
   copyText(text: string): Promise<void>;
   startPairing(): Promise<PairingPayload>;
+  retryRemoteRegistration(): Promise<void>;
   revokeDevice(deviceId: string): Promise<void>;
   setDefaultShell(shellId: string): Promise<void>;
   selectShell(sessionId: string | null, shellId: string): Promise<TerminalSession | null>;

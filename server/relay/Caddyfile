@@ -4,6 +4,9 @@
     # The only public enrollment operation. handle_path removes the
     # /api/provision prefix before forwarding to the narrow service.
     handle_path /api/provision/* {
+        request_body {
+            max_size 4KB
+        }
         reverse_proxy provisioner:8090
     }
 

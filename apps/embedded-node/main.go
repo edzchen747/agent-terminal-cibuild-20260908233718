@@ -54,7 +54,9 @@ func main() {
 		Hostname:   *nodeID,
 		ControlURL: *controlURL,
 		AuthKey:    os.Getenv("AGENT_TERMINAL_NODE_AUTH_KEY"),
-		Logf:       func(format string, args ...any) { log.Printf("tsnet: "+format, args...) },
+		// Native logs are persisted on Android. Suppress tsnet's verbose log
+		// callback so an enrollment capability can never be written to disk.
+		Logf: func(string, ...any) {},
 	}
 	if err := node.Start(); err != nil {
 		writeFailure(*stateDir, *nodeID, err, false)
@@ -65,6 +67,10 @@ func main() {
 		writeFailure(*stateDir, *nodeID, err, false)
 		log.Fatal(err)
 	}
+	// The native engine's state directory now contains the durable node
+	// identity. Drop the single-use enrollment capability immediately.
+	node.AuthKey = ""
+	_ = os.Unsetenv("AGENT_TERMINAL_NODE_AUTH_KEY")
 
 	result := status{NodeID: *nodeID}
 	if ipv4, _ := node.TailscaleIPs(); ipv4.IsValid() {

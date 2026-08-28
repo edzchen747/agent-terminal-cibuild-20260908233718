@@ -37,5 +37,8 @@ An auth key is supplied only to the native process at enrollment time through
 `AGENT_TERMINAL_NODE_AUTH_KEY`; the long-lived node identity remains in the
 state directory and must be preserved across app restarts. For mobile this is
 a separately provisioned, single-use key received after trusted LAN pairing,
-not a value from the QR or saved host record. The optional desktop bootstrap
-key is likewise desktop-only.
+not a value from the QR or saved host record. Desktop enrollment uses a
+separate role-bound key obtained after pairing. The native process clears the
+environment and in-memory server field once registration reaches `Running`,
+and suppresses verbose tsnet logging so the capability is never written to
+disk.

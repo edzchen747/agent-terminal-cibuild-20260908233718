@@ -17,6 +17,7 @@ use chrono::{Duration, Utc};
 use percent_encoding::percent_decode_str;
 use portable_pty::{ChildKiller, MasterPty, PtySize, native_pty_system};
 use regex::Regex;
+use serde::Deserialize;
 use tauri::{AppHandle, Emitter, EventTarget, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::mpsc;
 use url::Url;
@@ -25,8 +26,8 @@ use uuid::Uuid;
 use crate::{
     models::{
         AuthorizedDevice, ClientMessage, DesktopState, DirectoryEntry, DirectoryListing, HostInfo,
-        HostSnapshot, PROTOCOL_VERSION, PairingPayload, Project, ServerMessage, ShellProfile,
-        TerminalDataEvent, TerminalSession,
+        HostSnapshot, PROTOCOL_VERSION, PairingPayload, Project, RemoteRegistration, ServerMessage,
+        ShellProfile, TerminalDataEvent, TerminalSession,
     },
     network,
     path_utils::user_visible_path,
@@ -59,13 +60,25 @@ pub enum ClientSink {
 
 struct RemoteClient {
     device_id: Option<String>,
-    enrollment_allowed: bool,
+    paired_connection: bool,
+    enrollment_requests: u8,
     attached_sessions: HashSet<String>,
     sink: ClientSink,
 }
 
 struct PairingGrant {
     expires_at_ms: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EmbeddedNodeStatus {
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    tailnet_address: String,
+    #[serde(default)]
+    error_code: String,
 }
 
 struct Inner {
@@ -83,6 +96,7 @@ pub struct Core {
     inner: Mutex<Inner>,
     clients: Mutex<HashMap<String, RemoteClient>>,
     embedded_node: Mutex<Option<Child>>,
+    desktop_enrollment_running: AtomicBool,
     remote_port: AtomicU16,
     direct_server_ready: AtomicBool,
     exit_requested: AtomicBool,
@@ -104,6 +118,7 @@ impl Core {
             }),
             clients: Mutex::new(HashMap::new()),
             embedded_node: Mutex::new(None),
+            desktop_enrollment_running: AtomicBool::new(false),
             remote_port: AtomicU16::new(remote_port),
             direct_server_ready: AtomicBool::new(false),
             exit_requested: AtomicBool::new(false),
@@ -240,6 +255,10 @@ impl Core {
     }
 
     pub fn start_embedded_node(&self) -> Result<bool> {
+        self.start_embedded_node_with_auth_key(None)
+    }
+
+    fn start_embedded_node_with_auth_key(&self, auth_key: Option<&str>) -> Result<bool> {
         if std::env::var("AGENT_TERMINAL_DISABLE_EMBEDDED_NODE").as_deref() == Ok("1") {
             return Ok(false);
         }
@@ -264,18 +283,10 @@ impl Core {
             let host_id = inner.store.host().id.clone();
             (network_state, host_id)
         };
-        let state_dir = std::env::var_os("AGENT_TERMINAL_EMBEDDED_NODE_STATE_DIR")
-            .map(PathBuf::from)
-            .or_else(|| {
-                self.app
-                    .path()
-                    .app_data_dir()
-                    .ok()
-                    .map(|path| path.join("embedded-node"))
-            })
-            .ok_or_else(|| anyhow!("Could not determine the embedded node state directory."))?;
+        let state_dir = self.embedded_node_state_dir()?;
         std::fs::create_dir_all(&state_dir)
             .with_context(|| format!("could not create {}", state_dir.display()))?;
+        let _ = std::fs::remove_file(state_dir.join("status.json"));
 
         let mut command = Command::new(&binary);
         command
@@ -307,22 +318,172 @@ impl Core {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.creation_flags(CREATE_NO_WINDOW);
         }
-        if let Some(auth_key) = network::embedded_node_auth_key() {
+        if let Some(auth_key) = auth_key {
             command.env("AGENT_TERMINAL_NODE_AUTH_KEY", auth_key);
         }
         let child = command
             .spawn()
             .with_context(|| format!("could not start embedded node {}", binary.display()))?;
-        let mut saved_network = self.network_state();
-        saved_network.node_id = Some(host_id);
-        saved_network.last_connected_at = Some(chrono::Utc::now().to_rfc3339());
-        self.inner
+        *self.embedded_node.lock().expect("embedded node poisoned") = Some(child);
+        Ok(true)
+    }
+
+    fn embedded_node_state_dir(&self) -> Result<PathBuf> {
+        std::env::var_os("AGENT_TERMINAL_EMBEDDED_NODE_STATE_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                self.app
+                    .path()
+                    .app_data_dir()
+                    .ok()
+                    .map(|path| path.join("embedded-node"))
+            })
+            .ok_or_else(|| anyhow!("Could not determine the embedded node state directory."))
+    }
+
+    fn stop_embedded_node(&self) {
+        if let Some(mut child) = self
+            .embedded_node
+            .lock()
+            .expect("embedded node poisoned")
+            .take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    async fn wait_for_embedded_node(&self) -> Result<EmbeddedNodeStatus> {
+        let status_path = self.embedded_node_state_dir()?.join("status.json");
+        for _ in 0..120 {
+            if let Ok(contents) = std::fs::read_to_string(&status_path)
+                && let Ok(status) = serde_json::from_str::<EmbeddedNodeStatus>(&contents)
+            {
+                if !status.error_code.is_empty() {
+                    return Err(anyhow!("embedded node enrollment was rejected"));
+                }
+                if !status.tailnet_address.is_empty() {
+                    return Ok(status);
+                }
+            }
+            {
+                let mut process = self.embedded_node.lock().expect("embedded node poisoned");
+                if let Some(child) = process.as_mut()
+                    && child.try_wait()?.is_some()
+                {
+                    *process = None;
+                    return Err(anyhow!(
+                        "embedded node stopped before registration completed"
+                    ));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        Err(anyhow!("embedded node registration timed out"))
+    }
+
+    fn set_remote_registration(
+        &self,
+        status: &str,
+        error: Option<String>,
+        enrolled: bool,
+        node: Option<&EmbeddedNodeStatus>,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().expect("desktop state poisoned");
+        let mut network = inner.store.network().clone();
+        network.registration_status = status.into();
+        network.registration_error = error;
+        network.enrolled = enrolled;
+        if let Some(node) = node {
+            network.node_id = Some(node.node_id.clone());
+            network.tailnet_address = Some(node.tailnet_address.clone());
+            network.last_connected_at = Some(Utc::now().to_rfc3339());
+        }
+        inner.store.save_network(network)
+    }
+
+    pub fn begin_desktop_enrollment(self: &Arc<Self>, device_id: String) -> Result<()> {
+        if self.network_state().enrolled {
+            return Ok(());
+        }
+        if self
+            .desktop_enrollment_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.set_remote_registration("pending", None, false, None) {
+            self.desktop_enrollment_running
+                .store(false, Ordering::Release);
+            return Err(error);
+        }
+        self.broadcast();
+
+        let core = Arc::clone(self);
+        let host_id = self.snapshot().host.id;
+        tauri::async_runtime::spawn(async move {
+            let result = async {
+                let nonce = random_token(32);
+                let enrollment =
+                    provisioning::issue_node_key("desktop", &host_id, &device_id, &nonce).await?;
+                core.stop_embedded_node();
+                let started = core.start_embedded_node_with_auth_key(Some(&enrollment.auth_key))?;
+                drop(enrollment);
+                if !started {
+                    return Err(anyhow!("the embedded network component is unavailable"));
+                }
+                core.wait_for_embedded_node().await
+            }
+            .await;
+
+            match result {
+                Ok(node) => {
+                    let _ = core.set_remote_registration("enrolled", None, true, Some(&node));
+                }
+                Err(error) => {
+                    core.stop_embedded_node();
+                    eprintln!("Agent Terminal desktop enrollment failed: {error:#}");
+                    let _ = core.set_remote_registration(
+                        "failed",
+                        Some(
+                            "Remote connection registration failed. LAN access is still available."
+                                .into(),
+                        ),
+                        false,
+                        None,
+                    );
+                }
+            }
+            core.desktop_enrollment_running
+                .store(false, Ordering::Release);
+            core.broadcast();
+        });
+        Ok(())
+    }
+
+    pub fn retry_desktop_enrollment(self: &Arc<Self>) -> Result<()> {
+        let device_id = self
+            .inner
             .lock()
             .expect("desktop state poisoned")
             .store
-            .save_network(saved_network)?;
-        *self.embedded_node.lock().expect("embedded node poisoned") = Some(child);
-        Ok(true)
+            .devices()
+            .first()
+            .map(|device| device.device.id.clone())
+            .ok_or_else(|| anyhow!("Pair a mobile device before enabling remote access."))?;
+        self.begin_desktop_enrollment(device_id)
+    }
+
+    pub fn resume_remote_node(self: &Arc<Self>) {
+        let network = self.network_state();
+        if network.enrolled {
+            if let Err(error) = self.start_embedded_node() {
+                eprintln!("Agent Terminal embedded network node is unavailable: {error:#}");
+            }
+        } else if network.registration_status == "failed" {
+            let _ = self.retry_desktop_enrollment();
+        }
     }
 
     pub fn state_for_window(&self, label: &str) -> DesktopState {
@@ -335,6 +496,10 @@ impl Core {
         DesktopState {
             snapshot: snapshot_from_inner(&inner),
             current_project_id,
+            remote_registration: RemoteRegistration {
+                status: inner.store.network().registration_status.clone(),
+                error: inner.store.network().registration_error.clone(),
+            },
         }
     }
 
@@ -1005,7 +1170,8 @@ impl Core {
                 id,
                 RemoteClient {
                     device_id: None,
-                    enrollment_allowed: false,
+                    paired_connection: false,
+                    enrollment_requests: 0,
                     attached_sessions: HashSet::new(),
                     sink: ClientSink::Direct { messages, close },
                 },
@@ -1056,8 +1222,10 @@ impl Core {
                     .get_mut(client_id)
                 {
                     client.device_id = Some(device.id.clone());
-                    client.enrollment_allowed = true;
+                    client.paired_connection = true;
+                    client.enrollment_requests = 0;
                 }
+                let paired_device_id = device.id.clone();
                 self.send_to_client(
                     client_id,
                     ServerMessage::PairAccepted {
@@ -1066,8 +1234,9 @@ impl Core {
                         snapshot: self.snapshot(),
                     },
                 );
-                let _ = self.app.emit("pairing-succeeded", device.id);
+                let _ = self.app.emit("pairing-succeeded", paired_device_id.clone());
                 self.broadcast();
+                let _ = self.begin_desktop_enrollment(paired_device_id);
                 return;
             }
             ClientMessage::NodeEnroll { request_id, nonce } => {
@@ -1090,10 +1259,10 @@ impl Core {
                 let device_id = {
                     let mut clients = self.clients.lock().expect("remote clients poisoned");
                     clients.get_mut(client_id).and_then(|client| {
-                        if !client.enrollment_allowed {
+                        if !client.paired_connection || client.enrollment_requests >= 3 {
                             return None;
                         }
-                        client.enrollment_allowed = false;
+                        client.enrollment_requests += 1;
                         client.device_id.clone()
                     })
                 };
@@ -1113,7 +1282,8 @@ impl Core {
                 let client_id = client_id.to_string();
                 let host_id = self.snapshot().host.id;
                 tauri::async_runtime::spawn(async move {
-                    match provisioning::issue_mobile_key(&host_id, &device_id, &nonce).await {
+                    match provisioning::issue_node_key("mobile", &host_id, &device_id, &nonce).await
+                    {
                         Ok(key) => core.send_to_client(
                             &client_id,
                             ServerMessage::NodeEnrollment {
@@ -1132,7 +1302,7 @@ impl Core {
                                 ServerMessage::Error {
                                     request_id: Some(request_id),
                                     code: "ENROLLMENT_UNAVAILABLE".into(),
-                                    message: "A one-time mobile enrollment key could not be issued. Reopen pairing and try again.".into(),
+                                    message: "A one-time mobile enrollment key could not be issued. LAN access remains available; retry remote registration from this paired session.".into(),
                                 },
                             );
                         }

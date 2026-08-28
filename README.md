@@ -78,13 +78,10 @@ $env:AGENT_TERMINAL_CONTROL_URL = "https://headscale.example.com"
 $env:AGENT_TERMINAL_REMOTE_ENDPOINT = "ws://desktop-host-id.agent-terminal.internal:47831"
 $env:AGENT_TERMINAL_REMOTE_TRANSPORT = "overlay"
 $env:AGENT_TERMINAL_TAILNET_DOMAIN = "agent-terminal.internal"
-$env:AGENT_TERMINAL_PROVISIONING_TOKEN = "<unique-per-installation-client-token>"
-# Optional, desktop-only bootstrap key. It is never copied into pairing data.
-$env:AGENT_TERMINAL_NODE_AUTH_KEY = "<single-use-desktop-preauth-key>"
 npm run dev
 ```
 
-QR pairing is LAN-only: the QR contains the desktop's local WebSocket endpoint and a five-minute device-binding grant, never a Headscale key. After the desktop accepts the phone, it exchanges its scoped installation credential for a 60-second activation and requests a separate single-use mobile pre-auth key. That key is returned only on the already-authorized LAN socket and is not persisted by the web layer. Later, the phone probes LAN for 1.5 seconds before using its persistent embedded-node identity over Headscale/DERP. Neither endpoint needs an inbound port-forwarding rule.
+QR pairing is LAN-only: the QR contains the desktop's local WebSocket endpoint and a five-minute device-binding grant, never a Headscale key. Pairing commits as soon as the desktop consumes that grant and authorizes the phone, so terminals begin streaming even if remote registration is unavailable. The desktop then requests separate role-bound, single-use pre-auth keys for itself and the mobile in the background. Those keys exist only in process memory until the native nodes accept them; the apps persist only their node identities. A failed registration leaves LAN access running and shows a retryable warning. Later, the phone probes LAN for 1.5 seconds before using its persistent embedded-node identity over Headscale/DERP. Neither endpoint needs an inbound port-forwarding rule.
 
 ## Start the desktop app
 

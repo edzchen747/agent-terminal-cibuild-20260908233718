@@ -47,6 +47,7 @@ const api: DesktopApi = {
   detachSession: (sessionId) => { void invoke("detach_session", { sessionId }); },
   copyText: (text) => invoke("copy_text", { text }),
   startPairing: () => invoke("start_pairing"),
+  retryRemoteRegistration: () => invoke("retry_remote_registration"),
   revokeDevice: (deviceId) => invoke("revoke_device", { deviceId }),
   setDefaultShell: (shellId) => invoke("set_default_shell", { shellId }),
   selectShell: (sessionId, shellId) => invoke("select_shell", { sessionId, shellId }),

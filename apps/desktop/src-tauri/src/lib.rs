@@ -1,5 +1,4 @@
 mod core;
-mod embedded_node;
 mod models;
 mod network;
 mod path_utils;
@@ -179,6 +178,13 @@ fn start_pairing(state: State<'_, Arc<Core>>) -> Result<PairingPayload, String> 
 }
 
 #[tauri::command]
+fn retry_remote_registration(state: State<'_, Arc<Core>>) -> Result<(), String> {
+    Arc::clone(state.inner())
+        .retry_desktop_enrollment()
+        .map_err(error_string)
+}
+
+#[tauri::command]
 fn revoke_device(state: State<'_, Arc<Core>>, device_id: String) -> Result<(), String> {
     state.revoke_device(&device_id).map_err(error_string)
 }
@@ -248,6 +254,7 @@ pub fn run() {
             detach_session,
             copy_text,
             start_pairing,
+            retry_remote_registration,
             revoke_device,
             set_default_shell,
             select_shell,

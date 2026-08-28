@@ -52,6 +52,10 @@ database:
     wal_autocheckpoint: 1000
 
 disable_check_updates: true
+policy:
+  mode: file
+  path: /etc/headscale/policy.hujson
+
 log:
   level: info
   format: text

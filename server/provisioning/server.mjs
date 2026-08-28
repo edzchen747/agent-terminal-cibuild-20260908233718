@@ -1,37 +1,34 @@
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
+import { isIP } from "node:net";
 
 const JSON_LIMIT_BYTES = 4_096;
 const NONCE_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const ROLES = new Set(["desktop", "mobile"]);
 
 export function loadConfig(env = process.env) {
-  const tokenHashes = (env.PROVISIONING_CLIENT_TOKEN_HASHES ?? "")
-    .split(",")
-    .map((value) => value.trim().toLowerCase())
-    .filter(Boolean);
-  if (tokenHashes.length === 0 || tokenHashes.some((value) => !/^[a-f0-9]{64}$/.test(value))) {
-    throw new Error("PROVISIONING_CLIENT_TOKEN_HASHES must contain one or more comma-separated SHA-256 hashes");
-  }
-
-  const headscaleApiKey = required(env, "HEADSCALE_PROVISION_API_KEY");
-  const headscaleUserId = required(env, "HEADSCALE_USER_ID");
-  if (!/^\d+$/.test(headscaleUserId)) throw new Error("HEADSCALE_USER_ID must be a numeric Headscale user ID");
-
-  const keyTtlSeconds = boundedInteger(env.PROVISIONING_KEY_TTL_SECONDS, 300, 60, 3_600, "PROVISIONING_KEY_TTL_SECONDS");
-  const activationTtlSeconds = boundedInteger(env.PROVISIONING_ACTIVATION_TTL_SECONDS, 60, 15, 300, "PROVISIONING_ACTIVATION_TTL_SECONDS");
+  const keyTtlSeconds = boundedInteger(env.PROVISIONING_KEY_TTL_SECONDS, 300, 60, 900, "PROVISIONING_KEY_TTL_SECONDS");
   return {
     port: boundedInteger(env.PORT, 8090, 1, 65_535, "PORT"),
     headscaleUrl: (env.HEADSCALE_INTERNAL_URL ?? "http://headscale:8080").replace(/\/+$/, ""),
-    headscaleApiKey,
-    headscaleUserId,
-    aclTags: (env.HEADSCALE_ACL_TAGS ?? "").split(",").map((value) => value.trim()).filter(Boolean),
-    tokenHashes,
+    headscaleApiKey: required(env, "HEADSCALE_PROVISION_API_KEY"),
     keyTtlSeconds,
-    activationTtlSeconds,
+    activationTtlSeconds: boundedInteger(env.PROVISIONING_ACTIVATION_TTL_SECONDS, 45, 15, 120, "PROVISIONING_ACTIVATION_TTL_SECONDS"),
     nonceRetentionMs: boundedInteger(env.PROVISIONING_NONCE_RETENTION_SECONDS, 3_600, keyTtlSeconds, 86_400, "PROVISIONING_NONCE_RETENTION_SECONDS") * 1_000,
-    rateWindowMs: boundedInteger(env.PROVISIONING_RATE_WINDOW_SECONDS, 60, 10, 3_600, "PROVISIONING_RATE_WINDOW_SECONDS") * 1_000,
-    rateLimit: boundedInteger(env.PROVISIONING_RATE_LIMIT, 10, 1, 1_000, "PROVISIONING_RATE_LIMIT")
+    rateWindowMs: boundedInteger(env.PROVISIONING_RATE_WINDOW_SECONDS, 60, 10, 600, "PROVISIONING_RATE_WINDOW_SECONDS") * 1_000,
+    rateLimits: {
+      source: boundedInteger(env.PROVISIONING_SOURCE_RATE_LIMIT, 12, 1, 1_000, "PROVISIONING_SOURCE_RATE_LIMIT"),
+      subnet: boundedInteger(env.PROVISIONING_SUBNET_RATE_LIMIT, 32, 1, 5_000, "PROVISIONING_SUBNET_RATE_LIMIT"),
+      host: boundedInteger(env.PROVISIONING_HOST_RATE_LIMIT, 12, 1, 1_000, "PROVISIONING_HOST_RATE_LIMIT"),
+      desktop: boundedInteger(env.PROVISIONING_DESKTOP_RATE_LIMIT, 4, 1, 100, "PROVISIONING_DESKTOP_RATE_LIMIT"),
+      mobile: boundedInteger(env.PROVISIONING_MOBILE_RATE_LIMIT, 6, 1, 100, "PROVISIONING_MOBILE_RATE_LIMIT"),
+      global: boundedInteger(env.PROVISIONING_GLOBAL_RATE_LIMIT, 500, 1, 100_000, "PROVISIONING_GLOBAL_RATE_LIMIT")
+    },
+    maxConcurrentEnrollments: boundedInteger(env.PROVISIONING_MAX_CONCURRENT_ENROLLMENTS, 4, 1, 64, "PROVISIONING_MAX_CONCURRENT_ENROLLMENTS"),
+    maxConnections: boundedInteger(env.PROVISIONING_MAX_CONNECTIONS, 128, 16, 2_048, "PROVISIONING_MAX_CONNECTIONS"),
+    maxActiveActivations: boundedInteger(env.PROVISIONING_MAX_ACTIVE_ACTIVATIONS, 10_000, 100, 100_000, "PROVISIONING_MAX_ACTIVE_ACTIVATIONS"),
+    upstreamTimeoutMs: boundedInteger(env.PROVISIONING_UPSTREAM_TIMEOUT_MS, 8_000, 1_000, 30_000, "PROVISIONING_UPSTREAM_TIMEOUT_MS")
   };
 }
 
@@ -41,92 +38,164 @@ export function createProvisioningServer(config, dependencies = {}) {
   const usedNonces = new Map();
   const activations = new Map();
   const rateBuckets = new Map();
+  let enrollmentCount = 0;
 
-  return createServer(async (req, res) => {
+  const server = createServer(async (req, res) => {
     const requestId = randomUUID();
     setSecurityHeaders(res, requestId);
     const url = new URL(req.url ?? "/", "http://provisioner.invalid");
 
-    if (req.method === "GET" && url.pathname === "/health") {
-      return json(res, 200, { ok: true });
-    }
+    if (req.method === "GET" && url.pathname === "/health") return json(res, 200, { ok: true });
     if (req.method !== "POST" || (url.pathname !== "/v1/activate" && url.pathname !== "/v1/enroll")) {
       return json(res, 404, { error: "not_found" });
     }
+
     const source = clientAddress(req);
-    cleanup(usedNonces, activations, rateBuckets, now());
+    const timestamp = now();
+    cleanup(usedNonces, activations, rateBuckets, timestamp);
     let body;
     try {
       body = await readJson(req);
     } catch (error) {
+      audit("request_rejected", { requestId, source, reason: error?.code === "BODY_TOO_LARGE" ? "body_too_large" : "invalid_json" });
       return json(res, error?.code === "BODY_TOO_LARGE" ? 413 : 400, { error: "invalid_request" });
     }
-    if (!validEnrollment(body)) return json(res, 400, { error: "invalid_request" });
+    if (!validEnrollment(body)) {
+      audit("request_rejected", { requestId, source, reason: "invalid_fields" });
+      return json(res, 400, { error: "invalid_request" });
+    }
+
+    const auditFields = { requestId, source, role: body.role, hostId: body.hostId, deviceId: body.deviceId };
+    if (!takeRequestQuotas(rateBuckets, config, source, body, timestamp)) {
+      res.setHeader("Retry-After", String(Math.ceil(config.rateWindowMs / 1_000)));
+      audit("request_rate_limited", auditFields);
+      return json(res, 429, { error: "rate_limited" });
+    }
 
     if (url.pathname === "/v1/activate") {
-      const tokenIdentity = authenticate(req.headers.authorization, config.tokenHashes);
-      if (!tokenIdentity) return json(res, 401, { error: "unauthorized" });
-      if (!takeRateLimit(rateBuckets, `token:${tokenIdentity}`, config, now()) ||
-          !takeRateLimit(rateBuckets, `source:${source}`, config, now())) {
-        res.setHeader("Retry-After", String(Math.ceil(config.rateWindowMs / 1_000)));
-        return json(res, 429, { error: "rate_limited" });
+      if (activations.size >= config.maxActiveActivations) {
+        audit("activation_capacity_reached", auditFields);
+        return json(res, 503, { error: "provisioning_busy" });
       }
-      const nonceIdentity = sha256(`${tokenIdentity}:${body.nonce}`);
-      if (usedNonces.has(nonceIdentity)) return json(res, 409, { error: "nonce_already_used" });
-      usedNonces.set(nonceIdentity, now() + config.nonceRetentionMs);
+      const nonceIdentity = sha256(`${body.role}:${body.hostId}:${body.deviceId}:${body.nonce}`);
+      if (usedNonces.has(nonceIdentity)) {
+        audit("activation_replay_rejected", auditFields);
+        return json(res, 409, { error: "nonce_already_used" });
+      }
+      usedNonces.set(nonceIdentity, timestamp + config.nonceRetentionMs);
 
       const activationToken = randomBytes(32).toString("base64url");
-      const expiresAt = now() + config.activationTtlSeconds * 1_000;
-      activations.set(sha256(activationToken), { ...body, expiresAt });
+      const expiresAt = timestamp + config.activationTtlSeconds * 1_000;
+      activations.set(sha256(activationToken), { ...body, expiresAt, source });
+      audit("activation_issued", auditFields);
       return json(res, 201, { activationToken, expiresAt: new Date(expiresAt).toISOString() });
     }
 
     const activationToken = bearerToken(req.headers.authorization);
     const activationIdentity = activationToken && sha256(activationToken);
     const activation = activationIdentity && activations.get(activationIdentity);
-    if (!activation || activation.expiresAt <= now()) return json(res, 401, { error: "unauthorized" });
-    // Consume before validation or Headscale access. An activation can return
-    // an enrollment credential at most once, even during concurrent calls.
-    activations.delete(activationIdentity);
-    if (activation.nonce !== body.nonce || activation.hostId !== body.hostId || activation.deviceId !== body.deviceId) {
-      return json(res, 403, { error: "activation_mismatch" });
+    if (!activation || activation.expiresAt <= timestamp) {
+      audit("enrollment_unauthorized", auditFields);
+      return json(res, 401, { error: "unauthorized" });
     }
-    if (!takeRateLimit(rateBuckets, `source:${source}`, config, now())) {
-      res.setHeader("Retry-After", String(Math.ceil(config.rateWindowMs / 1_000)));
-      return json(res, 429, { error: "rate_limited" });
+    if (enrollmentCount >= config.maxConcurrentEnrollments) {
+      res.setHeader("Retry-After", "2");
+      audit("enrollment_capacity_reached", auditFields);
+      return json(res, 503, { error: "provisioning_busy" });
     }
 
+    // Delete synchronously before the first await. Concurrent requests can never
+    // redeem the same capability twice, including failed or mismatched attempts.
+    activations.delete(activationIdentity);
+    if (!sameEnrollment(activation, body) || activation.source !== source) {
+      audit("activation_mismatch", auditFields);
+      return json(res, 403, { error: "activation_mismatch" });
+    }
+
+    enrollmentCount += 1;
     try {
+      const userId = await ensureHeadscaleUser(config, request, body.hostId);
       const expiresAt = new Date(now() + config.keyTtlSeconds * 1_000).toISOString();
-      const headscaleResponse = await request(`${config.headscaleUrl}/api/v1/preauthkey`, {
+      const headscaleResponse = await headscaleRequest(config, request, "/api/v1/preauthkey", {
         method: "POST",
-        headers: {
-          authorization: `Bearer ${config.headscaleApiKey}`,
-          "content-type": "application/json",
-          accept: "application/json"
-        },
-        body: JSON.stringify({
-          user: config.headscaleUserId,
+        body: {
+          user: userId,
           reusable: false,
           ephemeral: false,
           expiration: expiresAt,
-          aclTags: config.aclTags
-        }),
-        signal: AbortSignal.timeout(8_000)
+          // Headscale 0.29 tags remove user ownership. Keep this empty so the
+          // same-user ACL can isolate every desktop/mobile pairing group.
+          aclTags: []
+        }
       });
-      if (!headscaleResponse.ok) throw new Error(`Headscale returned HTTP ${headscaleResponse.status}`);
       const result = await headscaleResponse.json();
       const key = result?.preAuthKey?.key;
       if (typeof key !== "string" || key.length < 20) throw new Error("Headscale returned no pre-auth key");
 
-      // Never include the nonce, client credential, Headscale credential, or key in logs.
-      console.info(JSON.stringify({ event: "enrollment_issued", requestId, hostId: body.hostId, deviceId: body.deviceId }));
+      audit("enrollment_issued", auditFields);
       return json(res, 201, { authKey: key, expiresAt });
     } catch (error) {
-      console.error(JSON.stringify({ event: "enrollment_failed", requestId, reason: safeReason(error) }));
+      audit("enrollment_failed", { ...auditFields, reason: safeReason(error) }, true);
       return json(res, 502, { error: "provisioning_unavailable" });
+    } finally {
+      enrollmentCount -= 1;
     }
   });
+
+  server.maxHeadersCount = 32;
+  server.headersTimeout = 5_000;
+  server.requestTimeout = 10_000;
+  server.keepAliveTimeout = 5_000;
+  server.maxConnections = config.maxConnections;
+  server.maxRequestsPerSocket = 20;
+  return server;
+}
+
+async function ensureHeadscaleUser(config, request, hostId) {
+  const digest = sha256(hostId);
+  const name = `at-${digest.slice(0, 24)}`;
+  const existing = await findHeadscaleUser(config, request, name);
+  if (existing) return String(existing.id);
+
+  try {
+    const response = await headscaleRequest(config, request, "/api/v1/user", {
+      method: "POST",
+      body: { name, displayName: `Agent Terminal ${digest.slice(0, 8)}` }
+    });
+    const result = await response.json();
+    const user = result?.user ?? result;
+    if (user?.id !== undefined) return String(user.id);
+  } catch (error) {
+    const raced = await findHeadscaleUser(config, request, name);
+    if (raced) return String(raced.id);
+    throw error;
+  }
+  throw new Error("Headscale returned no user ID");
+}
+
+async function findHeadscaleUser(config, request, name) {
+  const response = await headscaleRequest(config, request, `/api/v1/user?name=${encodeURIComponent(name)}`, { method: "GET", allowNotFound: true });
+  if (response.status === 404) return undefined;
+  const result = await response.json();
+  const users = Array.isArray(result?.users) ? result.users : [];
+  return users.find((user) => user?.name === name);
+}
+
+async function headscaleRequest(config, request, path, options) {
+  const response = await request(`${config.headscaleUrl}${path}`, {
+    method: options.method,
+    headers: {
+      authorization: `Bearer ${config.headscaleApiKey}`,
+      accept: "application/json",
+      ...(options.body ? { "content-type": "application/json" } : {})
+    },
+    ...(options.body ? { body: JSON.stringify(options.body) } : {}),
+    signal: AbortSignal.timeout(config.upstreamTimeoutMs)
+  });
+  if (!response.ok && !(options.allowNotFound && response.status === 404)) {
+    throw new Error(`Headscale returned HTTP ${response.status}`);
+  }
+  return response;
 }
 
 function required(env, name) {
@@ -143,29 +212,22 @@ function boundedInteger(value, fallback, minimum, maximum, name) {
   return parsed;
 }
 
-function authenticate(header, allowedHashes) {
-  const token = bearerToken(header);
-  if (!token) return undefined;
-  if (token.length < 32 || token.length > 512) return undefined;
-  const candidate = Buffer.from(sha256(token), "hex");
-  for (const hash of allowedHashes) {
-    if (timingSafeEqual(candidate, Buffer.from(hash, "hex"))) return hash.slice(0, 16);
-  }
-  return undefined;
-}
-
 function bearerToken(header) {
   if (typeof header !== "string" || !header.startsWith("Bearer ")) return undefined;
   const token = header.slice(7);
-  return token.length >= 32 && token.length <= 512 ? token : undefined;
+  return token.length >= 32 && token.length <= 128 ? token : undefined;
 }
 
 function validEnrollment(body) {
-  return body && typeof body === "object" &&
+  return body && typeof body === "object" && ROLES.has(body.role) &&
     typeof body.nonce === "string" && NONCE_PATTERN.test(body.nonce) &&
     typeof body.hostId === "string" && ID_PATTERN.test(body.hostId) &&
     typeof body.deviceId === "string" && ID_PATTERN.test(body.deviceId) &&
-    Object.keys(body).every((key) => key === "nonce" || key === "hostId" || key === "deviceId");
+    Object.keys(body).every((key) => key === "role" || key === "nonce" || key === "hostId" || key === "deviceId");
+}
+
+function sameEnrollment(left, right) {
+  return left.role === right.role && left.nonce === right.nonce && left.hostId === right.hostId && left.deviceId === right.deviceId;
 }
 
 async function readJson(req) {
@@ -184,14 +246,25 @@ async function readJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-function takeRateLimit(buckets, identity, config, timestamp) {
+function takeRequestQuotas(buckets, config, source, body, timestamp) {
+  const keys = [
+    ["global", config.rateLimits.global],
+    [`source:${source}`, config.rateLimits.source],
+    [`subnet:${networkPrefix(source)}`, config.rateLimits.subnet],
+    [`host:${sha256(body.hostId).slice(0, 24)}`, config.rateLimits.host],
+    [`role:${body.role}:${sha256(body.hostId).slice(0, 24)}`, config.rateLimits[body.role]]
+  ];
+  return keys.every(([identity, limit]) => takeRateLimit(buckets, identity, limit, config.rateWindowMs, timestamp));
+}
+
+function takeRateLimit(buckets, identity, limit, windowMs, timestamp) {
   const current = buckets.get(identity);
   if (!current || current.resetAt <= timestamp) {
-    buckets.set(identity, { count: 1, resetAt: timestamp + config.rateWindowMs });
+    buckets.set(identity, { count: 1, resetAt: timestamp + windowMs });
     return true;
   }
   current.count += 1;
-  return current.count <= config.rateLimit;
+  return current.count <= limit;
 }
 
 function cleanup(nonces, activations, buckets, timestamp) {
@@ -201,10 +274,28 @@ function cleanup(nonces, activations, buckets, timestamp) {
 }
 
 function clientAddress(req) {
-  // Caddy replaces X-Forwarded-For, so only the right-most value is needed.
   const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string" && forwarded.length <= 256) return forwarded.split(",").at(-1)?.trim() ?? "unknown";
-  return req.socket.remoteAddress ?? "unknown";
+  const raw = typeof forwarded === "string" && forwarded.length <= 256
+    ? forwarded.split(",").at(-1)?.trim()
+    : req.socket.remoteAddress;
+  return normalizeAddress(raw ?? "unknown");
+}
+
+function normalizeAddress(address) {
+  if (address.startsWith("::ffff:") && isIP(address.slice(7)) === 4) return address.slice(7);
+  return address.toLowerCase();
+}
+
+function networkPrefix(address) {
+  if (isIP(address) === 4) return `${address.split(".").slice(0, 3).join(".")}.0/24`;
+  if (isIP(address) !== 6) return address;
+  const [leftRaw, rightRaw = ""] = address.split("::");
+  const left = leftRaw ? leftRaw.split(":") : [];
+  const right = rightRaw ? rightRaw.split(":") : [];
+  const groups = rightRaw === "" && !address.includes("::")
+    ? left
+    : [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill("0"), ...right];
+  return `${groups.slice(0, 4).map((group) => Number.parseInt(group || "0", 16).toString(16)).join(":")}::/64`;
 }
 
 function setSecurityHeaders(res, requestId) {
@@ -228,6 +319,11 @@ function sha256(value) {
 function safeReason(error) {
   const message = error instanceof Error ? error.message : "unknown failure";
   return message.replace(/[A-Za-z0-9_-]{20,}/g, "[redacted]").slice(0, 160);
+}
+
+function audit(event, fields, isError = false) {
+  const output = JSON.stringify({ event, ...fields });
+  (isError ? console.error : console.info)(output);
 }
 
 if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, "/")}`).href) {

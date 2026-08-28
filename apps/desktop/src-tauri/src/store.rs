@@ -40,7 +40,7 @@ pub struct Settings {
     pub port: u16,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkState {
     /// The node's long-lived private identity key. It is never sent to the
@@ -53,6 +53,30 @@ pub struct NetworkState {
     pub tailnet_address: Option<String>,
     #[serde(default)]
     pub last_connected_at: Option<String>,
+    #[serde(default)]
+    pub enrolled: bool,
+    #[serde(default = "default_registration_status")]
+    pub registration_status: String,
+    #[serde(default)]
+    pub registration_error: Option<String>,
+}
+
+fn default_registration_status() -> String {
+    "unregistered".into()
+}
+
+impl Default for NetworkState {
+    fn default() -> Self {
+        Self {
+            private_key: None,
+            node_id: None,
+            tailnet_address: None,
+            last_connected_at: None,
+            enrolled: false,
+            registration_status: default_registration_status(),
+            registration_error: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -372,6 +396,9 @@ mod tests {
                 node_id: Some("node-1".into()),
                 tailnet_address: Some("100.64.0.2".into()),
                 last_connected_at: Some("2026-08-28T00:00:00Z".into()),
+                enrolled: true,
+                registration_status: "enrolled".into(),
+                registration_error: None,
             })
             .expect("save network state");
         drop(store);

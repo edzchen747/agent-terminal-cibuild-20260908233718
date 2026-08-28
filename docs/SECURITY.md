@@ -9,8 +9,9 @@ Agent Terminal exposes command execution, so the desktop is deliberately authori
 - The desktop stores only SHA-256 credential hashes.
 - Credential comparisons use a timing-safe comparison.
 - Headscale node expiry is disabled for age-based expiry; the public deployment bundle expires only nodes whose last activity is older than 30 days through a dedicated, server-only reaper API key.
-- Pairing QR/manual data never contains a Headscale key. A separate post-pairing exchange issues one non-reusable mobile pre-auth key with an explicit short expiry.
-- The enrollment service requires a hashed, per-installation client credential to mint a short-lived activation, consumes both the pairing nonce and activation once, fixes the Headscale user/tag/expiry, rate-limits by credential and source, rejects extra policy fields, and never logs returned keys.
+- Pairing QR/manual data never contains a Headscale key. Separate post-pairing exchanges issue non-reusable desktop and mobile pre-auth keys with explicit short expiries.
+- Public activation capabilities are bound to role, host, device, nonce, source address, and a short expiration. Redemption consumes them atomically before Headscale access. The service rejects extra policy fields and rate-limits exact IPs, IPv4 /24 or IPv6 /64 prefixes, host IDs, roles, and global traffic; it also caps bodies, active activations, concurrent upstream work, and request timeouts.
+- Every paired host gets a deterministic Headscale user. The checked-in deny-by-default policy permits Agent Terminal TCP traffic only between nodes owned by that same user. Provisioning roles are fixed server metadata rather than Headscale ACL tags because Headscale 0.29 makes tags and user ownership mutually exclusive; global role tags would defeat pair isolation.
 - `HEADSCALE_PROVISION_API_KEY` and `HEADSCALE_REAPER_API_KEY` remain inside the server environment. Neither app receives a Headscale administrative API credential, and Caddy blocks the public administrative `/api/v1/*` surface.
 - Every command requires an authenticated socket.
 - Device revocation closes currently connected sockets immediately.
@@ -20,7 +21,7 @@ Agent Terminal exposes command execution, so the desktop is deliberately authori
 
 ## Transport boundary
 
-For cross-network use, deploy `server/relay`. Headscale coordinates the embedded nodes and its DERP/STUN service attempts a direct NAT-traversed path before encrypted fallback. The provisioning facade exposes only activation and enrollment—not a generic Headscale proxy. Project state, terminal state, and device authorization remain on the desktop, which verifies the saved device credential after the overlay connection is established.
+For cross-network use, deploy `server/relay`. Headscale coordinates the embedded nodes and its DERP/STUN service attempts a direct NAT-traversed path before encrypted fallback. The provisioning facade exposes only activation and enrollment—not a generic Headscale proxy. These public capability endpoints intentionally have no reusable desktop secret; their abuse controls do not replace an upstream WAF and volumetric DDoS service. Project state, terminal state, and device authorization remain on the desktop, which verifies the saved device credential after the overlay connection is established.
 
 The direct `ws://` transport on port `47831` is the LAN pairing path and a trusted-network fast path only. Do not expose it to the public internet. The first QR exchange must occur on a trusted local network; remote reconnects use the saved credential and overlay path.
 

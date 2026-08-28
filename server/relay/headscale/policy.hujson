@@ -1,0 +1,12 @@
+{
+  // Headscale defaults to allow-all when no policy is configured. Keep the
+  // overlay deny-by-default and permit Agent Terminal traffic only between
+  // nodes owned by the same per-pair user on the application's TCP port.
+  "grants": [
+    {
+      "src": ["autogroup:member"],
+      "dst": ["autogroup:self"],
+      "ip": ["47831"]
+    }
+  ]
+}
