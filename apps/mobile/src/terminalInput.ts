@@ -25,12 +25,14 @@ export function nativeTerminalInput(event: NativeTerminalInputEvent, textareaVal
 /**
  * Whether xterm should defer a keydown to Android's native IME event.
  *
- * Backspace and Enter must not defer to beforeinput/input: an IME can report
- * them with keyCode 229 without mutating xterm's empty textarea. They are
- * handled directly by androidImeKeydownInput instead.
+ * Android WebViews can label a printable key as `Process` or `Unidentified`,
+ * and can deliver its input event before the keydown. Letting any
+ * non-composing keyCode 229 event reach xterm starts its deferred textarea
+ * diff, which can then emit a phantom Backspace after we clear the textarea.
+ * Backspace and Enter are recovered directly by androidImeKeydownInput.
  */
 export function shouldDeferToNativeInput(event: Pick<KeyboardEvent, "type" | "key" | "keyCode" | "isComposing">): boolean {
-  return event.type === "keydown" && event.keyCode === 229 && !event.isComposing && event.key.length === 1;
+  return event.type === "keydown" && event.keyCode === 229 && !event.isComposing && event.key !== "Backspace" && event.key !== "Enter";
 }
 
 /**

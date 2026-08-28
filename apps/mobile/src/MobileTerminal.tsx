@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { applyTerminalModifiers, createRequestId } from "@agentterminal/protocol";
@@ -88,7 +88,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     return output;
   };
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const hostElement = hostRef.current;
     if (!hostElement) return;
     const terminal = new Terminal({
@@ -179,7 +179,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     let lastNativeBeforeInput: { data: string; at: number } | undefined;
     const sendInput = (data: string) => {
       if (!data || !activeRef.current) return;
-      terminal.focus();
       const output = consumeSelectedKeys(data);
       if (output) connection.send({ type: "session.input", sessionId: session.id, data: output });
     };
@@ -231,8 +230,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         queueTerminalInput(directInput);
         return false;
       }
-      // Printable keyCode 229 events are delivered by beforeinput/input. Let
-      // the native IME path own them to avoid xterm's stale-value fallback.
+      // Non-composing keyCode 229 events are delivered by beforeinput/input,
+      // even when Android labels the key Process or Unidentified. Let the
+      // native IME path own them to avoid xterm's stale-value fallback.
       return !shouldDeferToNativeInput(event);
     });
     const input = terminal.onData(queueTerminalInput);
@@ -500,7 +500,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     };
   }, [connection, session.id]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!activeRef.current) {
       terminalRef.current?.blur();
       return;
