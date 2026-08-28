@@ -156,8 +156,10 @@ public class EmbeddedNodePlugin extends Plugin {
                     result.put("tailnetAddress", json.optString("tailnetAddress", null));
                     String errorCode = json.optString("errorCode", "");
                     String errorMessage = json.optString("errorMessage", "");
+                    String errorDetail = json.optString("errorDetail", "");
                     if (!errorCode.isEmpty()) result.put("errorCode", errorCode);
                     if (!errorMessage.isEmpty()) result.put("errorMessage", errorMessage);
+                    if (!errorDetail.isEmpty()) result.put("errorDetail", errorDetail);
                     String proxyAddress = json.optString("proxyAddress", "");
                     if (!proxyAddress.isEmpty()) {
                         result.put("endpoint", "ws://" + proxyAddress);
@@ -181,6 +183,10 @@ public class EmbeddedNodePlugin extends Plugin {
         String errorCode = result.optString("errorCode", "");
         if (errorCode.isEmpty()) return false;
         String message = result.optString("errorMessage", "The embedded network node could not start.");
+        String detail = result.optString("errorDetail", "");
+        if (errorCode.equals("embedded_node_start_failed") && !detail.isEmpty()) {
+            message += " (" + detail + ")";
+        }
         call.reject(message);
         return true;
     }

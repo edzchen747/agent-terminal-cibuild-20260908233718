@@ -28,6 +28,7 @@ type status struct {
 	ProxyAddress   string `json:"proxyAddress,omitempty"`
 	ErrorCode      string `json:"errorCode,omitempty"`
 	ErrorMessage   string `json:"errorMessage,omitempty"`
+	ErrorDetail    string `json:"errorDetail,omitempty"`
 }
 
 func main() {
@@ -113,7 +114,12 @@ func waitForRemote(node *tsnet.Server, address string) error {
 
 func writeFailure(stateDir, nodeID string, err error, remote bool) {
 	code, message := explainError(err, remote)
-	writeStatus(stateDir, status{NodeID: nodeID, ErrorCode: code, ErrorMessage: message})
+	writeStatus(stateDir, status{
+		NodeID:       nodeID,
+		ErrorCode:    code,
+		ErrorMessage: message,
+		ErrorDetail:  safeErrorDetail(err),
+	})
 }
 
 func explainError(err error, remote bool) (string, string) {
@@ -147,6 +153,8 @@ func isAuthFailure(text string) bool {
 		strings.Contains(text, "key not found") ||
 		strings.Contains(text, "expired") ||
 		strings.Contains(text, "already been used") ||
+		strings.Contains(text, "authentication failed") ||
+		strings.Contains(text, "access denied") ||
 		strings.Contains(text, "registration failed")
 }
 
@@ -157,7 +165,21 @@ func isHostNameNotFound(err error) bool {
 		strings.Contains(text, "unknown host") ||
 		strings.Contains(text, "name or service not known") ||
 		strings.Contains(text, "cannot resolve") ||
-		(strings.Contains(text, "lookup ") && strings.Contains(text, "not found"))
+		(strings.Contains(text, "lookup ") && (strings.Contains(text, "not found") || strings.Contains(text, "server misbehaving")))
+}
+
+// Keep the user-visible diagnostic useful without ever echoing an auth key or
+// token that a control server might include in an error string.
+func safeErrorDetail(err error) string {
+	value := strings.Join(strings.Fields(err.Error()), " ")
+	text := strings.ToLower(value)
+	if strings.Contains(text, "auth") || strings.Contains(text, "preauth") || strings.Contains(text, "token") || strings.Contains(text, "password") {
+		return "authentication or enrollment detail was redacted"
+	}
+	if len(value) > 180 {
+		return value[:180] + "…"
+	}
+	return value
 }
 
 func serve(listener net.Listener, dial func() (net.Conn, error)) {
