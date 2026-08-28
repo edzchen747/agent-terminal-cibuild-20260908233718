@@ -238,14 +238,13 @@ export function App() {
   if (view.type === "terminal" && activeSession) {
     const project = snapshot.projects.find((item) => item.id === activeSession.projectId);
     return <div className="mobile-app terminal-view">
-      <RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} />
       <MobileHeader title={activeSession.title} subtitle={project?.name ?? activeSession.cwd} onBack={() => setView({ type: "project", projectId: activeSession.projectId })} trailing={<div className="session-actions"><span className={`session-state ${activeSession.status}`}>{activeSession.status}</span><button className="close-session-button" onClick={() => setSessionToClose(activeSession)} aria-label="Close terminal session" title="Close terminal session"><CloseIcon /></button></div>} />
       <MobileTerminal key={activeSession.id} connection={connection} session={activeSession} />
       {sessionToClose?.id === activeSession.id && <CloseSessionSheet session={activeSession} onClose={() => setSessionToClose(null)} onConfirm={() => closeSession(activeSession)} />}
     </div>;
   }
   if (view.type === "project" && activeProject) {
-    return <><RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} /><ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={() => setView({ type: "home" })} onRename={() => setProjectToRename(activeProject)} onOpen={(session) => setView({ type: "terminal", sessionId: session.id, projectId: session.projectId })} />{projectToRename?.id === activeProject.id && <RenameProjectSheet project={activeProject} connection={connection} onClose={() => setProjectToRename(null)} />}</>;
+    return <><ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={() => setView({ type: "home" })} onRename={() => setProjectToRename(activeProject)} onOpen={(session) => setView({ type: "terminal", sessionId: session.id, projectId: session.projectId })} />{projectToRename?.id === activeProject.id && <RenameProjectSheet project={activeProject} connection={connection} onClose={() => setProjectToRename(null)} />}</>;
   }
   return <div className="mobile-app home-view">
     <RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} />

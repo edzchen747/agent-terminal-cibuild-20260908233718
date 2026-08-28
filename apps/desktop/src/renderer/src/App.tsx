@@ -289,7 +289,9 @@ export function App() {
     ? "Remote access ready"
     : state.remoteRegistration.status === "pending"
       ? "Registering remote access"
-      : "LAN access ready";
+      : state.remoteRegistration.status === "failed"
+        ? "Remote registration failed"
+        : "LAN access ready";
 
   return (
     <main className="app-shell">
@@ -302,16 +304,15 @@ export function App() {
         </div>
         <div className="titlebar-actions">
           <span className={`host-online is-${state.remoteRegistration.status}`}><i /> {remoteLabel}</span>
+          {state.remoteRegistration.status === "failed" && <span className="remote-registration-inline" role="status">
+            <span>{state.remoteRegistration.error ?? "LAN access is still available."}</span>
+            <button onClick={() => void window.agentTerminal.retryRemoteRegistration()}>Retry</button>
+          </span>}
           {currentProject && <button className={`project-persistence-action ${currentProject.persistent ? "is-saved" : ""}`} onClick={() => void toggleProjectPersistence()} title={currentProject.persistent ? "Stop saving this project" : "Save this temporary project"}>{currentProject.persistent ? <BookmarkIcon /> : <ClockIcon />}<span>{currentProject.persistent ? "Unsave" : "Save project"}</span></button>}
           <button className="icon-button" onClick={() => void showPairing()} title="Pair a mobile device"><PhoneIcon /></button>
           <button className="icon-button" onClick={() => setModal("settings")} title="Settings and devices"><SettingsIcon /></button>
         </div>
       </header>
-
-      {state.remoteRegistration.status === "failed" && <aside className="remote-registration-banner" role="status">
-        <span>{state.remoteRegistration.error ?? "Remote connection registration failed."}</span>
-        <button onClick={() => void window.agentTerminal.retryRemoteRegistration()}>Retry</button>
-      </aside>}
 
       <div className="workspace">
         <aside className={`sidebar ${sidebarOpen ? "" : "is-collapsed"}`}>
