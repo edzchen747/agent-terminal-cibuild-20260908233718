@@ -167,7 +167,6 @@ export function App() {
   async function renameProject() {
     if (!renamingProject || renaming) return;
     const name = projectName.trim();
-    if (!name) { setRenameError("Enter a project name."); return; }
     setRenaming(true);
     setRenameError("");
     try {
@@ -451,7 +450,7 @@ export function App() {
         <button type="button" className="modal-close icon-button" disabled={renaming} onClick={() => setModal(null)}><CloseIcon /></button>
         <div className="modal-kicker"><EditIcon /> Project name</div>
         <h1>Rename project</h1>
-        <p>The folder stays at {renamingProject.path}.</p>
+        <p>The folder stays at {renamingProject.path}. Leave the name blank to use the folder name.</p>
         <label className="rename-field">Name<input autoFocus maxLength={MAX_PROJECT_NAME_LENGTH} value={projectName} onChange={(event) => setProjectName(event.target.value)} /></label>
         {renameError && <div className="form-error">{renameError}</div>}
         <button className="primary wide" disabled={renaming} type="submit">{renaming ? "Renaming…" : "Save name"}</button>

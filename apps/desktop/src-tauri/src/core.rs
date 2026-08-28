@@ -890,12 +890,12 @@ impl Core {
     }
 
     pub fn rename_project(&self, project_id: &str, name: &str) -> Result<Project> {
-        let name = validate_project_name(name)?;
+        let name = name.trim();
         let (project, window_label) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let mut project =
                 project_by_id(&inner, project_id).ok_or_else(|| anyhow!("Project not found."))?;
-            project.name = name.to_string();
+            project.name = project_name_or_folder(name, Path::new(&project.path))?;
             project.persistent = true;
             if project.created_at.is_none() {
                 project.created_at = Some(Utc::now().to_rfc3339());
@@ -2289,6 +2289,14 @@ fn validate_project_name(name: &str) -> Result<&str> {
     Ok(name)
 }
 
+fn project_name_or_folder(name: &str, path: &Path) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(folder_name(path));
+    }
+    Ok(validate_project_name(name)?.to_string())
+}
+
 fn local_address() -> String {
     UdpSocket::bind("0.0.0.0:0")
         .and_then(|socket| {
@@ -2349,8 +2357,8 @@ fn is_dropped_node_status(status: &EmbeddedNodeStatus) -> bool {
 mod tests {
     use super::{
         EmbeddedNodeStatus, PairingGrant, is_dropped_node_status, is_within_project,
-        parse_terminal_titles, parse_working_directories, take_valid_pairing_grant,
-        validate_project_name,
+        parse_terminal_titles, parse_working_directories, project_name_or_folder,
+        take_valid_pairing_grant, validate_project_name,
     };
     use std::{collections::HashMap, path::Path};
 
@@ -2426,5 +2434,19 @@ mod tests {
         assert!(validate_project_name(&"x".repeat(100)).is_ok());
         assert!(validate_project_name(&"x".repeat(101)).is_err());
         assert!(validate_project_name("\n").is_err());
+    }
+
+    #[test]
+    fn blank_project_names_use_the_original_folder_name() {
+        assert_eq!(
+            project_name_or_folder("  ", Path::new("C:\\Users\\Ada\\AgentTerminal"))
+                .unwrap(),
+            "AgentTerminal"
+        );
+        assert_eq!(
+            project_name_or_folder("  Custom name  ", Path::new("C:\\Users\\Ada\\AgentTerminal"))
+                .unwrap(),
+            "Custom name"
+        );
     }
 }

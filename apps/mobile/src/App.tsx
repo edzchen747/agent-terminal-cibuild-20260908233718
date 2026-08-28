@@ -59,6 +59,7 @@ export function App() {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [projectOrder, setProjectOrder] = useState<string[]>([]);
   const [projectDrag, setProjectDrag] = useState<ProjectDragState | null>(null);
+  const [projectReordering, setProjectReordering] = useState(false);
   const [swipe, setSwipe] = useState<SwipeState | null>(null);
   const connectionRef = useRef<HostConnection | null>(null);
   connectionRef.current = connection;
@@ -78,8 +79,9 @@ export function App() {
 
   useEffect(() => {
     const ids = snapshot?.projects.map((project) => project.id) ?? [];
-    const available = new Set(ids);
-    setProjectOrder((current) => [...current.filter((id) => available.has(id)), ...ids.filter((id) => !current.includes(id))]);
+    // The snapshot is the host's canonical order. Reconcile local optimistic
+    // drag state with it so reorders made in another client are applied here.
+    setProjectOrder(ids);
   }, [snapshot?.projects]);
 
   const orderedProjects = useMemo(() => {
@@ -328,10 +330,14 @@ export function App() {
     if (commit && current.didMove && current.targetIndex !== current.startIndex && connection) {
       const ids = orderedProjects.map((project) => project.id);
       ids.splice(current.targetIndex, 0, ...ids.splice(current.startIndex, 1));
+      setProjectReordering(true);
       setProjectOrder(ids);
       void connection.request({ type: "project.reorder", requestId: createRequestId(), projectIds: ids }).catch(() => {
         setProjectOrder(snapshot?.projects.map((project) => project.id) ?? []);
       });
+      // Let the reordered layout paint once with transitions disabled before
+      // restoring the normal sibling-shift animation for the next drag.
+      window.requestAnimationFrame(() => setProjectReordering(false));
     }
     projectDragRef.current = null;
     setProjectDrag(null);
@@ -421,7 +427,7 @@ export function App() {
         <section className="home-content">
           <div className="section-title"><span>Projects</span><button onClick={() => setShowCreateProject(true)}><PlusIcon /> New</button></div>
           <div className="project-cards">
-            {orderedProjects.map((project, index) => <ProjectCard key={project.id} elementRef={(element) => { if (element) projectElementsRef.current.set(project.id, element); else projectElementsRef.current.delete(project.id); }} project={project} sessions={snapshot.sessions.filter((session) => session.projectId === project.id)} dragging={project.id === projectDrag?.projectId} transform={projectDragTransform(project.id, index)} onDragStart={(event) => beginProjectDrag(event, project.id, index)} onDragMove={moveProjectDrag} onDragEnd={(event, commit) => finishProjectDrag(event, commit)} onClick={() => openProject(project.id)} onSession={openTerminal} />)}
+            {orderedProjects.map((project, index) => <ProjectCard key={project.id} elementRef={(element) => { if (element) projectElementsRef.current.set(project.id, element); else projectElementsRef.current.delete(project.id); }} project={project} sessions={snapshot.sessions.filter((session) => session.projectId === project.id)} dragging={project.id === projectDrag?.projectId} reordering={projectReordering} transform={projectDragTransform(project.id, index)} onDragStart={(event) => beginProjectDrag(event, project.id, index)} onDragMove={moveProjectDrag} onDragEnd={(event, commit) => finishProjectDrag(event, commit)} onClick={() => openProject(project.id)} onSession={openTerminal} />)}
           </div>
           {!snapshot.projects.length && <div className="mobile-empty"><FolderIcon /><h2>No projects yet</h2><p>Add a folder from your desktop to begin.</p></div>}
         </section>
@@ -501,8 +507,8 @@ function ProjectScreen({ project, snapshot, connection, onBack, onRename, onOpen
   </div>;
 }
 
-function ProjectCard({ project, sessions, dragging, transform, elementRef, onDragStart, onDragMove, onDragEnd, onClick, onSession }: { project: Project; sessions: TerminalSession[]; dragging: boolean; transform?: string; elementRef: (element: HTMLElement | null) => void; onDragStart: (event: ReactPointerEvent<HTMLElement>) => void; onDragMove: (event: ReactPointerEvent<HTMLElement>) => void; onDragEnd: (event: ReactPointerEvent<HTMLElement>, commit: boolean) => void; onClick: () => void; onSession: (session: TerminalSession) => void }) {
-  return <article ref={elementRef} className={`project-card ${dragging ? "is-dragging" : ""}`} style={{ transform }}><button className="project-card-main" onClick={onClick}><span className="card-folder"><FolderIcon /></span><span className="card-copy"><strong className="display-name" title={project.name}>{project.name}</strong><small>{project.path}</small></span><span className="card-persist">{project.persistent ? <BookmarkIcon /> : <ClockIcon />}</span><span className="mobile-project-drag" role="button" aria-label={`Reorder ${project.name}`} data-no-swipe onClick={(event) => event.stopPropagation()} onPointerDown={onDragStart} onPointerMove={onDragMove} onPointerUp={(event) => onDragEnd(event, true)} onPointerCancel={(event) => onDragEnd(event, false)}>⠿</span><ChevronIcon /></button>
+function ProjectCard({ project, sessions, dragging, reordering, transform, elementRef, onDragStart, onDragMove, onDragEnd, onClick, onSession }: { project: Project; sessions: TerminalSession[]; dragging: boolean; reordering: boolean; transform?: string; elementRef: (element: HTMLElement | null) => void; onDragStart: (event: ReactPointerEvent<HTMLElement>) => void; onDragMove: (event: ReactPointerEvent<HTMLElement>) => void; onDragEnd: (event: ReactPointerEvent<HTMLElement>, commit: boolean) => void; onClick: () => void; onSession: (session: TerminalSession) => void }) {
+  return <article ref={elementRef} className={`project-card ${dragging ? "is-dragging" : ""} ${reordering ? "is-reordering" : ""}`} style={{ transform }}><button className="project-card-main" onClick={onClick}><span className="card-folder"><FolderIcon /></span><span className="card-copy"><strong className="display-name" title={project.name}>{project.name}</strong><small>{project.path}</small></span><span className="card-persist">{project.persistent ? <BookmarkIcon /> : <ClockIcon />}</span><span className="mobile-project-drag" role="button" aria-label={`Reorder ${project.name}`} data-no-swipe onClick={(event) => event.stopPropagation()} onPointerDown={onDragStart} onPointerMove={onDragMove} onPointerUp={(event) => onDragEnd(event, true)} onPointerCancel={(event) => onDragEnd(event, false)}>⠿</span><ChevronIcon /></button>
     {!!sessions.length && <div className="card-sessions">{sessions.slice(0, 3).map((session) => <button key={session.id} onClick={() => onSession(session)}><TerminalIcon /><span className="display-name" title={session.title}>{session.title}</span><i className={session.status} /></button>)}{sessions.length > 3 && <span className="more-sessions">+{sessions.length - 3}</span>}</div>}
   </article>;
 }
@@ -543,7 +549,6 @@ function RenameProjectSheet({ project, connection, onClose }: { project: Project
   const [error, setError] = useState("");
   async function submit() {
     const nextName = name.trim();
-    if (!nextName) { setError("Enter a project name."); return; }
     setSaving(true); setError("");
     try {
       await connection.request({ type: "project.rename", requestId: createRequestId(), projectId: project.id, name: nextName });
@@ -553,7 +558,7 @@ function RenameProjectSheet({ project, connection, onClose }: { project: Project
       setSaving(false);
     }
   }
-  return <div className="sheet-backdrop" onClick={saving ? undefined : onClose}><section className="bottom-sheet" onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Project name</span><h2>Rename project</h2><p>The desktop folder stays at {project.path}.</p><label>Name<input autoFocus maxLength={MAX_PROJECT_NAME_LENGTH} value={name} onChange={(event) => setName(event.target.value)} /></label>{error && <div className="form-error">{error}</div>}<button className="mobile-primary full" disabled={saving} onClick={() => void submit()}>{saving ? "Renaming…" : "Save name"}</button><button className="text-button" disabled={saving} onClick={onClose}>Cancel</button></section></div>;
+  return <div className="sheet-backdrop" onClick={saving ? undefined : onClose}><section className="bottom-sheet" onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Project name</span><h2>Rename project</h2><p>The desktop folder stays at {project.path}. Leave the name blank to use the folder name.</p><label>Name<input autoFocus maxLength={MAX_PROJECT_NAME_LENGTH} value={name} onChange={(event) => setName(event.target.value)} /></label>{error && <div className="form-error">{error}</div>}<button className="mobile-primary full" disabled={saving} onClick={() => void submit()}>{saving ? "Renaming…" : "Save name"}</button><button className="text-button" disabled={saving} onClick={onClose}>Cancel</button></section></div>;
 }
 
 function CloseSessionSheet({ session, onClose, onConfirm }: { session: TerminalSession; onClose: () => void; onConfirm: () => Promise<void> }) {

@@ -30,7 +30,8 @@ button { color: inherit; }
 .section-title small { padding: 2px 7px; border-radius: 9px; background: #1a1e26; color: #6c7482; font-size: 10px; }
 .project-cards { display: flex; flex-direction: column; gap: 10px; margin-top: 7px; }
 .project-card { position: relative; overflow: hidden; border: 1px solid #232934; border-radius: 14px; background: linear-gradient(150deg,#131820,#0f1319); box-shadow: 0 8px 28px #00000021; transition: transform 150ms cubic-bezier(.2,.8,.2,1), border-color 150ms ease; }
-.project-card.is-dragging { z-index: 5; overflow: visible; border-color: #47786d; box-shadow: 0 14px 38px #000a; transition: none; }
+.project-card.is-dragging, .project-card.is-reordering { transition: none; }
+.project-card.is-dragging { z-index: 5; overflow: visible; border-color: #47786d; box-shadow: 0 14px 38px #000a; }
 .project-card-main { width: 100%; min-height: 77px; padding: 12px 10px 12px 13px; display: grid; grid-template-columns: 42px minmax(0,1fr) 18px 22px 16px; gap: 8px; align-items: center; text-align: left; border: 0; background: transparent; }
 .card-folder { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 11px; color: #7dd5c3; background: #1c2b28; }
 .card-folder svg { width: 23px; }
@@ -115,7 +116,7 @@ button { color: inherit; }
 .mobile-terminal .xterm .xterm-accessibility:not(.debug) { pointer-events: auto; }
 .mobile-terminal .xterm .xterm-accessibility-tree { -webkit-user-select: text !important; user-select: text !important; -webkit-touch-callout: default; touch-action: auto; }
 .mobile-terminal .xterm-viewport, .mobile-terminal .xterm-scrollable-element > .scrollbar { -ms-overflow-style: none !important; scrollbar-width: none !important; scrollbar-color: transparent transparent !important; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
-.mobile-terminal .xterm-scrollable-element > .scrollbar.vertical { width: 28px !important; right: 0 !important; touch-action: none; border: 0 !important; background: #080b0f !important; background-image: none !important; isolation: isolate; }
+.mobile-terminal .xterm-scrollable-element > .scrollbar.vertical { width: 28px !important; right: 0 !important; touch-action: none; border: 0 !important; background: transparent !important; background-image: none !important; isolation: isolate; }
 .mobile-terminal .xterm-viewport::-webkit-scrollbar, .mobile-terminal .xterm-viewport::-webkit-scrollbar-track, .mobile-terminal .xterm-viewport::-webkit-scrollbar-thumb, .mobile-terminal .xterm-viewport::-webkit-scrollbar-corner { display: none !important; width: 0 !important; height: 0 !important; background: transparent !important; border: 0 !important; }
 .mobile-terminal .xterm-scrollable-element > .scrollbar::-webkit-scrollbar, .mobile-terminal .xterm-scrollable-element > .scrollbar::-webkit-scrollbar-track, .mobile-terminal .xterm-scrollable-element > .scrollbar::-webkit-scrollbar-thumb, .mobile-terminal .xterm-scrollable-element > .scrollbar::-webkit-scrollbar-corner { display: none !important; width: 0 !important; height: 0 !important; background: transparent !important; border: 0 !important; }
 .mobile-terminal .xterm-scrollable-element > .shadow { display: none !important; box-shadow: none !important; }
