@@ -132,7 +132,7 @@ func waitForNode(node *tsnet.Server) error {
 				if os.Getenv("AGENT_TERMINAL_NODE_AUTH_KEY") != "" {
 					return errors.New("tsnet: preauth authentication did not complete")
 				}
-				return errors.New("tsnet: backend needs login")
+				return errors.New("tsnet: preauth key missing")
 			}
 			return ctx.Err()
 		case <-time.After(250 * time.Millisecond):
@@ -174,6 +174,9 @@ func explainError(err error, remote bool) (string, string) {
 	if remote && isHostNameNotFound(err) {
 		return "tsnet_host_not_found", "The tsnet desktop host name could not be found. Update the mobile app and pair again."
 	}
+	if strings.Contains(text, "preauth key missing") {
+		return "preauth_missing", "The desktop did not provide an enrollment key."
+	}
 	if isAuthFailure(text) {
 		return "preauth_rejected", "The desktop preauth key was rejected or has expired. Update the desktop app and pair again."
 	}
@@ -201,7 +204,6 @@ func isAuthFailure(text string) bool {
 		strings.Contains(text, "expired") ||
 		strings.Contains(text, "already been used") ||
 		strings.Contains(text, "authentication failed") ||
-		strings.Contains(text, "needs login") ||
 		strings.Contains(text, "needs machine auth") ||
 		strings.Contains(text, "preauth authentication") ||
 		strings.Contains(text, "access denied") ||
