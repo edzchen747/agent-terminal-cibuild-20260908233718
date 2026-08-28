@@ -37,9 +37,9 @@ jobs:
           cache: true
           cache-dependency-path: apps/embedded-node/go.mod
 
-      - name: Download Go dependencies
+      - name: Resolve Go dependencies
         working-directory: apps/embedded-node
-        run: go mod download
+        run: go mod tidy
 
       - name: Build embedded-node.exe
         shell: pwsh
