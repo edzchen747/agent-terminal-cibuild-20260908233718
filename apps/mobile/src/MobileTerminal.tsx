@@ -159,6 +159,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     observer.observe(hostElement);
     const handlePointerActivity = (event: PointerEvent) => {
       if (!activeRef.current || !(event.target instanceof Node) || !hostElement.contains(event.target)) return;
+      // Keep tap-to-refit, but do not turn the tap into cursor-key input.
+      // PSReadLine treats those synthetic arrows as editing commands and can
+      // ring the bell or corrupt the first real key at a line boundary.
       terminal.focus();
       resize(true);
     };
@@ -284,13 +287,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     let previousTouchY: number | undefined;
     let touchStartX: number | undefined;
     let touchStartY: number | undefined;
-    let touchStartedAt = 0;
     let touchMoved = false;
     let touchAxis: GestureAxis = "pending";
     let selectionGesture = false;
     let scrollbarGesture = false;
-    let suppressTap = false;
-    let tapTimer: number | undefined;
     let longPressTimer: number | undefined;
     const findTouch = (touches: TouchList, identifier: number) => {
       for (let index = 0; index < touches.length; index += 1) {
@@ -308,7 +308,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       touchAxis = "pending";
       selectionGesture = false;
       scrollbarGesture = false;
-      suppressTap = false;
     };
     const clearLongPressTimer = () => {
       if (longPressTimer !== undefined) window.clearTimeout(longPressTimer);
@@ -347,34 +346,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       selection.addRange(range);
       return true;
     };
-    const moveCursorToTouch = (clientX: number, clientY: number) => {
-      if (!activeRef.current) return;
-      terminal.focus();
-      if (!screen || terminal.hasSelection() || terminal.modes.mouseTrackingMode !== "none") return;
-
-      const buffer = terminal.buffer.active;
-      if (buffer.type !== "normal") return;
-      const bounds = screen.getBoundingClientRect();
-      if (!bounds.width || !bounds.height || clientX < bounds.left || clientX > bounds.right || clientY < bounds.top || clientY > bounds.bottom) return;
-
-      const targetColumn = Math.max(0, Math.min(terminal.cols, Math.round((clientX - bounds.left) / (bounds.width / terminal.cols))));
-      const viewportRow = Math.max(0, Math.min(terminal.rows - 1, Math.floor((clientY - bounds.top) / (bounds.height / terminal.rows))));
-      const targetRow = buffer.viewportY + viewportRow;
-      const cursorRow = buffer.baseY + buffer.cursorY;
-
-      let inputStartRow = cursorRow;
-      while (inputStartRow > 0 && buffer.getLine(inputStartRow)?.isWrapped) inputStartRow -= 1;
-      let inputEndRow = cursorRow;
-      while (inputEndRow + 1 < buffer.length && buffer.getLine(inputEndRow + 1)?.isWrapped) inputEndRow += 1;
-      if (targetRow < inputStartRow || targetRow > inputEndRow) return;
-
-      const targetOffset = (targetRow - inputStartRow) * terminal.cols + targetColumn;
-      const cursorOffset = (cursorRow - inputStartRow) * terminal.cols + buffer.cursorX;
-      const distance = targetOffset - cursorOffset;
-      if (!distance) return;
-      const arrow = distance < 0 ? "\x1b[D" : "\x1b[C";
-      connection.send({ type: "session.input", sessionId: session.id, data: arrow.repeat(Math.abs(distance)) });
-    };
     const handleTouchStart = (event: TouchEvent) => {
       if (!activeRef.current) {
         resetTouch();
@@ -387,20 +358,16 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       const touch = event.touches.item(0);
       if (!touch) return;
       terminal.focus();
-      suppressTap = tapTimer !== undefined;
-      if (tapTimer !== undefined) window.clearTimeout(tapTimer);
-      tapTimer = undefined;
       activeTouchId = touch.identifier;
       previousTouchY = touch.clientY;
       touchStartX = touch.clientX;
       touchStartY = touch.clientY;
-      touchStartedAt = performance.now();
       touchMoved = false;
       touchAxis = "pending";
       selectionGesture = terminal.hasSelection();
       scrollbarGesture = event.target instanceof Element && Boolean(event.target.closest(".scrollbar.vertical"));
       clearLongPressTimer();
-      if (!selectionGesture && !scrollbarGesture && !suppressTap) {
+      if (!selectionGesture && !scrollbarGesture) {
         longPressTimer = window.setTimeout(() => {
           longPressTimer = undefined;
           if (activeRef.current && activeTouchId === touch.identifier && !touchMoved && !terminal.hasSelection() && selectWordAtTouch(touch.clientX, touch.clientY)) {
@@ -448,7 +415,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         deltaY
       }));
     };
-    const handleTouchEnd = (event: TouchEvent) => {
+    const handleTouchEnd = () => {
       if (!activeRef.current) {
         clearLongPressTimer();
         resetTouch();
@@ -456,15 +423,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       }
       if (activeTouchId === undefined) return resetTouch();
       clearLongPressTimer();
-      const touch = findTouch(event.changedTouches, activeTouchId);
-      const isQuickTap = performance.now() - touchStartedAt < 420;
-      if (touch && isQuickTap && !touchMoved && !selectionGesture && !scrollbarGesture && !suppressTap) {
-        const { clientX, clientY } = touch;
-        tapTimer = window.setTimeout(() => {
-          tapTimer = undefined;
-          moveCursorToTouch(clientX, clientY);
-        }, 280);
-      }
       resetTouch();
     };
     hostElement.addEventListener("touchstart", handleTouchStart, { passive: true });
@@ -499,7 +457,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       hostElement.removeEventListener("touchend", handleTouchEnd);
       hostElement.removeEventListener("touchcancel", resetTouch);
       clearLongPressTimer();
-      if (tapTimer !== undefined) window.clearTimeout(tapTimer);
       if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
       input.dispose(); output(); terminal.dispose(); terminalRef.current = null;
       resizeRef.current = () => undefined;

@@ -21,10 +21,10 @@ test("Android Backspace remains available through both input paths", () => {
   assert.equal(androidImeKeydownInput({ type: "keydown", key: "Backspace", keyCode: 229, isComposing: false }), "\x7f");
 });
 
-test("generic non-composing IME keydowns defer to native input", () => {
+test("only printable IME keydowns defer to native input", () => {
   assert.equal(shouldDeferToNativeInput({ type: "keydown", key: "a", keyCode: 229, isComposing: false }), true);
-  assert.equal(shouldDeferToNativeInput({ type: "keydown", key: "Process", keyCode: 229, isComposing: false }), true);
-  assert.equal(shouldDeferToNativeInput({ type: "keydown", key: "Unidentified", keyCode: 229, isComposing: false }), true);
+  assert.equal(shouldDeferToNativeInput({ type: "keydown", key: "Process", keyCode: 229, isComposing: false }), false);
+  assert.equal(shouldDeferToNativeInput({ type: "keydown", key: "Unidentified", keyCode: 229, isComposing: false }), false);
   assert.equal(shouldDeferToNativeInput({ type: "keydown", key: "Process", keyCode: 229, isComposing: true }), false);
   assert.equal(shouldDeferToNativeInput({ type: "keydown", key: "Backspace", keyCode: 229, isComposing: false }), false);
   assert.equal(shouldDeferToNativeInput({ type: "keydown", key: "Enter", keyCode: 229, isComposing: false }), false);
