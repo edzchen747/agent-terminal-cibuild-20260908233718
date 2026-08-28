@@ -148,7 +148,7 @@ public class EmbeddedNodePlugin extends Plugin {
         JSObject result = new JSObject();
         result.put("nodeId", nodeId);
         File status = new File(stateDir, "status.json");
-        for (int attempt = 0; attempt < 300; attempt++) {
+        for (int attempt = 0; attempt < 600; attempt++) {
             if (status.isFile()) {
                 try {
                     JSONObject json = new JSONObject(new String(java.nio.file.Files.readAllBytes(status.toPath()), StandardCharsets.UTF_8));
