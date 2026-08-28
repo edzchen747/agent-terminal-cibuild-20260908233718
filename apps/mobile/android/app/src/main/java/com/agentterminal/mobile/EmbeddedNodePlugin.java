@@ -6,6 +6,8 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.PluginMethod;
 
+import android.util.Log;
+
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -24,6 +26,7 @@ import org.json.JSONObject;
  */
 @CapacitorPlugin(name = "EmbeddedNode")
 public class EmbeddedNodePlugin extends Plugin {
+    private static final String TAG = "EmbeddedNode";
     private Process nodeProcess;
     private final ExecutorService processWatcher = Executors.newSingleThreadExecutor();
 
@@ -96,7 +99,11 @@ public class EmbeddedNodePlugin extends Plugin {
             }
             call.resolve(result);
         } catch (Exception error) {
-            call.reject("Could not start the embedded node engine.", error);
+            Log.e(TAG, "Could not start the embedded node engine", error);
+            String detail = error.getMessage();
+            call.reject(detail == null || detail.isEmpty()
+                ? "Could not start the embedded node engine."
+                : "Could not start the embedded node engine: " + detail);
         }
     }
 

@@ -141,7 +141,9 @@ func isHostNameNotFound(err error) bool {
 	text := strings.ToLower(err.Error())
 	return strings.Contains(text, "no such host") ||
 		strings.Contains(text, "host not found") ||
-		strings.Contains(text, "unknown host")
+		strings.Contains(text, "unknown host") ||
+		strings.Contains(text, "name or service not known") ||
+		strings.Contains(text, "cannot resolve")
 }
 
 func serve(listener net.Listener, dial func() (net.Conn, error)) {

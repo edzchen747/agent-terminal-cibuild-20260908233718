@@ -89,7 +89,6 @@ export class HostConnection {
       temporary.host.deviceToken = response.deviceToken;
       temporary.snapshot = response.snapshot;
       temporary.authenticated = true;
-      await Preferences.set({ key: HOST_KEY, value: JSON.stringify(temporary.host) });
       // Initialize and persist the overlay identity during pairing so a later
       // off-LAN reconnect does not create a new node after an app restart.
       await temporary.embeddedEngine.start(
@@ -98,6 +97,10 @@ export class HostConnection {
         temporary.host.remoteTransport ?? "overlay",
         temporary.host.nodeAuthKey
       );
+      // Commit the host only after both LAN pairing and native overlay
+      // enrollment succeeded. A failed enrollment must not leave a half-paired
+      // host that prevents the QR screen from appearing on the next launch.
+      await Preferences.set({ key: HOST_KEY, value: JSON.stringify(temporary.host) });
       temporary.startHeartbeat();
       return temporary;
     } catch (error) {
