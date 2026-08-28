@@ -1,6 +1,7 @@
 import { Capacitor, registerPlugin } from "@capacitor/core";
 import { Preferences } from "@capacitor/preferences";
 import { OVERLAY_CONTROL_URL } from "@agentterminal/protocol";
+import { asEmbeddedNodeFailure } from "./nodeEnrollment";
 
 const ENGINE_STATE_KEY = "agent-terminal-embedded-node";
 
@@ -62,7 +63,7 @@ export class EmbeddedNodeEngine {
         // caller can explain whether the enrollment key or target hostname
         // needs attention.
         await this.save(state);
-        throw asError(error);
+        throw asEmbeddedNodeFailure(error);
       }
     }
 
@@ -117,12 +118,4 @@ function randomKey(): string {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function asError(value: unknown): Error {
-  if (value instanceof Error) return value;
-  if (value && typeof value === "object" && "message" in value && typeof value.message === "string") {
-    return new Error(value.message);
-  }
-  return new Error("The embedded network node is unavailable.");
 }

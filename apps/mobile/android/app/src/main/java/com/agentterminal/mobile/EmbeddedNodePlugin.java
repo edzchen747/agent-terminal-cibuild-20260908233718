@@ -17,6 +17,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import org.json.JSONObject;
 
@@ -48,10 +49,16 @@ public class EmbeddedNodePlugin extends Plugin {
             return;
         }
         if (nodeProcess != null && nodeProcess.isAlive()) {
-            JSObject result = readStatus(new File(getContext().getFilesDir(), "embedded-node-state"), nodeId);
-            if (rejectForStatus(call, result)) return;
-            call.resolve(result);
-            return;
+            if (authKey == null || authKey.isEmpty()) {
+                JSObject result = readStatus(new File(getContext().getFilesDir(), "embedded-node-state"), nodeId);
+                if (rejectForStatus(call, result)) return;
+                call.resolve(result);
+                return;
+            }
+            // A fresh one-time key means the WebView detected that the saved
+            // Headscale node was removed. Restart tsnet so the key is applied
+            // instead of returning the stale process status.
+            stopNodeProcess();
         }
         try {
             File stateDir = new File(getContext().getFilesDir(), "embedded-node-state");
@@ -118,11 +125,21 @@ public class EmbeddedNodePlugin extends Plugin {
 
     @PluginMethod
     public synchronized void stop(PluginCall call) {
-        if (nodeProcess != null) {
-            nodeProcess.destroy();
-            nodeProcess = null;
-        }
+        stopNodeProcess();
         call.resolve();
+    }
+
+    private void stopNodeProcess() {
+        Process process = nodeProcess;
+        nodeProcess = null;
+        if (process == null) return;
+        process.destroy();
+        try {
+            if (!process.waitFor(2, TimeUnit.SECONDS)) process.destroyForcibly();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            process.destroyForcibly();
+        }
     }
 
     private void watchProcess(Process process) {
@@ -140,10 +157,7 @@ public class EmbeddedNodePlugin extends Plugin {
 
     @Override
     protected synchronized void handleOnDestroy() {
-        if (nodeProcess != null) {
-            nodeProcess.destroy();
-            nodeProcess = null;
-        }
+        stopNodeProcess();
         processWatcher.shutdownNow();
         super.handleOnDestroy();
     }
@@ -210,7 +224,7 @@ public class EmbeddedNodePlugin extends Plugin {
         if (errorCode.equals("embedded_node_start_failed") && !detail.isEmpty()) {
             message += " (" + detail + ")";
         }
-        call.reject(message);
+        call.reject(message, errorCode);
         return true;
     }
 }

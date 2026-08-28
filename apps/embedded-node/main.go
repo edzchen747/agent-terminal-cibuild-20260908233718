@@ -248,7 +248,7 @@ func explainError(err error, remote bool) (string, string) {
 		return "tsnet_host_not_found", "The tsnet desktop host name could not be found. Update the mobile app and pair again."
 	}
 	if strings.Contains(text, "preauth key missing") {
-		return "preauth_missing", "The desktop did not provide an enrollment key."
+		return "preauth_missing", "This device's overlay node is no longer registered."
 	}
 	if isAuthFailure(text) {
 		return "preauth_rejected", "The desktop preauth key was rejected or has expired. Update the desktop app and pair again."

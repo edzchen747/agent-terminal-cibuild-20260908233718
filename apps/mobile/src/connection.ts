@@ -1,7 +1,8 @@
 import { Preferences } from "@capacitor/preferences";
 import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage } from "@agentterminal/protocol";
 import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN } from "@agentterminal/protocol";
-import { EmbeddedNodeEngine } from "./embedded-engine";
+import { EmbeddedNodeEngine, type EmbeddedNodeState } from "./embedded-engine";
+import { isDroppedNodeEnrollmentError } from "./nodeEnrollment";
 
 const HOST_KEY = "agent-terminal-host";
 const REQUEST_TIMEOUT_MS = 12_000;
@@ -9,6 +10,7 @@ const HEARTBEAT_INTERVAL_MS = 20_000;
 const RECONNECT_BASE_DELAY_MS = 1_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const RECONNECT_TIMEOUT_MS = 30_000;
+const DROPPED_MOBILE_NODE_MESSAGE = "This phone's remote node is no longer registered. Reconnect to the desktop on LAN; remote registration will refresh automatically.";
 
 export interface SavedHost {
   id: string;
@@ -191,7 +193,9 @@ export class HostConnection {
         const error = cause instanceof Error ? cause : new Error("Remote connection registration failed.");
         this.setRemoteRegistration({
           status: "failed",
-          error: "Remote connection registration failed. LAN access is still available."
+          error: /update the desktop app/i.test(error.message)
+            ? error.message
+            : "Remote connection registration failed. LAN access is still available."
         });
         throw error;
       })
@@ -236,6 +240,12 @@ export class HostConnection {
     this.emit("remoteRegistration", { ...state });
   }
 
+  private async markRemoteNodeDropped(): Promise<void> {
+    this.host.remoteEnrolled = false;
+    await Preferences.set({ key: HOST_KEY, value: JSON.stringify(this.host) });
+    this.setRemoteRegistration({ status: "failed", error: DROPPED_MOBILE_NODE_MESSAGE });
+  }
+
   private async connectOnce(): Promise<HostSnapshot> {
     this.authenticated = false;
     this.stopHeartbeat();
@@ -243,10 +253,12 @@ export class HostConnection {
     if (this.socket) this.abortSocket();
 
     const localEndpoint = this.host.localEndpoint ?? (this.host.transport === "direct" ? this.host.endpoint : undefined);
+    let connectedOverLan = false;
     try {
       if (localEndpoint) {
         try {
           await this.open(localEndpoint, LAN_CONNECT_TIMEOUT_MS);
+          connectedOverLan = true;
         } catch {
           this.abortSocket();
         }
@@ -256,9 +268,18 @@ export class HostConnection {
         const remoteEndpoint = this.host.remoteEndpoint ?? defaultRemoteEndpoint(this.host.id);
         const remoteTransport = this.host.remoteTransport ?? "overlay";
         if (remoteTransport === "overlay" && !this.host.remoteEnrolled) {
-          throw new Error("Remote registration is still pending. Reconnect to the desktop on LAN and retry remote registration.");
+          throw new Error(DROPPED_MOBILE_NODE_MESSAGE);
         }
-        const nodeState = await this.embeddedEngine.start(this.host.controlUrl ?? OVERLAY_CONTROL_URL, remoteEndpoint, remoteTransport);
+        let nodeState: EmbeddedNodeState;
+        try {
+          nodeState = await this.embeddedEngine.start(this.host.controlUrl ?? OVERLAY_CONTROL_URL, remoteEndpoint, remoteTransport);
+        } catch (error) {
+          if (remoteTransport === "overlay" && isDroppedNodeEnrollmentError(error)) {
+            await this.markRemoteNodeDropped();
+            throw new Error(DROPPED_MOBILE_NODE_MESSAGE);
+          }
+          throw error;
+        }
         if (remoteTransport === "overlay" && !nodeState.proxyEndpoint) {
           throw new Error("The embedded network node is unavailable for a remote connection.");
         }
@@ -273,6 +294,9 @@ export class HostConnection {
       this.clearReconnectTimeout();
       this.startHeartbeat();
       this.emit("connected", response.snapshot);
+      if (connectedOverLan && (this.host.remoteTransport ?? "overlay") === "overlay" && !this.host.remoteEnrolled) {
+        queueMicrotask(() => { void this.retryRemoteRegistration(); });
+      }
       return response.snapshot;
     } catch (error) {
       this.abortSocket();
@@ -500,5 +524,5 @@ function defaultRemoteEndpoint(hostId: string): string {
 }
 
 function isEmbeddedNodeConfigurationError(error: unknown): boolean {
-  return error instanceof Error && /update the (desktop|mobile) app|enrollment key was rejected|tsnet desktop host name|remote registration is still pending/i.test(error.message);
+  return error instanceof Error && /update the (desktop|mobile) app|enrollment key was rejected|tsnet desktop host name|remote registration is still pending|remote node is no longer registered/i.test(error.message);
 }

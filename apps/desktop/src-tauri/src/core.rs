@@ -390,6 +390,22 @@ impl Core {
         Err(anyhow!("embedded node registration timed out"))
     }
 
+    fn embedded_node_status(&self) -> Option<EmbeddedNodeStatus> {
+        let status_path = self.embedded_node_state_dir().ok()?.join("status.json");
+        let contents = std::fs::read_to_string(status_path).ok()?;
+        serde_json::from_str(&contents).ok()
+    }
+
+    fn paired_device_id(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("desktop state poisoned")
+            .store
+            .devices()
+            .first()
+            .map(|device| device.device.id.clone())
+    }
+
     fn set_remote_registration(
         &self,
         status: &str,
@@ -411,7 +427,15 @@ impl Core {
     }
 
     pub fn begin_desktop_enrollment(self: &Arc<Self>, device_id: String) -> Result<()> {
-        if self.network_state().enrolled {
+        self.start_desktop_enrollment(device_id, false)
+    }
+
+    fn start_desktop_enrollment(
+        self: &Arc<Self>,
+        device_id: String,
+        replace_stale_registration: bool,
+    ) -> Result<()> {
+        if self.network_state().enrolled && !replace_stale_registration {
             return Ok(());
         }
         if self
@@ -472,23 +496,93 @@ impl Core {
 
     pub fn retry_desktop_enrollment(self: &Arc<Self>) -> Result<()> {
         let device_id = self
-            .inner
-            .lock()
-            .expect("desktop state poisoned")
-            .store
-            .devices()
-            .first()
-            .map(|device| device.device.id.clone())
+            .paired_device_id()
             .ok_or_else(|| anyhow!("Pair a mobile device before enabling remote access."))?;
-        self.begin_desktop_enrollment(device_id)
+        self.start_desktop_enrollment(device_id, true)
     }
 
     pub fn resume_remote_node(self: &Arc<Self>) {
         let network = self.network_state();
         if network.enrolled {
-            if let Err(error) = self.start_embedded_node() {
-                eprintln!("Agent Terminal embedded network node is unavailable: {error:#}");
-            }
+            let core = Arc::clone(self);
+            tauri::async_runtime::spawn(async move {
+                let started = match core.start_embedded_node() {
+                    Ok(started) => started,
+                    Err(error) => {
+                        eprintln!("Agent Terminal embedded network node is unavailable: {error:#}");
+                        let _ = core.set_remote_registration(
+                            "failed",
+                            Some("Remote connection registration failed. LAN access is still available.".into()),
+                            true,
+                            None,
+                        );
+                        core.broadcast();
+                        return;
+                    }
+                };
+                if !started {
+                    let _ = core.set_remote_registration(
+                        "failed",
+                        Some("The embedded network component is unavailable. Update the desktop app and try again.".into()),
+                        true,
+                        None,
+                    );
+                    core.broadcast();
+                    return;
+                }
+
+                match core.wait_for_embedded_node().await {
+                    Ok(node) => {
+                        let _ = core.set_remote_registration("enrolled", None, true, Some(&node));
+                        core.broadcast();
+                    }
+                    Err(error) => {
+                        let dropped = core
+                            .embedded_node_status()
+                            .as_ref()
+                            .is_some_and(is_dropped_node_status);
+                        core.stop_embedded_node();
+                        if dropped {
+                            eprintln!(
+                                "Agent Terminal desktop node is no longer registered; requesting a replacement enrollment: {error:#}"
+                            );
+                            if let Some(device_id) = core.paired_device_id() {
+                                if let Err(retry_error) =
+                                    core.start_desktop_enrollment(device_id, true)
+                                {
+                                    eprintln!(
+                                        "Agent Terminal could not restart desktop enrollment: {retry_error:#}"
+                                    );
+                                    let _ = core.set_remote_registration(
+                                        "failed",
+                                        Some("The desktop node was removed and could not be registered again. LAN access is still available.".into()),
+                                        false,
+                                        None,
+                                    );
+                                }
+                            } else {
+                                let _ = core.set_remote_registration(
+                                    "failed",
+                                    Some("The desktop node was removed. Pair a mobile device on LAN to register it again.".into()),
+                                    false,
+                                    None,
+                                );
+                            }
+                        } else {
+                            eprintln!(
+                                "Agent Terminal embedded network node did not resume: {error:#}"
+                            );
+                            let _ = core.set_remote_registration(
+                                "failed",
+                                Some("Remote connection registration failed. LAN access is still available.".into()),
+                                true,
+                                None,
+                            );
+                        }
+                        core.broadcast();
+                    }
+                }
+            });
         } else if network.registration_status == "failed" {
             let _ = self.retry_desktop_enrollment();
         }
@@ -2235,11 +2329,15 @@ fn take_valid_pairing_grant(
         .is_some_and(|grant| grant.expires_at_ms >= now_ms)
 }
 
+fn is_dropped_node_status(status: &EmbeddedNodeStatus) -> bool {
+    status.error_code == "preauth_missing"
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PairingGrant, is_within_project, parse_terminal_titles, parse_working_directories,
-        take_valid_pairing_grant,
+        EmbeddedNodeStatus, PairingGrant, is_dropped_node_status, is_within_project,
+        parse_terminal_titles, parse_working_directories, take_valid_pairing_grant,
     };
     use std::{collections::HashMap, path::Path};
 
@@ -2287,5 +2385,22 @@ mod tests {
         grants.insert("expired".to_string(), PairingGrant { expires_at_ms: 999 });
         assert!(!take_valid_pairing_grant(&mut grants, "expired", 1_000));
         assert!(!grants.contains_key("expired"));
+    }
+
+    #[test]
+    fn missing_preauth_marks_a_saved_desktop_registration_as_dropped() {
+        let dropped = EmbeddedNodeStatus {
+            node_id: "desktop-host".into(),
+            tailnet_address: String::new(),
+            error_code: "preauth_missing".into(),
+        };
+        let unavailable = EmbeddedNodeStatus {
+            node_id: "desktop-host".into(),
+            tailnet_address: String::new(),
+            error_code: "control_server_unavailable".into(),
+        };
+
+        assert!(is_dropped_node_status(&dropped));
+        assert!(!is_dropped_node_status(&unavailable));
     }
 }

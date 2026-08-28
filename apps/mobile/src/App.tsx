@@ -468,7 +468,7 @@ function isAuthorizationError(cause: unknown): boolean {
 }
 
 function isEmbeddedNodeConfigurationError(cause: unknown): boolean {
-  return cause instanceof Error && /update the (desktop|mobile) app|enrollment key was rejected|tsnet desktop host name/i.test(cause.message);
+  return cause instanceof Error && /update the (desktop|mobile) app|enrollment key was rejected|tsnet desktop host name|remote node is no longer registered/i.test(cause.message);
 }
 
 function ProjectScreen({ project, snapshot, connection, onBack, onRename, onOpen }: { project: Project; snapshot: HostSnapshot; connection: HostConnection; onBack: () => void; onRename: () => void; onOpen: (session: TerminalSession) => void }) {
