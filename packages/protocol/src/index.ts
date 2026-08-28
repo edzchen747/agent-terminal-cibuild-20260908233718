@@ -185,18 +185,61 @@ export function decodeServerMessage(value: unknown): ServerMessage {
   return parsed as ServerMessage;
 }
 
+/**
+ * Encode only the pairing information needed by a phone. The full payload is
+ * still returned by the desktop IPC API, but the QR uses short keys and omits
+ * values that the mobile client can derive. This keeps the modules larger and
+ * easier for a camera to resolve without changing the pairing semantics.
+ */
+export function encodePairingPayload(payload: PairingPayload): string {
+  const compact: Record<string, string | number> = {
+    v: payload.version,
+    i: payload.hostId,
+    n: payload.hostName,
+    e: payload.localEndpoint ?? payload.endpoint,
+    t: payload.pairingToken
+  };
+  const expiresAt = Date.parse(payload.expiresAt);
+  compact.x = Number.isFinite(expiresAt) ? Math.floor(expiresAt / 1_000) : payload.expiresAt;
+
+  const defaultRemoteEndpoint = `ws://${payload.hostId}.${OVERLAY_TAILNET_DOMAIN}:47831`;
+  if (payload.remoteEndpoint && payload.remoteEndpoint !== defaultRemoteEndpoint) compact.r = payload.remoteEndpoint;
+  if (payload.controlUrl && payload.controlUrl !== OVERLAY_CONTROL_URL) compact.c = payload.controlUrl;
+  if (payload.remoteTransport && payload.remoteTransport !== "overlay") compact.rt = payload.remoteTransport;
+  if (payload.nodeAuthKey) compact.k = payload.nodeAuthKey;
+
+  return JSON.stringify(compact);
+}
+
 export function parsePairingPayload(raw: string): PairingPayload {
   const text = raw.startsWith("agentterminal://pair?")
     ? decodeURIComponent(new URL(raw).searchParams.get("data") ?? "")
     : raw;
-  const payload = JSON.parse(text) as Partial<PairingPayload>;
+
+  const parsed = JSON.parse(text) as Record<string, unknown>;
+  const payload: Partial<PairingPayload> = Object.prototype.hasOwnProperty.call(parsed, "v")
+    ? {
+        version: parsed.v as PairingPayload["version"],
+        hostId: parsed.i as string,
+        hostName: parsed.n as string,
+        endpoint: parsed.e as string,
+        ...(typeof parsed.e === "string" ? { localEndpoint: parsed.e } : {}),
+        ...(typeof parsed.r === "string" ? { remoteEndpoint: parsed.r } : {}),
+        ...(typeof parsed.c === "string" ? { controlUrl: parsed.c } : {}),
+        ...(parsed.rt === "direct" || parsed.rt === "overlay" ? { remoteTransport: parsed.rt } : {}),
+        pairingToken: parsed.t as string,
+        expiresAt: typeof parsed.x === "number" ? new Date(parsed.x * 1_000).toISOString() : parsed.x as string,
+        ...(typeof parsed.k === "string" ? { nodeAuthKey: parsed.k } : {})
+      }
+    : parsed as Partial<PairingPayload>;
+
   if (
     payload.version !== PROTOCOL_VERSION ||
-    !payload.hostId ||
-    !payload.hostName ||
-    !payload.endpoint ||
-    !payload.pairingToken ||
-    !payload.expiresAt
+    typeof payload.hostId !== "string" ||
+    typeof payload.hostName !== "string" ||
+    typeof payload.endpoint !== "string" ||
+    typeof payload.pairingToken !== "string" ||
+    typeof payload.expiresAt !== "string"
   ) {
     throw new Error("This is not valid Agent Terminal pairing QR data.");
   }

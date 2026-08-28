@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import QRCode from "qrcode";
+import { encodePairingPayload } from "@agentterminal/protocol";
 import type { DesktopState } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, FolderIcon, MenuIcon, PhoneIcon, PlusIcon, SettingsIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { TerminalPane } from "./TerminalPane";
@@ -44,15 +45,18 @@ export function App() {
     setPairError("");
     try {
       const payload = await window.agentTerminal.startPairing();
-      setQr(await QRCode.toDataURL(JSON.stringify(payload), {
+      const svg = await QRCode.toString(encodePairingPayload(payload), {
+        type: "svg",
         width: 320,
         margin: 4,
-        // The pairing payload is intentionally text-heavy. Lowering the QR
-        // redundancy gives camera decoders larger, cleaner modules while the
-        // on-screen code still retains the standard quiet zone.
-        errorCorrectionLevel: "L",
+        // The compact payload leaves room for normal error correction while
+        // preserving larger, cleaner modules on the physical display.
+        errorCorrectionLevel: "M",
         color: { dark: "#0a1015", light: "#ffffff" }
-      }));
+      });
+      // Keep the code vector-based so browser scaling cannot blur module
+      // edges before the phone camera gets a chance to resolve them.
+      setQr(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`);
     } catch (cause) {
       setPairError(cause instanceof Error ? cause.message : String(cause));
     }

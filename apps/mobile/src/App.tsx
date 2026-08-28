@@ -175,11 +175,10 @@ export function App() {
         cameraDirection: CapacitorBarcodeScannerCameraDirection.BACK,
         scanOrientation: CapacitorBarcodeScannerScanOrientation.ADAPTIVE,
         cancelButtonAccessibilityLabel: "Cancel QR scan",
-        // ZXing handles long, text-heavy QR payloads without requiring a
-        // model download. Keep it explicit so Android does not silently
-        // choose a decoder that fails on some camera/device combinations.
+        // Use Android's native ML Kit QR decoder. Camera exposure and focus
+        // remain fully native; the app does not manipulate either setting.
         android: Capacitor.getPlatform() === "android"
-          ? { scanningLibrary: CapacitorBarcodeScannerAndroidScanningLibrary.ZXING }
+          ? { scanningLibrary: CapacitorBarcodeScannerAndroidScanningLibrary.MLKIT }
           : undefined
       });
       const raw = result.ScanResult?.trim();

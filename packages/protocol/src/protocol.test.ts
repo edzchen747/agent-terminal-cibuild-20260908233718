@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, PROTOCOL_VERSION, applyTerminalModifiers, encodeMessage, parsePairingPayload, parseTerminalWorkingDirectories } from "./index.js";
+import { LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, applyTerminalModifiers, encodeMessage, encodePairingPayload, parsePairingPayload, parseTerminalWorkingDirectories } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -30,6 +30,38 @@ test("network defaults keep pairing local and remote control configurable", () =
   }));
   assert.equal(payload.remoteTransport, "overlay");
   assert.equal(payload.localEndpoint, payload.endpoint);
+});
+
+test("compact pairing payloads preserve connection data", () => {
+  const payload = {
+    version: PROTOCOL_VERSION,
+    hostId: "host-1",
+    hostName: "Workstation",
+    endpoint: "ws://192.168.1.10:47831",
+    localEndpoint: "ws://192.168.1.10:47831",
+    remoteEndpoint: `ws://host-1.${OVERLAY_TAILNET_DOMAIN}:47831`,
+    controlUrl: OVERLAY_CONTROL_URL,
+    transport: "direct" as const,
+    remoteTransport: "overlay" as const,
+    pairingToken: "one-time-secret",
+    expiresAt: "2026-08-28T12:00:00.000Z",
+    nodeAuthKey: "node-auth-key"
+  };
+  const encoded = encodePairingPayload(payload);
+  const decoded = parsePairingPayload(encoded);
+
+  assert.ok(encoded.length < JSON.stringify(payload).length);
+  assert.equal(decoded.version, payload.version);
+  assert.equal(decoded.hostId, payload.hostId);
+  assert.equal(decoded.hostName, payload.hostName);
+  assert.equal(decoded.endpoint, payload.endpoint);
+  assert.equal(decoded.localEndpoint, payload.localEndpoint);
+  assert.equal(decoded.pairingToken, payload.pairingToken);
+  assert.equal(decoded.expiresAt, payload.expiresAt);
+  assert.equal(decoded.remoteEndpoint, undefined);
+  assert.equal(decoded.controlUrl, undefined);
+  assert.equal(decoded.remoteTransport, undefined);
+  assert.equal(decoded.nodeAuthKey, payload.nodeAuthKey);
 });
 
 test("messages encode as JSON", () => {
