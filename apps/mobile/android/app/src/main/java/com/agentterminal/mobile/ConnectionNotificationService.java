@@ -6,10 +6,12 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.IBinder;
 
 import androidx.core.app.NotificationCompat;
+import androidx.core.app.ServiceCompat;
 
 public class ConnectionNotificationService extends Service {
     public static final String ACTION_START = "com.agentterminal.mobile.START_CONNECTION_NOTIFICATION";
@@ -51,12 +53,19 @@ public class ConnectionNotificationService extends Service {
             .setContentText("Connected to " + hostName)
             .setContentIntent(openPendingIntent)
             .setOngoing(true)
+            .setAutoCancel(false)
+            .setShowWhen(false)
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .addAction(new NotificationCompat.Action.Builder(0, "Disconnect", disconnectPendingIntent).build())
             .build();
-        startForeground(NOTIFICATION_ID, notification);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING);
+        } else {
+            startForeground(NOTIFICATION_ID, notification);
+        }
         return START_STICKY;
     }
 
