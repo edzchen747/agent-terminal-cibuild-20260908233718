@@ -51,8 +51,12 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
   const [countdownVersion, setCountdownVersion] = useState(0);
 
   useEffect(() => {
+    if (!activeRef.current) {
+      terminalRef.current?.blur();
+      return;
+    }
     resizeRef.current(true);
-    if (activeRef.current) terminalRef.current?.focus();
+    terminalRef.current?.focus();
   }, [active, fontWidthScale]);
 
   const activeModifiers = (keys = selectedKeysRef.current) => new Set(keys.flatMap((key) => key.modifier ? [key.modifier] : []));
@@ -65,6 +69,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
   };
 
   const executeChord = (keys: AccessibilityKey[]) => {
+    if (!activeRef.current) return;
     const modifiers = activeModifiers(keys);
     const output = keys.flatMap((key) => key.value ? [applyTerminalModifiers(key.value, modifiers)] : []).join("");
     if (output) {
@@ -118,6 +123,12 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     let forceResizePending = false;
     let lastSize = { cols: 0, rows: 0 };
     const resize = (force = false) => {
+      if (!activeRef.current) {
+        if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
+        resizeFrame = undefined;
+        forceResizePending = false;
+        return;
+      }
       if (force) {
         if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
         resizeFrame = undefined;
@@ -135,6 +146,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       if (resizeFrame !== undefined) return;
       resizeFrame = requestAnimationFrame(() => {
         resizeFrame = undefined;
+        if (!activeRef.current) {
+          forceResizePending = false;
+          return;
+        }
         const shouldForce = forceResizePending;
         forceResizePending = false;
         try {
@@ -151,7 +166,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     resizeRef.current = resize;
     const observer = new ResizeObserver(() => resize());
     observer.observe(hostElement);
-    const handlePointerActivity = () => resize(true);
+    const handlePointerActivity = () => {
+      if (activeRef.current) resize(true);
+    };
     window.addEventListener("pointerdown", handlePointerActivity, true);
     const textarea = terminal.textarea;
     // Disable the IME's remembered text/autofill behavior. Android keyboards
@@ -169,7 +186,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     let terminalInputTimer: number | undefined;
     let lastNativeBeforeInput: { data: string; at: number } | undefined;
     const sendInput = (data: string) => {
-      if (!data) return;
+      if (!data || !activeRef.current) return;
       resize(true);
       const output = consumeSelectedKeys(data);
       if (output) connection.send({ type: "session.input", sessionId: session.id, data: output });
@@ -177,6 +194,12 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const flushPendingInput = () => {
       nativeInputTimer = undefined;
       terminalInputTimer = undefined;
+      if (!activeRef.current) {
+        pendingNativeInput.length = 0;
+        pendingTerminalInput.length = 0;
+        lastNativeBeforeInput = undefined;
+        return;
+      }
       const now = performance.now();
 
       for (const native of pendingNativeInput.splice(0)) {
@@ -195,17 +218,18 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       }
     };
     const queueNativeInput = (data: string) => {
-      if (!data) return;
+      if (!data || !activeRef.current) return;
       pendingNativeInput.push({ data, at: performance.now() });
       if (nativeInputTimer !== undefined) return;
       nativeInputTimer = window.setTimeout(flushPendingInput, 20);
     };
     const queueTerminalInput = (data: string) => {
-      if (!data) return;
+      if (!data || !activeRef.current) return;
       pendingTerminalInput.push({ data, at: performance.now() });
       if (terminalInputTimer === undefined) terminalInputTimer = window.setTimeout(flushPendingInput, 40);
     };
     terminal.attachCustomKeyEventHandler((event) => {
+      if (!activeRef.current) return false;
       const directInput = androidImeKeydownInput(event);
       if (directInput) {
         // xterm cannot decode keyCode 229 as Backspace/Enter, and an empty
@@ -221,6 +245,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     });
     const input = terminal.onData(queueTerminalInput);
     const handleNativeBeforeInput = (event: Event) => {
+      if (!activeRef.current) return;
       const inputEvent = event as InputEvent;
       const data = nativeTerminalInput(inputEvent, textarea?.value ?? "");
       if (!data || inputEvent.inputType === "insertCompositionText") return;
@@ -230,6 +255,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       if (inputEvent.cancelable && textarea) textarea.value = "";
     };
     const handleNativeInput = (event: Event) => {
+      if (!activeRef.current) return;
       const inputEvent = event as InputEvent;
       const now = performance.now();
       const data = nativeTerminalInput(inputEvent, textarea?.value ?? "");
@@ -294,6 +320,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       longPressTimer = undefined;
     };
     const selectWordAtTouch = (clientX: number, clientY: number) => {
+      if (!activeRef.current) return false;
       const target = document.elementFromPoint(clientX, clientY);
       if (!(target instanceof Element) || !target.closest(".xterm-accessibility-tree")) return false;
 
@@ -326,7 +353,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       return true;
     };
     const moveCursorToTouch = (clientX: number, clientY: number) => {
-      if (activeRef.current) terminal.focus();
+      if (!activeRef.current) return;
+      terminal.focus();
       resize(true);
       if (!screen || terminal.hasSelection() || terminal.modes.mouseTrackingMode !== "none") return;
 
@@ -354,13 +382,17 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       connection.send({ type: "session.input", sessionId: session.id, data: arrow.repeat(Math.abs(distance)) });
     };
     const handleTouchStart = (event: TouchEvent) => {
+      if (!activeRef.current) {
+        resetTouch();
+        return;
+      }
       if (event.touches.length !== 1) {
         resetTouch();
         return;
       }
       const touch = event.touches.item(0);
       if (!touch) return;
-      if (activeRef.current) terminal.focus();
+      terminal.focus();
       suppressTap = tapTimer !== undefined;
       if (tapTimer !== undefined) window.clearTimeout(tapTimer);
       tapTimer = undefined;
@@ -376,13 +408,18 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       if (!selectionGesture && !scrollbarGesture && !suppressTap) {
         longPressTimer = window.setTimeout(() => {
           longPressTimer = undefined;
-          if (activeTouchId === touch.identifier && !touchMoved && !terminal.hasSelection() && selectWordAtTouch(touch.clientX, touch.clientY)) {
+          if (activeRef.current && activeTouchId === touch.identifier && !touchMoved && !terminal.hasSelection() && selectWordAtTouch(touch.clientX, touch.clientY)) {
             selectionGesture = true;
           }
         }, 500);
       }
     };
     const handleTouchMove = (event: TouchEvent) => {
+      if (!activeRef.current) {
+        clearLongPressTimer();
+        resetTouch();
+        return;
+      }
       if (activeTouchId === undefined || previousTouchY === undefined) return;
       const touch = findTouch(event.touches, activeTouchId);
       if (!touch) return;
@@ -405,6 +442,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       }));
     };
     const handleTouchEnd = (event: TouchEvent) => {
+      if (!activeRef.current) {
+        clearLongPressTimer();
+        resetTouch();
+        return;
+      }
       if (activeTouchId === undefined) return resetTouch();
       clearLongPressTimer();
       const touch = findTouch(event.changedTouches, activeTouchId);
@@ -458,6 +500,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
   }, [connection, session.id]);
 
   function pressAccessibilityKey(key: AccessibilityKey) {
+    if (!activeRef.current) return;
     const current = selectedKeysRef.current;
     const isSelected = current.some((item) => item.id === key.id);
     const next = isSelected ? current.filter((item) => item.id !== key.id) : [...current, key];
