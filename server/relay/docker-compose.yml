@@ -13,9 +13,11 @@ services:
     command: >-
       /bin/sh -c
       "apk add --no-cache gettext >/dev/null &&
-      envsubst < /templates/config.yaml.template > /generated/config.yaml"
+      envsubst < /templates/config.yaml.template > /generated/config.yaml &&
+      cp /templates/policy.hujson /generated/policy.hujson"
     volumes:
       - ./headscale/config.yaml.template:/templates/config.yaml.template:ro
+      - ./headscale/policy.hujson:/templates/policy.hujson:ro
       - headscale-config:/generated
     restart: "no"
 
@@ -27,7 +29,6 @@ services:
     command: serve
     volumes:
       - headscale-config:/etc/headscale:ro
-      - ./headscale/policy.hujson:/etc/headscale/policy.hujson:ro
       - headscale-data:/var/lib/headscale
     expose:
       - "8080"
@@ -97,7 +98,7 @@ services:
       - headscale
     environment:
       HEADSCALE_INTERNAL_URL: http://headscale:8080
-      HEADSCALE_REAPER_API_KEY: ${HEADSCALE_REAPER_API_KEY:-}
+      HEADSCALE_REAPER_API_KEY: ${HEADSCALE_REAPER_API_KEY:?HEADSCALE_REAPER_API_KEY must be set}
       NODE_INACTIVITY_DAYS: ${NODE_INACTIVITY_DAYS:-30}
       NODE_REAPER_INTERVAL_SECONDS: ${NODE_REAPER_INTERVAL_SECONDS:-3600}
     command: ["/bin/sh", "/reap-inactive-nodes.sh"]

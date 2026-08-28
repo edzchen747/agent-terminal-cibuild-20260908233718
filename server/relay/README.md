@@ -39,14 +39,30 @@ desktop/mobile tags would remove the same-user isolation boundary.
    UDP 3478.
 2. Copy `.env.example` to `.env` and fill the public addresses and domains.
 3. Start Headscale, create two server API keys, and put them in the named
-   server-only variables:
+   server-only variables. Compose validates required variables for the whole
+   file even when only Headscale is being started, so use a temporary
+   command-line value during this bootstrap phase. Do not put this placeholder
+   in `.env`:
 
    ```sh
    cp .env.example .env
-   docker compose up -d headscale-config headscale
-   docker compose exec headscale headscale apikeys create
-   docker compose exec headscale headscale apikeys create
+   HEADSCALE_PROVISION_API_KEY=bootstrap-only \
+   HEADSCALE_REAPER_API_KEY=bootstrap-only \
+   docker compose up -d --force-recreate headscale-config headscale
+   HEADSCALE_PROVISION_API_KEY=bootstrap-only \
+   HEADSCALE_REAPER_API_KEY=bootstrap-only \
+   docker compose exec headscale headscale configtest
+   HEADSCALE_PROVISION_API_KEY=bootstrap-only \
+   HEADSCALE_REAPER_API_KEY=bootstrap-only \
+   docker compose exec headscale headscale apikeys create --expiration 3650d
+   HEADSCALE_PROVISION_API_KEY=bootstrap-only \
+   HEADSCALE_REAPER_API_KEY=bootstrap-only \
+   docker compose exec headscale headscale apikeys create --expiration 3650d
    ```
+
+   Save the first key as `HEADSCALE_PROVISION_API_KEY` and the second as
+   `HEADSCALE_REAPER_API_KEY` in `.env`. The placeholder is not a credential
+   and must never be used when starting the provisioner.
 
 4. Start and validate the complete stack:
 
@@ -79,9 +95,10 @@ public router.
 ## Node lifetime
 
 `node.expiry: 0` keeps an enrolled node stable across network changes. The
-`node-reaper` expires nodes whose `lastSeen` exceeds `NODE_INACTIVITY_DAYS`.
-It uses its own API key so provisioning and maintenance credentials can be
-rotated independently.
+`node-reaper` expires nodes whose `lastSeen` exceeds `NODE_INACTIVITY_DAYS`,
+which defaults to 30 days. It checks hourly, so expiry can occur up to one
+hour after the 30-day threshold. Its own required API key keeps provisioning
+and maintenance credentials independently rotatable.
 
 ## Client configuration
 
