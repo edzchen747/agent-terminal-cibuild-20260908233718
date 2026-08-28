@@ -8,7 +8,7 @@ const REQUEST_TIMEOUT_MS = 12_000;
 const HEARTBEAT_INTERVAL_MS = 20_000;
 const RECONNECT_BASE_DELAY_MS = 1_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
-const RECONNECT_TIMEOUT_MS = 5_000;
+const RECONNECT_TIMEOUT_MS = 30_000;
 
 export interface SavedHost {
   id: string;
@@ -371,7 +371,7 @@ export class HostConnection {
     this.reconnectTimeoutTimer = window.setTimeout(() => {
       this.reconnectTimeoutTimer = undefined;
       if (!this.autoReconnect || this.closed || this.isConnected()) return;
-      const error = new Error("Could not reach the desktop within 5 seconds.");
+      const error = new Error("Could not reach the desktop within 30 seconds.");
       this.close();
       this.emit("reconnectFailed", error);
     }, RECONNECT_TIMEOUT_MS);

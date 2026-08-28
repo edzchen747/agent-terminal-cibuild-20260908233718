@@ -51,10 +51,10 @@ func main() {
 		Hostname:   *nodeID,
 		ControlURL: *controlURL,
 		AuthKey:    os.Getenv("AGENT_TERMINAL_NODE_AUTH_KEY"),
-		Logf:       func(string, ...any) {},
+		Logf:       func(format string, args ...any) { log.Printf("tsnet: "+format, args...) },
 	}
 	if err := node.Start(); err != nil {
-		writeFailure(*stateDir, *nodeID, err)
+		writeFailure(*stateDir, *nodeID, err, false)
 		log.Fatal(err)
 	}
 	defer node.Close()
@@ -66,7 +66,7 @@ func main() {
 
 	if *remoteAddress != "" {
 		if err := waitForRemote(node, *remoteAddress); err != nil {
-			writeFailure(*stateDir, *nodeID, err)
+			writeFailure(*stateDir, *nodeID, err, true)
 			log.Fatal(err)
 		}
 		if *proxyListen == "" {
@@ -111,30 +111,43 @@ func waitForRemote(node *tsnet.Server, address string) error {
 	}
 }
 
-func writeFailure(stateDir, nodeID string, err error) {
-	code, message := explainError(err)
+func writeFailure(stateDir, nodeID string, err error, remote bool) {
+	code, message := explainError(err, remote)
 	writeStatus(stateDir, status{NodeID: nodeID, ErrorCode: code, ErrorMessage: message})
 }
 
-func explainError(err error) (string, string) {
+func explainError(err error, remote bool) (string, string) {
 	text := strings.ToLower(err.Error())
-	if isHostNameNotFound(err) {
+	if remote && isHostNameNotFound(err) {
 		return "tsnet_host_not_found", "The tsnet desktop host name could not be found. Update the mobile app and pair again."
 	}
-	if strings.Contains(text, "authkey") ||
+	if isAuthFailure(text) {
+		return "preauth_rejected", "The desktop preauth key was rejected or has expired. Update the desktop app and pair again."
+	}
+	if strings.Contains(text, "connection refused") ||
+		strings.Contains(text, "i/o timeout") ||
+		strings.Contains(text, "context deadline exceeded") ||
+		strings.Contains(text, "network is unreachable") ||
+		strings.Contains(text, "no route to host") {
+		if !remote {
+			return "control_server_unavailable", "The overlay control server could not be reached. Check the control URL and try pairing again."
+		}
+		return "remote_host_unavailable", "The desktop overlay host is unavailable. Check that the desktop app is running and try again."
+	}
+	return "embedded_node_start_failed", "The embedded network node could not start. Try pairing again."
+}
+
+func isAuthFailure(text string) bool {
+	return strings.Contains(text, "authkey") ||
 		strings.Contains(text, "auth key") ||
 		strings.Contains(text, "preauth") ||
 		strings.Contains(text, "unauthorized") ||
 		strings.Contains(text, "not authorized") ||
 		strings.Contains(text, "invalid key") ||
+		strings.Contains(text, "key not found") ||
 		strings.Contains(text, "expired") ||
-		strings.Contains(text, "already been used") {
-		return "preauth_rejected", "The desktop preauth key was rejected or has expired. Update the desktop app and pair again."
-	}
-	if strings.Contains(text, "connection refused") || strings.Contains(text, "i/o timeout") {
-		return "remote_host_unavailable", "The desktop overlay host is unavailable. Check that the desktop app is running and try again."
-	}
-	return "embedded_node_start_failed", "The embedded network node could not start. Try pairing again."
+		strings.Contains(text, "already been used") ||
+		strings.Contains(text, "registration failed")
 }
 
 func isHostNameNotFound(err error) bool {
@@ -143,7 +156,8 @@ func isHostNameNotFound(err error) bool {
 		strings.Contains(text, "host not found") ||
 		strings.Contains(text, "unknown host") ||
 		strings.Contains(text, "name or service not known") ||
-		strings.Contains(text, "cannot resolve")
+		strings.Contains(text, "cannot resolve") ||
+		(strings.Contains(text, "lookup ") && strings.Contains(text, "not found"))
 }
 
 func serve(listener net.Listener, dial func() (net.Conn, error)) {
