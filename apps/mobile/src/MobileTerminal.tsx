@@ -8,7 +8,7 @@ import { androidImeKeydownInput, claimNativeInput, nativeTerminalInput, shouldDe
 import type { TimedTerminalInput } from "./terminalInput";
 import "@xterm/xterm/css/xterm.css";
 
-interface Props { connection: HostConnection; session: TerminalSession; }
+interface Props { connection: HostConnection; session: TerminalSession; active: boolean; fontWidthScale: number; }
 
 interface AccessibilityKey {
   id: string;
@@ -39,14 +39,21 @@ const ACCESSIBILITY_KEY_ROWS: AccessibilityKey[][] = [
   ]
 ];
 
-export function MobileTerminal({ connection, session }: Props) {
+export function MobileTerminal({ connection, session, active, fontWidthScale }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
+  const activeRef = useRef(active);
+  activeRef.current = active;
   const resizeRef = useRef<(force?: boolean) => void>(() => undefined);
   const selectedKeysRef = useRef<AccessibilityKey[]>([]);
   const countdownTimerRef = useRef<number | undefined>(undefined);
   const [selectedKeyIds, setSelectedKeyIds] = useState<ReadonlySet<string>>(new Set());
   const [countdownVersion, setCountdownVersion] = useState(0);
+
+  useEffect(() => {
+    resizeRef.current(true);
+    if (activeRef.current) terminalRef.current?.focus();
+  }, [active, fontWidthScale]);
 
   const activeModifiers = (keys = selectedKeysRef.current) => new Set(keys.flatMap((key) => key.modifier ? [key.modifier] : []));
 
@@ -104,7 +111,7 @@ export function MobileTerminal({ connection, session }: Props) {
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(hostElement);
-    terminal.focus();
+    if (activeRef.current) terminal.focus();
     fit.fit();
 
     let resizeFrame: number | undefined;
@@ -319,7 +326,7 @@ export function MobileTerminal({ connection, session }: Props) {
       return true;
     };
     const moveCursorToTouch = (clientX: number, clientY: number) => {
-      terminal.focus();
+      if (activeRef.current) terminal.focus();
       resize(true);
       if (!screen || terminal.hasSelection() || terminal.modes.mouseTrackingMode !== "none") return;
 
@@ -353,7 +360,7 @@ export function MobileTerminal({ connection, session }: Props) {
       }
       const touch = event.touches.item(0);
       if (!touch) return;
-      terminal.focus();
+      if (activeRef.current) terminal.focus();
       suppressTap = tapTimer !== undefined;
       if (tapTimer !== undefined) window.clearTimeout(tapTimer);
       tapTimer = undefined;
@@ -423,7 +430,7 @@ export function MobileTerminal({ connection, session }: Props) {
       pendingOutput.length = 0;
       initialized = true;
       resize();
-      terminal.focus();
+      if (activeRef.current) terminal.focus();
     }).catch((cause) => {
       if (!disposed) terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
     });
@@ -465,7 +472,7 @@ export function MobileTerminal({ connection, session }: Props) {
   }
 
   return <div className="mobile-terminal-shell">
-    <div ref={hostRef} className="mobile-terminal" />
+    <div ref={hostRef} className="mobile-terminal" style={{ width: `${100 / fontWidthScale}%`, transform: `scaleX(${fontWidthScale})`, transformOrigin: "left center" }} />
     <div className="extra-keys" aria-label="Terminal function keys">
       {ACCESSIBILITY_KEY_ROWS.map((row, rowIndex) => <div className="key-row" key={rowIndex}>{row.map((key) => {
         const selected = selectedKeyIds.has(key.id);

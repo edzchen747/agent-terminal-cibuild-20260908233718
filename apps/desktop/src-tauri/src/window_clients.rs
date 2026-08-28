@@ -42,6 +42,10 @@ impl WindowClients {
             .or_else(|| self.window_projects.keys().next().cloned())
     }
 
+    pub fn labels(&self) -> Vec<String> {
+        self.window_projects.keys().cloned().collect()
+    }
+
     pub fn assign(&mut self, label: &str, project_id: &str) -> WindowAssignment {
         let previous_project = self.window_projects.remove(label);
         if let Some(previous) = &previous_project

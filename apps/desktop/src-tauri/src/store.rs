@@ -38,6 +38,12 @@ pub struct StoredDevice {
 pub struct Settings {
     pub default_shell_id: String,
     pub port: u16,
+    #[serde(default = "default_open_projects_in_new_windows")]
+    pub open_projects_in_new_windows: bool,
+}
+
+fn default_open_projects_in_new_windows() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -177,6 +183,30 @@ impl DesktopStore {
         self.write()
     }
 
+    pub fn reorder_projects(&mut self, project_ids: &[String]) -> Result<()> {
+        let existing = self
+            .state
+            .projects
+            .iter()
+            .map(|project| project.id.clone())
+            .collect::<HashSet<_>>();
+        let requested = project_ids.iter().cloned().collect::<HashSet<_>>();
+        if requested.len() != project_ids.len() || requested != existing {
+            return Err(anyhow!("Project order does not match the saved projects."));
+        }
+        let mut projects = self
+            .state
+            .projects
+            .drain(..)
+            .map(|project| (project.id.clone(), project))
+            .collect::<std::collections::HashMap<_, _>>();
+        self.state.projects = project_ids
+            .iter()
+            .filter_map(|id| projects.remove(id))
+            .collect();
+        self.write()
+    }
+
     pub fn authorize_device(&mut self, device: AuthorizedDevice, token: &str) -> Result<()> {
         let id = device.id.clone();
         self.state.devices.retain(|item| item.device.id != id);
@@ -229,6 +259,11 @@ impl DesktopStore {
         self.write()
     }
 
+    pub fn set_open_projects_in_new_windows(&mut self, enabled: bool) -> Result<()> {
+        self.state.settings.open_projects_in_new_windows = enabled;
+        self.write()
+    }
+
     fn write(&self) -> Result<()> {
         if let Some(parent) = self.file_path.parent() {
             fs::create_dir_all(parent)?;
@@ -259,6 +294,7 @@ fn default_state() -> StoredState {
         settings: Settings {
             default_shell_id: "powershell".into(),
             port: 47_831,
+            open_projects_in_new_windows: true,
         },
     }
 }

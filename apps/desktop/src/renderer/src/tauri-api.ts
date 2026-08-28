@@ -35,6 +35,7 @@ const api: DesktopApi = {
   removeProject: (projectId) => invoke("remove_project", { projectId }),
   setProjectPersistent: (projectId, persistent) => invoke("set_project_persistent", { projectId, persistent }),
   openProject: (projectId) => invoke("open_project", { projectId }),
+  reorderProjects: (projectIds) => invoke("reorder_projects", { projectIds }),
   createSession: (projectId, shellId) => invoke("create_session", { projectId, shellId }),
   closeSession: (sessionId) => invoke("close_session", { sessionId }),
   reorderSessions: (projectId, sessionIds) => invoke("reorder_sessions", { projectId, sessionIds }),
@@ -50,6 +51,7 @@ const api: DesktopApi = {
   retryRemoteRegistration: () => invoke("retry_remote_registration"),
   revokeDevice: (deviceId) => invoke("revoke_device", { deviceId }),
   setDefaultShell: (shellId) => invoke("set_default_shell", { shellId }),
+  setOpenProjectsInNewWindows: (enabled) => invoke("set_open_projects_in_new_windows", { enabled }),
   selectShell: (sessionId, shellId) => invoke("select_shell", { sessionId, shellId }),
   onPairingSucceeded: (callback) => {
     pairingListeners.add(callback);

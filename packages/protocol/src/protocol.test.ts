@@ -87,6 +87,10 @@ test("messages encode as JSON", () => {
     '{"type":"project.rename","requestId":"r3","projectId":"p1","name":"New name"}'
   );
   assert.equal(
+    encodeMessage({ type: "project.reorder", requestId: "r4", projectIds: ["p2", "p1"] }),
+    '{"type":"project.reorder","requestId":"r4","projectIds":["p2","p1"]}'
+  );
+  assert.equal(
     encodeMessage({ type: "directory.list", requestId: "r4", path: "C:\\Users\\Ada" }),
     '{"type":"directory.list","requestId":"r4","path":"C:\\\\Users\\\\Ada"}'
   );

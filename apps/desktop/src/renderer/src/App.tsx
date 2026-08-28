@@ -19,6 +19,17 @@ interface TabDragState {
   centers: number[];
 }
 
+interface ProjectDragState {
+  projectId: string;
+  pointerId: number;
+  startY: number;
+  deltaY: number;
+  startIndex: number;
+  targetIndex: number;
+  didMove: boolean;
+  centers: number[];
+}
+
 export function App() {
   const [state, setState] = useState<DesktopState | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -33,10 +44,13 @@ export function App() {
   const [sessionOrder, setSessionOrder] = useState<string[]>([]);
   const [tabDrag, setTabDrag] = useState<TabDragState | null>(null);
   const [closingSessionIds, setClosingSessionIds] = useState<Set<string>>(() => new Set());
+  const [projectDrag, setProjectDrag] = useState<ProjectDragState | null>(null);
   const tabDragRef = useRef<TabDragState | null>(null);
   const tabElementsRef = useRef(new Map<string, HTMLButtonElement>());
   const pendingTabPositionsRef = useRef<Map<string, number> | null>(null);
   const suppressTabClickRef = useRef(false);
+  const projectDragRef = useRef<ProjectDragState | null>(null);
+  const projectElementsRef = useRef(new Map<string, HTMLDivElement>());
 
   useEffect(() => {
     void window.agentTerminal.getState().then(setState);
@@ -273,6 +287,65 @@ export function App() {
     return undefined;
   }
 
+  function beginProjectDrag(event: ReactPointerEvent<HTMLElement>, projectId: string, index: number) {
+    if (event.button !== 0 || !state) return;
+    const centers = state.projects.map((project) => {
+      const bounds = projectElementsRef.current.get(project.id)?.getBoundingClientRect();
+      return bounds ? bounds.top + bounds.height / 2 : 0;
+    });
+    if (centers.some((center) => center === 0)) return;
+    const next: ProjectDragState = { projectId, pointerId: event.pointerId, startY: event.clientY, deltaY: 0, startIndex: index, targetIndex: index, didMove: false, centers };
+    projectDragRef.current = next;
+    setProjectDrag(next);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.stopPropagation();
+  }
+
+  function moveProjectDrag(event: ReactPointerEvent<HTMLElement>) {
+    const current = projectDragRef.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    const deltaY = event.clientY - current.startY;
+    const didMove = current.didMove || Math.abs(deltaY) > 4;
+    const draggedCenter = current.centers[current.startIndex]! + deltaY;
+    let targetIndex = current.startIndex;
+    if (didMove) {
+      targetIndex = current.centers.reduce((nearest, center, index) => Math.abs(center - draggedCenter) < Math.abs(current.centers[nearest]! - draggedCenter) ? index : nearest, current.startIndex);
+      event.preventDefault();
+    }
+    const next = { ...current, deltaY, didMove, targetIndex };
+    projectDragRef.current = next;
+    setProjectDrag(next);
+  }
+
+  function finishProjectDrag(event: ReactPointerEvent<HTMLElement>, commit: boolean) {
+    const current = projectDragRef.current;
+    if (!current || current.pointerId !== event.pointerId || !state) return;
+    if (commit && current.didMove && current.targetIndex !== current.startIndex) {
+      const projects = [...state.projects];
+      projects.splice(current.targetIndex, 0, ...projects.splice(current.startIndex, 1));
+      const previous = state;
+      setState({ ...state, projects });
+      void window.agentTerminal.reorderProjects(projects.map((project) => project.id)).catch(() => {
+        setState(previous);
+        void window.agentTerminal.getState().then(setState);
+      });
+    }
+    projectDragRef.current = null;
+    setProjectDrag(null);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    event.stopPropagation();
+  }
+
+  function projectDragTransform(projectId: string, index: number): string | undefined {
+    if (!projectDrag) return undefined;
+    if (projectId === projectDrag.projectId) return `translate3d(0,${projectDrag.deltaY}px,0)`;
+    const gap = projectDrag.centers[Math.min(projectDrag.startIndex + 1, projectDrag.centers.length - 1)]! - projectDrag.centers[Math.max(0, projectDrag.startIndex - 1)]!;
+    const step = projectDrag.centers.length > 1 ? Math.abs(gap) / (projectDrag.startIndex > 0 && projectDrag.startIndex < projectDrag.centers.length - 1 ? 2 : 1) : 61;
+    if (projectDrag.startIndex < projectDrag.targetIndex && index > projectDrag.startIndex && index <= projectDrag.targetIndex) return `translate3d(0,-${step}px,0)`;
+    if (projectDrag.startIndex > projectDrag.targetIndex && index >= projectDrag.targetIndex && index < projectDrag.startIndex) return `translate3d(0,${step}px,0)`;
+    return undefined;
+  }
+
   async function selectShell(shellId: string) {
     const replacement = await window.agentTerminal.selectShell(activeSessionId, shellId);
     if (replacement) setActiveSessionId(replacement.id);
@@ -318,12 +391,12 @@ export function App() {
         <aside className={`sidebar ${sidebarOpen ? "" : "is-collapsed"}`}>
           <div className="sidebar-heading"><span>Projects</span><button className="icon-button small" onClick={() => void window.agentTerminal.createProject()} title="Add project"><PlusIcon /></button></div>
           <nav className="project-list">
-            {state.projects.map((project) => {
+            {state.projects.map((project, index) => {
               const count = state.sessions.filter((session) => session.projectId === project.id && session.status === "running").length;
-              return <div key={project.id} role="button" tabIndex={0} className={`project-item ${project.id === state.currentProjectId ? "active" : ""}`} onClick={() => void window.agentTerminal.openProject(project.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") void window.agentTerminal.openProject(project.id); }}>
+              return <div key={project.id} ref={(element) => { if (element) projectElementsRef.current.set(project.id, element); else projectElementsRef.current.delete(project.id); }} role="button" tabIndex={0} className={`project-item ${project.id === state.currentProjectId ? "active" : ""} ${project.id === projectDrag?.projectId ? "is-dragging" : ""}`} style={{ transform: projectDragTransform(project.id, index) }} onClick={() => void window.agentTerminal.openProject(project.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") void window.agentTerminal.openProject(project.id); }}>
                 <span className="project-icon"><FolderIcon /></span>
                 <span className="project-copy"><strong>{project.name}</strong><small>{count ? `${count} active session${count === 1 ? "" : "s"}` : "No active sessions"}</small></span>
-                <span className="project-item-actions"><span className="persistence" title={project.persistent ? "Saved project" : "Temporary project"}>{project.persistent ? <BookmarkIcon /> : <ClockIcon />}</span><button className="project-rename" onClick={(event) => { event.stopPropagation(); startRename(project.id); }} title={`Rename ${project.name}`} aria-label={`Rename ${project.name}`}><EditIcon /></button></span>
+                <span className="project-item-actions"><span className="project-drag-handle" role="button" aria-label={`Reorder ${project.name}`} title="Drag to reorder" onClick={(event) => event.stopPropagation()} onPointerDown={(event) => beginProjectDrag(event, project.id, index)} onPointerMove={moveProjectDrag} onPointerUp={(event) => finishProjectDrag(event, true)} onPointerCancel={(event) => finishProjectDrag(event, false)}>⠿</span><span className="persistence" title={project.persistent ? "Saved project" : "Temporary project"}>{project.persistent ? <BookmarkIcon /> : <ClockIcon />}</span><button className="project-rename" onClick={(event) => { event.stopPropagation(); startRename(project.id); }} title={`Rename ${project.name}`} aria-label={`Rename ${project.name}`}><EditIcon /></button></span>
               </div>;
             })}
           </nav>
@@ -366,6 +439,7 @@ export function App() {
         <div className="modal-kicker"><SettingsIcon /> Settings</div>
         <h1>Desktop host</h1>
         <div className="settings-row"><span><strong>Default terminal</strong><small>Used for new tabs and projects</small></span><select value={state.defaultShellId} onChange={(event) => void selectShell(event.target.value)}>{state.shells.map((shell) => <option key={shell.id} value={shell.id}>{shell.name}</option>)}</select></div>
+        <label className="settings-row settings-toggle"><span><strong>Open each project in a new window</strong><small>Turn off to switch projects like tabs in this window</small></span><input type="checkbox" checked={state.openProjectsInNewWindows} onChange={(event) => void window.agentTerminal.setOpenProjectsInNewWindows(event.target.checked)} /><i /></label>
         <div className="section-label">Authorized devices</div>
         <div className="device-list">
           {state.devices.length ? state.devices.map((device) => <div className="device-row" key={device.id}><span className="device-avatar"><PhoneIcon /></span><span><strong>{device.name}</strong><small>{device.platform} · Last connected {new Date(device.lastSeenAt).toLocaleString()}</small></span><button className="danger-icon" title="Revoke device" onClick={() => void window.agentTerminal.revokeDevice(device.id)}><TrashIcon /></button></div>) : <div className="empty-devices">No mobile devices have been paired.</div>}

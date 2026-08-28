@@ -160,6 +160,7 @@ export type ClientMessage =
   | { type: "project.rename"; requestId: string; projectId: string; name: string }
   | { type: "project.remove"; requestId: string; projectId: string }
   | { type: "project.persistence"; requestId: string; projectId: string; persistent: boolean }
+  | { type: "project.reorder"; requestId: string; projectIds: string[] }
   | { type: "directory.list"; requestId: string; path?: string }
   | { type: "session.create"; requestId: string; projectId: string; shellId?: string }
   | { type: "session.close"; requestId: string; sessionId: string }

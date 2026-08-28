@@ -85,6 +85,7 @@ struct Inner {
     store: DesktopStore,
     shells: Vec<ShellProfile>,
     temporary_projects: HashMap<String, Project>,
+    project_order: Vec<String>,
     sessions: HashMap<String, ManagedSession>,
     session_order: Vec<String>,
     windows: WindowClients,
@@ -105,12 +106,18 @@ pub struct Core {
 impl Core {
     pub fn new(app: AppHandle, store: DesktopStore) -> Arc<Self> {
         let remote_port = store.settings().port;
+        let project_order = store
+            .projects()
+            .iter()
+            .map(|project| project.id.clone())
+            .collect();
         Arc::new(Self {
             app,
             inner: Mutex::new(Inner {
                 store,
                 shells: detect_shells(),
                 temporary_projects: HashMap::new(),
+                project_order,
                 sessions: HashMap::new(),
                 session_order: Vec::new(),
                 windows: WindowClients::default(),
@@ -156,6 +163,7 @@ impl Core {
                 inner
                     .temporary_projects
                     .insert(project.id.clone(), project.clone());
+                inner.project_order.push(project.id.clone());
             }
         }
         self.create_session(&project.id, None)?;
@@ -496,6 +504,7 @@ impl Core {
         DesktopState {
             snapshot: snapshot_from_inner(&inner),
             current_project_id,
+            open_projects_in_new_windows: inner.store.settings().open_projects_in_new_windows,
             remote_registration: RemoteRegistration {
                 status: inner.store.network().registration_status.clone(),
                 error: inner.store.network().registration_error.clone(),
@@ -601,18 +610,59 @@ impl Core {
     }
 
     pub fn ensure_project_window(self: &Arc<Self>, project_id: &str) -> Result<()> {
-        self.ensure_project_window_with_focus(project_id, true)
+        self.ensure_project_window_with_focus(project_id, true, None)
     }
 
     fn ensure_project_window_in_background(self: &Arc<Self>, project_id: &str) -> Result<()> {
-        self.ensure_project_window_with_focus(project_id, false)
+        self.ensure_project_window_with_focus(project_id, false, None)
     }
 
     fn ensure_project_window_with_focus(
         self: &Arc<Self>,
         project_id: &str,
         focus: bool,
+        preferred_window: Option<&str>,
     ) -> Result<()> {
+        let reusable = {
+            let inner = self.inner.lock().expect("desktop state poisoned");
+            (!inner.store.settings().open_projects_in_new_windows)
+                .then(|| {
+                    preferred_window
+                        .filter(|label| inner.windows.is_registered(label))
+                        .map(str::to_owned)
+                        .or_else(|| inner.windows.last_or_any())
+                })
+                .flatten()
+        };
+        if let Some(label) = reusable {
+            let (project, displaced) = {
+                let project = self.project_by_id(project_id)?;
+                let displaced = self
+                    .inner
+                    .lock()
+                    .expect("desktop state poisoned")
+                    .windows
+                    .assign(&label, project_id)
+                    .displaced_window;
+                (project, displaced)
+            };
+            if let Some(displaced) = displaced
+                && let Some(window) = self.app.get_webview_window(&displaced)
+            {
+                let _ = window.destroy();
+            }
+            if let Some(window) = self.app.get_webview_window(&label) {
+                let _ = window.set_title(&format!("{} — Agent Terminal", project.name));
+                let _ = window.unminimize();
+                window.show()?;
+                if focus {
+                    window.set_focus()?;
+                    self.mark_window_focused(&label);
+                }
+                self.broadcast();
+                return Ok(());
+            }
+        }
         let existing = self
             .inner
             .lock()
@@ -668,7 +718,11 @@ impl Core {
         Ok(())
     }
 
-    pub fn open_project(self: &Arc<Self>, project_id: &str) -> Result<()> {
+    pub fn open_project(
+        self: &Arc<Self>,
+        project_id: &str,
+        preferred_window: Option<&str>,
+    ) -> Result<()> {
         let has_running = self
             .inner
             .lock()
@@ -681,7 +735,7 @@ impl Core {
         if !has_running {
             self.create_session(project_id, None)?;
         } else {
-            self.ensure_project_window(project_id)?;
+            self.ensure_project_window_with_focus(project_id, true, preferred_window)?;
         }
         Ok(())
     }
@@ -725,6 +779,7 @@ impl Core {
                     created_at: Some(Utc::now().to_rfc3339()),
                 };
                 inner.store.save_project(project.clone())?;
+                inner.project_order.push(project.id.clone());
                 project
             }
         };
@@ -765,6 +820,69 @@ impl Core {
         }
         self.broadcast();
         Ok(project)
+    }
+
+    pub fn reorder_projects(&self, project_ids: &[String]) -> Result<()> {
+        {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let public_ids = public_projects(&inner)
+                .into_iter()
+                .map(|project| project.id)
+                .collect::<HashSet<_>>();
+            let requested_ids = project_ids.iter().cloned().collect::<HashSet<_>>();
+            if requested_ids.len() != project_ids.len() || requested_ids != public_ids {
+                return Err(anyhow!(
+                    "Project order does not match the available projects."
+                ));
+            }
+            inner.project_order = project_ids.to_vec();
+            let saved = project_ids
+                .iter()
+                .filter(|id| {
+                    inner
+                        .store
+                        .projects()
+                        .iter()
+                        .any(|project| project.id.as_str() == id.as_str())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            inner.store.reorder_projects(&saved)?;
+        }
+        self.broadcast();
+        Ok(())
+    }
+
+    pub fn set_open_projects_in_new_windows(
+        &self,
+        enabled: bool,
+        preferred_window: Option<&str>,
+    ) -> Result<()> {
+        let windows_to_close = {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            inner.store.set_open_projects_in_new_windows(enabled)?;
+            if enabled {
+                Vec::new()
+            } else {
+                let keep = preferred_window
+                    .filter(|label| inner.windows.is_registered(label))
+                    .map(str::to_owned)
+                    .or_else(|| inner.windows.last_or_any());
+                inner
+                    .windows
+                    .labels()
+                    .into_iter()
+                    .filter(|label| Some(label) != keep.as_ref())
+                    .collect::<Vec<_>>()
+            }
+        };
+        for label in windows_to_close {
+            if let Some(window) = self.app.get_webview_window(&label) {
+                let _ = window.destroy();
+            }
+        }
+        self.broadcast();
+        Ok(())
     }
 
     pub fn list_directories(&self, folder: Option<&str>) -> Result<DirectoryListing> {
@@ -1455,6 +1573,16 @@ impl Core {
                     snapshot: self.snapshot(),
                 })
             }
+            ClientMessage::ProjectReorder {
+                request_id,
+                project_ids,
+            } => {
+                self.reorder_projects(&project_ids)?;
+                Some(ServerMessage::Snapshot {
+                    request_id: Some(request_id),
+                    snapshot: self.snapshot(),
+                })
+            }
             ClientMessage::DirectoryList { request_id, path } => {
                 Some(ServerMessage::DirectoryListing {
                     request_id,
@@ -1675,7 +1803,14 @@ impl Core {
         let Ok(cwd) = canonical_directory(&cleaned) else {
             return;
         };
-        let (project, previous_project_id, active_window, displaced_window, old_has_sessions) = {
+        let (
+            project,
+            previous_project_id,
+            active_window,
+            displaced_window,
+            old_has_sessions,
+            open_projects_in_new_windows,
+        ) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let Some(current) = inner
                 .sessions
@@ -1717,6 +1852,7 @@ impl Core {
                     inner
                         .temporary_projects
                         .insert(project.id.clone(), project.clone());
+                    inner.project_order.push(project.id.clone());
                     project
                 });
             if let Some(session) = inner.sessions.get_mut(session_id) {
@@ -1741,12 +1877,14 @@ impl Core {
                     .sessions
                     .values()
                     .any(|session| session.metadata.project_id == current.project_id);
+            let open_projects_in_new_windows = inner.store.settings().open_projects_in_new_windows;
             (
                 project,
                 current.project_id,
                 active_window,
                 displaced_window,
                 old_has_sessions,
+                open_projects_in_new_windows,
             )
         };
         if project.id != previous_project_id {
@@ -1759,7 +1897,7 @@ impl Core {
             if let Some(label) = active_window {
                 if let Some(window) = self.app.get_webview_window(&label) {
                     let _ = window.set_title(&format!("{} — Agent Terminal", project.name));
-                    if old_has_sessions {
+                    if old_has_sessions && open_projects_in_new_windows {
                         let _ = self.ensure_project_window_in_background(&previous_project_id);
                     } else {
                         self.cleanup_empty_temporary_project(&previous_project_id);
@@ -1793,6 +1931,7 @@ impl Core {
                 return;
             }
             inner.temporary_projects.remove(project_id);
+            inner.project_order.retain(|id| id != project_id);
             let label = inner
                 .windows
                 .window_for_project(project_id)
@@ -1899,6 +2038,28 @@ fn public_projects(inner: &Inner) -> Vec<Project> {
             })
             .cloned(),
     );
+    let positions = inner
+        .project_order
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    projects.sort_by(|left, right| {
+        (
+            positions
+                .get(left.id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX),
+            &left.id,
+        )
+            .cmp(&(
+                positions
+                    .get(right.id.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                &right.id,
+            ))
+    });
     projects
 }
 

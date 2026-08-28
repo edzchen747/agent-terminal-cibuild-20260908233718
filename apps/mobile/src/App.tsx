@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { App as CapacitorApp } from "@capacitor/app";
 import { Capacitor, type PluginListenerHandle } from "@capacitor/core";
+import { Preferences } from "@capacitor/preferences";
 import {
   CapacitorBarcodeScanner,
   CapacitorBarcodeScannerAndroidScanningLibrary,
@@ -12,11 +14,32 @@ import type { DirectoryListing, HostSnapshot, PairingPayload, Platform, Project,
 import { createRequestId, parsePairingPayload } from "@agentterminal/protocol";
 import { HostConnection, type RemoteRegistrationState } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
-import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, TerminalIcon, WifiIcon } from "./icons";
+import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, SettingsIcon, TerminalIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
 
 type View = { type: "home" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
 type ConnectionNotificationState = "connected" | "reconnecting";
+const TERMINAL_FONT_WIDTH_KEY = "agent-terminal-font-width-percent";
+
+interface ProjectDragState {
+  projectId: string;
+  pointerId: number;
+  startY: number;
+  deltaY: number;
+  startIndex: number;
+  targetIndex: number;
+  didMove: boolean;
+  centers: number[];
+}
+
+interface SwipeState {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  startedAt: number;
+  deltaX: number;
+  horizontal: boolean;
+}
 
 export function App() {
   const [connection, setConnection] = useState<HostConnection | null>(null);
@@ -30,15 +53,48 @@ export function App() {
   const [showCreateProject, setShowCreateProject] = useState(false);
   const [projectToRename, setProjectToRename] = useState<Project | null>(null);
   const [sessionToClose, setSessionToClose] = useState<TerminalSession | null>(null);
+  const [showTerminalSettings, setShowTerminalSettings] = useState(false);
+  const [fontWidthPercent, setFontWidthPercent] = useState(100);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [projectOrder, setProjectOrder] = useState<string[]>([]);
+  const [projectDrag, setProjectDrag] = useState<ProjectDragState | null>(null);
+  const [swipe, setSwipe] = useState<SwipeState | null>(null);
   const connectionRef = useRef<HostConnection | null>(null);
   connectionRef.current = connection;
-  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose });
-  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose };
+  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings });
+  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings };
+  const projectDragRef = useRef<ProjectDragState | null>(null);
+  const projectElementsRef = useRef(new Map<string, HTMLElement>());
+  const swipeRef = useRef<SwipeState | null>(null);
+
+  useEffect(() => {
+    void Preferences.get({ key: TERMINAL_FONT_WIDTH_KEY }).then(({ value }) => {
+      if (value === null) return;
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) setFontWidthPercent(Math.max(65, Math.min(100, parsed)));
+    });
+  }, []);
+
+  useEffect(() => {
+    const ids = snapshot?.projects.map((project) => project.id) ?? [];
+    const available = new Set(ids);
+    setProjectOrder((current) => [...current.filter((id) => available.has(id)), ...ids.filter((id) => !current.includes(id))]);
+  }, [snapshot?.projects]);
+
+  const orderedProjects = useMemo(() => {
+    const positions = new Map(projectOrder.map((id, index) => [id, index]));
+    return [...(snapshot?.projects ?? [])].sort((left, right) => (positions.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (positions.get(right.id) ?? Number.MAX_SAFE_INTEGER));
+  }, [snapshot?.projects, projectOrder]);
 
   useEffect(() => {
     if (Capacitor.getPlatform() !== "android") return;
     const listener = CapacitorApp.addListener("backButton", () => {
       const navigation = navigationRef.current;
+      if (navigation.showTerminalSettings) {
+        setShowTerminalSettings(false);
+        return;
+      }
       if (navigation.projectToRename) {
         setProjectToRename(null);
         return;
@@ -221,6 +277,79 @@ export function App() {
     setConnection(null); setSnapshot(null); setRemoteRegistration({ status: "unregistered" }); setError(""); setStatus("pairing"); setView({ type: "home" });
   }
 
+  function openProject(projectId: string) {
+    setSelectedProjectId(projectId);
+    setSelectedSessionId((current) => snapshot?.sessions.some((session) => session.id === current && session.projectId === projectId) ? current : null);
+    setView({ type: "project", projectId });
+  }
+
+  function openTerminal(session: TerminalSession) {
+    setSelectedProjectId(session.projectId);
+    setSelectedSessionId(session.id);
+    setView({ type: "terminal", sessionId: session.id, projectId: session.projectId });
+  }
+
+  function navigateBack() {
+    if (view.type === "terminal") setView({ type: "project", projectId: view.projectId });
+    else if (view.type === "project") setView({ type: "home" });
+  }
+
+  function beginProjectDrag(event: ReactPointerEvent<HTMLElement>, projectId: string, index: number) {
+    const centers = orderedProjects.map((project) => {
+      const bounds = projectElementsRef.current.get(project.id)?.getBoundingClientRect();
+      return bounds ? bounds.top + bounds.height / 2 : 0;
+    });
+    if (centers.some((center) => center === 0)) return;
+    const next: ProjectDragState = { projectId, pointerId: event.pointerId, startY: event.clientY, deltaY: 0, startIndex: index, targetIndex: index, didMove: false, centers };
+    projectDragRef.current = next;
+    setProjectDrag(next);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.stopPropagation();
+  }
+
+  function moveProjectDrag(event: ReactPointerEvent<HTMLElement>) {
+    const current = projectDragRef.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    const deltaY = event.clientY - current.startY;
+    const didMove = current.didMove || Math.abs(deltaY) > 4;
+    const draggedCenter = current.centers[current.startIndex]! + deltaY;
+    const targetIndex = didMove
+      ? current.centers.reduce((nearest, center, index) => Math.abs(center - draggedCenter) < Math.abs(current.centers[nearest]! - draggedCenter) ? index : nearest, current.startIndex)
+      : current.startIndex;
+    if (didMove) event.preventDefault();
+    const next = { ...current, deltaY, didMove, targetIndex };
+    projectDragRef.current = next;
+    setProjectDrag(next);
+  }
+
+  function finishProjectDrag(event: ReactPointerEvent<HTMLElement>, commit: boolean) {
+    const current = projectDragRef.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    if (commit && current.didMove && current.targetIndex !== current.startIndex && connection) {
+      const ids = orderedProjects.map((project) => project.id);
+      ids.splice(current.targetIndex, 0, ...ids.splice(current.startIndex, 1));
+      setProjectOrder(ids);
+      void connection.request({ type: "project.reorder", requestId: createRequestId(), projectIds: ids }).catch(() => {
+        setProjectOrder(snapshot?.projects.map((project) => project.id) ?? []);
+      });
+    }
+    projectDragRef.current = null;
+    setProjectDrag(null);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    event.stopPropagation();
+  }
+
+  function projectDragTransform(projectId: string, index: number): string | undefined {
+    if (!projectDrag) return undefined;
+    if (projectId === projectDrag.projectId) return `translate3d(0,${projectDrag.deltaY}px,0)`;
+    const previous = projectDrag.centers[Math.max(0, projectDrag.startIndex - 1)]!;
+    const next = projectDrag.centers[Math.min(projectDrag.centers.length - 1, projectDrag.startIndex + 1)]!;
+    const step = Math.abs(next - previous) / (projectDrag.startIndex > 0 && projectDrag.startIndex < projectDrag.centers.length - 1 ? 2 : 1) || 87;
+    if (projectDrag.startIndex < projectDrag.targetIndex && index > projectDrag.startIndex && index <= projectDrag.targetIndex) return `translate3d(0,-${step}px,0)`;
+    if (projectDrag.startIndex > projectDrag.targetIndex && index >= projectDrag.targetIndex && index < projectDrag.startIndex) return `translate3d(0,${step}px,0)`;
+    return undefined;
+  }
+
   async function closeSession(session: TerminalSession) {
     if (!connection) return;
     await connection.request({ type: "session.close", requestId: createRequestId(), sessionId: session.id });
@@ -233,34 +362,81 @@ export function App() {
   if (status === "error") return <ErrorScreen message={error} onRetry={() => window.location.reload()} onForget={() => void forgetHost()} />;
   if (!connection || !snapshot) return null;
 
-  const activeProject = view.type === "project" ? snapshot.projects.find((item) => item.id === view.projectId) : undefined;
-  const activeSession = view.type === "terminal" ? snapshot.sessions.find((item) => item.id === view.sessionId) : undefined;
-  if (view.type === "terminal" && activeSession) {
-    const project = snapshot.projects.find((item) => item.id === activeSession.projectId);
-    return <div className="mobile-app terminal-view">
-      <MobileHeader title={activeSession.title} subtitle={project?.name ?? activeSession.cwd} onBack={() => setView({ type: "project", projectId: activeSession.projectId })} trailing={<div className="session-actions"><span className={`session-state ${activeSession.status}`}>{activeSession.status}</span><button className="close-session-button" onClick={() => setSessionToClose(activeSession)} aria-label="Close terminal session" title="Close terminal session"><CloseIcon /></button></div>} />
-      <MobileTerminal key={activeSession.id} connection={connection} session={activeSession} />
-      {sessionToClose?.id === activeSession.id && <CloseSessionSheet session={activeSession} onClose={() => setSessionToClose(null)} onConfirm={() => closeSession(activeSession)} />}
-    </div>;
+  const requestedProjectId = view.type === "home" ? selectedProjectId : view.projectId;
+  const activeProject = snapshot.projects.find((item) => item.id === requestedProjectId);
+  const requestedSessionId = view.type === "terminal" ? view.sessionId : selectedSessionId;
+  const activeSession = snapshot.sessions.find((item) => item.id === requestedSessionId && (!activeProject || item.projectId === activeProject.id));
+  const pageCount = 1 + (activeProject ? 1 : 0) + (activeProject && activeSession ? 1 : 0);
+  const currentPage = Math.min(view.type === "terminal" ? 2 : view.type === "project" ? 1 : 0, pageCount - 1);
+
+  function beginSwipe(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.pointerType === "mouse" || (event.target instanceof Element && event.target.closest("button,input,textarea,select,[data-no-swipe],.xterm-accessibility-tree,.scrollbar"))) return;
+    const next: SwipeState = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startedAt: performance.now(), deltaX: 0, horizontal: false };
+    swipeRef.current = next;
+    setSwipe(next);
+    event.currentTarget.setPointerCapture(event.pointerId);
   }
-  if (view.type === "project" && activeProject) {
-    return <><ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={() => setView({ type: "home" })} onRename={() => setProjectToRename(activeProject)} onOpen={(session) => setView({ type: "terminal", sessionId: session.id, projectId: session.projectId })} />{projectToRename?.id === activeProject.id && <RenameProjectSheet project={activeProject} connection={connection} onClose={() => setProjectToRename(null)} />}</>;
+
+  function moveSwipe(event: ReactPointerEvent<HTMLDivElement>) {
+    const current = swipeRef.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    const rawX = event.clientX - current.startX;
+    const deltaY = event.clientY - current.startY;
+    if (!current.horizontal && Math.abs(rawX) < 7) return;
+    if (!current.horizontal && Math.abs(rawX) <= Math.abs(deltaY)) {
+      swipeRef.current = null;
+      setSwipe(null);
+      return;
+    }
+    const hasTarget = rawX > 0 ? currentPage > 0 : currentPage < pageCount - 1;
+    const deltaX = hasTarget ? rawX : rawX * .14;
+    const next = { ...current, horizontal: true, deltaX };
+    swipeRef.current = next;
+    setSwipe(next);
+    event.preventDefault();
   }
-  return <div className="mobile-app home-view">
-    <RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} />
-    <header className="home-header">
-      <div><span className="eyebrow">Connected desktop</span><h1>{snapshot.host.name}</h1><span className="connection-label"><i /> Online · {snapshot.sessions.filter((s) => s.status === "running").length} sessions</span></div>
-      <button className="round-button" onClick={() => void forgetHost()} title="Host options"><MoreIcon /></button>
-    </header>
-    <section className="home-content">
-      <div className="section-title"><span>Projects</span><button onClick={() => setShowCreateProject(true)}><PlusIcon /> New</button></div>
-      <div className="project-cards">
-        {snapshot.projects.map((project) => <ProjectCard key={project.id} project={project} sessions={snapshot.sessions.filter((session) => session.projectId === project.id)} onClick={() => setView({ type: "project", projectId: project.id })} onSession={(session) => setView({ type: "terminal", sessionId: session.id, projectId: session.projectId })} />)}
-      </div>
-      {!snapshot.projects.length && <div className="mobile-empty"><FolderIcon /><h2>No projects yet</h2><p>Add a folder from your desktop to begin.</p></div>}
-    </section>
-    <nav className="bottom-nav"><button className="active"><FolderIcon /><span>Projects</span></button><button onClick={() => void scan()}><ScanIcon /><span>Pair</span></button><button onClick={() => void forgetHost()}><WifiIcon /><span>Host</span></button></nav>
+
+  function finishSwipe(event: ReactPointerEvent<HTMLDivElement>, cancelled = false) {
+    const current = swipeRef.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    const velocity = Math.abs(current.deltaX) / Math.max(1, performance.now() - current.startedAt);
+    const commit = !cancelled && current.horizontal && (Math.abs(current.deltaX) > window.innerWidth * .22 || velocity > .55);
+    const targetPage = commit ? currentPage + (current.deltaX < 0 ? 1 : -1) : currentPage;
+    swipeRef.current = null;
+    setSwipe(null);
+    if (targetPage === 0) setView({ type: "home" });
+    else if (targetPage === 1 && activeProject) setView({ type: "project", projectId: activeProject.id });
+    else if (targetPage === 2 && activeProject && activeSession) setView({ type: "terminal", projectId: activeProject.id, sessionId: activeSession.id });
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  }
+
+  return <div className="mobile-pager" onPointerDown={beginSwipe} onPointerMove={moveSwipe} onPointerUp={(event) => finishSwipe(event)} onPointerCancel={(event) => finishSwipe(event, true)}>
+    <div className={`mobile-page-track ${swipe?.horizontal ? "is-dragging" : ""}`} style={{ transform: `translate3d(calc(${-currentPage * 100}% + ${swipe?.deltaX ?? 0}px),0,0)` }}>
+      <div className="mobile-page"><div className="mobile-app home-view">
+        <RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} />
+        <header className="home-header">
+          <div><span className="eyebrow">Connected desktop</span><h1>{snapshot.host.name}</h1><span className="connection-label"><i /> Online · {snapshot.sessions.filter((s) => s.status === "running").length} sessions</span></div>
+          <button className="round-button" onClick={() => void forgetHost()} title="Host options"><MoreIcon /></button>
+        </header>
+        <section className="home-content">
+          <div className="section-title"><span>Projects</span><button onClick={() => setShowCreateProject(true)}><PlusIcon /> New</button></div>
+          <div className="project-cards">
+            {orderedProjects.map((project, index) => <ProjectCard key={project.id} elementRef={(element) => { if (element) projectElementsRef.current.set(project.id, element); else projectElementsRef.current.delete(project.id); }} project={project} sessions={snapshot.sessions.filter((session) => session.projectId === project.id)} dragging={project.id === projectDrag?.projectId} transform={projectDragTransform(project.id, index)} onDragStart={(event) => beginProjectDrag(event, project.id, index)} onDragMove={moveProjectDrag} onDragEnd={(event, commit) => finishProjectDrag(event, commit)} onClick={() => openProject(project.id)} onSession={openTerminal} />)}
+          </div>
+          {!snapshot.projects.length && <div className="mobile-empty"><FolderIcon /><h2>No projects yet</h2><p>Add a folder from your desktop to begin.</p></div>}
+        </section>
+        <nav className="bottom-nav"><button className="active"><FolderIcon /><span>Projects</span></button><button onClick={() => void scan()}><ScanIcon /><span>Pair</span></button><button onClick={() => void forgetHost()}><WifiIcon /><span>Host</span></button></nav>
+      </div></div>
+      {activeProject && <div className="mobile-page"><ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={navigateBack} onRename={() => setProjectToRename(activeProject)} onOpen={openTerminal} /></div>}
+      {activeProject && activeSession && <div className="mobile-page"><div className="mobile-app terminal-view">
+        <MobileHeader title={activeSession.title} subtitle={activeProject.name} onBack={navigateBack} trailing={<div className="session-actions"><span className={`session-state ${activeSession.status}`}>{activeSession.status}</span><button className="terminal-settings-button" onClick={() => setShowTerminalSettings(true)} aria-label="Terminal display settings"><SettingsIcon /></button><button className="close-session-button" onClick={() => setSessionToClose(activeSession)} aria-label="Close terminal session" title="Close terminal session"><CloseIcon /></button></div>} />
+        <MobileTerminal key={activeSession.id} active={view.type === "terminal"} fontWidthScale={fontWidthPercent / 100} connection={connection} session={activeSession} />
+      </div></div>}
+    </div>
     {showCreateProject && <CreateProjectSheet connection={connection} onClose={() => setShowCreateProject(false)} />}
+    {projectToRename && activeProject?.id === projectToRename.id && <RenameProjectSheet project={activeProject} connection={connection} onClose={() => setProjectToRename(null)} />}
+    {sessionToClose && activeSession?.id === sessionToClose.id && <CloseSessionSheet session={activeSession} onClose={() => setSessionToClose(null)} onConfirm={() => closeSession(activeSession)} />}
+    {showTerminalSettings && <TerminalSettingsSheet value={fontWidthPercent} onChange={(value) => { setFontWidthPercent(value); void Preferences.set({ key: TERMINAL_FONT_WIDTH_KEY, value: String(value) }); }} onClose={() => setShowTerminalSettings(false)} />}
   </div>;
 }
 
@@ -325,10 +501,14 @@ function ProjectScreen({ project, snapshot, connection, onBack, onRename, onOpen
   </div>;
 }
 
-function ProjectCard({ project, sessions, onClick, onSession }: { project: Project; sessions: TerminalSession[]; onClick: () => void; onSession: (session: TerminalSession) => void }) {
-  return <article className="project-card"><button className="project-card-main" onClick={onClick}><span className="card-folder"><FolderIcon /></span><span className="card-copy"><strong>{project.name}</strong><small>{project.path}</small></span><span className="card-persist">{project.persistent ? <BookmarkIcon /> : <ClockIcon />}</span><ChevronIcon /></button>
+function ProjectCard({ project, sessions, dragging, transform, elementRef, onDragStart, onDragMove, onDragEnd, onClick, onSession }: { project: Project; sessions: TerminalSession[]; dragging: boolean; transform?: string; elementRef: (element: HTMLElement | null) => void; onDragStart: (event: ReactPointerEvent<HTMLElement>) => void; onDragMove: (event: ReactPointerEvent<HTMLElement>) => void; onDragEnd: (event: ReactPointerEvent<HTMLElement>, commit: boolean) => void; onClick: () => void; onSession: (session: TerminalSession) => void }) {
+  return <article ref={elementRef} className={`project-card ${dragging ? "is-dragging" : ""}`} style={{ transform }}><button className="project-card-main" onClick={onClick}><span className="card-folder"><FolderIcon /></span><span className="card-copy"><strong>{project.name}</strong><small>{project.path}</small></span><span className="card-persist">{project.persistent ? <BookmarkIcon /> : <ClockIcon />}</span><span className="mobile-project-drag" role="button" aria-label={`Reorder ${project.name}`} data-no-swipe onClick={(event) => event.stopPropagation()} onPointerDown={onDragStart} onPointerMove={onDragMove} onPointerUp={(event) => onDragEnd(event, true)} onPointerCancel={(event) => onDragEnd(event, false)}>⠿</span><ChevronIcon /></button>
     {!!sessions.length && <div className="card-sessions">{sessions.slice(0, 3).map((session) => <button key={session.id} onClick={() => onSession(session)}><TerminalIcon /><span>{session.title}</span><i className={session.status} /></button>)}{sessions.length > 3 && <span className="more-sessions">+{sessions.length - 3}</span>}</div>}
   </article>;
+}
+
+function TerminalSettingsSheet({ value, onChange, onClose }: { value: number; onChange: (value: number) => void; onClose: () => void }) {
+  return <div className="sheet-backdrop" onClick={onClose}><section className="bottom-sheet terminal-settings-sheet" data-no-swipe onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Terminal display</span><h2>Fit more text</h2><p>Squish characters horizontally while keeping their height readable. The terminal refits to show more columns.</p><label className="font-width-control"><span><strong>Character width</strong><output>{value}%</output></span><input type="range" min="65" max="100" step="1" value={value} onChange={(event) => onChange(Number(event.target.value))} /></label><div className="font-width-preview" style={{ transform: `scaleX(${value / 100})` }}>C:\project&gt; npm run dev</div><button className="mobile-primary full" onClick={onClose}>Done</button></section></div>;
 }
 
 function CreateProjectSheet({ connection, onClose }: { connection: HostConnection; onClose: () => void }) {

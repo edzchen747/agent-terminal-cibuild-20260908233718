@@ -91,10 +91,19 @@ fn set_project_persistent(
 }
 
 #[tauri::command]
-async fn open_project(state: State<'_, Arc<Core>>, project_id: String) -> Result<(), String> {
+async fn open_project(
+    window: WebviewWindow,
+    state: State<'_, Arc<Core>>,
+    project_id: String,
+) -> Result<(), String> {
     Arc::clone(state.inner())
-        .open_project(&project_id)
+        .open_project(&project_id, Some(window.label()))
         .map_err(error_string)
+}
+
+#[tauri::command]
+fn reorder_projects(state: State<'_, Arc<Core>>, project_ids: Vec<String>) -> Result<(), String> {
+    state.reorder_projects(&project_ids).map_err(error_string)
 }
 
 #[tauri::command]
@@ -195,6 +204,17 @@ fn set_default_shell(state: State<'_, Arc<Core>>, shell_id: String) -> Result<()
 }
 
 #[tauri::command]
+fn set_open_projects_in_new_windows(
+    window: WebviewWindow,
+    state: State<'_, Arc<Core>>,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .set_open_projects_in_new_windows(enabled, Some(window.label()))
+        .map_err(error_string)
+}
+
+#[tauri::command]
 async fn select_shell(
     state: State<'_, Arc<Core>>,
     session_id: Option<String>,
@@ -245,6 +265,7 @@ pub fn run() {
             remove_project,
             set_project_persistent,
             open_project,
+            reorder_projects,
             create_session,
             close_session,
             reorder_sessions,
@@ -257,6 +278,7 @@ pub fn run() {
             retry_remote_registration,
             revoke_device,
             set_default_shell,
+            set_open_projects_in_new_windows,
             select_shell,
         ])
         .build(tauri::generate_context!())

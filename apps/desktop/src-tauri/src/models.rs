@@ -95,6 +95,7 @@ pub struct DesktopState {
     #[serde(flatten)]
     pub snapshot: HostSnapshot,
     pub current_project_id: String,
+    pub open_projects_in_new_windows: bool,
     pub remote_registration: RemoteRegistration,
 }
 
@@ -177,6 +178,11 @@ pub enum ClientMessage {
         project_id: String,
         persistent: bool,
     },
+    #[serde(rename = "project.reorder")]
+    ProjectReorder {
+        request_id: String,
+        project_ids: Vec<String>,
+    },
     #[serde(rename = "directory.list")]
     DirectoryList {
         request_id: String,
@@ -227,6 +233,7 @@ impl ClientMessage {
             | Self::ProjectRename { request_id, .. }
             | Self::ProjectRemove { request_id, .. }
             | Self::ProjectPersistence { request_id, .. }
+            | Self::ProjectReorder { request_id, .. }
             | Self::DirectoryList { request_id, .. }
             | Self::SessionCreate { request_id, .. }
             | Self::SessionClose { request_id, .. }
