@@ -261,19 +261,13 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       }, 0);
     };
     let initialized = false;
-    let replayingSessionBuffer = false;
     const input = terminal.onData((data) => {
-      if (replayingSessionBuffer) {
-        // No keyboard data can come from xterm here: mobile keyboard input is
-        // owned by inputElement. Suppress every terminal-generated reply while
-        // replaying history, not only CPR, because PowerShell may also leave
-        // device-attributes/status queries in the saved buffer.
-        return;
-      }
       if (isCursorPositionReport(data)) {
-        // CPR is terminal-generated, not keyboard input. Send it immediately
-        // so the keyboard deduplicator cannot discard it as a phantom key.
-        if (activeRef.current) connection.send({ type: "session.input", sessionId: session.id, data });
+        // A replayed buffer can contain a CPR query for which the shell is
+        // still waiting. Forward the xterm reply even during attach replay;
+        // the desktop tracks outstanding CPR queries and rejects duplicates
+        // from already-serviced history before they reach the shell.
+        connection.send({ type: "session.input", sessionId: session.id, data });
         return;
       }
       if (activeRef.current) connection.send({ type: "session.input", sessionId: session.id, data });
@@ -543,10 +537,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const attachment = connection.request({ type: "session.attach", requestId: createRequestId(), sessionId: session.id, cols: terminal.cols, rows: terminal.rows }).then((message) => {
       if (disposed) return;
       if (message.type === "session.buffer") {
-        replayingSessionBuffer = true;
-        terminal.write(message.data, () => {
-          replayingSessionBuffer = false;
-          replayPendingOutput();
+                terminal.write(message.data, () => {
+                    replayPendingOutput();
         });
       } else {
         replayPendingOutput();

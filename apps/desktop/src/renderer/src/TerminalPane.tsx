@@ -129,6 +129,13 @@ export function TerminalPane({ sessionId, visible, active }: Props) {
     };
     window.addEventListener("pointerdown", handlePointerActivity, true);
     const dataSubscription = terminal.onData((data) => {
+      if (isCursorPositionReport(data)) {
+        // A newly created pane is attached before it becomes the active tab.
+        // Forward terminal-generated CPR replies even while hidden; the tray
+        // validates them against the shell's outstanding queries.
+        window.agentTerminal.write(sessionId, data, terminal.cols, terminal.rows);
+        return;
+      }
       if (!activeRef.current) return;
       try { fit.fit(); } catch { /* hidden pane */ }
       window.agentTerminal.write(sessionId, data, terminal.cols, terminal.rows);
