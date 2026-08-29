@@ -184,6 +184,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     textarea?.setAttribute("readonly", "true");
     textarea?.setAttribute("tabindex", "-1");
     textarea?.setAttribute("aria-hidden", "true");
+    // Keyboard input is owned by the dedicated IME field below. Keeping
+    // xterm's textarea in the hit/focus path makes a terminal tap blur the IME
+    // field and briefly dismiss Android's keyboard.
+    if (textarea) textarea.style.display = "none";
     // Android WebViews may produce both an xterm key event and a native IME
     // event for one key, or only the native event. Hold xterm events briefly so
     // the native event can claim the input and prevent duplicate/phantom keys.
@@ -330,7 +334,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     let selectionGesture = false;
     let scrollbarGesture = false;
     let longPressTimer: number | undefined;
-    let focusRecoveryFrame: number | undefined;
     const findTouch = (touches: TouchList, identifier: number) => {
       for (let index = 0; index < touches.length; index += 1) {
         const touch = touches.item(index);
@@ -351,13 +354,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const clearLongPressTimer = () => {
       if (longPressTimer !== undefined) window.clearTimeout(longPressTimer);
       longPressTimer = undefined;
-    };
-    const recoverInputFocus = () => {
-      if (focusRecoveryFrame !== undefined) cancelAnimationFrame(focusRecoveryFrame);
-      focusRecoveryFrame = requestAnimationFrame(() => {
-        focusRecoveryFrame = undefined;
-        if (activeRef.current) focusInputRef.current();
-      });
     };
     const clearTouchSelection = () => {
       if (terminal.hasSelection()) terminal.clearSelection();
@@ -494,29 +490,18 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       }
       if (activeTouchId === undefined) return resetTouch();
       clearLongPressTimer();
-      const shouldKeepKeyboard = touchAxis !== "horizontal" && !selectionGesture;
       if (touchAxis === "horizontal" && !selectionGesture && !terminal.hasSelection() && !hasNativeSelection()) clearTouchSelection();
       resetTouch();
-      if (shouldKeepKeyboard) recoverInputFocus();
     };
     const handleTouchCancel = () => {
       clearLongPressTimer();
-      if (focusRecoveryFrame !== undefined) cancelAnimationFrame(focusRecoveryFrame);
-      focusRecoveryFrame = undefined;
       if (touchAxis === "horizontal" && !selectionGesture && !terminal.hasSelection() && !hasNativeSelection()) clearTouchSelection();
       resetTouch();
-    };
-    const handleTerminalClick = () => {
-      // xterm's accessibility layer can reclaim focus while handling the
-      // click. Restore the IME field after that event has finished so tapping
-      // the terminal does not dismiss Android's keyboard.
-      if (activeRef.current) recoverInputFocus();
     };
     hostElement.addEventListener("touchstart", handleTouchStart, { passive: true });
     hostElement.addEventListener("touchmove", handleTouchMove, { passive: false });
     hostElement.addEventListener("touchend", handleTouchEnd, { passive: true });
     hostElement.addEventListener("touchcancel", handleTouchCancel, { passive: true });
-    hostElement.addEventListener("click", handleTerminalClick, true);
 
     const finishAttachment = () => {
       if (disposed) return;
@@ -562,9 +547,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       hostElement.removeEventListener("touchmove", handleTouchMove);
       hostElement.removeEventListener("touchend", handleTouchEnd);
       hostElement.removeEventListener("touchcancel", handleTouchCancel);
-      hostElement.removeEventListener("click", handleTerminalClick, true);
       clearLongPressTimer();
-      if (focusRecoveryFrame !== undefined) cancelAnimationFrame(focusRecoveryFrame);
       if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
       input.dispose(); output(); terminal.dispose(); terminalRef.current = null;
       resizeRef.current = () => undefined;
