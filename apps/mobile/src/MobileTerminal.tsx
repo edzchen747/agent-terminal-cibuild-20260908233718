@@ -1,7 +1,7 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { applyTerminalModifiers, createRequestId } from "@agentterminal/protocol";
+import { applyTerminalModifiers, createRequestId, findHttpLinks } from "@agentterminal/protocol";
 import type { TerminalModifier, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
 import { classifyGestureAxis, type GestureAxis } from "./gesture";
@@ -16,6 +16,20 @@ interface AccessibilityKey {
   label: string;
   modifier?: TerminalModifier;
   value?: string;
+}
+
+function openExternalLink(uri: string): void {
+  try {
+    const parsed = new URL(uri);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+    const link = document.createElement("a");
+    link.href = parsed.href;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.click();
+  } catch {
+    // Ignore malformed or unsupported terminal URLs.
+  }
 }
 
 const ACCESSIBILITY_KEY_ROWS: AccessibilityKey[][] = [
@@ -105,7 +119,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       cursorStyle: "bar",
       fontFamily: '"Cascadia Mono", "Roboto Mono", monospace',
       fontSize: 12,
-      lineHeight: 1.18,
+      lineHeight: 1,
       scrollback: 5000,
       screenReaderMode: true,
       smoothScrollDuration: 75,
@@ -115,6 +129,17 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(hostElement);
+    const httpLinkProvider = terminal.registerLinkProvider({
+      provideLinks: (y, callback) => {
+        const line = terminal.buffer.active.getLine(y - 1);
+        const links = findHttpLinks(line?.translateToString(true) ?? "");
+        callback(links.map((link) => ({
+          text: link.text,
+          range: { start: { x: link.start + 1, y }, end: { x: link.end, y } },
+          activate: () => openExternalLink(link.text)
+        })));
+      }
+    });
     if (activeRef.current) focusInput();
     fit.fit();
 
@@ -549,7 +574,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       hostElement.removeEventListener("touchcancel", handleTouchCancel);
       clearLongPressTimer();
       if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
-      input.dispose(); output(); terminal.dispose(); terminalRef.current = null;
+      input.dispose(); output(); httpLinkProvider.dispose(); terminal.dispose(); terminalRef.current = null;
       resizeRef.current = () => undefined;
       focusInputRef.current = () => undefined;
     };

@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { applyTerminalModifiers, type TerminalModifier } from "@agentterminal/protocol";
+import { applyTerminalModifiers, findHttpLinks, type TerminalModifier } from "@agentterminal/protocol";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { sessionId: string; visible: boolean; active: boolean; }
@@ -12,6 +12,23 @@ export function TerminalPane({ sessionId, visible, active }: Props) {
   const activeRef = useRef(active);
   const resizeRef = useRef<() => void>(() => undefined);
   activeRef.current = active;
+  const activateLink = (uri: string) => {
+    try {
+      const parsed = new URL(uri);
+      if (!["http:", "https:"].includes(parsed.protocol)) return;
+      if (!confirmExternalLinksRef.current) {
+        void window.agentTerminal.openExternalUrl(parsed.href).catch((cause) => {
+          setLinkError(`Could not open this link: ${String(cause)}`);
+          setPendingUrl(parsed.href);
+        });
+        return;
+      }
+      setLinkError(null);
+      setPendingUrl(parsed.href);
+    } catch {
+      // Ignore malformed or unsupported terminal URLs.
+    }
+  };
 
   useEffect(() => {
     if (!hostRef.current) return;
@@ -21,8 +38,11 @@ export function TerminalPane({ sessionId, visible, active }: Props) {
       cursorStyle: "bar",
       fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, monospace',
       fontSize: 14,
-      lineHeight: 1.18,
+      lineHeight: 1,
       scrollback: 10_000,
+      linkHandler: {
+        activate: (_event, uri) => activateLink(uri)
+      },
       theme: {
         background: "#090b10",
         foreground: "#d9deea",
@@ -39,6 +59,17 @@ export function TerminalPane({ sessionId, visible, active }: Props) {
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(hostRef.current);
+    const httpLinkProvider = terminal.registerLinkProvider({
+      provideLinks: (y, callback) => {
+        const line = terminal.buffer.active.getLine(y - 1);
+        const links = findHttpLinks(line?.translateToString(true) ?? "");
+        callback(links.map((link) => ({
+          text: link.text,
+          range: { start: { x: link.start + 1, y }, end: { x: link.end, y } },
+          activate: () => activateLink(link.text)
+        })));
+      }
+    });
     let copyToastTimer: number | undefined;
     const copyToast = document.createElement("div");
     copyToast.className = "terminal-copy-toast";
@@ -170,6 +201,7 @@ export function TerminalPane({ sessionId, visible, active }: Props) {
       offData();
       void attachment.then(() => window.agentTerminal.detachSession(sessionId));
       if (copyToastTimer) window.clearTimeout(copyToastTimer);
+      httpLinkProvider.dispose();
       terminal.dispose();
       terminalRef.current = null;
       resizeRef.current = () => undefined;

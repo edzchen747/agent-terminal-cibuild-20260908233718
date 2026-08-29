@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, applyTerminalModifiers, encodeMessage, encodePairingPayload, parsePairingPayload, parseTerminalWorkingDirectories } from "./index.js";
+import { LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, applyTerminalModifiers, encodeMessage, encodePairingPayload, findHttpLinks, parsePairingPayload, parseTerminalWorkingDirectories } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -111,6 +111,19 @@ test("mobile terminal modifiers encode control characters", () => {
 test("control modifiers do not corrupt paste or unsupported characters", () => {
   assert.equal(applyTerminalModifiers("echo hello", new Set(["ctrl"])), "echo hello");
   assert.equal(applyTerminalModifiers("1", new Set(["ctrl"])), "1");
+});
+
+test("terminal link detection finds HTTP(S) URLs and excludes sentence punctuation", () => {
+  assert.deepEqual(
+    findHttpLinks("Access it at: http://192.168.1.218:8000. More: https://example.com/path?q=1."),
+    [
+      { text: "http://192.168.1.218:8000", start: 14, end: 39 },
+      { text: "https://example.com/path?q=1", start: 47, end: 75 }
+    ]
+  );
+  assert.deepEqual(findHttpLinks("not-a-http://example.com http://example.com/(docs)"), [
+    { text: "http://example.com/(docs)", start: 25, end: 50 }
+  ]);
 });
 
 test("shell working-directory reports parse from Windows Terminal OSC sequences", () => {

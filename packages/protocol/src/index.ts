@@ -12,6 +12,52 @@ export const MAX_PROJECT_NAME_LENGTH = 100 as const;
 export type Platform = "android" | "ios" | "web";
 export type TerminalModifier = "ctrl" | "alt" | "shift";
 
+export interface HttpLinkMatch {
+  text: string;
+  start: number;
+  end: number;
+}
+
+const HTTP_LINK_PATTERN = /https?:\/\/[^\s<>"'`]+/gi;
+
+/** Find valid HTTP(S) URLs in one rendered terminal line. */
+export function findHttpLinks(value: string): HttpLinkMatch[] {
+  const links: HttpLinkMatch[] = [];
+  for (const match of value.matchAll(HTTP_LINK_PATTERN)) {
+    const rawText = match[0];
+    const matchStart = match.index ?? 0;
+    if (!rawText || (matchStart > 0 && /[\w./-]/.test(value[matchStart - 1] ?? ""))) continue;
+
+    const text = trimUrlPunctuation(rawText);
+    if (!text) continue;
+    try {
+      const parsed = new URL(text);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
+    } catch {
+      continue;
+    }
+    links.push({ text, start: matchStart, end: matchStart + text.length });
+  }
+  return links;
+}
+
+function trimUrlPunctuation(value: string): string {
+  let end = value.length;
+  while (end > 0 && /[.,!?;:]/.test(value[end - 1] ?? "")) end -= 1;
+
+  while (end > 0 && ")]}".includes(value[end - 1] ?? "")) {
+    const closing = value[end - 1];
+    const opening = closing === ")" ? "(" : closing === "]" ? "[" : "{";
+    const prefix = value.slice(0, end - 1);
+    const opens = [...prefix].filter((character) => character === opening).length;
+    const closes = [...prefix].filter((character) => character === closing).length;
+    if (closes < opens) break;
+    end -= 1;
+  }
+
+  return value.slice(0, end);
+}
+
 export function applyTerminalModifiers(value: string, modifiers: ReadonlySet<TerminalModifier>): string {
   let output = value;
   const modifierCode = 1 + (modifiers.has("shift") ? 1 : 0) + (modifiers.has("alt") ? 2 : 0) + (modifiers.has("ctrl") ? 4 : 0);
