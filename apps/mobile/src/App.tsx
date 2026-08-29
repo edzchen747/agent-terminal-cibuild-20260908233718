@@ -437,16 +437,6 @@ export function App() {
     const hasTarget = rawX > 0 ? currentPage > 0 : currentPage < pageCount - 1;
     const deltaX = hasTarget ? rawX : rawX * .14;
     const next = { ...current, horizontal: true, deltaX };
-    // Capture only after the gesture is clearly horizontal. This keeps native
-    // long-press selection intact while ensuring a fast swipe still delivers
-    // its pointer-up even when the finger leaves the original child control.
-    if (!current.horizontal) {
-      try {
-        event.currentTarget.setPointerCapture(event.pointerId);
-      } catch {
-        // The pointer may already have been cancelled by the WebView.
-      }
-    }
     swipeRef.current = next;
     setSwipe(next);
     event.preventDefault();
@@ -479,7 +469,6 @@ export function App() {
     if (targetPage === 0) setView({ type: "home" });
     else if (targetPage === 1 && activeProject) setView({ type: "project", projectId: activeProject.id });
     else if (targetPage === 2 && activeProject && activeSession) setView({ type: "terminal", projectId: activeProject.id, sessionId: activeSession.id });
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   }
 
   function suppressSwipeClick(event: React.MouseEvent<HTMLDivElement>) {
@@ -504,7 +493,7 @@ export function App() {
     event.stopPropagation();
   }
 
-  return <div className="mobile-pager" onPointerDownCapture={beginSwipe} onTouchStartCapture={() => { suppressSwipeClickRef.current = false; swipeClickPageRef.current = null; if (swipeClickTimerRef.current !== undefined) window.clearTimeout(swipeClickTimerRef.current); swipeClickTimerRef.current = undefined; }} onPointerMoveCapture={moveSwipe} onPointerUpCapture={(event) => finishSwipe(event)} onPointerCancelCapture={(event) => finishSwipe(event, true)} onLostPointerCaptureCapture={(event) => finishSwipe(event, true)} onClickCapture={suppressSwipeClick}>
+  return <div className="mobile-pager" onPointerDownCapture={beginSwipe} onTouchStartCapture={() => { suppressSwipeClickRef.current = false; swipeClickPageRef.current = null; if (swipeClickTimerRef.current !== undefined) window.clearTimeout(swipeClickTimerRef.current); swipeClickTimerRef.current = undefined; }} onPointerMoveCapture={moveSwipe} onPointerUpCapture={(event) => finishSwipe(event)} onPointerCancelCapture={(event) => finishSwipe(event)} onClickCapture={suppressSwipeClick}>
     <div className={`mobile-page-track ${swipe?.horizontal ? "is-dragging" : ""}`} style={{ transform: `translate3d(calc(${-currentPage * 100}% + ${swipe?.deltaX ?? 0}px),0,0)` }}>
       <div className="mobile-page"><div className="mobile-app home-view">
         <RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} />

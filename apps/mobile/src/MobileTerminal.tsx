@@ -260,8 +260,17 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         inputElement.value = "";
       }, 0);
     };
+    let initialized = false;
+    let replayingSessionBuffer = false;
     const input = terminal.onData((data) => {
       if (isCursorPositionReport(data)) {
+        if (replayingSessionBuffer) {
+          // The attach response is a replay of old PTY output. PowerShell can
+          // leave old CPR queries (ESC[6n) in that buffer; xterm answers them
+          // as if they were live queries, which injects a stale CPR into the
+          // shell input stream before the first mobile key.
+          return;
+        }
         // CPR is terminal-generated, not keyboard input. Send it immediately
         // so the keyboard deduplicator cannot discard it as a phantom key.
         if (activeRef.current) connection.send({ type: "session.input", sessionId: session.id, data });
@@ -309,7 +318,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     inputElement.addEventListener("beforeinput", handleNativeBeforeInput, true);
     inputElement.addEventListener("input", handleNativeInput);
     inputElement.addEventListener("compositionend", handleCompositionEnd);
-    let initialized = false;
     let disposed = false;
     const pendingOutput: string[] = [];
     const output = connection.on("output", (event) => {
@@ -497,14 +505,33 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     hostElement.addEventListener("touchend", handleTouchEnd, { passive: true });
     hostElement.addEventListener("touchcancel", handleTouchCancel, { passive: true });
 
-    const attachment = connection.request({ type: "session.attach", requestId: createRequestId(), sessionId: session.id, cols: terminal.cols, rows: terminal.rows }).then((message) => {
+    const finishAttachment = () => {
       if (disposed) return;
-      if (message.type === "session.buffer") terminal.write(message.data);
-      for (const data of pendingOutput) terminal.write(data);
-      pendingOutput.length = 0;
       initialized = true;
       resize();
       if (activeRef.current) focusInput();
+    };
+    const replayPendingOutput = (index = 0) => {
+      if (disposed) return;
+      const data = pendingOutput[index];
+      if (data === undefined) {
+        pendingOutput.length = 0;
+        finishAttachment();
+        return;
+      }
+      terminal.write(data, () => replayPendingOutput(index + 1));
+    };
+    const attachment = connection.request({ type: "session.attach", requestId: createRequestId(), sessionId: session.id, cols: terminal.cols, rows: terminal.rows }).then((message) => {
+      if (disposed) return;
+      if (message.type === "session.buffer") {
+        replayingSessionBuffer = true;
+        terminal.write(message.data, () => {
+          replayingSessionBuffer = false;
+          replayPendingOutput();
+        });
+      } else {
+        replayPendingOutput();
+      }
     }).catch((cause) => {
       if (!disposed) terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
     });
