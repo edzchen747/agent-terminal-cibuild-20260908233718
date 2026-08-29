@@ -81,6 +81,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const modifiers = activeModifiers(keys);
     const output = keys.flatMap((key) => key.value ? [applyTerminalModifiers(key.value, modifiers)] : []).join("");
     if (output) {
+      // Mirror the desktop write path, which resizes the PTY with every key.
+      resizeRef.current();
       connection.send({ type: "session.input", sessionId: session.id, data: output });
     }
   };
@@ -223,6 +225,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     let lastNativeBeforeInput: { data: string; at: number } | undefined;
     const sendInput = (data: string) => {
       if (!data || !activeRef.current) return;
+      // Desktop resizes the PTY with every write. Refit on each input so a
+      // keyboard-driven layout change emits a session.resize even when its
+      // ResizeObserver event was missed. The fit is rAF-coalesced and the
+      // resize is only sent when the fitted size actually changed.
+      resize();
       const output = consumeSelectedKeys(data);
       if (output) connection.send({ type: "session.input", sessionId: session.id, data: output });
     };
@@ -299,7 +306,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         connection.send({ type: "session.input", sessionId: session.id, data });
         return;
       }
-      if (activeRef.current) connection.send({ type: "session.input", sessionId: session.id, data });
+      if (activeRef.current) {
+        resize();
+        connection.send({ type: "session.input", sessionId: session.id, data });
+      }
     });
     const handleNativeBeforeInput = (event: Event) => {
       if (!activeRef.current) return;
@@ -547,8 +557,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const attachment = connection.request({ type: "session.attach", requestId: createRequestId(), sessionId: session.id, cols: terminal.cols, rows: terminal.rows }).then((message) => {
       if (disposed) return;
       if (message.type === "session.buffer") {
-                terminal.write(message.data, () => {
-                    replayPendingOutput();
+        terminal.write(message.data, () => {
+          replayPendingOutput();
         });
       } else {
         replayPendingOutput();
@@ -610,6 +620,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const next = isSelected ? current.filter((item) => item.id !== key.id) : [...current, key];
     if (!current.length && !isSelected && key.value) {
       focusInputRef.current();
+      // Mirror the desktop write path, which resizes the PTY with every key.
+      resizeRef.current();
       connection.send({ type: "session.input", sessionId: session.id, data: key.value });
     }
     selectedKeysRef.current = next;
