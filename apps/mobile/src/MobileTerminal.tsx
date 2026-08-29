@@ -7,6 +7,7 @@ import type { HostConnection } from "./connection";
 import { classifyGestureAxis, type GestureAxis } from "./gesture";
 import { claimNativeInput, isCursorPositionReport, mobileTerminalKeydownInput, nativeTerminalInput } from "./terminalInput";
 import type { TimedTerminalInput } from "./terminalInput";
+import { shouldSendResize } from "./terminalResize";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { connection: HostConnection; session: TerminalSession; active: boolean; fontWidthScale: number; }
@@ -81,8 +82,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const modifiers = activeModifiers(keys);
     const output = keys.flatMap((key) => key.value ? [applyTerminalModifiers(key.value, modifiers)] : []).join("");
     if (output) {
-      // Mirror the desktop write path, which resizes the PTY with every key.
-      resizeRef.current();
+      // Mirror the desktop write path, which reasserts its size with every
+      // key. Force it: a plain resize sends nothing when the local fit is
+      // unchanged, leaving the host at another client's PTY size.
+      resizeRef.current(true);
       connection.send({ type: "session.input", sessionId: session.id, data: output });
     }
   };
@@ -161,8 +164,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         forceResizePending = false;
         try {
           fit.fit();
-          lastSize = { cols: terminal.cols, rows: terminal.rows };
-          connection.send({ type: "session.resize", sessionId: session.id, cols: terminal.cols, rows: terminal.rows, force: true });
+          if (shouldSendResize(true, terminal.cols, terminal.rows, lastSize)) {
+            lastSize = { cols: terminal.cols, rows: terminal.rows };
+            connection.send({ type: "session.resize", sessionId: session.id, cols: terminal.cols, rows: terminal.rows, force: true });
+          }
         } catch {
           // The WebView can report an intermediate zero-sized layout while the keyboard opens.
         }
@@ -180,7 +185,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         forceResizePending = false;
         try {
           fit.fit();
-          if (shouldForce || terminal.cols !== lastSize.cols || terminal.rows !== lastSize.rows) {
+          if (shouldSendResize(shouldForce, terminal.cols, terminal.rows, lastSize)) {
             lastSize = { cols: terminal.cols, rows: terminal.rows };
             connection.send({ type: "session.resize", sessionId: session.id, cols: terminal.cols, rows: terminal.rows, force: shouldForce });
           }
@@ -225,11 +230,12 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     let lastNativeBeforeInput: { data: string; at: number } | undefined;
     const sendInput = (data: string) => {
       if (!data || !activeRef.current) return;
-      // Desktop resizes the PTY with every write. Refit on each input so a
-      // keyboard-driven layout change emits a session.resize even when its
-      // ResizeObserver event was missed. The fit is rAF-coalesced and the
-      // resize is only sent when the fitted size actually changed.
-      resize();
+      // The desktop write path attaches its cols/rows to every key, so the
+      // host reasserts that client's size on every input. Remote input
+      // carries no size, so force a session.resize on each key; a plain
+      // resize would send nothing while our local fit is unchanged and the
+      // host would keep another client's (or a lost) PTY size.
+      resize(true);
       const output = consumeSelectedKeys(data);
       if (output) connection.send({ type: "session.input", sessionId: session.id, data: output });
     };
@@ -307,7 +313,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         return;
       }
       if (activeRef.current) {
-        resize();
+        // Force, like every other input path, so the host reasserts this
+        // client's size even when the local fit has not changed.
+        resize(true);
         connection.send({ type: "session.input", sessionId: session.id, data });
       }
     });
@@ -620,8 +628,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const next = isSelected ? current.filter((item) => item.id !== key.id) : [...current, key];
     if (!current.length && !isSelected && key.value) {
       focusInputRef.current();
-      // Mirror the desktop write path, which resizes the PTY with every key.
-      resizeRef.current();
+      // Mirror the desktop write path, which reasserts its size with every
+      // key. Force it so the host does not keep another client's PTY size.
+      resizeRef.current(true);
       connection.send({ type: "session.input", sessionId: session.id, data: key.value });
     }
     selectedKeysRef.current = next;
