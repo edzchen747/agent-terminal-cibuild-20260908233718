@@ -4,7 +4,7 @@ import QRCode from "qrcode";
 import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH } from "@agentterminal/protocol";
 import type { DesktopState } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
-import { clampSplitRatio, findSplitGroup, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
+import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
 import type { SplitGroup, SplitLayout } from "./split-tabs";
 import { TerminalPane } from "./TerminalPane";
 
@@ -642,6 +642,13 @@ export function App() {
   const pickerCandidates = splitMenu?.kind === "picker"
     ? projectSessions.filter((session) => session.id !== splitMenu.anchorId && !findSplitGroup(splitGroups, session.id))
     : [];
+  const splitHitboxVisible = isSplitEdgeHintVisible({
+    dragging: tabDrag ? { sessionId: tabDrag.sessionId, didMove: tabDrag.didMove } : null,
+    activeSessionId,
+    allowEdgeDrop: allowSplitEdgeDrop,
+    groups: splitGroups,
+    dropSide: splitDropSide
+  });
 
   return (
     <main className="app-shell">
@@ -730,6 +737,8 @@ export function App() {
               </div>;
             })}
             {activeSplit && <div role="separator" tabIndex={0} aria-label="Resize split view" aria-orientation={activeSplit.layout === "side-by-side" ? "vertical" : "horizontal"} aria-valuemin={18} aria-valuemax={82} aria-valuenow={Math.round(activeSplit.ratio * 100)} className={`split-divider ${activeSplit.layout}`} style={activeSplit.layout === "side-by-side" ? { left: `calc(${activeSplit.ratio * 100}% - 4px)` } : { top: `calc(${activeSplit.ratio * 100}% - 4px)` }} onPointerDown={(event) => beginSplitResize(event, activeSplit.id)} onPointerMove={resizeSplit} onPointerUp={finishSplitResize} onPointerCancel={finishSplitResize} onDoubleClick={() => setSplitGroups((groups) => groups.map((group) => group.id === activeSplit.id ? { ...group, ratio: 0.5 } : group))} onKeyDown={(event) => resizeSplitWithKeyboard(activeSplit.id, event)}><i /></div>}
+            {splitHitboxVisible && <div className="split-hitbox is-left" aria-hidden="true" />}
+            {splitHitboxVisible && <div className="split-hitbox is-right" aria-hidden="true" />}
             {splitDropSide && <div className={`split-drop-target is-${splitDropSide}`}><span><SplitViewIcon /> Drop to split {splitDropSide}</span></div>}
             {!projectSessions.length && <div className="empty-terminal"><TerminalIcon /><h2>No open terminals</h2><p className="display-name" title={`Start a session in ${currentProject?.name}.`}>Start a session in {currentProject?.name}.</p><button className="primary" onClick={() => void addTab()}><PlusIcon /> New terminal</button></div>}
           </div>

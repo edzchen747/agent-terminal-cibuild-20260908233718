@@ -26,6 +26,32 @@ export function findSplitGroup(groups: SplitGroup[], sessionId: string | null | 
   return groups.find((group) => group.sessionIds.includes(sessionId));
 }
 
+export interface SplitEdgeHintState {
+  /** The tab currently held by a pointer, null when no tab press is in flight. */
+  dragging: { sessionId: string; didMove: boolean } | null;
+  activeSessionId: string | null;
+  allowEdgeDrop: boolean;
+  groups: SplitGroup[];
+  /** Non-null while the pointer is inside an edge drop zone. */
+  dropSide: "left" | "right" | null;
+}
+
+/**
+ * Whether the faint edge-drop hitbox hint should be shown: the pointer must
+ * have crossed the drag threshold, the drop must be valid for the active
+ * session, and the pointer must not already be inside the drop zone.
+ */
+export function isSplitEdgeHintVisible(state: SplitEdgeHintState): boolean {
+  if (state.dropSide !== null) return false;
+  if (!state.dragging || !state.dragging.didMove) return false;
+  if (!state.allowEdgeDrop) return false;
+  if (!state.activeSessionId) return false;
+  if (state.activeSessionId === state.dragging.sessionId) return false;
+  if (findSplitGroup(state.groups, state.activeSessionId)) return false;
+  if (findSplitGroup(state.groups, state.dragging.sessionId)) return false;
+  return true;
+}
+
 export function clampSplitRatio(ratio: number, minimum = 0.18): number {
   return Math.max(minimum, Math.min(1 - minimum, ratio));
 }
