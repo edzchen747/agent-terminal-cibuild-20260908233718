@@ -321,6 +321,17 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       if (longPressTimer !== undefined) window.clearTimeout(longPressTimer);
       longPressTimer = undefined;
     };
+    const clearTouchSelection = () => {
+      if (terminal.hasSelection()) terminal.clearSelection();
+      const selection = document.getSelection();
+      if (selection && !selection.isCollapsed && (selection.anchorNode === hostElement || hostElement.contains(selection.anchorNode))) {
+        selection.removeAllRanges();
+      }
+    };
+    const hasNativeSelection = () => {
+      const selection = document.getSelection();
+      return Boolean(selection && !selection.isCollapsed && selection.anchorNode && hostElement.contains(selection.anchorNode));
+    };
     const selectWordAtTouch = (clientX: number, clientY: number) => {
       if (!activeRef.current) return false;
       const target = document.elementFromPoint(clientX, clientY);
@@ -328,13 +339,22 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
 
       const documentWithCaret = document as Document & {
         caretRangeFromPoint?: (x: number, y: number) => Range | null;
+        caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
       };
       const caret = documentWithCaret.caretRangeFromPoint?.(clientX, clientY);
-      if (!caret || !(caret.startContainer instanceof Text)) return false;
+      const caretPosition = caret?.startContainer instanceof Text
+        ? undefined
+        : documentWithCaret.caretPositionFromPoint?.(clientX, clientY);
+      const position = caret?.startContainer instanceof Text
+        ? { container: caret.startContainer, offset: caret.startOffset }
+        : caretPosition
+          ? { container: caretPosition.offsetNode, offset: caretPosition.offset }
+          : undefined;
+      if (!position || !(position.container instanceof Text)) return false;
 
-      const text = caret.startContainer.textContent ?? "";
+      const text = position.container.textContent ?? "";
       if (!text.length) return false;
-      let offset = Math.max(0, Math.min(caret.startOffset, text.length - 1));
+      let offset = Math.max(0, Math.min(position.offset, text.length - 1));
       const isWordCharacter = (character: string) => /\S/.test(character);
       if (!isWordCharacter(text[offset] ?? "") && offset > 0) offset -= 1;
       let start = offset;
@@ -348,8 +368,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       const selection = document.getSelection();
       if (!selection) return false;
       const range = document.createRange();
-      range.setStart(caret.startContainer, start);
-      range.setEnd(caret.startContainer, end);
+      range.setStart(position.container, start);
+      range.setEnd(position.container, end);
       selection.removeAllRanges();
       selection.addRange(range);
       return true;
@@ -408,6 +428,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       }
       if (touchAxis === "pending") return;
       if (touchAxis === "horizontal") {
+        // A drag that starts on the accessibility text can otherwise leave a
+        // native/xterm selection behind, disabling the next long-press word
+        // selection. Horizontal page navigation owns this gesture, except
+        // when the user is dragging an existing native selection handle.
+        if (!selectionGesture && !terminal.hasSelection() && !hasNativeSelection()) clearTouchSelection();
         previousTouchY = touch.clientY;
         return;
       }
@@ -431,12 +456,18 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       }
       if (activeTouchId === undefined) return resetTouch();
       clearLongPressTimer();
+      if (touchAxis === "horizontal" && !selectionGesture && !terminal.hasSelection() && !hasNativeSelection()) clearTouchSelection();
+      resetTouch();
+    };
+    const handleTouchCancel = () => {
+      clearLongPressTimer();
+      if (touchAxis === "horizontal" && !selectionGesture && !terminal.hasSelection() && !hasNativeSelection()) clearTouchSelection();
       resetTouch();
     };
     hostElement.addEventListener("touchstart", handleTouchStart, { passive: true });
     hostElement.addEventListener("touchmove", handleTouchMove, { passive: false });
     hostElement.addEventListener("touchend", handleTouchEnd, { passive: true });
-    hostElement.addEventListener("touchcancel", resetTouch, { passive: true });
+    hostElement.addEventListener("touchcancel", handleTouchCancel, { passive: true });
 
     const attachment = connection.request({ type: "session.attach", requestId: createRequestId(), sessionId: session.id, cols: terminal.cols, rows: terminal.rows }).then((message) => {
       if (disposed) return;
@@ -463,7 +494,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       hostElement.removeEventListener("touchstart", handleTouchStart);
       hostElement.removeEventListener("touchmove", handleTouchMove);
       hostElement.removeEventListener("touchend", handleTouchEnd);
-      hostElement.removeEventListener("touchcancel", resetTouch);
+      hostElement.removeEventListener("touchcancel", handleTouchCancel);
       clearLongPressTimer();
       if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
       input.dispose(); output(); terminal.dispose(); terminalRef.current = null;
@@ -473,6 +504,12 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
 
   useLayoutEffect(() => {
     if (!activeRef.current) {
+      terminalRef.current?.clearSelection();
+      const selection = document.getSelection();
+      const hostElement = hostRef.current;
+      if (selection && hostElement && !selection.isCollapsed && (selection.anchorNode === hostElement || hostElement.contains(selection.anchorNode))) {
+        selection.removeAllRanges();
+      }
       terminalRef.current?.blur();
       return;
     }
