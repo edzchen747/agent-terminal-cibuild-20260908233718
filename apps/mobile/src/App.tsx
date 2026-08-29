@@ -71,6 +71,7 @@ export function App() {
   const swipeRef = useRef<SwipeState | null>(null);
   const suppressSwipeClickRef = useRef(false);
   const swipeClickPageRef = useRef<number | null>(null);
+  const swipeClickTimerRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     void Preferences.get({ key: TERMINAL_FONT_WIDTH_KEY }).then(({ value }) => {
@@ -397,19 +398,20 @@ export function App() {
   function beginSwipe(event: ReactPointerEvent<HTMLDivElement>) {
     // A new pointer sequence is a fresh interaction. Do not let a delayed
     // compatibility click from an earlier page transition consume this one.
+    if (swipeClickTimerRef.current !== undefined) window.clearTimeout(swipeClickTimerRef.current);
+    swipeClickTimerRef.current = undefined;
     suppressSwipeClickRef.current = false;
     swipeClickPageRef.current = null;
-    // Session cards and terminal accessibility text are part of the swipeable
-    // surface. Controls that would be unsafe to drag from (inputs, selectors,
-    // utility buttons and scrollbars) opt out explicitly.
+    // Start tracking every touch, including touches that begin on a button.
+    // We only turn it into a pager gesture after movement is classified as
+    // horizontal, so a normal button tap keeps its native click behavior.
     const target = event.target instanceof Element ? event.target : undefined;
     const terminalText = target?.closest(".xterm-accessibility-tree");
     const selection = document.getSelection();
     const draggingTerminalSelection = Boolean(terminalText && selection && !selection.isCollapsed && selection.anchorNode && terminalText.contains(selection.anchorNode));
-    if (swipeRef.current || event.pointerType === "mouse" || draggingTerminalSelection || target?.closest("button,a,input,textarea,select,[role=button],[data-no-swipe],.scrollbar")) return;
+    if (swipeRef.current || event.pointerType === "mouse" || draggingTerminalSelection) return;
     const next: SwipeState = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startedAt: performance.now(), deltaX: 0, horizontal: false };
     swipeRef.current = next;
-    setSwipe(next);
   }
 
   function moveSwipe(event: ReactPointerEvent<HTMLDivElement>) {
@@ -435,6 +437,16 @@ export function App() {
     const hasTarget = rawX > 0 ? currentPage > 0 : currentPage < pageCount - 1;
     const deltaX = hasTarget ? rawX : rawX * .14;
     const next = { ...current, horizontal: true, deltaX };
+    // Capture only after the gesture is clearly horizontal. This keeps native
+    // long-press selection intact while ensuring a fast swipe still delivers
+    // its pointer-up even when the finger leaves the original child control.
+    if (!current.horizontal) {
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      } catch {
+        // The pointer may already have been cancelled by the WebView.
+      }
+    }
     swipeRef.current = next;
     setSwipe(next);
     event.preventDefault();
@@ -455,10 +467,19 @@ export function App() {
     // that gesture cannot consume a control on the newly visible page.
     suppressSwipeClickRef.current = commit;
     swipeClickPageRef.current = commit ? currentPage : null;
-    if (commit) event.preventDefault();
+    if (commit) {
+      // A WebView may omit the compatibility click after a touch drag. Bound
+      // the fallback guard so it can never consume a later real interaction.
+      swipeClickTimerRef.current = window.setTimeout(() => {
+        suppressSwipeClickRef.current = false;
+        swipeClickPageRef.current = null;
+        swipeClickTimerRef.current = undefined;
+      }, 500);
+    }
     if (targetPage === 0) setView({ type: "home" });
     else if (targetPage === 1 && activeProject) setView({ type: "project", projectId: activeProject.id });
     else if (targetPage === 2 && activeProject && activeSession) setView({ type: "terminal", projectId: activeProject.id, sessionId: activeSession.id });
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   }
 
   function suppressSwipeClick(event: React.MouseEvent<HTMLDivElement>) {
@@ -471,15 +492,19 @@ export function App() {
       // swipe started on.
       suppressSwipeClickRef.current = false;
       swipeClickPageRef.current = null;
+      if (swipeClickTimerRef.current !== undefined) window.clearTimeout(swipeClickTimerRef.current);
+      swipeClickTimerRef.current = undefined;
       return;
     }
     suppressSwipeClickRef.current = false;
     swipeClickPageRef.current = null;
+    if (swipeClickTimerRef.current !== undefined) window.clearTimeout(swipeClickTimerRef.current);
+    swipeClickTimerRef.current = undefined;
     event.preventDefault();
     event.stopPropagation();
   }
 
-  return <div className="mobile-pager" onPointerDownCapture={beginSwipe} onPointerMoveCapture={moveSwipe} onPointerUpCapture={(event) => finishSwipe(event)} onPointerCancelCapture={(event) => finishSwipe(event, true)} onClickCapture={suppressSwipeClick}>
+  return <div className="mobile-pager" onPointerDownCapture={beginSwipe} onTouchStartCapture={() => { suppressSwipeClickRef.current = false; swipeClickPageRef.current = null; if (swipeClickTimerRef.current !== undefined) window.clearTimeout(swipeClickTimerRef.current); swipeClickTimerRef.current = undefined; }} onPointerMoveCapture={moveSwipe} onPointerUpCapture={(event) => finishSwipe(event)} onPointerCancelCapture={(event) => finishSwipe(event, true)} onLostPointerCaptureCapture={(event) => finishSwipe(event, true)} onClickCapture={suppressSwipeClick}>
     <div className={`mobile-page-track ${swipe?.horizontal ? "is-dragging" : ""}`} style={{ transform: `translate3d(calc(${-currentPage * 100}% + ${swipe?.deltaX ?? 0}px),0,0)` }}>
       <div className="mobile-page"><div className="mobile-app home-view">
         <RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} />

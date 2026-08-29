@@ -11,6 +11,33 @@ export function isCursorPositionReport(data: string): boolean {
   return /^\x1b\[\??\d+;\d+R$/.test(data);
 }
 
+export function mobileTerminalKeydownInput(
+  event: Pick<KeyboardEvent, "type" | "key" | "keyCode" | "isComposing" | "ctrlKey" | "altKey" | "metaKey">
+): string {
+  if (event.type !== "keydown" || event.isComposing || event.metaKey) return "";
+  const specialKeys: Record<string, string> = {
+    Backspace: "\x7f",
+    Delete: "\x1b[3~",
+    Enter: "\r",
+    Tab: "\t",
+    Escape: "\x1b",
+    ArrowUp: "\x1b[A",
+    ArrowDown: "\x1b[B",
+    ArrowRight: "\x1b[C",
+    ArrowLeft: "\x1b[D",
+    Home: "\x1b[H",
+    End: "\x1b[F",
+    PageUp: "\x1b[5~",
+    PageDown: "\x1b[6~",
+    Insert: "\x1b[2~"
+  };
+  const specialKey = specialKeys[event.key];
+  if (specialKey) return specialKey;
+  if (event.keyCode === 229 && event.key.length === 1) return event.key;
+  if ((event.ctrlKey || event.altKey) && event.key.length === 1) return event.key;
+  return "";
+}
+
 export function nativeTerminalInput(event: NativeTerminalInputEvent, textareaValue = ""): string {
   const inputType = event.inputType ?? "";
   if (inputType === "deleteContentBackward" || inputType === "deleteWordBackward" || inputType === "deleteSoftLineBackward") {

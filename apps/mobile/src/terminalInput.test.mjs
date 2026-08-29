@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { androidImeKeydownInput, claimNativeInput, isCursorPositionReport, nativeTerminalInput, shouldDeferToNativeInput } from "./terminalInput.ts";
+import { androidImeKeydownInput, claimNativeInput, isCursorPositionReport, mobileTerminalKeydownInput, nativeTerminalInput, shouldDeferToNativeInput } from "./terminalInput.ts";
 
 test("a matching native event replaces, rather than drops, the queued xterm character", () => {
   const terminal = [{ data: "a", at: 10 }];
@@ -26,6 +26,13 @@ test("an authoritative native event replaces a phantom xterm event", () => {
 test("Android Backspace remains available through both input paths", () => {
   assert.equal(nativeTerminalInput({ data: null, inputType: "deleteContentBackward", isComposing: false }), "\x7f");
   assert.equal(androidImeKeydownInput({ type: "keydown", key: "Backspace", keyCode: 229, isComposing: false }), "\x7f");
+});
+
+test("mobile keydown fallback handles control keys without claiming normal text", () => {
+  assert.equal(mobileTerminalKeydownInput({ type: "keydown", key: "Enter", keyCode: 229, isComposing: false, ctrlKey: false, altKey: false, metaKey: false }), "\r");
+  assert.equal(mobileTerminalKeydownInput({ type: "keydown", key: "Backspace", keyCode: 229, isComposing: false, ctrlKey: false, altKey: false, metaKey: false }), "\x7f");
+  assert.equal(mobileTerminalKeydownInput({ type: "keydown", key: "a", keyCode: 65, isComposing: false, ctrlKey: false, altKey: false, metaKey: false }), "");
+  assert.equal(mobileTerminalKeydownInput({ type: "keydown", key: "a", keyCode: 229, isComposing: false, ctrlKey: false, altKey: false, metaKey: false }), "a");
 });
 
 test("only printable IME keydowns defer to native input", () => {

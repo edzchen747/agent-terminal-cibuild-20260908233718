@@ -5,7 +5,7 @@ import { applyTerminalModifiers, createRequestId } from "@agentterminal/protocol
 import type { TerminalModifier, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
 import { classifyGestureAxis, type GestureAxis } from "./gesture";
-import { androidImeKeydownInput, claimNativeInput, isCursorPositionReport, nativeTerminalInput, shouldDeferToNativeInput } from "./terminalInput";
+import { claimNativeInput, isCursorPositionReport, mobileTerminalKeydownInput, nativeTerminalInput } from "./terminalInput";
 import type { TimedTerminalInput } from "./terminalInput";
 import "@xterm/xterm/css/xterm.css";
 
@@ -42,10 +42,12 @@ const ACCESSIBILITY_KEY_ROWS: AccessibilityKey[][] = [
 
 export function MobileTerminal({ connection, session, active, fontWidthScale }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const activeRef = useRef(active);
   activeRef.current = active;
   const resizeRef = useRef<(force?: boolean) => void>(() => undefined);
+  const focusInputRef = useRef<() => void>(() => undefined);
   const selectedKeysRef = useRef<AccessibilityKey[]>([]);
   const countdownTimerRef = useRef<number | undefined>(undefined);
   const [selectedKeyIds, setSelectedKeyIds] = useState<ReadonlySet<string>>(new Set());
@@ -91,7 +93,13 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
 
   useLayoutEffect(() => {
     const hostElement = hostRef.current;
-    if (!hostElement) return;
+    const inputElement = inputRef.current;
+    if (!hostElement || !inputElement) return;
+    const focusInput = () => {
+      inputElement.focus({ preventScroll: true });
+      inputElement.setSelectionRange(inputElement.value.length, inputElement.value.length);
+    };
+    focusInputRef.current = focusInput;
     const terminal = new Terminal({
       cursorBlink: true,
       cursorStyle: "bar",
@@ -107,7 +115,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(hostElement);
-    if (activeRef.current) terminal.focus();
+    if (activeRef.current) focusInput();
     fit.fit();
 
     let resizeFrame: number | undefined;
@@ -162,7 +170,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       // Keep tap-to-refit, but do not turn the tap into cursor-key input.
       // PSReadLine treats those synthetic arrows as editing commands and can
       // ring the bell or corrupt the first real key at a line boundary.
-      terminal.focus();
+      focusInput();
       resize(true);
     };
     window.addEventListener("pointerdown", handlePointerActivity, true);
@@ -173,6 +181,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     textarea?.setAttribute("autocomplete", "off");
     textarea?.setAttribute("autocorrect", "off");
     textarea?.setAttribute("autocapitalize", "off");
+    textarea?.setAttribute("readonly", "true");
+    textarea?.setAttribute("tabindex", "-1");
+    textarea?.setAttribute("aria-hidden", "true");
     // Android WebViews may produce both an xterm key event and a native IME
     // event for one key, or only the native event. Hold xterm events briefly so
     // the native event can claim the input and prevent duplicate/phantom keys.
@@ -223,22 +234,32 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       pendingTerminalInput.push({ data, at: performance.now() });
       if (terminalInputTimer === undefined) terminalInputTimer = window.setTimeout(flushPendingInput, 40);
     };
-    terminal.attachCustomKeyEventHandler((event) => {
-      if (!activeRef.current) return false;
-      const directInput = androidImeKeydownInput(event);
+    const applyPhysicalModifiers = (data: string, event: KeyboardEvent) => {
+      const modifiers = new Set<TerminalModifier>();
+      if (event.ctrlKey) modifiers.add("ctrl");
+      if (event.altKey) modifiers.add("alt");
+      if (event.shiftKey) modifiers.add("shift");
+      return applyTerminalModifiers(data, modifiers);
+    };
+    const handleNativeKeyDown = (event: KeyboardEvent) => {
+      if (!activeRef.current) return;
+      const directInput = mobileTerminalKeydownInput(event);
       if (directInput) {
-        // xterm cannot decode keyCode 229 as Backspace/Enter, and an empty
-        // textarea may not emit beforeinput. Queue the key here; if a native
-        // event still follows, the normal deduplicator will claim it.
         event.preventDefault();
-        queueTerminalInput(directInput);
-        return false;
+        queueTerminalInput(applyPhysicalModifiers(directInput, event));
       }
-      // Non-composing keyCode 229 events are delivered by beforeinput/input,
-      // even when Android labels the key Process or Unidentified. Let the
-      // native IME path own them to avoid xterm's stale-value fallback.
-      return !shouldDeferToNativeInput(event);
-    });
+      if (event.keyCode !== 229 || event.isComposing) return;
+      const valueBeforeKey = inputElement.value;
+      window.setTimeout(() => {
+        if (!activeRef.current || inputElement.value === valueBeforeKey) return;
+        const valueAfterKey = inputElement.value;
+        const data = valueAfterKey.startsWith(valueBeforeKey)
+          ? valueAfterKey.slice(valueBeforeKey.length)
+          : valueAfterKey;
+        if (data) queueTerminalInput(data);
+        inputElement.value = "";
+      }, 0);
+    };
     const input = terminal.onData((data) => {
       if (isCursorPositionReport(data)) {
         // CPR is terminal-generated, not keyboard input. Send it immediately
@@ -246,41 +267,48 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         if (activeRef.current) connection.send({ type: "session.input", sessionId: session.id, data });
         return;
       }
-      queueTerminalInput(data);
+      if (activeRef.current) connection.send({ type: "session.input", sessionId: session.id, data });
     });
     const handleNativeBeforeInput = (event: Event) => {
       if (!activeRef.current) return;
       const inputEvent = event as InputEvent;
-      const data = nativeTerminalInput(inputEvent, textarea?.value ?? "");
+      const data = nativeTerminalInput(inputEvent, inputElement.value);
       if (!data || inputEvent.inputType === "insertCompositionText") return;
       lastNativeBeforeInput = { data, at: performance.now() };
       if (inputEvent.cancelable) event.preventDefault();
       queueNativeInput(data);
-      if (inputEvent.cancelable && textarea) textarea.value = "";
+      if (inputEvent.cancelable) inputElement.value = "";
     };
     const handleNativeInput = (event: Event) => {
       if (!activeRef.current) return;
       const inputEvent = event as InputEvent;
       const now = performance.now();
-      const data = nativeTerminalInput(inputEvent, textarea?.value ?? "");
+      const data = nativeTerminalInput(inputEvent, inputElement.value);
       if (!data) return;
       if (lastNativeBeforeInput && now - lastNativeBeforeInput.at <= 120 && lastNativeBeforeInput.data === data) {
         lastNativeBeforeInput = undefined;
-        if (!inputEvent.isComposing && textarea) window.setTimeout(() => { textarea.value = ""; }, 0);
+        if (!inputEvent.isComposing) window.setTimeout(() => { inputElement.value = ""; }, 0);
         return;
       }
       queueNativeInput(data);
       // Clear after the event chain has completed so xterm's composition
       // handler can read committed text, but Android cannot retain it for the
       // next character/backspace operation.
-      if (!inputEvent.isComposing && textarea) window.setTimeout(() => { textarea.value = ""; }, 0);
+      if (!inputEvent.isComposing) window.setTimeout(() => { inputElement.value = ""; }, 0);
     };
-    const handleCompositionEnd = () => {
-      window.setTimeout(() => { if (textarea) textarea.value = ""; }, 0);
+    const handleCompositionEnd = (event: Event) => {
+      const composition = event as CompositionEvent;
+      const data = composition.data;
+      if (data) {
+        lastNativeBeforeInput = { data, at: performance.now() };
+        queueNativeInput(data);
+      }
+      window.setTimeout(() => { inputElement.value = ""; }, 0);
     };
-    textarea?.addEventListener("beforeinput", handleNativeBeforeInput, true);
-    textarea?.addEventListener("input", handleNativeInput);
-    textarea?.addEventListener("compositionend", handleCompositionEnd);
+    inputElement.addEventListener("keydown", handleNativeKeyDown);
+    inputElement.addEventListener("beforeinput", handleNativeBeforeInput, true);
+    inputElement.addEventListener("input", handleNativeInput);
+    inputElement.addEventListener("compositionend", handleCompositionEnd);
     let initialized = false;
     let disposed = false;
     const pendingOutput: string[] = [];
@@ -385,7 +413,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       }
       const touch = event.touches.item(0);
       if (!touch) return;
-      terminal.focus();
+      focusInputRef.current();
       activeTouchId = touch.identifier;
       previousTouchY = touch.clientY;
       touchStartX = touch.clientX;
@@ -476,7 +504,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       pendingOutput.length = 0;
       initialized = true;
       resize();
-      if (activeRef.current) terminal.focus();
+      if (activeRef.current) focusInput();
     }).catch((cause) => {
       if (!disposed) terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
     });
@@ -486,9 +514,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       observer.disconnect();
       if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
       window.removeEventListener("pointerdown", handlePointerActivity, true);
-      textarea?.removeEventListener("beforeinput", handleNativeBeforeInput, true);
-      textarea?.removeEventListener("input", handleNativeInput);
-      textarea?.removeEventListener("compositionend", handleCompositionEnd);
+      inputElement.removeEventListener("keydown", handleNativeKeyDown);
+      inputElement.removeEventListener("beforeinput", handleNativeBeforeInput, true);
+      inputElement.removeEventListener("input", handleNativeInput);
+      inputElement.removeEventListener("compositionend", handleCompositionEnd);
       if (nativeInputTimer !== undefined) window.clearTimeout(nativeInputTimer);
       if (terminalInputTimer !== undefined) window.clearTimeout(terminalInputTimer);
       hostElement.removeEventListener("touchstart", handleTouchStart);
@@ -499,6 +528,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
       input.dispose(); output(); terminal.dispose(); terminalRef.current = null;
       resizeRef.current = () => undefined;
+      focusInputRef.current = () => undefined;
     };
   }, [connection, session.id]);
 
@@ -511,10 +541,18 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         selection.removeAllRanges();
       }
       terminalRef.current?.blur();
+      inputRef.current?.blur();
       return;
     }
-    terminalRef.current?.focus();
+    // A fast pager swipe can leave the WebView's pointer-up processing with
+    // focus on the page that was swiped from. Refocus once after that event
+    // cycle has settled so the first terminal character is not dropped.
+    focusInputRef.current();
+    const focusFrame = window.requestAnimationFrame(() => {
+      if (activeRef.current) focusInputRef.current();
+    });
     resizeRef.current(true);
+    return () => window.cancelAnimationFrame(focusFrame);
   }, [active, fontWidthScale]);
 
   function pressAccessibilityKey(key: AccessibilityKey) {
@@ -523,16 +561,17 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const isSelected = current.some((item) => item.id === key.id);
     const next = isSelected ? current.filter((item) => item.id !== key.id) : [...current, key];
     if (!current.length && !isSelected && key.value) {
-      terminalRef.current?.focus();
+      focusInputRef.current();
       connection.send({ type: "session.input", sessionId: session.id, data: key.value });
     }
     selectedKeysRef.current = next;
     setSelectedKeyIds(new Set(next.map((item) => item.id)));
     restartCountdown(next);
-    terminalRef.current?.focus();
+    focusInputRef.current();
   }
 
   return <div className="mobile-terminal-shell">
+    <input ref={inputRef} className="mobile-terminal-input" type="text" inputMode="text" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} aria-label="Terminal input" />
     <div ref={hostRef} className="mobile-terminal" style={{ width: `${100 / fontWidthScale}%`, transform: `scaleX(${fontWidthScale})`, transformOrigin: "left center" }} />
     <div className="extra-keys" data-no-swipe aria-label="Terminal function keys">
       {ACCESSIBILITY_KEY_ROWS.map((row, rowIndex) => <div className="key-row" key={rowIndex}>{row.map((key) => {

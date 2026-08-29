@@ -107,7 +107,8 @@ button { color: inherit; }
 .session-list button > svg { width: 15px; color: #525b69; }
 .inline-empty { margin-top: 6px; padding: 30px; border: 1px dashed #282e38; border-radius: 12px; color: #616b79; text-align: center; font-size: 11px; }
 .terminal-view { background: #080b0f; }
-.mobile-terminal-shell { flex: 1; min-height: 0; display: grid; grid-template-rows: 1fr auto; overflow: hidden; }
+.mobile-terminal-shell { position: relative; flex: 1; min-height: 0; display: grid; grid-template-rows: 1fr auto; overflow: hidden; }
+.mobile-terminal-input { position: absolute; top: 0; left: 0; width: 1px; height: 1px; padding: 0; border: 0; opacity: 0; pointer-events: none; font-size: 16px; }
 .mobile-terminal { min-height: 0; padding: 8px 0 4px 8px; overflow: hidden; }
 .mobile-terminal .xterm, .mobile-terminal .xterm-scrollable-element { width: 100%; min-width: 0; }
 .mobile-terminal .xterm { height: 100%; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
