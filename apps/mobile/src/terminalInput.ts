@@ -7,6 +7,10 @@ export interface TimedTerminalInput {
 
 const DUPLICATE_INPUT_WINDOW_MS = 120;
 
+export function isCursorPositionReport(data: string): boolean {
+  return /^\x1b\[\??\d+;\d+R$/.test(data);
+}
+
 export function nativeTerminalInput(event: NativeTerminalInputEvent, textareaValue = ""): string {
   const inputType = event.inputType ?? "";
   if (inputType === "deleteContentBackward" || inputType === "deleteWordBackward" || inputType === "deleteSoftLineBackward") {

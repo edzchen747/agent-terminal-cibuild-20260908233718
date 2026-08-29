@@ -135,27 +135,32 @@ fn reorder_sessions(
 
 #[tauri::command]
 fn write_session(
+    window: WebviewWindow,
     state: State<'_, Arc<Core>>,
     session_id: String,
     data: String,
     cols: Option<u16>,
     rows: Option<u16>,
 ) {
-    if let (Some(cols), Some(rows)) = (cols, rows) {
-        state.resize_session(&session_id, cols, rows, true);
-    }
-    state.write_session(&session_id, &data);
+    state.write_desktop_session(window.label(), &session_id, &data, cols, rows);
 }
 
 #[tauri::command]
 fn resize_session(
+    window: WebviewWindow,
     state: State<'_, Arc<Core>>,
     session_id: String,
     cols: u16,
     rows: u16,
     force: Option<bool>,
 ) {
-    state.resize_session(&session_id, cols, rows, force.unwrap_or(false));
+    state.resize_desktop_session(
+        window.label(),
+        &session_id,
+        cols,
+        rows,
+        force.unwrap_or(false),
+    );
 }
 
 #[tauri::command]

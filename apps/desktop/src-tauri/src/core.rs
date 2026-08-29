@@ -41,6 +41,30 @@ const MAX_SCROLLBACK_BYTES: usize = 512_000;
 const MAX_CONTROL_BYTES: usize = 8_192;
 const MAX_PROJECT_NAME_CHARACTERS: usize = 100;
 
+fn is_cursor_position_report(data: &str) -> bool {
+    let bytes = data.as_bytes();
+    if bytes.len() < 6 || bytes[0] != 0x1b || bytes[1] != b'[' {
+        return false;
+    }
+    let mut index = 2;
+    if bytes[index] == b'?' {
+        index += 1;
+    }
+    let first_start = index;
+    while bytes.get(index).is_some_and(|byte| byte.is_ascii_digit()) {
+        index += 1;
+    }
+    if index == first_start || bytes.get(index) != Some(&b';') {
+        return false;
+    }
+    index += 1;
+    let second_start = index;
+    while bytes.get(index).is_some_and(|byte| byte.is_ascii_digit()) {
+        index += 1;
+    }
+    index > second_start && bytes.get(index) == Some(&b'R') && index + 1 == bytes.len()
+}
+
 struct ManagedSession {
     metadata: TerminalSession,
     master: Box<dyn MasterPty + Send>,
@@ -49,6 +73,13 @@ struct ManagedSession {
     buffer: String,
     control_tail: String,
     has_run_command: bool,
+    terminal_controller: Option<TerminalController>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TerminalController {
+    Desktop(String),
+    Remote(String),
 }
 
 #[derive(Clone)]
@@ -1105,6 +1136,7 @@ impl Core {
                     buffer: String::new(),
                     control_tail: String::new(),
                     has_run_command: false,
+                    terminal_controller: None,
                 },
             );
             inner.session_order.push(id.clone());
@@ -1186,28 +1218,128 @@ impl Core {
         Ok(())
     }
 
-    pub fn write_session(&self, session_id: &str, data: &str) {
+    fn write_session_from(
+        &self,
+        session_id: &str,
+        data: &str,
+        controller: TerminalController,
+        size: Option<(u16, u16)>,
+    ) {
         let mut inner = self.inner.lock().expect("desktop state poisoned");
         let Some(session) = inner.sessions.get_mut(session_id) else {
-            return;
-        };
-        if session.metadata.status == "running" {
-            if data.contains('\r') || data.contains('\n') {
-                session.has_run_command = true;
-            }
-            let _ = session.writer.write_all(data.as_bytes());
-            let _ = session.writer.flush();
-        }
-    }
-
-    pub fn resize_session(&self, session_id: &str, cols: u16, rows: u16, _force: bool) {
-        let inner = self.inner.lock().expect("desktop state poisoned");
-        let Some(session) = inner.sessions.get(session_id) else {
             return;
         };
         if session.metadata.status != "running" {
             return;
         }
+
+        // PowerShell/PSReadLine asks the terminal for its cursor position
+        // after a resize. Every xterm instance attached to this PTY receives
+        // that query and can answer it. Only the client that currently owns
+        // the PTY may send the CPR reply; otherwise the duplicate reply is
+        // interpreted as the first shell key and PSReadLine beeps.
+        if is_cursor_position_report(data) {
+            if let Some(current) = &session.terminal_controller
+                && current != &controller
+            {
+                return;
+            }
+        } else {
+            session.terminal_controller = Some(controller.clone());
+            if let Some((cols, rows)) = size {
+                Self::resize_managed_session(session, cols, rows);
+            }
+        }
+
+        if data.contains('\r') || data.contains('\n') {
+            session.has_run_command = true;
+        }
+        let _ = session.writer.write_all(data.as_bytes());
+        let _ = session.writer.flush();
+        if is_cursor_position_report(data) {
+            session.terminal_controller = Some(controller);
+        }
+    }
+
+    pub fn write_desktop_session(
+        &self,
+        window_label: &str,
+        session_id: &str,
+        data: &str,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    ) {
+        self.write_session_from(
+            session_id,
+            data,
+            TerminalController::Desktop(window_label.to_string()),
+            cols.zip(rows),
+        );
+    }
+
+    fn write_remote_session(&self, client_id: &str, session_id: &str, data: &str) {
+        self.write_session_from(
+            session_id,
+            data,
+            TerminalController::Remote(client_id.to_string()),
+            None,
+        );
+    }
+
+    fn resize_session_from(
+        &self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+        controller: TerminalController,
+    ) {
+        let mut inner = self.inner.lock().expect("desktop state poisoned");
+        let Some(session) = inner.sessions.get_mut(session_id) else {
+            return;
+        };
+        if session.metadata.status != "running" {
+            return;
+        }
+        session.terminal_controller = Some(controller);
+        Self::resize_managed_session(session, cols, rows);
+    }
+
+    pub fn resize_desktop_session(
+        &self,
+        window_label: &str,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+        _force: bool,
+    ) {
+        self.resize_session_from(
+            session_id,
+            cols,
+            rows,
+            TerminalController::Desktop(window_label.to_string()),
+        );
+    }
+
+    fn resize_remote_session(&self, client_id: &str, session_id: &str, cols: u16, rows: u16) {
+        self.resize_session_from(
+            session_id,
+            cols,
+            rows,
+            TerminalController::Remote(client_id.to_string()),
+        );
+    }
+
+    fn release_remote_controller(&self, client_id: &str, session_id: &str) {
+        let mut inner = self.inner.lock().expect("desktop state poisoned");
+        let Some(session) = inner.sessions.get_mut(session_id) else {
+            return;
+        };
+        if session.terminal_controller == Some(TerminalController::Remote(client_id.to_string())) {
+            session.terminal_controller = None;
+        }
+    }
+
+    fn resize_managed_session(session: &ManagedSession, cols: u16, rows: u16) {
         let cols = cols.clamp(2, 500);
         let rows = rows.clamp(1, 200);
         // A resize is already a PTY notification.  Do not pulse through a
@@ -1239,6 +1371,9 @@ impl Core {
         if session_project_id != window_project_id {
             return Err(anyhow!("Terminal session moved to another project window."));
         }
+        if let Some(session) = inner.sessions.get_mut(session_id) {
+            session.terminal_controller = Some(TerminalController::Desktop(label.to_string()));
+        }
         if !inner.windows.attach(label, session_id) {
             return Err(anyhow!(
                 "Terminal window is no longer registered with the tray host."
@@ -1253,6 +1388,17 @@ impl Core {
             .expect("desktop state poisoned")
             .windows
             .detach(label, session_id);
+        let mut inner = self.inner.lock().expect("desktop state poisoned");
+        if inner
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.terminal_controller.as_ref())
+            == Some(&TerminalController::Desktop(label.to_string()))
+        {
+            if let Some(session) = inner.sessions.get_mut(session_id) {
+                session.terminal_controller = None;
+            }
+        }
     }
 
     fn session_buffer(&self, session_id: &str) -> String {
@@ -1389,6 +1535,12 @@ impl Core {
             .lock()
             .expect("remote clients poisoned")
             .remove(id);
+        let mut inner = self.inner.lock().expect("desktop state poisoned");
+        for session in inner.sessions.values_mut() {
+            if session.terminal_controller == Some(TerminalController::Remote(id.to_string())) {
+                session.terminal_controller = None;
+            }
+        }
     }
 
     pub fn handle_client_raw(self: &Arc<Self>, client_id: &str, raw: &str) {
@@ -1595,7 +1747,7 @@ impl Core {
                 }
             }
         }
-        match self.execute_client_message(message) {
+        match self.execute_client_message(client_id, message) {
             Ok(Some(response)) => self.send_to_client(client_id, response),
             Ok(None) => {}
             Err(error) => self.send_to_client(
@@ -1611,6 +1763,7 @@ impl Core {
 
     fn execute_client_message(
         self: &Arc<Self>,
+        client_id: &str,
         message: ClientMessage,
     ) -> Result<Option<ServerMessage>> {
         Ok(match message {
@@ -1701,18 +1854,22 @@ impl Core {
                 cols,
                 rows,
             } => {
-                self.resize_session(&session_id, cols, rows, false);
+                self.resize_remote_session(client_id, &session_id, cols, rows);
                 Some(ServerMessage::SessionBuffer {
                     request_id,
                     session_id: session_id.clone(),
                     data: self.session_buffer(&session_id),
                 })
             }
-            ClientMessage::SessionDetach { request_id, .. } => {
+            ClientMessage::SessionDetach {
+                request_id,
+                session_id,
+            } => {
+                self.release_remote_controller(client_id, &session_id);
                 Some(ServerMessage::Ok { request_id })
             }
             ClientMessage::SessionInput { session_id, data } => {
-                self.write_session(&session_id, &data);
+                self.write_remote_session(client_id, &session_id, &data);
                 None
             }
             ClientMessage::SessionResize {
@@ -1721,7 +1878,8 @@ impl Core {
                 rows,
                 force,
             } => {
-                self.resize_session(&session_id, cols, rows, force.unwrap_or(false));
+                let _ = force;
+                self.resize_remote_session(client_id, &session_id, cols, rows);
                 None
             }
             ClientMessage::Pair { .. }
@@ -2351,9 +2509,9 @@ fn is_dropped_node_status(status: &EmbeddedNodeStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        EmbeddedNodeStatus, PairingGrant, is_dropped_node_status, is_within_project,
-        parse_terminal_titles, parse_working_directories, project_name_or_folder,
-        take_valid_pairing_grant, validate_project_name,
+        EmbeddedNodeStatus, PairingGrant, is_cursor_position_report, is_dropped_node_status,
+        is_within_project, parse_terminal_titles, parse_working_directories,
+        project_name_or_folder, take_valid_pairing_grant, validate_project_name,
     };
     use std::{collections::HashMap, path::Path};
 
@@ -2364,6 +2522,15 @@ mod tests {
             parse_working_directories(output),
             vec!["C:\\Users\\edzch\\Project", "C:/Users/edzch/Other Project"]
         );
+    }
+
+    #[test]
+    fn recognizes_only_complete_cursor_position_reports() {
+        assert!(is_cursor_position_report("\x1b[12;34R"));
+        assert!(is_cursor_position_report("\x1b[?12;34R"));
+        assert!(is_cursor_position_report("\x1b[1;1R"));
+        assert!(!is_cursor_position_report("\x1b[12;34C"));
+        assert!(!is_cursor_position_report("\x1b[12;34Rtail"));
     }
 
     #[test]
@@ -2434,13 +2601,15 @@ mod tests {
     #[test]
     fn blank_project_names_use_the_original_folder_name() {
         assert_eq!(
-            project_name_or_folder("  ", Path::new("C:\\Users\\Ada\\AgentTerminal"))
-                .unwrap(),
+            project_name_or_folder("  ", Path::new("C:\\Users\\Ada\\AgentTerminal")).unwrap(),
             "AgentTerminal"
         );
         assert_eq!(
-            project_name_or_folder("  Custom name  ", Path::new("C:\\Users\\Ada\\AgentTerminal"))
-                .unwrap(),
+            project_name_or_folder(
+                "  Custom name  ",
+                Path::new("C:\\Users\\Ada\\AgentTerminal")
+            )
+            .unwrap(),
             "Custom name"
         );
     }

@@ -5,7 +5,7 @@ import { applyTerminalModifiers, createRequestId } from "@agentterminal/protocol
 import type { TerminalModifier, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
 import { classifyGestureAxis, type GestureAxis } from "./gesture";
-import { androidImeKeydownInput, claimNativeInput, nativeTerminalInput, shouldDeferToNativeInput } from "./terminalInput";
+import { androidImeKeydownInput, claimNativeInput, isCursorPositionReport, nativeTerminalInput, shouldDeferToNativeInput } from "./terminalInput";
 import type { TimedTerminalInput } from "./terminalInput";
 import "@xterm/xterm/css/xterm.css";
 
@@ -239,7 +239,15 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       // native IME path own them to avoid xterm's stale-value fallback.
       return !shouldDeferToNativeInput(event);
     });
-    const input = terminal.onData(queueTerminalInput);
+    const input = terminal.onData((data) => {
+      if (isCursorPositionReport(data)) {
+        // CPR is terminal-generated, not keyboard input. Send it immediately
+        // so the keyboard deduplicator cannot discard it as a phantom key.
+        if (activeRef.current) connection.send({ type: "session.input", sessionId: session.id, data });
+        return;
+      }
+      queueTerminalInput(data);
+    });
     const handleNativeBeforeInput = (event: Event) => {
       if (!activeRef.current) return;
       const inputEvent = event as InputEvent;

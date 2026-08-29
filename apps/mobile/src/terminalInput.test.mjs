@@ -1,12 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { androidImeKeydownInput, claimNativeInput, nativeTerminalInput, shouldDeferToNativeInput } from "./terminalInput.ts";
+import { androidImeKeydownInput, claimNativeInput, isCursorPositionReport, nativeTerminalInput, shouldDeferToNativeInput } from "./terminalInput.ts";
 
 test("a matching native event replaces, rather than drops, the queued xterm character", () => {
   const terminal = [{ data: "a", at: 10 }];
 
   assert.equal(claimNativeInput({ data: "a", at: 15 }, terminal), "a");
   assert.deepEqual(terminal, []);
+});
+
+test("recognizes xterm cursor-position replies as terminal control data", () => {
+  assert.equal(isCursorPositionReport("\x1b[12;34R"), true);
+  assert.equal(isCursorPositionReport("\x1b[?12;34R"), true);
+  assert.equal(isCursorPositionReport("\x1b[12;34C"), false);
+  assert.equal(isCursorPositionReport("\x1b[12;34Rtail"), false);
 });
 
 test("an authoritative native event replaces a phantom xterm event", () => {
