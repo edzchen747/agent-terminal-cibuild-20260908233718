@@ -65,6 +65,37 @@ fn is_cursor_position_report(data: &str) -> bool {
     index > second_start && bytes.get(index) == Some(&b'R') && index + 1 == bytes.len()
 }
 
+fn record_cursor_position_requests(tail: &mut String, data: &str) -> usize {
+    const STANDARD: &[u8] = b"\x1b[6n";
+    const DEC_PRIVATE: &[u8] = b"\x1b[?6n";
+    let bytes = data.as_bytes();
+    let crosses_boundary = |query: &[u8]| {
+        (1..query.len()).any(|split| {
+            tail.as_bytes().ends_with(&query[..split]) && bytes.starts_with(&query[split..])
+        })
+    };
+    let standard = bytes
+        .windows(4)
+        .filter(|window| *window == STANDARD)
+        .count();
+    let dec_private = bytes
+        .windows(5)
+        .filter(|window| *window == DEC_PRIVATE)
+        .count();
+    let boundary_count =
+        usize::from(crosses_boundary(STANDARD)) + usize::from(crosses_boundary(DEC_PRIVATE));
+    let combined = format!("{tail}{data}");
+    *tail = combined
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    standard + dec_private + boundary_count
+}
+
 struct ManagedSession {
     metadata: TerminalSession,
     master: Box<dyn MasterPty + Send>,
@@ -72,6 +103,8 @@ struct ManagedSession {
     killer: Box<dyn ChildKiller + Send + Sync>,
     buffer: String,
     control_tail: String,
+    cursor_query_tail: String,
+    pending_cursor_reports: usize,
     has_run_command: bool,
     terminal_controller: Option<TerminalController>,
 }
@@ -1135,6 +1168,8 @@ impl Core {
                     killer,
                     buffer: String::new(),
                     control_tail: String::new(),
+                    cursor_query_tail: String::new(),
+                    pending_cursor_reports: 0,
                     has_run_command: false,
                     terminal_controller: None,
                 },
@@ -1233,17 +1268,15 @@ impl Core {
             return;
         }
 
-        // PowerShell/PSReadLine asks the terminal for its cursor position
-        // after a resize. Every xterm instance attached to this PTY receives
-        // that query and can answer it. Only the client that currently owns
-        // the PTY may send the CPR reply; otherwise the duplicate reply is
-        // interpreted as the first shell key and PSReadLine beeps.
+        // A CPR is valid only as a response to a live query emitted by the
+        // shell. Replayed PTY history and duplicate xterm responses otherwise
+        // arrive on the same input stream as typed keys; PSReadLine interprets
+        // those stale reports as an editing key and rings the bell.
         if is_cursor_position_report(data) {
-            if let Some(current) = &session.terminal_controller
-                && current != &controller
-            {
+            if session.pending_cursor_reports == 0 {
                 return;
             }
+            session.pending_cursor_reports -= 1;
         } else {
             session.terminal_controller = Some(controller.clone());
             if let Some((cols, rows)) = size {
@@ -1256,9 +1289,6 @@ impl Core {
         }
         let _ = session.writer.write_all(data.as_bytes());
         let _ = session.writer.flush();
-        if is_cursor_position_report(data) {
-            session.terminal_controller = Some(controller);
-        }
     }
 
     pub fn write_desktop_session(
@@ -1981,6 +2011,13 @@ impl Core {
             truncate_front(&mut session.buffer, MAX_SCROLLBACK_BYTES);
             session.control_tail.push_str(&data);
             truncate_front(&mut session.control_tail, MAX_CONTROL_BYTES);
+            session.pending_cursor_reports =
+                session
+                    .pending_cursor_reports
+                    .saturating_add(record_cursor_position_requests(
+                        &mut session.cursor_query_tail,
+                        &data,
+                    ));
             let reported = parse_working_directories(&session.control_tail)
                 .into_iter()
                 .last()
@@ -2511,7 +2548,8 @@ mod tests {
     use super::{
         EmbeddedNodeStatus, PairingGrant, is_cursor_position_report, is_dropped_node_status,
         is_within_project, parse_terminal_titles, parse_working_directories,
-        project_name_or_folder, take_valid_pairing_grant, validate_project_name,
+        project_name_or_folder, record_cursor_position_requests, take_valid_pairing_grant,
+        validate_project_name,
     };
     use std::{collections::HashMap, path::Path};
 
@@ -2531,6 +2569,19 @@ mod tests {
         assert!(is_cursor_position_report("\x1b[1;1R"));
         assert!(!is_cursor_position_report("\x1b[12;34C"));
         assert!(!is_cursor_position_report("\x1b[12;34Rtail"));
+    }
+
+    #[test]
+    fn records_live_cursor_position_queries_even_when_split_across_output_chunks() {
+        let mut tail = String::new();
+        assert_eq!(record_cursor_position_requests(&mut tail, "\x1b["), 0);
+        assert_eq!(record_cursor_position_requests(&mut tail, "6n"), 1);
+        assert_eq!(record_cursor_position_requests(&mut tail, "\x1b[?6"), 0);
+        assert_eq!(record_cursor_position_requests(&mut tail, "n"), 1);
+        assert_eq!(
+            record_cursor_position_requests(&mut tail, "\x1b[6n\x1b[?6n"),
+            2
+        );
     }
 
     #[test]

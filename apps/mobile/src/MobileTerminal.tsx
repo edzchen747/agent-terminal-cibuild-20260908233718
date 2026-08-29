@@ -263,14 +263,14 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     let initialized = false;
     let replayingSessionBuffer = false;
     const input = terminal.onData((data) => {
+      if (replayingSessionBuffer) {
+        // No keyboard data can come from xterm here: mobile keyboard input is
+        // owned by inputElement. Suppress every terminal-generated reply while
+        // replaying history, not only CPR, because PowerShell may also leave
+        // device-attributes/status queries in the saved buffer.
+        return;
+      }
       if (isCursorPositionReport(data)) {
-        if (replayingSessionBuffer) {
-          // The attach response is a replay of old PTY output. PowerShell can
-          // leave old CPR queries (ESC[6n) in that buffer; xterm answers them
-          // as if they were live queries, which injects a stale CPR into the
-          // shell input stream before the first mobile key.
-          return;
-        }
         // CPR is terminal-generated, not keyboard input. Send it immediately
         // so the keyboard deduplicator cannot discard it as a phantom key.
         if (activeRef.current) connection.send({ type: "session.input", sessionId: session.id, data });
