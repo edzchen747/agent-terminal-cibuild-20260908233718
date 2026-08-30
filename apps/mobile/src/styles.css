@@ -204,6 +204,7 @@ button { color: inherit; }
 .ambient.one { width: 220px; height: 220px; top: -90px; right: -100px; background: #52b7a226; }
 .ambient.two { width: 140px; height: 140px; bottom: 20%; left: -90px; background: #476eaa17; }
 .onboarding-top { display: flex; align-items: center; gap: 11px; color: #e7eaf0; font-size: 14px; }
+.onboarding-top .round-button { width: 38px; height: 38px; }
 .pair-copy { margin-top: clamp(30px,8vh,65px); }
 .pair-copy h1 { margin: 9px 0 13px; color: #f3f5f8; font-size: clamp(30px,9vw,40px); line-height: 1.08; letter-spacing: -.055em; }
 .pair-copy h1 em { color: #7cd6c3; font-style: normal; }
@@ -225,11 +226,15 @@ button { color: inherit; }
 .pair-error { margin: 0 0 10px; text-align: center; }
 .splash, .error-screen { height: 100%; padding: 35px; display: flex; flex-direction: column; align-items: center; justify-content: center; touch-action: pan-y; overscroll-behavior-x: none; background: radial-gradient(circle at 50% 35%,#17312d,#090c11 38%); }
 .splash > strong { margin-top: 14px; font-size: 17px; }.splash > small { margin-top: 6px; color: #65707e; font-size: 10px; }
+.splash-host { margin-top: 10px; color: #7dd5c3; font-size: 12px; font-weight: 700; }
+.splash .text-button { margin-top: 22px; }
 .loader { width: 18px; height: 18px; margin-top: 25px; border: 2px solid #27332f; border-top-color: #7bd5c2; border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .error-screen { text-align: center; }
 .offline-icon { width: 64px; height: 64px; display: grid; place-items: center; border: 1px solid #37313a; border-radius: 18px; background: #1e171c; color: #bd7380; }
 .offline-icon svg { width: 31px; height: 31px; }
 .error-screen h1 { margin: 20px 0 7px; color: #e9ecf2; font-size: 23px; }.error-screen p { max-width: 320px; margin: 0 0 25px; color: #737d8c; font-size: 11px; line-height: 1.55; }
+.error-screen .error-host { margin: 0 0 8px; color: #97a1b1; font-size: 12px; font-weight: 700; }
+.error-screen .error-host strong { color: #e9ecf2; }
 @media (min-width: 700px) { .mobile-app,.onboarding,.splash,.error-screen { max-width: 520px; margin: auto; border-left: 1px solid #20252e; border-right: 1px solid #20252e; } }
 @media (prefers-reduced-motion: reduce) { .mobile-page-track, .project-card { transition-duration: 1ms; } }

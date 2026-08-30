@@ -60,6 +60,12 @@ export function App() {
   const [snapshot, setSnapshot] = useState<HostSnapshot | null>(null);
   const [status, setStatus] = useState<"loading" | "pairing" | "connecting" | "connected" | "error">("loading");
   const [error, setError] = useState("");
+  // The desktop every connection attempt targets, kept so the connecting and
+  // try-again screens can name it even after the connection object is gone.
+  const [hostName, setHostName] = useState("");
+  // The user chose "Pair a different desktop": the saved record is kept until
+  // a new desktop is successfully paired (or the user presses back).
+  const [pendingNewDesktop, setPendingNewDesktop] = useState(false);
   const [remoteRegistration, setRemoteRegistration] = useState<RemoteRegistrationState>({ status: "unregistered" });
   const [manualCode, setManualCode] = useState("");
   const [showManual, setShowManual] = useState(false);
@@ -81,8 +87,11 @@ export function App() {
   connectionRef.current = connection;
   const screenAwakeRef = useRef(true);
   const deviceSleepingRef = useRef(false);
-  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings });
-  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings };
+  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pendingNewDesktop });
+  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pendingNewDesktop };
+  // The try-again message captured when the user moves on to pair a different
+  // desktop, so pressing back restores the same try-again page.
+  const pendingPairErrorRef = useRef("");
   const projectDragRef = useRef<ProjectDragState | null>(null);
   const projectElementsRef = useRef(new Map<string, HTMLElement>());
   const swipeRef = useRef<SwipeState | null>(null);
@@ -135,6 +144,10 @@ export function App() {
       }
       if (navigation.showCreateProject) {
         setShowCreateProject(false);
+        return;
+      }
+      if (navigation.status === "pairing" && navigation.pendingNewDesktop) {
+        backFromPairDifferentDesktop();
         return;
       }
       if (navigation.status !== "connected") return;
@@ -262,6 +275,7 @@ export function App() {
       if (!host) { setStatus("pairing"); return; }
       setStatus("connecting");
       current = new HostConnection(host);
+      setHostName(current.host.name);
       current.setScreenAwake(screenAwakeRef.current);
       current.setDeviceSleeping(deviceSleepingRef.current);
       setRemoteRegistration(current.remoteRegistrationState());
@@ -342,7 +356,9 @@ export function App() {
       next.startAutoReconnect();
       next.setScreenAwake(screenAwakeRef.current);
       next.setDeviceSleeping(deviceSleepingRef.current);
-      setConnection(next); setSnapshot(next.snapshot ?? null); setRemoteRegistration(next.remoteRegistrationState()); setStatus("connected"); setView({ type: "home" });
+      // Pairing succeeded: HostConnection.pair has already overwritten the
+      // saved host record, so any previously kept desktop is wiped now.
+      setConnection(next); setSnapshot(next.snapshot ?? null); setRemoteRegistration(next.remoteRegistrationState()); setStatus("connected"); setView({ type: "home" }); setHostName(next.host.name); setPendingNewDesktop(false);
       await startConnectionNotification(next.host.name, next.endpoint());
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Pairing failed."); setStatus("pairing");
@@ -374,7 +390,40 @@ export function App() {
 
   async function forgetHost() {
     connection?.close(); await stopConnectionNotification(); await HostConnection.forget();
-    setConnection(null); setSnapshot(null); setRemoteRegistration({ status: "unregistered" }); setError(""); setStatus("pairing"); setView({ type: "home" });
+    setConnection(null); setSnapshot(null); setRemoteRegistration({ status: "unregistered" }); setError(""); setHostName(""); setPendingNewDesktop(false); setStatus("pairing"); setView({ type: "home" });
+  }
+
+  // Stop the retry loop and land on the try-again screen. The saved desktop
+  // record is kept, so "Try again" still targets it.
+  function cancelConnection() {
+    connectionRef.current?.close();
+    connectionRef.current = null;
+    setConnection(null); setSnapshot(null); setRemoteRegistration({ status: "unregistered" });
+    setError("The connection was cancelled.");
+    setStatus("error");
+    void stopConnectionNotification();
+  }
+
+  // Move to the pairing screen without wiping the saved desktop: the record
+  // survives until a new desktop is successfully paired, and back returns to
+  // the try-again page with the original error.
+  function pairDifferentDesktop() {
+    connectionRef.current?.close();
+    connectionRef.current = null;
+    pendingPairErrorRef.current = error;
+    setConnection(null); setSnapshot(null); setRemoteRegistration({ status: "unregistered" });
+    setPendingNewDesktop(true);
+    setStatus("pairing");
+    void stopConnectionNotification();
+  }
+
+  // The pairing screen's back button and the Android back key share this:
+  // restore the captured try-again error and return to that page. The saved
+  // record is untouched, so "Try again" still targets the old desktop.
+  function backFromPairDifferentDesktop() {
+    setPendingNewDesktop(false);
+    setError(pendingPairErrorRef.current);
+    setStatus("error");
   }
 
   function openProject(projectId: string) {
@@ -461,9 +510,15 @@ export function App() {
     setView({ type: "project", projectId: session.projectId });
   }
 
-  if (status === "loading" || status === "connecting") return <Splash label={status === "loading" ? "Opening Agent Terminal" : error || "Connecting to desktop"} />;
-  if (status === "pairing") return <PairScreen error={error} manualCode={manualCode} showManual={showManual} onManualCode={setManualCode} onShowManual={() => setShowManual(true)} onScan={() => void scan()} onPair={() => void pair(manualCode)} />;
-  if (status === "error") return <ErrorScreen message={error} onRetry={() => window.location.reload()} onForget={() => void forgetHost()} />;
+  if (status === "loading" || status === "connecting") {
+    // The cancel control only makes sense while a saved desktop connection is
+    // being retried; a pairing attempt (connection is null) keeps the plain
+    // splash so cancelling it cannot drop the user into the try-again page.
+    const retryingSavedHost = status === "connecting" && connection !== null;
+    return <Splash label={status === "loading" ? "Opening Agent Terminal" : error || "Connecting to desktop"} hostName={retryingSavedHost ? hostName : undefined} onCancel={retryingSavedHost ? cancelConnection : undefined} />;
+  }
+  if (status === "pairing") return <PairScreen error={error} manualCode={manualCode} showManual={showManual} onManualCode={setManualCode} onShowManual={() => setShowManual(true)} onScan={() => void scan()} onPair={() => void pair(manualCode)} onBack={pendingNewDesktop ? backFromPairDifferentDesktop : undefined} />;
+  if (status === "error") return <ErrorScreen message={error} hostName={hostName || undefined} onRetry={() => window.location.reload()} onForget={pairDifferentDesktop} />;
   if (!connection || !snapshot) return null;
 
   const requestedProjectId = view.type === "home" ? selectedProjectId : view.projectId;
@@ -920,9 +975,12 @@ function MobileHeader({ title, subtitle, onBack, trailing }: { title: string; su
   return <header className="mobile-header"><button className="round-button" onClick={onBack}><BackIcon /></button><span><strong className="display-name" title={title}>{title}</strong><small title={subtitle}>{subtitle}</small></span><div className="header-trailing">{trailing}</div></header>;
 }
 
-function PairScreen({ error, manualCode, showManual, onManualCode, onShowManual, onScan, onPair }: { error: string; manualCode: string; showManual: boolean; onManualCode: (value: string) => void; onShowManual: () => void; onScan: () => void; onPair: () => void }) {
-  return <div className="onboarding"><div className="ambient one"/><div className="ambient two"/><div className="onboarding-top"><span className="logo"><TerminalIcon /></span><strong>Agent Terminal</strong></div><section className="pair-copy"><span className="eyebrow">Desktop, untethered</span><h1>Your Windows terminal.<br/><em>Now in your pocket.</em></h1><p>Scan once while both devices are on the same network to authorize this phone. Once paired, connect to your desktop from anywhere.</p></section><div className="scan-illustration"><span className="scan-corner tl"/><span className="scan-corner tr"/><span className="scan-corner bl"/><span className="scan-corner br"/><div className="qr-art"><i/><i/><i/><i/><i/><i/><i/><i/><i/></div><div className="scan-line"/></div>{error && <div className="pair-error">{error}</div>}<section className="pair-actions"><button className="scan-button" onClick={onScan}><ScanIcon /> Authorize this phone</button>{showManual ? <div className="manual-pair"><textarea value={manualCode} onChange={(event) => onManualCode(event.target.value)} placeholder="Paste setup QR data"/><button onClick={onPair}>Authorize</button></div> : <button className="manual-link" onClick={onShowManual}>Enter setup data manually</button>}<small>Future connections work automatically from any network.</small></section></div>;
+function PairScreen({ error, manualCode, showManual, onManualCode, onShowManual, onScan, onPair, onBack }: { error: string; manualCode: string; showManual: boolean; onManualCode: (value: string) => void; onShowManual: () => void; onScan: () => void; onPair: () => void; onBack?: () => void }) {
+  return <div className="onboarding"><div className="ambient one"/><div className="ambient two"/><div className="onboarding-top">{onBack && <button className="round-button" onClick={onBack} aria-label="Back to try again"><BackIcon /></button>}<span className="logo"><TerminalIcon /></span><strong>Agent Terminal</strong></div><section className="pair-copy"><span className="eyebrow">Desktop, untethered</span><h1>Your Windows terminal.<br/><em>Now in your pocket.</em></h1><p>Scan once while both devices are on the same network to authorize this phone. Once paired, connect to your desktop from anywhere.</p></section><div className="scan-illustration"><span className="scan-corner tl"/><span className="scan-corner tr"/><span className="scan-corner bl"/><span className="scan-corner br"/><div className="qr-art"><i/><i/><i/><i/><i/><i/><i/><i/><i/></div><div className="scan-line"/></div>{error && <div className="pair-error">{error}</div>}<section className="pair-actions"><button className="scan-button" onClick={onScan}><ScanIcon /> Authorize this phone</button>{showManual ? <div className="manual-pair"><textarea value={manualCode} onChange={(event) => onManualCode(event.target.value)} placeholder="Paste setup QR data"/><button onClick={onPair}>Authorize</button></div> : <button className="manual-link" onClick={onShowManual}>Enter setup data manually</button>}<small>Future connections work automatically from any network.</small></section></div>;
 }
 
-function Splash({ label }: { label: string }) { return <div className="splash"><span className="logo large"><TerminalIcon /></span><strong>Agent Terminal</strong><small>{label}…</small><i className="loader" /></div>; }
-function ErrorScreen({ message, onRetry, onForget }: { message: string; onRetry: () => void; onForget: () => void }) { return <div className="error-screen"><span className="offline-icon"><WifiIcon /></span><h1>Desktop unavailable</h1><p>{message}</p><button className="mobile-primary full" onClick={onRetry}>Try again</button><button className="text-button" onClick={onForget}>Pair a different desktop</button></div>; }
+function Splash({ label, hostName, onCancel }: { label: string; hostName?: string; onCancel?: () => void }) {
+  const status = label.endsWith("…") ? label : `${label}…`;
+  return <div className="splash"><span className="logo large"><TerminalIcon /></span><strong>Agent Terminal</strong>{hostName && <span className="splash-host">Connecting to {hostName}</span>}<small>{status}</small><i className="loader" />{onCancel && <button className="text-button" onClick={onCancel}>Cancel</button>}</div>;
+}
+function ErrorScreen({ message, hostName, onRetry, onForget }: { message: string; hostName?: string; onRetry: () => void; onForget: () => void }) { return <div className="error-screen"><span className="offline-icon"><WifiIcon /></span><h1>Desktop unavailable</h1>{hostName && <p className="error-host">Trying to connect to <strong>{hostName}</strong></p>}<p>{message}</p><button className="mobile-primary full" onClick={onRetry}>Try again</button><button className="text-button" onClick={onForget}>Pair a different desktop</button></div>; }
