@@ -113,7 +113,7 @@ button { color: inherit; }
 .session-list button > svg { width: 15px; color: #525b69; }
 .inline-empty { margin-top: 6px; padding: 30px; border: 1px dashed #282e38; border-radius: 12px; color: #616b79; text-align: center; font-size: 11px; }
 .terminal-view { background: #080b0f; }
-.mobile-terminal-shell { position: relative; flex: 1; min-height: 0; display: grid; grid-template-rows: 1fr auto; overflow: hidden; }
+.mobile-terminal-shell { position: relative; flex: 1; min-height: 0; display: grid; grid-template-rows: 1fr auto; grid-template-columns: minmax(0, 1fr); overflow: hidden; }
 .mobile-terminal-input { position: absolute; top: 0; left: 0; width: 1px; height: 1px; padding: 0; border: 0; opacity: 0; pointer-events: none; font-size: 16px; }
 .mobile-terminal { min-height: 0; padding: 8px 0 4px 8px; overflow: hidden; }
 .mobile-terminal .xterm, .mobile-terminal .xterm-scrollable-element { width: 100%; min-width: 0; }
@@ -149,7 +149,7 @@ button { color: inherit; }
 .mobile-terminal .xterm-scrollable-element > .scrollbar.vertical > .slider.active::after { width: 7px; background: #91f0dacc; }
 .extra-keys { padding: 6px 5px calc(7px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: 5px; border-top: 1px solid #222832; background: #0e1218; overflow: hidden; }
 .key-row { display: flex; gap: 5px; overflow-x: auto; scrollbar-width: none; }
-.key-row button { min-width: 43px; height: 36px; flex: 1 0 auto; position: relative; overflow: hidden; padding: 0 8px; border: 1px solid #2a303a; border-radius: 7px; background: linear-gradient(#1a1f27,#131820); color: #9ba3af; font-family: "Roboto Mono", monospace; font-size: 10px; box-shadow: 0 2px 0 #05070a; }
+.key-row button { min-width: 38px; height: 36px; flex: 1 1 auto; position: relative; overflow: hidden; padding: 0 6px; border: 1px solid #2a303a; border-radius: 7px; background: linear-gradient(#1a1f27,#131820); color: #9ba3af; font-family: "Roboto Mono", monospace; font-size: 10px; box-shadow: 0 2px 0 #05070a; }
 .key-row button > span { position: relative; z-index: 1; }
 .key-row button, .key-row button > span { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 .key-row button:active, .key-row button.latched, .key-row button.held { color: #8ce0cf; border-color: #3a7065; background: #1c302b; transform: translateY(1px); box-shadow: none; }
