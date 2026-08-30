@@ -1,0 +1,7 @@
+/* All fonts the app renders are provided here, bundled at build time instead
+   of resolved from device system fonts, so the UI renders identically
+   everywhere. App code must only reference families declared by these
+   rules or generic families; fonts.test.mjs enforces "provided <=> used". */
+@import "@fontsource-variable/inter/index.css";
+@import "@fontsource/roboto-mono/400.css";
+@import "@fontsource/cascadia-mono/400.css";

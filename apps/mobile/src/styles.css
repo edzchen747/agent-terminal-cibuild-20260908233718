@@ -1,4 +1,4 @@
-:root { color-scheme: dark; font-family: Inter, "Roboto", "Segoe UI", sans-serif; color: #e5e9f1; background: #090c11; font-synthesis: none; }
+:root { color-scheme: dark; font-family: "Inter Variable", sans-serif; color: #e5e9f1; background: #090c11; font-synthesis: none; }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body, #root { width: 100%; min-width: 320px; height: 100%; margin: 0; overflow: hidden; background: #090c11; }
 /* Battery: decorative animations only matter while visible. Freeze them when
