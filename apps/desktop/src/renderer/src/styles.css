@@ -136,6 +136,14 @@ button { color: inherit; }
 .split-drop-target svg { width: 15px; }
 .terminal-copy-toast { position: absolute; z-index: 5; padding: 5px 8px; border: 1px solid #3d655d; border-radius: 6px; background: #162a25ed; box-shadow: 0 7px 24px #0008; color: #a1ead9; font: 700 10px/1 "Segoe UI", sans-serif; letter-spacing: .02em; pointer-events: none; opacity: 0; transform: translateY(4px) scale(.97); transition: opacity .12s ease, transform .12s ease; }
 .terminal-copy-toast.is-visible { opacity: 1; transform: translateY(0) scale(1); }
+.link-confirm-backdrop { z-index: 40; }
+.link-confirm-modal { width: 430px; }
+.link-confirm-url { margin-top: 18px !important; padding: 10px 11px; overflow: hidden; border: 1px solid #2b3440; border-radius: 8px; background: #0b0f15; color: #a3d9ce !important; font: 11px/1.45 "Cascadia Code", Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.link-confirm-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 22px; }
+.link-confirm-actions button { min-height: 37px; padding: 0 15px; border-radius: 8px; font-size: 11.5px; font-weight: 700; cursor: pointer; }
+.link-confirm-actions button:disabled { opacity: .55; cursor: wait; }
+.link-cancel { border: 1px solid #343b47; background: #171b23; color: #a4acb9; }
+.link-cancel:hover:not(:disabled) { border-color: #4a5564; background: #202630; color: #e0e5ed; }
 .statusbar { display: grid; grid-template-columns: 140px 1fr 70px; align-items: center; gap: 10px; padding: 0 10px; border-top: 1px solid #181c24; color: #565e6d; background: #0c0f14; font-size: 9.5px; }
 .statusbar span { display: flex; align-items: center; gap: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .statusbar span:last-child { justify-content: end; }

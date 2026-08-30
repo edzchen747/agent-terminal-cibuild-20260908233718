@@ -1,17 +1,63 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { applyTerminalModifiers, findHttpLinks, type TerminalModifier } from "@agentterminal/protocol";
 import "@xterm/xterm/css/xterm.css";
 
-interface Props { sessionId: string; visible: boolean; active: boolean; }
+interface Props { sessionId: string; visible: boolean; active: boolean; confirmExternalLinks: boolean; }
 
-export function TerminalPane({ sessionId, visible, active }: Props) {
+const isCursorPositionReport = (data: string) => /^\x1b\[\??\d+;\d+R$/.test(data);
+
+export function TerminalPane({ sessionId, visible, active, confirmExternalLinks }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const activeRef = useRef(active);
   const resizeRef = useRef<() => void>(() => undefined);
+  const confirmExternalLinksRef = useRef(confirmExternalLinks);
+  const [pendingUrl, setPendingUrl] = useState<string | null>(null);
+  const [linkOpening, setLinkOpening] = useState(false);
+  const [linkError, setLinkError] = useState<string | null>(null);
   activeRef.current = active;
+  confirmExternalLinksRef.current = confirmExternalLinks;
+
+  useEffect(() => {
+    setPendingUrl(null);
+    setLinkError(null);
+    setLinkOpening(false);
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (confirmExternalLinks) return;
+    setPendingUrl(null);
+    setLinkError(null);
+  }, [confirmExternalLinks]);
+
+  useEffect(() => {
+    if (!pendingUrl) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !linkOpening) setPendingUrl(null);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [linkOpening, pendingUrl]);
+
+  async function openPendingLink() {
+    if (!pendingUrl || linkOpening) return;
+    const url = pendingUrl;
+    setLinkOpening(true);
+    setLinkError(null);
+    try {
+      const parsed = new URL(url);
+      if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Only HTTP and HTTPS links can be opened.");
+      await window.agentTerminal.openExternalUrl(parsed.href);
+      setPendingUrl(null);
+    } catch (cause) {
+      setLinkError(`Could not open this link: ${String(cause)}`);
+    } finally {
+      setLinkOpening(false);
+    }
+  }
+
   const activateLink = (uri: string) => {
     try {
       const parsed = new URL(uri);
@@ -172,24 +218,45 @@ export function TerminalPane({ sessionId, visible, active }: Props) {
       window.agentTerminal.write(sessionId, data, terminal.cols, terminal.rows);
     });
     let initialized = false;
+    let replayingSessionBuffer = false;
     let disposed = false;
     const pendingData: string[] = [];
     const offData = window.agentTerminal.onData((id, data) => {
       if (id !== sessionId) return;
+      if (replayingSessionBuffer && isCursorPositionReport(data)) return;
       if (initialized) terminal.write(data);
       else pendingData.push(data);
     });
+    const finishAttachment = () => {
+      if (disposed) return;
+      initialized = true;
+      resize();
+      if (activeRef.current) terminal.focus();
+    };
+    const replayPendingData = (index = 0) => {
+      if (disposed) return;
+      const data = pendingData[index];
+      if (data === undefined) {
+        pendingData.length = 0;
+        finishAttachment();
+        return;
+      }
+      terminal.write(data, () => replayPendingData(index + 1));
+    };
     const attachment = window.agentTerminal.attachSession(sessionId).then((buffer) => {
       if (disposed) {
         window.agentTerminal.detachSession(sessionId);
         return;
       }
-      if (buffer) terminal.write(buffer);
-      for (const data of pendingData) terminal.write(data);
-      pendingData.length = 0;
-      initialized = true;
-      resize();
-      if (activeRef.current) terminal.focus();
+      if (buffer) {
+        replayingSessionBuffer = true;
+        terminal.write(buffer, () => {
+          replayingSessionBuffer = false;
+          replayPendingData();
+        });
+      } else {
+        replayPendingData();
+      }
     }).catch((cause) => {
       if (!disposed) terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
     });
@@ -223,5 +290,19 @@ export function TerminalPane({ sessionId, visible, active }: Props) {
     return () => window.cancelAnimationFrame(frame);
   }, [visible]);
 
-  return <div ref={hostRef} className={`terminal-pane ${visible ? "is-visible" : ""} ${active ? "is-active" : ""}`} />;
+  return <div ref={hostRef} className={`terminal-pane ${visible ? "is-visible" : ""} ${active ? "is-active" : ""}`}>
+    {pendingUrl && <div className="modal-backdrop link-confirm-backdrop" onMouseDown={() => { if (!linkOpening) setPendingUrl(null); }}>
+      <section className="modal link-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="link-confirm-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-kicker">Agent Terminal</div>
+        <h1 id="link-confirm-title">Open external link?</h1>
+        <p className="link-confirm-url" title={pendingUrl}>{pendingUrl}</p>
+        <p>This link will open in your system browser. Only continue if you trust the destination.</p>
+        {linkError && <div className="form-error">{linkError}</div>}
+        <div className="link-confirm-actions">
+          <button className="link-cancel" disabled={linkOpening} onClick={() => setPendingUrl(null)}>Cancel</button>
+          <button autoFocus className="primary" disabled={linkOpening} onClick={() => void openPendingLink()}>{linkOpening ? "Opening…" : "Open link"}</button>
+        </div>
+      </section>
+    </div>}
+  </div>;
 }

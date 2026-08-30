@@ -40,9 +40,15 @@ pub struct Settings {
     pub port: u16,
     #[serde(default = "default_open_projects_in_new_windows")]
     pub open_projects_in_new_windows: bool,
+    #[serde(default = "default_confirm_external_links")]
+    pub confirm_external_links: bool,
 }
 
 fn default_open_projects_in_new_windows() -> bool {
+    true
+}
+
+fn default_confirm_external_links() -> bool {
     true
 }
 
@@ -264,6 +270,11 @@ impl DesktopStore {
         self.write()
     }
 
+    pub fn set_confirm_external_links(&mut self, enabled: bool) -> Result<()> {
+        self.state.settings.confirm_external_links = enabled;
+        self.write()
+    }
+
     fn write(&self) -> Result<()> {
         if let Some(parent) = self.file_path.parent() {
             fs::create_dir_all(parent)?;
@@ -295,6 +306,7 @@ fn default_state() -> StoredState {
             default_shell_id: "powershell".into(),
             port: 47_831,
             open_projects_in_new_windows: true,
+            confirm_external_links: true,
         },
     }
 }

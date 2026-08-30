@@ -664,6 +664,7 @@ impl Core {
             snapshot: snapshot_from_inner(&inner),
             current_project_id,
             open_projects_in_new_windows: inner.store.settings().open_projects_in_new_windows,
+            confirm_external_links: inner.store.settings().confirm_external_links,
             remote_registration: RemoteRegistration {
                 status: inner.store.network().registration_status.clone(),
                 error: inner.store.network().registration_error.clone(),
@@ -1037,6 +1038,15 @@ impl Core {
             if let Some(window) = self.app.get_webview_window(&label) {
                 let _ = window.destroy();
             }
+        }
+        self.broadcast();
+        Ok(())
+    }
+
+    pub fn set_confirm_external_links(&self, enabled: bool) -> Result<()> {
+        {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            inner.store.set_confirm_external_links(enabled)?;
         }
         self.broadcast();
         Ok(())

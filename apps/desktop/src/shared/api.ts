@@ -3,6 +3,7 @@ import type { HostSnapshot, PairingPayload, Project, TerminalSession } from "@ag
 export interface DesktopState extends HostSnapshot {
   currentProjectId: string;
   openProjectsInNewWindows: boolean;
+  confirmExternalLinks: boolean;
   remoteRegistration: {
     status: "unregistered" | "pending" | "enrolled" | "failed";
     error?: string;
@@ -25,11 +26,13 @@ export interface DesktopApi {
   attachSession(sessionId: string): Promise<string>;
   detachSession(sessionId: string): void;
   copyText(text: string): Promise<void>;
+  openExternalUrl(url: string): Promise<void>;
   startPairing(): Promise<PairingPayload>;
   retryRemoteRegistration(): Promise<void>;
   revokeDevice(deviceId: string): Promise<void>;
   setDefaultShell(shellId: string): Promise<void>;
   setOpenProjectsInNewWindows(enabled: boolean): Promise<void>;
+  setConfirmExternalLinks(enabled: boolean): Promise<void>;
   selectShell(sessionId: string | null, shellId: string): Promise<TerminalSession | null>;
   onPairingSucceeded(callback: () => void): () => void;
   onState(callback: (state: DesktopState) => void): () => void;

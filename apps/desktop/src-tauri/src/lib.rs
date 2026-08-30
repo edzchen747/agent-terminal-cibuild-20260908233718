@@ -220,6 +220,16 @@ fn set_open_projects_in_new_windows(
 }
 
 #[tauri::command]
+fn set_confirm_external_links(
+    state: State<'_, Arc<Core>>,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .set_confirm_external_links(enabled)
+        .map_err(error_string)
+}
+
+#[tauri::command]
 async fn select_shell(
     state: State<'_, Arc<Core>>,
     session_id: Option<String>,
@@ -237,6 +247,7 @@ pub fn run() {
                 show_terminal_window_from_worker(Arc::clone(core.inner()));
             }
         }))
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let data_path = std::env::var_os("AGENT_TERMINAL_DATA_DIR")
                 .map(std::path::PathBuf::from)
@@ -284,6 +295,7 @@ pub fn run() {
             revoke_device,
             set_default_shell,
             set_open_projects_in_new_windows,
+            set_confirm_external_links,
             select_shell,
         ])
         .build(tauri::generate_context!())

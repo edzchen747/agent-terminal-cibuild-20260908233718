@@ -1,1 +1,1 @@
-{"desktop":{"identifier":"desktop","description":"Core APIs used by Agent Terminal desktop windows","local":true,"windows":["*"],"permissions":["core:default","core:event:allow-listen","core:event:allow-unlisten"]}}
+{"desktop":{"identifier":"desktop","description":"Core APIs used by Agent Terminal desktop windows","local":true,"windows":["*"],"permissions":["core:default","core:event:allow-listen","core:event:allow-unlisten","opener:default"]}}

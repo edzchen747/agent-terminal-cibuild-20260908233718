@@ -728,7 +728,7 @@ export function App() {
                 }
               }
               return <div key={session.id} className={`terminal-surface ${visible ? "is-visible" : ""} ${paneActive ? "is-active" : "is-inactive"} ${activeSplit ? `is-split ${activeSplit.layout}` : ""}`} style={surfaceStyle} onPointerDown={() => { if (visible && !paneActive) setActiveSessionId(session.id); }}>
-                <TerminalPane sessionId={session.id} visible={visible} active={paneActive} />
+                <TerminalPane sessionId={session.id} visible={visible} active={paneActive} confirmExternalLinks={state.confirmExternalLinks} />
                 {visible && activeSplit && !paneActive && <div className="split-mini-toolbar" onPointerDown={(event) => event.stopPropagation()}>
                   <TerminalIcon /><span className="display-name" title={session.title}>{session.title}</span>
                   <button title="Manage split view" aria-label="Manage split view" onClick={(event) => { const bounds = event.currentTarget.getBoundingClientRect(); setSplitMenu({ kind: "manage", groupId: activeSplit.id, x: bounds.right, y: bounds.top }); }}><MoreIcon /></button>
@@ -803,6 +803,7 @@ export function App() {
         <h1>Desktop host</h1>
         <div className="settings-row"><span><strong>Default terminal</strong><small>Used for new tabs and projects</small></span><select value={state.defaultShellId} onChange={(event) => void selectShell(event.target.value)}>{state.shells.map((shell) => <option key={shell.id} value={shell.id}>{shell.name}</option>)}</select></div>
         <label className="settings-row settings-toggle"><span><strong>Open each project in a new window</strong><small>Turn off to switch projects like tabs in this window</small></span><input type="checkbox" checked={state.openProjectsInNewWindows} onChange={(event) => void window.agentTerminal.setOpenProjectsInNewWindows(event.target.checked)} /><i /></label>
+        <label className="settings-row settings-toggle"><span><strong>Warn before opening external links</strong><small>Ask for confirmation before sending terminal links to your browser</small></span><input type="checkbox" checked={state.confirmExternalLinks} onChange={(event) => void window.agentTerminal.setConfirmExternalLinks(event.target.checked)} /><i /></label>
         <label className="settings-row settings-toggle"><span><strong>Drag tabs to split</strong><small>Drop a tab on the left or right edge of the terminal</small></span><input type="checkbox" checked={allowSplitEdgeDrop} onChange={(event) => setAllowSplitEdgeDrop(event.target.checked)} /><i /></label>
         <div className="section-label">Authorized devices</div>
         <div className="device-list">

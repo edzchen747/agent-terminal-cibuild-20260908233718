@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { DesktopApi, DesktopState } from "../../shared/api";
 
 interface TerminalDataEvent {
@@ -47,11 +48,13 @@ const api: DesktopApi = {
   },
   detachSession: (sessionId) => { void invoke("detach_session", { sessionId }); },
   copyText: (text) => invoke("copy_text", { text }),
+  openExternalUrl: (url) => openUrl(url),
   startPairing: () => invoke("start_pairing"),
   retryRemoteRegistration: () => invoke("retry_remote_registration"),
   revokeDevice: (deviceId) => invoke("revoke_device", { deviceId }),
   setDefaultShell: (shellId) => invoke("set_default_shell", { shellId }),
   setOpenProjectsInNewWindows: (enabled) => invoke("set_open_projects_in_new_windows", { enabled }),
+  setConfirmExternalLinks: (enabled) => invoke("set_confirm_external_links", { enabled }),
   selectShell: (sessionId, shellId) => invoke("select_shell", { sessionId, shellId }),
   onPairingSucceeded: (callback) => {
     pairingListeners.add(callback);

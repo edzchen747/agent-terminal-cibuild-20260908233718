@@ -96,6 +96,7 @@ pub struct DesktopState {
     pub snapshot: HostSnapshot,
     pub current_project_id: String,
     pub open_projects_in_new_windows: bool,
+    pub confirm_external_links: bool,
     pub remote_registration: RemoteRegistration,
 }
 
