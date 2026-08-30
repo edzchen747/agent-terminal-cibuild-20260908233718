@@ -25,12 +25,24 @@ export function nextReconnectDelay(currentDelayMs: number): number {
 }
 
 /**
- * Heartbeat work is pointless while the page is hidden or the route is gone:
- * the socket stays open, the native service covers route-loss detection, and
- * background timers are throttled or paused anyway. Resuming restarts it.
+ * Heartbeats run while the screen is awake so a dying desktop is caught by
+ * the request timeout even when the app is in the background. They stop while
+ * the screen is off: the native service covers route loss, background timers
+ * are throttled anyway, and a missed tick is never queued - the transition
+ * back to awake runs an overdue check immediately instead.
  */
-export function heartbeatActive(documentHidden: boolean, online: boolean): boolean {
-  return !documentHidden && online;
+export function heartbeatActive(screenAwake: boolean, online: boolean): boolean {
+  return screenAwake && online;
+}
+
+/**
+ * A screen wake runs the heartbeat immediately only if the previous one ran
+ * a full interval ago, i.e. a tick was actually missed while the screen was
+ * off. A fresh handoff has a heartbeat due on schedule, so the catch-up would
+ * only add a request.
+ */
+export function heartbeatCatchUpNeeded(lastHeartbeatAtMs: number, nowMs: number): boolean {
+  return nowMs - lastHeartbeatAtMs >= HEARTBEAT_INTERVAL_MS;
 }
 
 /** What the ongoing notification should report for a given device state. */

@@ -67,6 +67,7 @@ export function App() {
   const [swipe, setSwipe] = useState<SwipeState | null>(null);
   const connectionRef = useRef<HostConnection | null>(null);
   connectionRef.current = connection;
+  const screenAwakeRef = useRef(true);
   const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings });
   navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings };
   const projectDragRef = useRef<ProjectDragState | null>(null);
@@ -180,6 +181,34 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (Capacitor.getPlatform() === "android") {
+      let disposed = false;
+      let screenListener: PluginListenerHandle | undefined;
+      const applyScreenAwake = (awake: boolean) => {
+        if (disposed) return;
+        screenAwakeRef.current = awake;
+        connectionRef.current?.setScreenAwake(awake);
+      };
+      void ConnectionNotification.getScreenState().then(({ awake }) => applyScreenAwake(awake));
+      void ConnectionNotification.addListener("screenState", ({ awake }) => applyScreenAwake(awake)).then((handle) => {
+        if (disposed) void handle.remove();
+        else screenListener = handle;
+      });
+      return () => {
+        disposed = true;
+        void screenListener?.remove();
+      };
+    }
+    const update = () => {
+      screenAwakeRef.current = !document.hidden;
+      connectionRef.current?.setScreenAwake(screenAwakeRef.current);
+    };
+    document.addEventListener("visibilitychange", update);
+    update();
+    return () => document.removeEventListener("visibilitychange", update);
+  }, []);
+
+  useEffect(() => {
     const listener = CapacitorApp.addListener("appStateChange", ({ isActive }) => {
       if (isActive) connectionRef.current?.retryNow();
     });
@@ -212,6 +241,7 @@ export function App() {
       if (!host) { setStatus("pairing"); return; }
       setStatus("connecting");
       current = new HostConnection(host);
+      current.setScreenAwake(screenAwakeRef.current);
       setRemoteRegistration(current.remoteRegistrationState());
       current.startAutoReconnect();
       setConnection(current);
@@ -288,6 +318,7 @@ export function App() {
       const next = await HostConnection.pair(payload, { id: crypto.randomUUID(), name: await deviceName(), platform });
       connection?.close();
       next.startAutoReconnect();
+      next.setScreenAwake(screenAwakeRef.current);
       setConnection(next); setSnapshot(next.snapshot ?? null); setRemoteRegistration(next.remoteRegistrationState()); setStatus("connected"); setView({ type: "home" });
       await startConnectionNotification(next.host.name);
     } catch (cause) {

@@ -7,9 +7,13 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.PowerManager;
 
 import androidx.core.content.ContextCompat;
 
+import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
@@ -20,10 +24,36 @@ public class ConnectionNotificationPlugin extends Plugin {
     public static final String ACTION_DISCONNECT_REQUESTED = "com.agentterminal.mobile.DISCONNECT_REQUESTED";
     public static final String ACTION_RECONNECT_TIMED_OUT = "com.agentterminal.mobile.RECONNECT_TIMED_OUT";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 4201;
+    private static final String SCREEN_STATE_EVENT = "screenState";
     private BroadcastReceiver connectionReceiver;
+    private BroadcastReceiver screenStateReceiver;
+    private PowerManager powerManager;
+    private final Handler screenStateHandler = new Handler(Looper.getMainLooper());
+    private final Runnable reportScreenState = () -> {
+        boolean awake = powerManager != null && powerManager.isInteractive();
+        JSObject data = new JSObject();
+        data.put("awake", awake);
+        notifyListeners(SCREEN_STATE_EVENT, data);
+    };
 
     @Override
     public void load() {
+        powerManager = (PowerManager) getContext().getSystemService(Context.POWER_SERVICE);
+        screenStateReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                screenStateHandler.removeCallbacks(reportScreenState);
+                // Debounce quick screen flickers; the runnable reads the actual
+                // interactive state so a stale broadcast cannot win.
+                screenStateHandler.postDelayed(reportScreenState, 250L);
+            }
+        };
+        IntentFilter screenFilter = new IntentFilter();
+        screenFilter.addAction(Intent.ACTION_SCREEN_ON);
+        screenFilter.addAction(Intent.ACTION_SCREEN_OFF);
+        screenFilter.addAction(Intent.ACTION_USER_PRESENT);
+        ContextCompat.registerReceiver(getContext(), screenStateReceiver, screenFilter, ContextCompat.RECEIVER_NOT_EXPORTED);
+
         connectionReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
@@ -35,6 +65,14 @@ public class ConnectionNotificationPlugin extends Plugin {
         filter.addAction(ACTION_DISCONNECT_REQUESTED);
         filter.addAction(ACTION_RECONNECT_TIMED_OUT);
         ContextCompat.registerReceiver(getContext(), connectionReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
+    }
+
+    @PluginMethod
+    public void getScreenState(PluginCall call) {
+        boolean awake = powerManager != null && powerManager.isInteractive();
+        JSObject data = new JSObject();
+        data.put("awake", awake);
+        call.resolve(data);
     }
 
     @PluginMethod
@@ -97,6 +135,11 @@ public class ConnectionNotificationPlugin extends Plugin {
             getContext().unregisterReceiver(connectionReceiver);
             connectionReceiver = null;
         }
+        if (screenStateReceiver != null) {
+            getContext().unregisterReceiver(screenStateReceiver);
+            screenStateReceiver = null;
+        }
+        screenStateHandler.removeCallbacks(reportScreenState);
         super.handleOnDestroy();
     }
 }

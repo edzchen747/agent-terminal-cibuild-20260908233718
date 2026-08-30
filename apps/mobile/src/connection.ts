@@ -2,7 +2,7 @@ import { Preferences } from "@capacitor/preferences";
 import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage } from "@agentterminal/protocol";
 import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN } from "@agentterminal/protocol";
 import { deviceName } from "./device";
-import { canAttemptConnection, heartbeatActive, nextReconnectDelay, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS } from "./connectionPolicy";
+import { canAttemptConnection, heartbeatActive, heartbeatCatchUpNeeded, nextReconnectDelay, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS } from "./connectionPolicy";
 import { EmbeddedNodeEngine, type EmbeddedNodeState } from "./embedded-engine";
 import { isDroppedNodeEnrollmentError } from "./nodeEnrollment";
 
@@ -52,6 +52,8 @@ export class HostConnection {
   private authenticated = false;
   private heartbeatTimer?: number;
   private heartbeatInFlight = false;
+  private screenAwake = true;
+  private lastHeartbeatAt = 0;
   private connectPromise?: Promise<HostSnapshot>;
   private reconnectTimer?: number;
   private reconnectTimeoutTimer?: number;
@@ -442,6 +444,10 @@ export class HostConnection {
   private startHeartbeat(): void {
     this.stopHeartbeat();
     if (!this.authenticated) return;
+    // Seed the catch-up window from the start of the cadence: a pointer
+    // measured from page load could make a screen wake fire an immediate
+    // heartbeat even though the first tick is still on schedule.
+    this.lastHeartbeatAt = performance.now();
     this.heartbeatTimer = window.setInterval(() => void this.checkHeartbeat(), HEARTBEAT_INTERVAL_MS);
   }
 
@@ -453,12 +459,15 @@ export class HostConnection {
 
   private async checkHeartbeat(): Promise<void> {
     if (this.heartbeatInFlight || !this.isConnected()) return;
-    // Liveness work is pointless while the page is hidden or the route is
-    // gone: the socket stays open, the native service covers route-loss
-    // detection, and background timers are throttled/paused anyway. Resuming
-    // or the online event restarts it.
-    if (!heartbeatActive(document.hidden, navigator.onLine)) return;
+    // Heartbeats keep running while the device screen is awake, even when the
+    // app sits in the background, so a dead desktop is caught promptly. They
+    // pause while the screen is off: background timers are throttled anyway
+    // and the native service covers route loss. A tick missed during screen
+    // off is never queued; the wake transition runs one overdue check at
+    // most (setScreenAwake).
+    if (!heartbeatActive(this.screenAwake, navigator.onLine)) return;
     this.heartbeatInFlight = true;
+    this.lastHeartbeatAt = performance.now();
     try {
       const response = await this.request({ type: "snapshot.request", requestId: createRequestId() });
       if (response.type === "snapshot") this.emit("heartbeat", response.snapshot);
@@ -467,6 +476,20 @@ export class HostConnection {
     } finally {
       this.heartbeatInFlight = false;
     }
+  }
+
+  /**
+   * Native screen events keep the heartbeat policy honest: the interval keeps
+   * ticking on its own schedule, so while the screen is off its ticks return
+   * early instead of stacking up. When the screen comes back awake, a check
+   * runs immediately only if a whole heartbeat period was missed, otherwise
+   * the next scheduled tick does it. Capped by heartbeatInFlight, so it never
+   * queues a request alongside a heartbeat in progress.
+   */
+  setScreenAwake(awake: boolean): void {
+    this.screenAwake = awake;
+    if (!awake || !this.isConnected()) return;
+    if (heartbeatCatchUpNeeded(this.lastHeartbeatAt, performance.now())) void this.checkHeartbeat();
   }
 
   private scheduleReconnect(delayOverride?: number): void {

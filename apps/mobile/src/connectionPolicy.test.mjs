@@ -4,6 +4,7 @@ import {
   canAttemptConnection,
   HEARTBEAT_INTERVAL_MS,
   heartbeatActive,
+  heartbeatCatchUpNeeded,
   nextReconnectDelay,
   notificationStateFor,
   RECONNECT_BASE_DELAY_MS,
@@ -35,11 +36,19 @@ test("the base delay never betrays the clamp even when fed degenerate values", (
   assert.equal(nextReconnectDelay(Number.MAX_SAFE_INTEGER), RECONNECT_MAX_DELAY_MS);
 });
 
-test("the notification heartbeat fires only while visible and online", () => {
-  assert.equal(heartbeatActive(false, true), true);
-  assert.equal(heartbeatActive(true, true), false, "hidden pages skip heartbeat work");
-  assert.equal(heartbeatActive(false, false), false, "offline heartbeats cannot succeed");
-  assert.equal(heartbeatActive(true, false), false);
+test("the heartbeat runs only while the device screen is awake and online", () => {
+  assert.equal(heartbeatActive(true, true), true);
+  assert.equal(heartbeatActive(false, true), false, "screen-off devices skip heartbeat work");
+  assert.equal(heartbeatActive(true, false), false, "offline heartbeats cannot succeed");
+  assert.equal(heartbeatActive(false, false), false);
+});
+
+test("a screen wake catches up only after a full heartbeat interval was missed", () => {
+  const now = 1_000_000;
+  assert.equal(heartbeatCatchUpNeeded(now - HEARTBEAT_INTERVAL_MS - 1, now), true);
+  assert.equal(heartbeatCatchUpNeeded(now - HEARTBEAT_INTERVAL_MS, now), true, "an overdue tick is a miss");
+  assert.equal(heartbeatCatchUpNeeded(now - HEARTBEAT_INTERVAL_MS + 1, now), false, "an on-schedule heartbeat waits for its tick");
+  assert.equal(heartbeatCatchUpNeeded(now, now), false);
 });
 
 test("every minute of heartbeat, no more: waiting does not wake the radio", () => {
