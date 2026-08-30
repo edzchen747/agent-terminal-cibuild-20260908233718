@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { applyTerminalModifiers, createRequestId, findHttpLinks } from "@agentterminal/protocol";
@@ -11,6 +11,9 @@ import { shouldSendResize } from "./terminalResize";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { connection: HostConnection; session: TerminalSession; active: boolean; fontWidthScale: number; }
+
+const TERMINAL_FONT_FAMILY = '"Cascadia Mono", "Roboto Mono", monospace';
+const TERMINAL_FONT_SIZE = 12;
 
 interface AccessibilityKey {
   id: string;
@@ -122,8 +125,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const terminal = new Terminal({
       cursorBlink: true,
       cursorStyle: "bar",
-      fontFamily: '"Cascadia Mono", "Roboto Mono", monospace',
-      fontSize: 12,
+      fontFamily: TERMINAL_FONT_FAMILY,
+      fontSize: TERMINAL_FONT_SIZE,
       lineHeight: 1,
       scrollback: 5000,
       screenReaderMode: true,
@@ -639,9 +642,12 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     focusInputRef.current();
   }
 
+  const squishFontSize = `${TERMINAL_FONT_SIZE * fontWidthScale}px`;
+  const squishLineHeight = `${1 / fontWidthScale}`;
+  const squishInverse = fontWidthScale > 0 ? 1 / fontWidthScale : 1;
   return <div className="mobile-terminal-shell">
     <input ref={inputRef} className="mobile-terminal-input" type="text" inputMode="text" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} aria-label="Terminal input" />
-    <div ref={hostRef} className="mobile-terminal" style={{ width: `${100 / fontWidthScale}%`, transform: `scaleX(${fontWidthScale})`, transformOrigin: "left center" }} />
+    <div ref={hostRef} className="mobile-terminal" style={{ width: `${100 / fontWidthScale}%`, transform: `scaleX(${fontWidthScale})`, transformOrigin: "left center", "--terminal-squish-font-size": squishFontSize, "--terminal-squish-line-height": squishLineHeight, "--terminal-squish-inverse": `${squishInverse}` } as CSSProperties} />
     <div className="extra-keys" data-no-swipe aria-label="Terminal function keys">
       {ACCESSIBILITY_KEY_ROWS.map((row, rowIndex) => <div className="key-row" key={rowIndex}>{row.map((key) => {
         const selected = selectedKeyIds.has(key.id);
