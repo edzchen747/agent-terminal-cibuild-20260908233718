@@ -23,4 +23,9 @@ apps/mobile/android/.gradle/
 apps/mobile/android/app/build/
 apps/mobile/android/build/
 apps/mobile/.capacitor/
+# Local environment files; templates stay tracked.
+.env
+.env.*
+!.env.example
+
 coverage/
