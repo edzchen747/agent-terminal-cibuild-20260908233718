@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   canAttemptConnection,
-  HEARTBEAT_INTERVAL_MS,
+  HEARTBEAT_ASLEEP_INTERVAL_MS,
+  HEARTBEAT_AWAKE_INTERVAL_MS,
   heartbeatActive,
   heartbeatCatchUpNeeded,
+  heartbeatIntervalMs,
   nextReconnectDelay,
   notificationStateFor,
   RECONNECT_BASE_DELAY_MS,
@@ -36,23 +38,40 @@ test("the base delay never betrays the clamp even when fed degenerate values", (
   assert.equal(nextReconnectDelay(Number.MAX_SAFE_INTEGER), RECONNECT_MAX_DELAY_MS);
 });
 
-test("the heartbeat runs only while the device screen is awake and online", () => {
-  assert.equal(heartbeatActive(true, true), true);
-  assert.equal(heartbeatActive(false, true), false, "screen-off devices skip heartbeat work");
-  assert.equal(heartbeatActive(true, false), false, "offline heartbeats cannot succeed");
-  assert.equal(heartbeatActive(false, false), false);
+test("the heartbeat cadence is 10s with the screen on and 60s with it off", () => {
+  assert.equal(heartbeatIntervalMs(true), HEARTBEAT_AWAKE_INTERVAL_MS);
+  assert.equal(heartbeatIntervalMs(false), HEARTBEAT_ASLEEP_INTERVAL_MS);
+  assert.equal(HEARTBEAT_AWAKE_INTERVAL_MS, 10_000);
+  assert.equal(HEARTBEAT_ASLEEP_INTERVAL_MS, 60_000);
 });
 
-test("a screen wake catches up only after a full heartbeat interval was missed", () => {
+test("heartbeats run while online unless the device is sleeping", () => {
+  assert.equal(heartbeatActive(true, false), true);
+  assert.equal(heartbeatActive(false, false), false, "offline heartbeats cannot succeed");
+  assert.equal(heartbeatActive(true, true), false, "doze devices skip heartbeat work");
+  assert.equal(heartbeatActive(false, true), false);
+});
+
+test("a power wake catches up only after a full cadence was missed", () => {
   const now = 1_000_000;
-  assert.equal(heartbeatCatchUpNeeded(now - HEARTBEAT_INTERVAL_MS - 1, now), true);
-  assert.equal(heartbeatCatchUpNeeded(now - HEARTBEAT_INTERVAL_MS, now), true, "an overdue tick is a miss");
-  assert.equal(heartbeatCatchUpNeeded(now - HEARTBEAT_INTERVAL_MS + 1, now), false, "an on-schedule heartbeat waits for its tick");
-  assert.equal(heartbeatCatchUpNeeded(now, now), false);
+  assert.equal(heartbeatCatchUpNeeded(now - HEARTBEAT_AWAKE_INTERVAL_MS - 1, now, HEARTBEAT_AWAKE_INTERVAL_MS), true);
+  assert.equal(heartbeatCatchUpNeeded(now - HEARTBEAT_AWAKE_INTERVAL_MS, now, HEARTBEAT_AWAKE_INTERVAL_MS), true, "an overdue tick is a miss");
+  assert.equal(heartbeatCatchUpNeeded(now - HEARTBEAT_AWAKE_INTERVAL_MS + 1, now, HEARTBEAT_AWAKE_INTERVAL_MS), false, "an on-schedule heartbeat waits for its tick");
+  assert.equal(heartbeatCatchUpNeeded(now, now, HEARTBEAT_AWAKE_INTERVAL_MS), false);
 });
 
-test("every minute of heartbeat, no more: waiting does not wake the radio", () => {
-  assert.equal(HEARTBEAT_INTERVAL_MS, 60_000);
+test("a wake from a sleep window checks against the awake cadence, not the asleep one", () => {
+  const now = 1_000_000;
+  const midInterval = now - 15_000;
+  // 15s of sleep fits inside the 60s asleep cadence, so the asleep schedule
+  // would not be overdue - but the device is interactive again, where every
+  // 10s cadence is authoritative: one check now, never a queue of refreshes.
+  assert.equal(heartbeatCatchUpNeeded(midInterval, now, HEARTBEAT_AWAKE_INTERVAL_MS), true);
+  assert.equal(heartbeatCatchUpNeeded(midInterval, now, HEARTBEAT_ASLEEP_INTERVAL_MS), false);
+});
+
+test("the asleep cadence fits a packet on a schedule that never wakes the radio harder", () => {
+  assert.equal(HEARTBEAT_AWAKE_INTERVAL_MS < HEARTBEAT_ASLEEP_INTERVAL_MS, true);
   assert.equal(RECONNECT_BASE_DELAY_MS, 1_000);
   assert.ok(RECONNECT_BASE_DELAY_MS < RECONNECT_MAX_DELAY_MS);
 });

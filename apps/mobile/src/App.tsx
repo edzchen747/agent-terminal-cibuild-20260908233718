@@ -78,6 +78,7 @@ export function App() {
   const connectionRef = useRef<HostConnection | null>(null);
   connectionRef.current = connection;
   const screenAwakeRef = useRef(true);
+  const deviceSleepingRef = useRef(false);
   const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings });
   navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings };
   const projectDragRef = useRef<ProjectDragState | null>(null);
@@ -194,13 +195,15 @@ export function App() {
     if (Capacitor.getPlatform() === "android") {
       let disposed = false;
       let screenListener: PluginListenerHandle | undefined;
-      const applyScreenAwake = (awake: boolean) => {
+      const applyPowerState = (awake: boolean, sleeping: boolean) => {
         if (disposed) return;
         screenAwakeRef.current = awake;
+        deviceSleepingRef.current = sleeping;
         connectionRef.current?.setScreenAwake(awake);
+        connectionRef.current?.setDeviceSleeping(sleeping);
       };
-      void ConnectionNotification.getScreenState().then(({ awake }) => applyScreenAwake(awake));
-      void ConnectionNotification.addListener("screenState", ({ awake }) => applyScreenAwake(awake)).then((handle) => {
+      void ConnectionNotification.getScreenState().then(({ awake, sleeping }) => applyPowerState(awake, sleeping));
+      void ConnectionNotification.addListener("screenState", ({ awake, sleeping }) => applyPowerState(awake, sleeping)).then((handle) => {
         if (disposed) void handle.remove();
         else screenListener = handle;
       });
@@ -211,7 +214,9 @@ export function App() {
     }
     const update = () => {
       screenAwakeRef.current = !document.hidden;
+      deviceSleepingRef.current = false;
       connectionRef.current?.setScreenAwake(screenAwakeRef.current);
+      connectionRef.current?.setDeviceSleeping(false);
     };
     document.addEventListener("visibilitychange", update);
     update();
@@ -252,6 +257,7 @@ export function App() {
       setStatus("connecting");
       current = new HostConnection(host);
       current.setScreenAwake(screenAwakeRef.current);
+      current.setDeviceSleeping(deviceSleepingRef.current);
       setRemoteRegistration(current.remoteRegistrationState());
       current.startAutoReconnect();
       setConnection(current);
@@ -329,6 +335,7 @@ export function App() {
       connection?.close();
       next.startAutoReconnect();
       next.setScreenAwake(screenAwakeRef.current);
+      next.setDeviceSleeping(deviceSleepingRef.current);
       setConnection(next); setSnapshot(next.snapshot ?? null); setRemoteRegistration(next.remoteRegistrationState()); setStatus("connected"); setView({ type: "home" });
       await startConnectionNotification(next.host.name, next.endpoint());
     } catch (cause) {

@@ -9,10 +9,17 @@ export const RECONNECT_BASE_DELAY_MS = 1_000;
 export const RECONNECT_MAX_DELAY_MS = 30_000;
 
 /**
- * A heartbeat every minute keeps sockets sufficient liveness detection without
- * waking the radio three times a minute while the device is in active use.
+ * Heartbeat cadence: fast while the screen is on so a dying desktop is caught
+ * promptly, slow while the screen is off to conserve radio, and none at all
+ * while the device sleeps (Doze) because the WebView is frozen anyway and a
+ * refresh could only wake the radio pointlessly.
  */
-export const HEARTBEAT_INTERVAL_MS = 60_000;
+export const HEARTBEAT_AWAKE_INTERVAL_MS = 10_000;
+export const HEARTBEAT_ASLEEP_INTERVAL_MS = 60_000;
+
+export function heartbeatIntervalMs(screenAwake: boolean): number {
+  return screenAwake ? HEARTBEAT_AWAKE_INTERVAL_MS : HEARTBEAT_ASLEEP_INTERVAL_MS;
+}
 
 /** Only attempt a connection when a route exists; offline attempts wake the radio to fail. */
 export function canAttemptConnection(online: boolean): boolean {
@@ -25,24 +32,23 @@ export function nextReconnectDelay(currentDelayMs: number): number {
 }
 
 /**
- * Heartbeats run while the screen is awake so a dying desktop is caught by
- * the request timeout even when the app is in the background. They stop while
- * the screen is off: the native service covers route loss, background timers
- * are throttled anyway, and a missed tick is never queued - the transition
- * back to awake runs an overdue check immediately instead.
+ * Heartbeats run while the device is online and awake (screen on: every 10s;
+ * screen off: every 60s). They pause entirely while the device sleeps: the
+ * OS freezes the WebView with it, so a tick cannot run, and the wake
+ * transition runs one overdue check instead of queuing.
  */
-export function heartbeatActive(screenAwake: boolean, online: boolean): boolean {
-  return screenAwake && online;
+export function heartbeatActive(online: boolean, sleeping: boolean): boolean {
+  return online && !sleeping;
 }
 
 /**
- * A screen wake runs the heartbeat immediately only if the previous one ran
- * a full interval ago, i.e. a tick was actually missed while the screen was
- * off. A fresh handoff has a heartbeat due on schedule, so the catch-up would
- * only add a request.
+ * A screen wake runs the heartbeat immediately only if the cadence-appropriate
+ * interval elapsed since the previous one, i.e. a tick was actually missed
+ * while inactive. A fresh handoff has a heartbeat due on schedule, so the
+ * catch-up would only add a request.
  */
-export function heartbeatCatchUpNeeded(lastHeartbeatAtMs: number, nowMs: number): boolean {
-  return nowMs - lastHeartbeatAtMs >= HEARTBEAT_INTERVAL_MS;
+export function heartbeatCatchUpNeeded(lastHeartbeatAtMs: number, nowMs: number, intervalMs: number): boolean {
+  return nowMs - lastHeartbeatAtMs >= intervalMs;
 }
 
 /** What the ongoing notification should report for a given device state. */

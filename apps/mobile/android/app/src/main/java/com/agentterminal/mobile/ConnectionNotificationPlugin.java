@@ -26,33 +26,41 @@ public class ConnectionNotificationPlugin extends Plugin {
     private static final int NOTIFICATION_PERMISSION_REQUEST = 4201;
     private static final String SCREEN_STATE_EVENT = "screenState";
     private BroadcastReceiver connectionReceiver;
-    private BroadcastReceiver screenStateReceiver;
+    private BroadcastReceiver powerStateReceiver;
     private PowerManager powerManager;
     private final Handler screenStateHandler = new Handler(Looper.getMainLooper());
     private final Runnable reportScreenState = () -> {
-        boolean awake = powerManager != null && powerManager.isInteractive();
-        JSObject data = new JSObject();
-        data.put("awake", awake);
+        JSObject data = screenState();
         notifyListeners(SCREEN_STATE_EVENT, data);
     };
+
+    private JSObject screenState() {
+        boolean awake = powerManager != null && powerManager.isInteractive();
+        boolean sleeping = powerManager != null && powerManager.isDeviceIdleMode();
+        JSObject data = new JSObject();
+        data.put("awake", awake);
+        data.put("sleeping", sleeping);
+        return data;
+    }
 
     @Override
     public void load() {
         powerManager = (PowerManager) getContext().getSystemService(Context.POWER_SERVICE);
-        screenStateReceiver = new BroadcastReceiver() {
+        powerStateReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
                 screenStateHandler.removeCallbacks(reportScreenState);
-                // Debounce quick screen flickers; the runnable reads the actual
-                // interactive state so a stale broadcast cannot win.
+                // Debounce quick screen flickers and handoffs; the runnable
+                // reads the actual power state so a stale broadcast cannot win.
                 screenStateHandler.postDelayed(reportScreenState, 250L);
             }
         };
-        IntentFilter screenFilter = new IntentFilter();
-        screenFilter.addAction(Intent.ACTION_SCREEN_ON);
-        screenFilter.addAction(Intent.ACTION_SCREEN_OFF);
-        screenFilter.addAction(Intent.ACTION_USER_PRESENT);
-        ContextCompat.registerReceiver(getContext(), screenStateReceiver, screenFilter, ContextCompat.RECEIVER_NOT_EXPORTED);
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_SCREEN_ON);
+        filter.addAction(Intent.ACTION_SCREEN_OFF);
+        filter.addAction(Intent.ACTION_USER_PRESENT);
+        filter.addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED);
+        ContextCompat.registerReceiver(getContext(), powerStateReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
 
         connectionReceiver = new BroadcastReceiver() {
             @Override
@@ -61,18 +69,15 @@ public class ConnectionNotificationPlugin extends Plugin {
                 else notifyListeners("disconnectRequested", null);
             }
         };
-        IntentFilter filter = new IntentFilter();
-        filter.addAction(ACTION_DISCONNECT_REQUESTED);
-        filter.addAction(ACTION_RECONNECT_TIMED_OUT);
-        ContextCompat.registerReceiver(getContext(), connectionReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
+        IntentFilter filter2 = new IntentFilter();
+        filter2.addAction(ACTION_DISCONNECT_REQUESTED);
+        filter2.addAction(ACTION_RECONNECT_TIMED_OUT);
+        ContextCompat.registerReceiver(getContext(), connectionReceiver, filter2, ContextCompat.RECEIVER_NOT_EXPORTED);
     }
 
     @PluginMethod
     public void getScreenState(PluginCall call) {
-        boolean awake = powerManager != null && powerManager.isInteractive();
-        JSObject data = new JSObject();
-        data.put("awake", awake);
-        call.resolve(data);
+        call.resolve(screenState());
     }
 
     @PluginMethod
@@ -137,9 +142,9 @@ public class ConnectionNotificationPlugin extends Plugin {
             getContext().unregisterReceiver(connectionReceiver);
             connectionReceiver = null;
         }
-        if (screenStateReceiver != null) {
-            getContext().unregisterReceiver(screenStateReceiver);
-            screenStateReceiver = null;
+        if (powerStateReceiver != null) {
+            getContext().unregisterReceiver(powerStateReceiver);
+            powerStateReceiver = null;
         }
         screenStateHandler.removeCallbacks(reportScreenState);
         super.handleOnDestroy();

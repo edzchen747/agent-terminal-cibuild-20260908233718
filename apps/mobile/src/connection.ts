@@ -1,16 +1,13 @@
 import { Preferences } from "@capacitor/preferences";
 import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage } from "@agentterminal/protocol";
-import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN } from "@agentterminal/protocol";
+import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN } from "@agentterminal/protocol";
 import { deviceName } from "./device";
-import { canAttemptConnection, heartbeatActive, heartbeatCatchUpNeeded, nextReconnectDelay, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS } from "./connectionPolicy";
+import { canAttemptConnection, heartbeatActive, heartbeatCatchUpNeeded, heartbeatIntervalMs, nextReconnectDelay, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS } from "./connectionPolicy";
 import { EmbeddedNodeEngine, type EmbeddedNodeState } from "./embedded-engine";
 import { isDroppedNodeEnrollmentError } from "./nodeEnrollment";
 
 const HOST_KEY = "agent-terminal-host";
 const REQUEST_TIMEOUT_MS = 12_000;
-// A heartbeat every minute keeps sockets sufficient liveness detection without
-// waking the radio three times a minute while the device is in active use.
-const HEARTBEAT_INTERVAL_MS = MOBILE_HEARTBEAT_INTERVAL_MS;
 const RECONNECT_TIMEOUT_MS = 30_000;
 const DROPPED_MOBILE_NODE_MESSAGE = "This phone's remote node is no longer registered. Reconnect to the desktop on LAN; remote registration will refresh automatically.";
 
@@ -53,6 +50,7 @@ export class HostConnection {
   private heartbeatTimer?: number;
   private heartbeatInFlight = false;
   private screenAwake = true;
+  private deviceSleeping = false;
   private lastHeartbeatAt = 0;
   private activeEndpoint = "";
   private connectPromise?: Promise<HostSnapshot>;
@@ -449,30 +447,34 @@ export class HostConnection {
   }
 
   private startHeartbeat(): void {
-    this.stopHeartbeat();
     if (!this.authenticated) return;
     // Seed the catch-up window from the start of the cadence: a pointer
     // measured from page load could make a screen wake fire an immediate
     // heartbeat even though the first tick is still on schedule.
     this.lastHeartbeatAt = performance.now();
-    this.heartbeatTimer = window.setInterval(() => void this.checkHeartbeat(), HEARTBEAT_INTERVAL_MS);
+    this.restartHeartbeat();
   }
 
-  private stopHeartbeat(): void {
+  /** Re-arms the interval for the current power cadence without reseeding the catch-up window. */
+  private restartHeartbeat(): void {
+    if (!this.authenticated) return;
+    this.stopHeartbeat(false);
+    this.heartbeatTimer = window.setInterval(() => void this.checkHeartbeat(), heartbeatIntervalMs(this.screenAwake));
+  }
+
+  private stopHeartbeat(resetInFlight = true): void {
     if (this.heartbeatTimer !== undefined) window.clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = undefined;
-    this.heartbeatInFlight = false;
+    if (resetInFlight) this.heartbeatInFlight = false;
   }
 
   private async checkHeartbeat(): Promise<void> {
     if (this.heartbeatInFlight || !this.isConnected()) return;
-    // Heartbeats keep running while the device screen is awake, even when the
-    // app sits in the background, so a dead desktop is caught promptly. They
-    // pause while the screen is off: background timers are throttled anyway
-    // and the native service covers route loss. A tick missed during screen
-    // off is never queued; the wake transition runs one overdue check at
-    // most (setScreenAwake).
-    if (!heartbeatActive(this.screenAwake, navigator.onLine)) return;
+    // Cadence follows the power state: 10s while the screen is on, 60s while
+    // it is off, none while the device sleeps (the WebView is frozen with it).
+    // Ticks that land while inactive return early instead of stacking up, and
+    // the wake/awake transitions run one overdue check at most (setPowerState).
+    if (!heartbeatActive(navigator.onLine, this.deviceSleeping)) return;
     this.heartbeatInFlight = true;
     this.lastHeartbeatAt = performance.now();
     try {
@@ -489,17 +491,30 @@ export class HostConnection {
   }
 
   /**
-   * Native screen events keep the heartbeat policy honest: the interval keeps
-   * ticking on its own schedule, so while the screen is off its ticks return
-   * early instead of stacking up. When the screen comes back awake, a check
-   * runs immediately only if a whole heartbeat period was missed, otherwise
-   * the next scheduled tick does it. Capped by heartbeatInFlight, so it never
-   * queues a request alongside a heartbeat in progress.
+   * Native power events keep the heartbeat policy honest: the interval ticks
+   * on its own schedule, so while the screen is off there is one check every
+   * 60s instead of 10s, and none at all while the device sleeps. Coming awake
+   * runs a check immediately when a whole cadence was missed - never a queue
+   * of accrued refreshes. heartbeatInFlight caps concurrent requests.
    */
   setScreenAwake(awake: boolean): void {
     this.screenAwake = awake;
+    if (this.heartbeatTimer !== undefined) this.restartHeartbeat();
     if (!awake || !this.isConnected()) return;
-    if (heartbeatCatchUpNeeded(this.lastHeartbeatAt, performance.now())) void this.checkHeartbeat();
+    if (heartbeatCatchUpNeeded(this.lastHeartbeatAt, performance.now(), heartbeatIntervalMs(awake))) void this.checkHeartbeat();
+  }
+
+  /**
+   * Doze/sleep enters a hard pause: the OS freezes the WebView with the
+   * device, so no timer survives anyway, and the heartbeat must not try until
+   * the device comes back. The transition back to awake is handled by
+   * setScreenAwake's overdue check.
+   */
+  setDeviceSleeping(sleeping: boolean): void {
+    this.deviceSleeping = sleeping;
+    if (this.heartbeatTimer !== undefined) this.restartHeartbeat();
+    if (sleeping || !this.isConnected()) return;
+    if (heartbeatCatchUpNeeded(this.lastHeartbeatAt, performance.now(), heartbeatIntervalMs(this.screenAwake))) void this.checkHeartbeat();
   }
 
   private scheduleReconnect(delayOverride?: number): void {
