@@ -9,18 +9,12 @@ import { claimNativeInput, isCursorPositionReport, mobileTerminalKeydownInput, n
 import type { TimedTerminalInput } from "./terminalInput";
 import { shouldSendResize } from "./terminalResize";
 import { TERMINAL_FONT_SIZE, squishFontSize as squishFontSizeValue, squishInverse as squishInverseValue, squishLineHeight as squishLineHeightValue, squishWidthPercent } from "./terminalSquish";
+import { createUtilityKeyPad, type KeyPadResult, type UtilityKey } from "./utilityKeys";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { connection: HostConnection; session: TerminalSession; active: boolean; fontWidthScale: number; }
 
 const TERMINAL_FONT_FAMILY = '"Cascadia Mono", "Roboto Mono", monospace';
-
-interface AccessibilityKey {
-  id: string;
-  label: string;
-  modifier?: TerminalModifier;
-  value?: string;
-}
 
 function openExternalLink(uri: string): void {
   try {
@@ -36,7 +30,7 @@ function openExternalLink(uri: string): void {
   }
 }
 
-const ACCESSIBILITY_KEY_ROWS: AccessibilityKey[][] = [
+const ACCESSIBILITY_KEY_ROWS: UtilityKey[][] = [
   [
     { id: "esc", label: "Esc", value: "\x1b" },
     { id: "ctrl", label: "Ctrl", modifier: "ctrl" },
@@ -49,12 +43,12 @@ const ACCESSIBILITY_KEY_ROWS: AccessibilityKey[][] = [
   [
     { id: "page-up", label: "PgUp", value: "\x1b[5~" },
     { id: "page-down", label: "PgDn", value: "\x1b[6~" },
-    { id: "word-left", label: "⌃←", value: "\x1b[1;5D" },
-    { id: "left", label: "←", value: "\x1b[D" },
-    { id: "up", label: "↑", value: "\x1b[A" },
-    { id: "down", label: "↓", value: "\x1b[B" },
-    { id: "right", label: "→", value: "\x1b[C" },
-    { id: "word-right", label: "⌃→", value: "\x1b[1;5C" }
+    { id: "word-left", label: "⌃←", value: "\x1b[1;5D", instant: true },
+    { id: "left", label: "←", value: "\x1b[D", instant: true },
+    { id: "up", label: "↑", value: "\x1b[A", instant: true },
+    { id: "down", label: "↓", value: "\x1b[B", instant: true },
+    { id: "right", label: "→", value: "\x1b[C", instant: true },
+    { id: "word-right", label: "⌃→", value: "\x1b[1;5C", instant: true }
   ]
 ];
 
@@ -66,51 +60,49 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
   activeRef.current = active;
   const resizeRef = useRef<(force?: boolean) => void>(() => undefined);
   const focusInputRef = useRef<() => void>(() => undefined);
-  const selectedKeysRef = useRef<AccessibilityKey[]>([]);
+  const keyPadRef = useRef<ReturnType<typeof createUtilityKeyPad> | null>(null);
+  if (keyPadRef.current === null) keyPadRef.current = createUtilityKeyPad();
   const countdownTimerRef = useRef<number | undefined>(undefined);
   const [selectedKeyIds, setSelectedKeyIds] = useState<ReadonlySet<string>>(new Set());
+  const [heldKeyIds, setHeldKeyIds] = useState<ReadonlySet<string>>(new Set());
   const [countdownVersion, setCountdownVersion] = useState(0);
 
-  const activeModifiers = (keys = selectedKeysRef.current) => new Set(keys.flatMap((key) => key.modifier ? [key.modifier] : []));
-
-  const clearSelectedKeys = () => {
-    if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
-    countdownTimerRef.current = undefined;
-    selectedKeysRef.current = [];
-    setSelectedKeyIds(new Set());
+  const syncKeyPad = () => {
+    const current = keyPadRef.current!.state();
+    setSelectedKeyIds(new Set(current.selected));
+    setHeldKeyIds(new Set(current.held));
+    return current;
   };
 
-  const executeChord = (keys: AccessibilityKey[]) => {
-    if (!activeRef.current) return;
-    const modifiers = activeModifiers(keys);
-    const output = keys.flatMap((key) => key.value ? [applyTerminalModifiers(key.value, modifiers)] : []).join("");
-    if (output) {
-      // Mirror the desktop write path, which reasserts its size with every
-      // key. Force it: a plain resize sends nothing when the local fit is
-      // unchanged, leaving the host at another client's PTY size.
-      resizeRef.current(true);
-      connection.send({ type: "session.input", sessionId: session.id, data: output });
-    }
+  const sendKeyData = (data: string) => {
+    if (!data || !activeRef.current) return;
+    // Mirror the desktop write path, which reasserts its size with every
+    // key. Force it: a plain resize sends nothing when the local fit is
+    // unchanged, leaving the host at another client's PTY size.
+    focusInputRef.current();
+    resizeRef.current(true);
+    connection.send({ type: "session.input", sessionId: session.id, data });
   };
 
-  const restartCountdown = (keys: AccessibilityKey[]) => {
+  const restartCountdown = (selected: readonly string[]) => {
     if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
     setCountdownVersion((version) => version + 1);
-    if (!keys.length) {
+    if (!selected.length) {
       countdownTimerRef.current = undefined;
       return;
     }
     countdownTimerRef.current = window.setTimeout(() => {
-      const pending = selectedKeysRef.current;
-      if (pending.length > 1) executeChord(pending);
-      clearSelectedKeys();
+      countdownTimerRef.current = undefined;
+      const result = keyPadRef.current!.expire();
+      syncKeyPad();
+      sendKeyData(result.data ?? "");
     }, 3000);
   };
 
-  const consumeSelectedKeys = (value: string) => {
-    const output = applyTerminalModifiers(value, activeModifiers());
-    if (selectedKeysRef.current.length) clearSelectedKeys();
-    return output;
+  const applyKeyPadResult = (result: KeyPadResult) => {
+    syncKeyPad();
+    if (result.data) sendKeyData(result.data);
+    restartCountdown(result.state.selected);
   };
 
   useLayoutEffect(() => {
@@ -239,8 +231,13 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       // resize would send nothing while our local fit is unchanged and the
       // host would keep another client's (or a lost) PTY size.
       resize(true);
-      const output = consumeSelectedKeys(data);
-      if (output) connection.send({ type: "session.input", sessionId: session.id, data: output });
+      const result = keyPadRef.current!.consume(data);
+      syncKeyPad();
+      if (result.state.selected.length === 0 && countdownTimerRef.current !== undefined) {
+        window.clearTimeout(countdownTimerRef.current);
+        countdownTimerRef.current = undefined;
+      }
+      if (result.data) connection.send({ type: "session.input", sessionId: session.id, data: result.data });
     };
     const flushPendingInput = () => {
       nativeInputTimer = undefined;
@@ -603,6 +600,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
 
   useLayoutEffect(() => {
     if (!activeRef.current) {
+      // Dropping a finger on a bare page change would otherwise keep a held
+      // modifier engaged (and its chord alive) for the next session.
+      applyKeyPadResult(keyPadRef.current!.reset());
       terminalRef.current?.clearSelection();
       const selection = document.getSelection();
       const hostElement = hostRef.current;
@@ -624,21 +624,15 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     return () => window.cancelAnimationFrame(focusFrame);
   }, [active, fontWidthScale]);
 
-  function pressAccessibilityKey(key: AccessibilityKey) {
+  function pressAccessibilityKey(key: UtilityKey) {
     if (!activeRef.current) return;
-    const current = selectedKeysRef.current;
-    const isSelected = current.some((item) => item.id === key.id);
-    const next = isSelected ? current.filter((item) => item.id !== key.id) : [...current, key];
-    if (!current.length && !isSelected && key.value) {
-      focusInputRef.current();
-      // Mirror the desktop write path, which reasserts its size with every
-      // key. Force it so the host does not keep another client's PTY size.
-      resizeRef.current(true);
-      connection.send({ type: "session.input", sessionId: session.id, data: key.value });
-    }
-    selectedKeysRef.current = next;
-    setSelectedKeyIds(new Set(next.map((item) => item.id)));
-    restartCountdown(next);
+    applyKeyPadResult(keyPadRef.current!.press(key));
+    focusInputRef.current();
+  }
+
+  function releaseAccessibilityKey(key: UtilityKey) {
+    if (!activeRef.current) return;
+    applyKeyPadResult(keyPadRef.current!.release(key.id));
     focusInputRef.current();
   }
 
@@ -651,18 +645,27 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     <div className="extra-keys" data-no-swipe aria-label="Terminal function keys">
       {ACCESSIBILITY_KEY_ROWS.map((row, rowIndex) => <div className="key-row" key={rowIndex}>{row.map((key) => {
         const selected = selectedKeyIds.has(key.id);
+        const held = heldKeyIds.has(key.id);
         return <button
           key={key.id}
           type="button"
-          aria-pressed={selected}
-          className={selected ? "latched chord-pending" : ""}
+          aria-pressed={selected || held}
+          className={`${selected ? "latched chord-pending" : ""}${held ? " held" : ""}`}
           onPointerDown={(event) => {
             event.preventDefault();
+            event.currentTarget.setPointerCapture(event.pointerId);
             pressAccessibilityKey(key);
           }}
+          onPointerUp={() => releaseAccessibilityKey(key)}
+          onPointerCancel={() => releaseAccessibilityKey(key)}
           onClick={(event) => {
-            // Pointer taps are handled immediately above. Keep keyboard activation accessible.
-            if (event.detail === 0) pressAccessibilityKey(key);
+            // Pointer taps are handled above. Keep keyboard activation accessible:
+            // a keyboard click has detail 0 and no pointer hold, so press and
+            // release in one activation.
+            if (event.detail === 0) {
+              applyKeyPadResult(keyPadRef.current!.press(key));
+              applyKeyPadResult(keyPadRef.current!.release(key.id));
+            }
           }}
         ><span>{key.label}</span>{selected && <i key={countdownVersion} className="key-countdown" />}</button>;
       })}</div>)}
