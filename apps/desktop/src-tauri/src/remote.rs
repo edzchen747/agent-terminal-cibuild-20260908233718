@@ -12,8 +12,9 @@ use uuid::Uuid;
 use crate::core::Core;
 
 pub fn start(core: Arc<Core>) {
-    // First launch exposes only the LAN pairing listener. An already enrolled
-    // identity reconnects here; a previous failure gets one automatic retry
+    // First launch exposes only the LAN pairing listener. A known remote
+    // identity is re-verified against the control server before the badge may
+    // show "enrolled" again; a previous failure gets one automatic recovery
     // on this launch and no retry loop during the session.
     core.resume_remote_node();
     let direct_core = Arc::clone(&core);

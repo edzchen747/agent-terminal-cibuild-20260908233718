@@ -48,6 +48,8 @@ const PRESENCE_WINDOW_MS: i64 = 2 * MOBILE_HEARTBEAT_INTERVAL_MS;
 /// How often to re-check liveness so the indicator flips without waiting for
 /// an unrelated broadcast.
 const PRESENCE_REFRESH_INTERVAL_MS: u64 = (MOBILE_HEARTBEAT_INTERVAL_MS / 2) as u64;
+/// How often the connectivity monitor re-probes for internet access.
+const CONNECTIVITY_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn presence_now_ms() -> i64 {
     Utc::now().timestamp_millis()
@@ -186,6 +188,45 @@ pub struct Core {
     remote_port: AtomicU16,
     direct_server_ready: AtomicBool,
     exit_requested: AtomicBool,
+    /// Runtime knowledge of internet connectivity; the connectivity monitor
+    /// keeps it updated so the badge can show "no internet" instead of a
+    /// stale stored verdict while the machine has no network.
+    network_online: AtomicBool,
+}
+
+/// One in-flight network drop should not reset the registration: the monitor
+/// only acts on actual connectivity transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectivityAction {
+    /// Connectivity was lost; the badge must show a no-internet state.
+    ShowOffline,
+    /// Connectivity came back; reset the registration to pending and
+    /// re-confirm it with the control server.
+    Verify,
+    /// No transition; nothing to do.
+    None,
+}
+
+/// Tracks connectivity readings so side effects happen only on transitions.
+#[derive(Debug, Default)]
+struct ConnectivityTracker {
+    previous: Option<bool>,
+}
+
+impl ConnectivityTracker {
+    fn record(&mut self, online: bool) -> ConnectivityAction {
+        let previous = self.previous;
+        self.previous = Some(online);
+        match previous {
+            // The first reading only establishes the baseline, but it decides
+            // the badge immediately when the machine starts out offline.
+            None if online => ConnectivityAction::None,
+            None => ConnectivityAction::ShowOffline,
+            Some(value) if value == online => ConnectivityAction::None,
+            Some(true) => ConnectivityAction::ShowOffline,
+            Some(false) => ConnectivityAction::Verify,
+        }
+    }
 }
 
 impl Core {
@@ -215,6 +256,7 @@ impl Core {
             direct_server_ready: AtomicBool::new(false),
             exit_requested: AtomicBool::new(false),
             presence_cache: Mutex::new(None),
+            network_online: AtomicBool::new(true),
         });
         core.spawn_presence_refresh();
         core
@@ -307,6 +349,34 @@ impl Core {
 
     pub fn set_direct_server_ready(&self, ready: bool) {
         self.direct_server_ready.store(ready, Ordering::Release);
+    }
+
+    /// Watches internet connectivity and drives the remote registration state
+    /// machine: a lost connection shows the no-internet badge, and regaining
+    /// connectivity resets the stored verdict to pending and re-confirms it
+    /// with the control server.
+    pub fn start_connectivity_monitor(self: &Arc<Self>) {
+        let core = Arc::clone(self);
+        std::thread::spawn(move || {
+            let mut tracker = ConnectivityTracker::default();
+            loop {
+                match tracker.record(network::internet_connected()) {
+                    ConnectivityAction::Verify => {
+                        let _ = core.reverify_remote_registration();
+                        core.set_network_online(true);
+                    }
+                    ConnectivityAction::ShowOffline => core.set_network_online(false),
+                    ConnectivityAction::None => {}
+                }
+                std::thread::sleep(CONNECTIVITY_PROBE_INTERVAL);
+            }
+        });
+    }
+
+    fn set_network_online(&self, online: bool) {
+        if self.network_online.swap(online, Ordering::AcqRel) != online {
+            self.broadcast();
+        }
     }
 
     pub fn request_exit(&self) {
@@ -590,90 +660,137 @@ impl Core {
     }
 
     pub fn resume_remote_node(self: &Arc<Self>) {
+        if self.prepare_remote_verification() {
+            self.verify_remote_node(false);
+        }
+    }
+
+    /// Connectivity came back after an outage: the stored verdict is stale, so
+    /// reset to pending and re-confirm the registration with the control
+    /// server before the badge may show "enrolled" again.
+    pub fn reverify_remote_registration(self: &Arc<Self>) -> Result<()> {
+        if self
+            .desktop_enrollment_running
+            .load(Ordering::Acquire)
+        {
+            // An enrollment run already resolves the registration against the
+            // server; restarting the node now would only race its result.
+            return Ok(());
+        }
+        if self.prepare_remote_verification() {
+            self.verify_remote_node(true);
+        }
+        Ok(())
+    }
+
+    /// Writes the pending state and reports whether a verification may begin.
+    /// Nothing is ever verified for a host that has never paired, which keeps
+    /// the badge on "LAN access ready".
+    fn prepare_remote_verification(&self) -> bool {
         let network = self.network_state();
-        if network.enrolled {
-            let core = Arc::clone(self);
-            tauri::async_runtime::spawn(async move {
-                let started = match core.start_embedded_node() {
-                    Ok(started) => started,
-                    Err(error) => {
-                        eprintln!("Agent Terminal embedded network node is unavailable: {error:#}");
-                        let _ = core.set_remote_registration(
-                            "failed",
-                            Some("Remote connection registration failed. LAN access is still available.".into()),
-                            true,
-                            None,
-                        );
-                        core.broadcast();
-                        return;
-                    }
-                };
-                if !started {
+        let has_known_registration = network.enrolled
+            || network.node_id.is_some()
+            || network.registration_status != "unregistered";
+        if !has_known_registration {
+            return false;
+        }
+        // Never trust the last stored verdict: the node may have been revoked
+        // or expired since. Default to pending and let the control server
+        // confirm the registration before showing it again.
+        if let Err(error) = self.set_remote_registration("pending", None, network.enrolled, None)
+        {
+            eprintln!("Agent Terminal could not mark remote access as pending: {error:#}");
+            return false;
+        }
+        self.broadcast();
+        true
+    }
+
+    fn verify_remote_node(self: &Arc<Self>, force_restart: bool) {
+        let core = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            if force_restart {
+                // A still-running node never rewrites its status file, so the
+                // server verdict must come from a fresh process.
+                core.stop_embedded_node();
+            }
+            let started = match core.start_embedded_node() {
+                Ok(started) => started,
+                Err(error) => {
+                    eprintln!("Agent Terminal embedded network node is unavailable: {error:#}");
                     let _ = core.set_remote_registration(
                         "failed",
-                        Some("The embedded network component is unavailable. Update the desktop app and try again.".into()),
+                        Some("Remote connection registration failed. LAN access is still available.".into()),
                         true,
                         None,
                     );
                     core.broadcast();
                     return;
                 }
+            };
+            if !started {
+                let _ = core.set_remote_registration(
+                    "failed",
+                    Some("The embedded network component is unavailable. Update the desktop app and try again.".into()),
+                    true,
+                    None,
+                );
+                core.broadcast();
+                return;
+            }
 
-                match core.wait_for_embedded_node().await {
-                    Ok(node) => {
-                        let _ = core.set_remote_registration("enrolled", None, true, Some(&node));
-                        core.broadcast();
-                    }
-                    Err(error) => {
-                        let dropped = core
-                            .embedded_node_status()
-                            .as_ref()
-                            .is_some_and(is_dropped_node_status);
-                        core.stop_embedded_node();
-                        if dropped {
-                            eprintln!(
-                                "Agent Terminal desktop node is no longer registered; requesting a replacement enrollment: {error:#}"
-                            );
-                            if let Some(device_id) = core.paired_device_id() {
-                                if let Err(retry_error) =
-                                    core.start_desktop_enrollment(device_id, true)
-                                {
-                                    eprintln!(
-                                        "Agent Terminal could not restart desktop enrollment: {retry_error:#}"
-                                    );
-                                    let _ = core.set_remote_registration(
-                                        "failed",
-                                        Some("The desktop node was removed and could not be registered again. LAN access is still available.".into()),
-                                        false,
-                                        None,
-                                    );
-                                }
-                            } else {
+            match core.wait_for_embedded_node().await {
+                Ok(node) => {
+                    let _ = core.set_remote_registration("enrolled", None, true, Some(&node));
+                    core.broadcast();
+                }
+                Err(error) => {
+                    let dropped = core
+                        .embedded_node_status()
+                        .as_ref()
+                        .is_some_and(is_dropped_node_status);
+                    core.stop_embedded_node();
+                    if dropped {
+                        eprintln!(
+                            "Agent Terminal desktop node is no longer registered; requesting a replacement enrollment: {error:#}"
+                        );
+                        if let Some(device_id) = core.paired_device_id() {
+                            if let Err(retry_error) =
+                                core.start_desktop_enrollment(device_id, true)
+                            {
+                                eprintln!(
+                                    "Agent Terminal could not restart desktop enrollment: {retry_error:#}"
+                                );
                                 let _ = core.set_remote_registration(
                                     "failed",
-                                    Some("The desktop node was removed. Pair a mobile device on LAN to register it again.".into()),
+                                    Some("The desktop node was removed and could not be registered again. LAN access is still available.".into()),
                                     false,
                                     None,
                                 );
                             }
                         } else {
-                            eprintln!(
-                                "Agent Terminal embedded network node did not resume: {error:#}"
-                            );
                             let _ = core.set_remote_registration(
                                 "failed",
-                                Some("Remote connection registration failed. LAN access is still available.".into()),
-                                true,
+                                Some("The desktop node was removed. Pair a mobile device on LAN to register it again.".into()),
+                                false,
                                 None,
                             );
                         }
-                        core.broadcast();
+                    } else {
+                        eprintln!(
+                            "Agent Terminal embedded network node did not resume: {error:#}"
+                        );
+                        let _ = core.set_remote_registration(
+                            "failed",
+                            Some("Remote connection registration failed. LAN access is still available.".into()),
+                            true,
+                            None,
+                        );
                     }
+                    core.broadcast();
                 }
-            });
-        } else if network.registration_status == "failed" {
-            let _ = self.retry_desktop_enrollment();
-        }
+            }
+        });
     }
 
     pub fn state_for_window(&self, label: &str) -> DesktopState {
@@ -684,14 +801,18 @@ impl Core {
             .map(str::to_owned)
             .unwrap_or_default();
         let online_device_ids = self.online_device_ids();
+        let network = inner.store.network();
         DesktopState {
             snapshot: snapshot_from_inner(&inner, &online_device_ids),
             current_project_id,
             open_projects_in_new_windows: inner.store.settings().open_projects_in_new_windows,
             confirm_external_links: inner.store.settings().confirm_external_links,
             remote_registration: RemoteRegistration {
-                status: inner.store.network().registration_status.clone(),
-                error: inner.store.network().registration_error.clone(),
+                status: registration_status_for_display(
+                    self.network_online.load(Ordering::Acquire),
+                    &network.registration_status,
+                ),
+                error: network.registration_error.clone(),
             },
         }
     }
@@ -2640,16 +2761,28 @@ fn take_valid_pairing_grant(
 }
 
 fn is_dropped_node_status(status: &EmbeddedNodeStatus) -> bool {
-    status.error_code == "preauth_missing"
+    matches!(status.error_code.as_str(), "preauth_missing" | "preauth_rejected")
+}
+
+/// The badge status for a given connectivity reading: while the machine has
+/// no internet the stored registration verdict is hidden and the badge shows
+/// "No internet" instead of a stale enrolled/pending/failed state.
+fn registration_status_for_display(online: bool, stored: &str) -> String {
+    if online {
+        stored.to_owned()
+    } else {
+        "offline".to_owned()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        EmbeddedNodeStatus, Inner, PairingGrant, is_cursor_position_report, is_dropped_node_status,
-        is_within_project, parse_terminal_titles, parse_working_directories,
-        presence_alive, project_name_or_folder, record_cursor_position_requests,
-        snapshot_from_inner, take_valid_pairing_grant, validate_project_name, PRESENCE_WINDOW_MS,
+        ConnectivityAction, ConnectivityTracker, EmbeddedNodeStatus, Inner, PairingGrant,
+        is_cursor_position_report, is_dropped_node_status, is_within_project,
+        parse_terminal_titles, parse_working_directories, presence_alive, project_name_or_folder,
+        record_cursor_position_requests, registration_status_for_display, snapshot_from_inner,
+        take_valid_pairing_grant, validate_project_name, PRESENCE_WINDOW_MS,
     };
     use crate::{
         models::AuthorizedDevice,
@@ -2791,11 +2924,55 @@ mod tests {
     }
 
     #[test]
-    fn missing_preauth_marks_a_saved_desktop_registration_as_dropped() {
-        let dropped = EmbeddedNodeStatus {
+    fn connectivity_tracker_only_triggers_side_effects_on_transitions() {
+        let mut tracker = ConnectivityTracker::default();
+        // The first reading only establishes a baseline.
+        assert_eq!(tracker.record(true), ConnectivityAction::None);
+        assert_eq!(tracker.record(true), ConnectivityAction::None);
+        // Losing connectivity shows the no-internet badge once.
+        assert_eq!(tracker.record(false), ConnectivityAction::ShowOffline);
+        assert_eq!(tracker.record(false), ConnectivityAction::None);
+        assert_eq!(tracker.record(false), ConnectivityAction::None);
+        // Regaining connectivity resets and re-verifies the registration.
+        assert_eq!(tracker.record(true), ConnectivityAction::Verify);
+        assert_eq!(tracker.record(true), ConnectivityAction::None);
+        // A transient probe value must not restart the embedded node.
+        assert_eq!(tracker.record(false), ConnectivityAction::ShowOffline);
+        assert_eq!(tracker.record(false), ConnectivityAction::None);
+        assert_eq!(tracker.record(true), ConnectivityAction::Verify);
+    }
+
+    #[test]
+    fn a_machine_booted_offline_shows_no_internet_without_a_verify_cycle() {
+        let mut tracker = ConnectivityTracker::default();
+        assert_eq!(tracker.record(false), ConnectivityAction::ShowOffline);
+        // Only the reconnect may trigger verification.
+        assert_eq!(tracker.record(true), ConnectivityAction::Verify);
+    }
+
+    #[test]
+    fn offline_always_overrides_the_stored_registration_status() {
+        for stored in ["unregistered", "pending", "enrolled", "failed"] {
+            assert_eq!(
+                registration_status_for_display(false, stored),
+                "offline",
+                "offline must hide a stored {stored} status"
+            );
+            assert_eq!(registration_status_for_display(true, stored), stored);
+        }
+    }
+
+    #[test]
+    fn auth_rejections_after_resume_are_treated_as_a_dropped_registration() {
+        let missing = EmbeddedNodeStatus {
             node_id: "desktop-host".into(),
             tailnet_address: String::new(),
             error_code: "preauth_missing".into(),
+        };
+        let rejected = EmbeddedNodeStatus {
+            node_id: "desktop-host".into(),
+            tailnet_address: String::new(),
+            error_code: "preauth_rejected".into(),
         };
         let unavailable = EmbeddedNodeStatus {
             node_id: "desktop-host".into(),
@@ -2803,7 +2980,8 @@ mod tests {
             error_code: "control_server_unavailable".into(),
         };
 
-        assert!(is_dropped_node_status(&dropped));
+        assert!(is_dropped_node_status(&missing));
+        assert!(is_dropped_node_status(&rejected));
         assert!(!is_dropped_node_status(&unavailable));
     }
 

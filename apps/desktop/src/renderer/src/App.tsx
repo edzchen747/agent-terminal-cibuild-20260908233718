@@ -633,7 +633,9 @@ export function App() {
       ? "Registering remote access"
       : state.remoteRegistration.status === "failed"
         ? "Remote registration failed"
-        : "LAN access ready";
+        : state.remoteRegistration.status === "offline"
+          ? "No internet"
+          : "LAN access ready";
   const menuGroup = splitMenu && (splitMenu.kind === "manage"
     ? splitGroups.find((group) => group.id === splitMenu.groupId)
     : splitMenu.kind === "tab"

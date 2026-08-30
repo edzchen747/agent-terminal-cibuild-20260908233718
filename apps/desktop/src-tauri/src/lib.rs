@@ -258,7 +258,8 @@ pub fn run() {
             app.manage(Arc::clone(&core));
             build_tray(app)?;
             core.initialize()?;
-            remote::start(core);
+            remote::start(Arc::clone(&core));
+            core.start_connectivity_monitor();
             Ok(())
         })
         .on_window_event(|window, event| match event {
