@@ -80,7 +80,8 @@ public class ConnectionNotificationPlugin extends Plugin {
         String hostName = call.getString("hostName", "Agent Terminal");
         Intent intent = new Intent(getContext(), ConnectionNotificationService.class)
             .setAction(ConnectionNotificationService.ACTION_START)
-            .putExtra(ConnectionNotificationService.EXTRA_HOST_NAME, hostName);
+            .putExtra(ConnectionNotificationService.EXTRA_HOST_NAME, hostName)
+            .putExtra(ConnectionNotificationService.EXTRA_ENDPOINT, call.getString("endpoint", ""));
         try {
             startService(intent);
         } catch (RuntimeException error) {
@@ -108,7 +109,8 @@ public class ConnectionNotificationPlugin extends Plugin {
         Intent intent = new Intent(getContext(), ConnectionNotificationService.class)
             .setAction(ConnectionNotificationService.ACTION_UPDATE)
             .putExtra(ConnectionNotificationService.EXTRA_HOST_NAME, hostName)
-            .putExtra(ConnectionNotificationService.EXTRA_STATE, state);
+            .putExtra(ConnectionNotificationService.EXTRA_STATE, state)
+            .putExtra(ConnectionNotificationService.EXTRA_ENDPOINT, call.getString("endpoint", ""));
         try {
             startService(intent);
             call.resolve();

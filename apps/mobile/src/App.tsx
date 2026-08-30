@@ -226,13 +226,13 @@ export function App() {
       const current = connectionRef.current;
       if (!current) return;
       current.retryNow();
-      if (!current.isConnected()) void updateConnectionNotification(current.host.name, notificationStateFor(true, false));
+      if (!current.isConnected()) void updateConnectionNotification(current.host.name, notificationStateFor(true, false), current.endpoint());
     };
     const handleOffline = () => {
       const current = connectionRef.current;
       if (!current) return;
       current.notifyNetworkLost();
-      void updateConnectionNotification(current.host.name, notificationStateFor(false, false));
+      void updateConnectionNotification(current.host.name, notificationStateFor(false, false), current.endpoint());
     };
     window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
@@ -255,12 +255,12 @@ export function App() {
       setRemoteRegistration(current.remoteRegistrationState());
       current.startAutoReconnect();
       setConnection(current);
-      void updateConnectionNotification(current.host.name, "reconnecting");
+      void updateConnectionNotification(current.host.name, "reconnecting", current.endpoint());
       try {
         const nextSnapshot = await current.connect();
         if (disposed) return;
         setSnapshot(nextSnapshot);
-        await startConnectionNotification(current.host.name);
+        await startConnectionNotification(current.host.name, current.endpoint());
         setStatus("connected");
       } catch (cause) {
         if (disposed || current.isClosed()) return;
@@ -271,7 +271,7 @@ export function App() {
           setStatus("error");
           return;
         }
-        void updateConnectionNotification(current.host.name, notificationStateFor(navigator.onLine, false));
+        void updateConnectionNotification(current.host.name, notificationStateFor(navigator.onLine, false), current.endpoint());
         setError("The desktop connection could not be opened. Retrying…");
         setStatus("connecting");
       }
@@ -289,7 +289,7 @@ export function App() {
       setSnapshot(nextSnapshot);
       setError("");
       setStatus("connected");
-      void startConnectionNotification(connection.host.name);
+      void startConnectionNotification(connection.host.name, connection.endpoint());
     });
     const offHeartbeat = connection.on("heartbeat", () => {
       // The native service can detect a route loss while the WebSocket still
@@ -297,12 +297,12 @@ export function App() {
       // signal for the notification in that case.
       setError("");
       setStatus("connected");
-      void updateConnectionNotification(connection.host.name, "connected");
+      void updateConnectionNotification(connection.host.name, "connected", connection.endpoint());
     });
     const offReconnecting = connection.on("reconnecting", ({ attempt }) => {
       setError(attempt === 1 ? "The desktop connection was lost. Reconnecting…" : "Still trying to reach the desktop…");
       setStatus("connecting");
-      void updateConnectionNotification(connection.host.name, notificationStateFor(navigator.onLine, false));
+      void updateConnectionNotification(connection.host.name, notificationStateFor(navigator.onLine, false), connection.endpoint());
     });
     const offReconnectFailed = connection.on("reconnectFailed", (cause) => {
       setSnapshot(null);
@@ -313,7 +313,7 @@ export function App() {
     const offDisconnect = connection.on("disconnected", () => {
       setError("The desktop connection was lost. Reconnecting…");
       setStatus("connecting");
-      void updateConnectionNotification(connection.host.name, notificationStateFor(navigator.onLine, false));
+      void updateConnectionNotification(connection.host.name, notificationStateFor(navigator.onLine, false), connection.endpoint());
     });
     const offRemoteRegistration = connection.on("remoteRegistration", setRemoteRegistration);
     setRemoteRegistration(connection.remoteRegistrationState());
@@ -330,7 +330,7 @@ export function App() {
       next.startAutoReconnect();
       next.setScreenAwake(screenAwakeRef.current);
       setConnection(next); setSnapshot(next.snapshot ?? null); setRemoteRegistration(next.remoteRegistrationState()); setStatus("connected"); setView({ type: "home" });
-      await startConnectionNotification(next.host.name);
+      await startConnectionNotification(next.host.name, next.endpoint());
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Pairing failed."); setStatus("pairing");
     }
@@ -762,14 +762,14 @@ function RemoteRegistrationBanner({ state, onRetry }: { state: RemoteRegistratio
   </aside>;
 }
 
-async function startConnectionNotification(hostName: string) {
+async function startConnectionNotification(hostName: string, endpoint = "") {
   if (Capacitor.getPlatform() !== "android") return;
-  try { await ConnectionNotification.start({ hostName }); } catch { /* The connection still works if notifications are denied. */ }
+  try { await ConnectionNotification.start({ hostName, endpoint }); } catch { /* The connection still works if notifications are denied. */ }
 }
 
-async function updateConnectionNotification(hostName: string, state: ConnectionNotificationState) {
+async function updateConnectionNotification(hostName: string, state: ConnectionNotificationState, endpoint = "") {
   if (Capacitor.getPlatform() !== "android") return;
-  try { await ConnectionNotification.update({ hostName, state }); } catch { /* The service may be unavailable while Android recreates the app process. */ }
+  try { await ConnectionNotification.update({ hostName, state, endpoint }); } catch { /* The service may be unavailable while Android recreates the app process. */ }
 }
 
 async function stopConnectionNotification() {

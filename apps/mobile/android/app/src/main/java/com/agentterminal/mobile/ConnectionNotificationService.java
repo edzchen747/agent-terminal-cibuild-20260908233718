@@ -20,12 +20,26 @@ import androidx.core.app.NotificationCompat;
 import androidx.core.app.ServiceCompat;
 import androidx.core.content.ContextCompat;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+
 public class ConnectionNotificationService extends Service {
     public static final String ACTION_START = "com.agentterminal.mobile.START_CONNECTION_NOTIFICATION";
     public static final String ACTION_UPDATE = "com.agentterminal.mobile.UPDATE_CONNECTION_NOTIFICATION";
     public static final String ACTION_DISCONNECT = "com.agentterminal.mobile.DISCONNECT_CONNECTION";
     public static final String EXTRA_HOST_NAME = "hostName";
     public static final String EXTRA_STATE = "state";
+    public static final String EXTRA_ENDPOINT = "endpoint";
     public static final String STATE_CONNECTED = "connected";
     public static final String STATE_RECONNECTING = "reconnecting";
     public static final String STATE_OFFLINE = "offline";
@@ -38,12 +52,39 @@ public class ConnectionNotificationService extends Service {
     private static final String PREFS = "connection-notification";
     private static final String PREF_HOST_NAME = "hostName";
     private static final String PREF_STATE = "state";
+    private static final String PREF_ENDPOINT = "endpoint";
     private static final long RECONNECT_TIMEOUT_MS = 30_000L;
     private static final long NETWORK_LOSS_DEBOUNCE_MS = 750L;
+    // How often the native probe re-verifies that the desktop answers the
+    // WebSocket upgrade. Tailscale keeps the UDP NAT mapping alive on its
+    // own; this probe covers the app-level exit that tailscale cannot see.
+    private static final long PROBE_INTERVAL_MS = 20_000L;
+    private static final int PROBE_SOCKET_TIMEOUT_MS = 6_000;
     private Handler reconnectTimeoutHandler;
     private boolean reconnectTimeoutScheduled;
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback networkCallback;
+    // Runs on the main thread: schedules the probe and advances its timer.
+    private final ExecutorService probeExecutor = Executors.newSingleThreadExecutor();
+    private final AtomicBoolean probeArmed = new AtomicBoolean(false);
+    private final AtomicBoolean probeRunning = new AtomicBoolean(false);
+    private final Runnable probeLoop = () -> {
+        if (!probeArmed.get() || probeRunning.get()) return;
+        String endpoint = endpointFrom(getSharedPreferences(PREFS, MODE_PRIVATE));
+        if (endpoint.isEmpty()) {
+            reconnectTimeoutHandler.postDelayed(probeLoop, PROBE_INTERVAL_MS);
+            return;
+        }
+        probeRunning.set(true);
+        probeExecutor.execute(() -> {
+            boolean alive = probeDesktop(endpoint);
+            reconnectTimeoutHandler.post(() -> {
+                probeRunning.set(false);
+                if (!alive && STATE_CONNECTED.equals(storedState())) markUnavailable();
+                if (probeArmed.get()) reconnectTimeoutHandler.postDelayed(probeLoop, PROBE_INTERVAL_MS);
+            });
+        });
+    };
     private final Runnable networkUnavailable = () -> markNetworkUnavailable();
     private final Runnable reconnectTimeout = () -> {
         reconnectTimeoutScheduled = false;
@@ -97,7 +138,15 @@ public class ConnectionNotificationService extends Service {
         // died with the old process. Never recreate a notification claiming
         // that the desktop is connected until the WebView authenticates again.
         if (restoredAfterProcessDeath) state = STATE_RECONNECTING;
-        preferences.edit().putString(PREF_HOST_NAME, hostName).putString(PREF_STATE, state).apply();
+        String endpoint = intent == null ? preferences.getString(PREF_ENDPOINT, "") : intent.getStringExtra(EXTRA_ENDPOINT);
+        if (endpoint == null || endpoint.isEmpty()) {
+            // Reconnecting updates before the new socket opens carry no
+            // endpoint; keep the last live one so the probe keeps watching
+            // the endpoint it can actually reach.
+            endpoint = preferences.getString(PREF_ENDPOINT, "");
+        }
+        if (endpoint == null) endpoint = "";
+        preferences.edit().putString(PREF_HOST_NAME, hostName).putString(PREF_STATE, state).putString(PREF_ENDPOINT, endpoint).apply();
 
         renderNotification(hostName, state);
         return START_STICKY;
@@ -136,6 +185,102 @@ public class ConnectionNotificationService extends Service {
         }
         if (STATE_RECONNECTING.equals(state)) scheduleReconnectTimeout();
         else cancelReconnectTimeout();
+        if (STATE_CONNECTED.equals(state)) {
+            probeArmed.set(true);
+            reconnectTimeoutHandler.removeCallbacks(probeLoop);
+            reconnectTimeoutHandler.postDelayed(probeLoop, PROBE_INTERVAL_MS);
+        } else {
+            probeArmed.set(false);
+            reconnectTimeoutHandler.removeCallbacks(probeLoop);
+        }
+    }
+
+    private void markUnavailable() {
+        SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String hostName = preferences.getString(PREF_HOST_NAME, null);
+        if (hostName == null || hostName.trim().isEmpty()) return;
+        // The desktop stopped answering the probe: the tailscale layer is
+        // fine (it keeps NAT mappings alive on its own) but the desktop app
+        // is gone. Show reconnecting; the WebView takes the notification
+        // back to connected after auth or a successful heartbeat, so the
+        // probe itself never claims connected. The give-up timer is left to
+        // the WebView's own loop, which runs once the screen is awake and
+        // can actually retry; while the screen is off it cannot.
+        preferences.edit().putString(PREF_STATE, STATE_RECONNECTING).apply();
+        renderNotification(hostName, STATE_RECONNECTING);
+        cancelReconnectTimeout();
+    }
+
+    /**
+     * Completes Socket.connect and the WebSocket upgrade over the endpoint the
+     * WebView socket is bound to. A live desktop answers 101 before the close
+     * we send right after; a tailnet orphan connects at the node but never
+     * reaches a local desktop app (probe dials through the same proxy), and a
+     * dead node answers nothing at all. Tailscale's own keepalives are not
+     * considered: the probe asks the desktop app itself.
+     */
+    private boolean probeDesktop(String endpoint) {
+        try {
+            URI parsed = new URI(endpoint);
+            String host = parsed.getHost();
+            int port = parsed.getPort() > 0 ? parsed.getPort() : (parsed.getScheme().equals("wss") ? 443 : 80);
+            if (host == null) return true;
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress(host, port), PROBE_SOCKET_TIMEOUT_MS);
+                socket.setSoTimeout(PROBE_SOCKET_TIMEOUT_MS);
+                BufferedOutputStream output = new BufferedOutputStream(socket.getOutputStream());
+                String key = Base64.getEncoder().encodeToString(UUID.randomUUID().toString().getBytes(StandardCharsets.UTF_8));
+                String request = "GET / HTTP/1.1\r\n"
+                    + "Host: " + host + "\r\n"
+                    + "Upgrade: websocket\r\n"
+                    + "Connection: Upgrade\r\n"
+                    + "Sec-WebSocket-Key: " + key + "\r\n"
+                    + "Sec-WebSocket-Version: 13\r\n"
+                    + "\r\n";
+                output.write(request.getBytes(StandardCharsets.UTF_8));
+                output.flush();
+                BufferedInputStream input = new BufferedInputStream(socket.getInputStream());
+                return readUpgradeAccepted(input);
+            }
+        } catch (Exception error) {
+            return false;
+        }
+    }
+
+    private boolean readUpgradeAccepted(BufferedInputStream input) throws IOException {
+        // A network read may return a partial header. Loop until the status
+        // line is complete, the stream ends, or the socket timeout fires.
+        byte[] buffer = new byte[1024];
+        StringBuilder header = new StringBuilder();
+        while (readerHasStatusCode(header) == null) {
+            int read = input.read(buffer);
+            if (read < 0) return false;
+            header.append(new String(buffer, 0, read, StandardCharsets.US_ASCII));
+            if (header.length() > 1024) return false;
+        }
+        return "101".equals(readerHasStatusCode(header));
+    }
+
+    /** Returns the HTTP status code once the status line is complete, else null. */
+    private String readerHasStatusCode(StringBuilder header) {
+        int lineEnd = header.indexOf("\r\n");
+        if (lineEnd < 0) return null;
+        String statusLine = header.substring(0, lineEnd);
+        if (!statusLine.startsWith("HTTP/1.1 ") && !statusLine.startsWith("HTTP/1.0 ")) return "";
+        int codeStart = statusLine.indexOf(' ') + 1;
+        if (codeStart + 3 > statusLine.length()) return null;
+        return statusLine.substring(codeStart, codeStart + 3);
+    }
+
+    private String storedState() {
+        SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String state = preferences.getString(PREF_STATE, null);
+        return state == null ? "" : state;
+    }
+
+    private String endpointFrom(SharedPreferences preferences) {
+        String endpoint = preferences.getString(PREF_ENDPOINT, "");
+        return endpoint == null ? "" : endpoint;
     }
 
     private void registerNetworkCallback() {
@@ -261,7 +406,12 @@ public class ConnectionNotificationService extends Service {
     @Override
     public void onDestroy() {
         cancelReconnectTimeout();
-        if (reconnectTimeoutHandler != null) reconnectTimeoutHandler.removeCallbacks(networkUnavailable);
+        probeArmed.set(false);
+        if (reconnectTimeoutHandler != null) {
+            reconnectTimeoutHandler.removeCallbacks(networkUnavailable);
+            reconnectTimeoutHandler.removeCallbacks(probeLoop);
+        }
+        probeExecutor.shutdownNow();
         if (connectivityManager != null && networkCallback != null) {
             try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (RuntimeException ignored) { }
         }

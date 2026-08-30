@@ -1,8 +1,8 @@
 import { registerPlugin } from "@capacitor/core";
 
 interface ConnectionNotificationPlugin {
-  start(options: { hostName: string }): Promise<void>;
-  update(options: { hostName: string; state: "connected" | "reconnecting" | "offline" }): Promise<void>;
+  start(options: { hostName: string; endpoint?: string }): Promise<void>;
+  update(options: { hostName: string; state: "connected" | "reconnecting" | "offline"; endpoint?: string }): Promise<void>;
   stop(): Promise<void>;
   getScreenState(): Promise<{ awake: boolean }>;
   addListener(eventName: "screenState", listenerFunc: (data: { awake: boolean }) => void): Promise<{ remove: () => Promise<void> }>;

@@ -54,6 +54,7 @@ export class HostConnection {
   private heartbeatInFlight = false;
   private screenAwake = true;
   private lastHeartbeatAt = 0;
+  private activeEndpoint = "";
   private connectPromise?: Promise<HostSnapshot>;
   private reconnectTimer?: number;
   private reconnectTimeoutTimer?: number;
@@ -197,6 +198,11 @@ export class HostConnection {
 
   isConnected(): boolean {
     return this.authenticated && this.socket?.readyState === WebSocket.OPEN;
+  }
+
+  /** The endpoint the current socket is actually bound to, for the native liveness probe. */
+  endpoint(): string {
+    return this.activeEndpoint;
   }
 
   isClosed(): boolean {
@@ -408,6 +414,7 @@ export class HostConnection {
         opened = true;
         settled = true;
         this.socket = socket;
+        this.activeEndpoint = endpoint;
         resolve();
       };
       socket.onerror = () => {
