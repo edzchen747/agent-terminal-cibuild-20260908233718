@@ -9,6 +9,7 @@ import { claimNativeInput, isCursorPositionReport, mobileTerminalKeydownInput, n
 import type { TimedTerminalInput } from "./terminalInput";
 import { shouldSendResize } from "./terminalResize";
 import { TERMINAL_FONT_SIZE, squishFontSize as squishFontSizeValue, squishInverse as squishInverseValue, squishLineHeight as squishLineHeightValue, squishWidthPercent } from "./terminalSquish";
+import { activateTerminalCursor, deactivateTerminalCursor } from "./terminalCursor";
 import { createUtilityKeyPad, type KeyPadResult, type UtilityKey } from "./utilityKeys";
 import "@xterm/xterm/css/xterm.css";
 
@@ -112,6 +113,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const focusInput = () => {
       inputElement.focus({ preventScroll: true });
       inputElement.setSelectionRange(inputElement.value.length, inputElement.value.length);
+      // The xterm textarea is display:none and cannot be focused, so xterm
+      // never sees a focus event and its cursor cell stays uninitialized.
+      // Make it believe it owns focus while the IME field actually does.
+      activateTerminalCursor(terminal.textarea);
     };
     focusInputRef.current = focusInput;
     const terminal = new Terminal({
@@ -609,6 +614,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       if (selection && hostElement && !selection.isCollapsed && (selection.anchorNode === hostElement || hostElement.contains(selection.anchorNode))) {
         selection.removeAllRanges();
       }
+      deactivateTerminalCursor(terminalRef.current?.textarea ?? null);
       terminalRef.current?.blur();
       inputRef.current?.blur();
       return;
