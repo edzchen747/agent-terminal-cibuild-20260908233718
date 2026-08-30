@@ -14,6 +14,7 @@ import type { DirectoryListing, HostSnapshot, PairingPayload, Platform, Project,
 import { createRequestId, MAX_PROJECT_NAME_LENGTH, parsePairingPayload } from "@agentterminal/protocol";
 import { HostConnection, type RemoteRegistrationState } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
+import { deviceName } from "./device";
 import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldSwallowTrailingClick } from "./gesture";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, SettingsIcon, TerminalIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
@@ -166,6 +167,19 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    // Freeze decorative CSS animations while the app is not visible so the
+    // phone can idle: infinite spin/pulse/scan effects render nothing useful
+    // once the screen it belongs to is hidden.
+    const updateMotionClass = () => document.body.classList.toggle("economy-motion", document.hidden);
+    document.addEventListener("visibilitychange", updateMotionClass);
+    updateMotionClass();
+    return () => {
+      document.removeEventListener("visibilitychange", updateMotionClass);
+      document.body.classList.remove("economy-motion");
+    };
+  }, []);
+
+  useEffect(() => {
     const listener = CapacitorApp.addListener("appStateChange", ({ isActive }) => {
       if (isActive) connectionRef.current?.retryNow();
     });
@@ -266,7 +280,7 @@ export function App() {
     try {
       const payload: PairingPayload = parsePairingPayload(raw.trim());
       const platform = (Capacitor.getPlatform() === "ios" ? "ios" : Capacitor.getPlatform() === "android" ? "android" : "web") as Platform;
-      const next = await HostConnection.pair(payload, { id: crypto.randomUUID(), name: mobileName(), platform });
+      const next = await HostConnection.pair(payload, { id: crypto.randomUUID(), name: await deviceName(), platform });
       connection?.close();
       next.startAutoReconnect();
       setConnection(next); setSnapshot(next.snapshot ?? null); setRemoteRegistration(next.remoteRegistrationState()); setStatus("connected"); setView({ type: "home" });
@@ -734,4 +748,3 @@ function PairScreen({ error, manualCode, showManual, onManualCode, onShowManual,
 
 function Splash({ label }: { label: string }) { return <div className="splash"><span className="logo large"><TerminalIcon /></span><strong>Agent Terminal</strong><small>{label}…</small><i className="loader" /></div>; }
 function ErrorScreen({ message, onRetry, onForget }: { message: string; onRetry: () => void; onForget: () => void }) { return <div className="error-screen"><span className="offline-icon"><WifiIcon /></span><h1>Desktop unavailable</h1><p>{message}</p><button className="mobile-primary full" onClick={onRetry}>Try again</button><button className="text-button" onClick={onForget}>Pair a different desktop</button></div>; }
-function mobileName() { const platform = Capacitor.getPlatform(); return platform === "android" ? "Android phone" : platform === "ios" ? "iPhone" : "Web client"; }

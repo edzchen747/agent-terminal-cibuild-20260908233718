@@ -1,12 +1,15 @@
 import { Preferences } from "@capacitor/preferences";
 import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage } from "@agentterminal/protocol";
 import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN } from "@agentterminal/protocol";
+import { deviceName } from "./device";
 import { EmbeddedNodeEngine, type EmbeddedNodeState } from "./embedded-engine";
 import { isDroppedNodeEnrollmentError } from "./nodeEnrollment";
 
 const HOST_KEY = "agent-terminal-host";
 const REQUEST_TIMEOUT_MS = 12_000;
-const HEARTBEAT_INTERVAL_MS = 20_000;
+// A heartbeat every minute keeps sockets sufficient liveness detection without
+// waking the radio three times a minute while the device is in active use.
+const HEARTBEAT_INTERVAL_MS = 60_000;
 const RECONNECT_BASE_DELAY_MS = 1_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const RECONNECT_TIMEOUT_MS = 30_000;
@@ -128,6 +131,13 @@ export class HostConnection {
       return this.snapshot;
     }
     if (this.connectPromise) return this.connectPromise;
+    if (!hasInternet()) {
+      // No route, no attempt: connecting can only fail, wake the radio, and
+      // burn battery. The online event triggers the retry when the route is
+      // back; the notification service already shows "reconnecting".
+      this.clearReconnectTimeout();
+      throw new Error("Waiting for an internet connection.");
+    }
 
     this.startReconnectTimeout();
     let failed = false;
@@ -161,7 +171,7 @@ export class HostConnection {
   }
 
   retryNow(): void {
-    if (!this.autoReconnect || this.closed) return;
+    if (!this.autoReconnect || this.closed || !hasInternet()) return;
     if (this.socket?.readyState === WebSocket.OPEN) {
       void this.checkHeartbeat();
       return;
@@ -173,12 +183,15 @@ export class HostConnection {
 
   notifyNetworkLost(): void {
     if (!this.autoReconnect || this.closed) return;
+    // Pause all reconnect bookkeeping while the route is gone. A closed
+    // socket cannot connect and every attempt would wake the radio.
+    this.clearReconnectTimer();
+    this.clearReconnectTimeout();
     if (this.socket?.readyState === WebSocket.OPEN || this.socket?.readyState === WebSocket.CONNECTING) {
       this.socket.close();
       return;
     }
-    this.clearReconnectTimer();
-    this.scheduleReconnect(0);
+    if (hasInternet()) this.scheduleReconnect(0);
   }
 
   isConnected(): boolean {
@@ -296,7 +309,7 @@ export class HostConnection {
         }
         await this.open(nodeState.proxyEndpoint ?? remoteEndpoint, 8_000);
       }
-      const response = await this.request({ type: "auth", requestId: createRequestId(), deviceId: this.host.deviceId, deviceToken: this.host.deviceToken });
+      const response = await this.request({ type: "auth", requestId: createRequestId(), deviceId: this.host.deviceId, deviceToken: this.host.deviceToken, name: await deviceName() });
       if (response.type !== "auth.accepted") throw new Error("This phone is not authorized by the desktop.");
       this.snapshot = response.snapshot;
       this.authenticated = true;
@@ -441,6 +454,10 @@ export class HostConnection {
 
   private async checkHeartbeat(): Promise<void> {
     if (this.heartbeatInFlight || !this.isConnected()) return;
+    // Liveness work is pointless while the page is hidden: the socket stays
+    // open, the native service covers route-loss detection, and timers are
+    // throttled/paused in the background anyway. Resuming restarts it.
+    if (document.hidden) return;
     this.heartbeatInFlight = true;
     try {
       const response = await this.request({ type: "snapshot.request", requestId: createRequestId() });
@@ -454,6 +471,12 @@ export class HostConnection {
 
   private scheduleReconnect(delayOverride?: number): void {
     if (!this.autoReconnect || this.closed || this.reconnectTimer !== undefined || this.connectPromise) return;
+    if (!hasInternet()) {
+      // Defer reconnects instead of failing: the online event restarts the
+      // connection with the base delay when a route exists again.
+      this.clearReconnectTimeout();
+      return;
+    }
     this.startReconnectTimeout();
     const delayMs = delayOverride ?? this.reconnectDelay;
     this.reconnectAttempt += 1;
@@ -472,6 +495,7 @@ export class HostConnection {
 
   private startReconnectTimeout(): void {
     if (!this.autoReconnect || this.closed || this.isConnected() || this.reconnectTimeoutTimer !== undefined) return;
+    if (!hasInternet()) return;
     this.reconnectTimeoutTimer = window.setTimeout(() => {
       this.reconnectTimeoutTimer = undefined;
       if (!this.autoReconnect || this.closed || this.isConnected()) return;
@@ -533,6 +557,10 @@ export class HostConnection {
 
 function defaultRemoteEndpoint(hostId: string): string {
   return `ws://${hostId}.${OVERLAY_TAILNET_DOMAIN}:47831`;
+}
+
+function hasInternet(): boolean {
+  return navigator.onLine;
 }
 
 function isEmbeddedNodeConfigurationError(error: unknown): boolean {

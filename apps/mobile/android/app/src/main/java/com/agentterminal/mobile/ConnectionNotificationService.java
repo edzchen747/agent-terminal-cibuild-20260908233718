@@ -28,10 +28,11 @@ public class ConnectionNotificationService extends Service {
     public static final String EXTRA_STATE = "state";
     public static final String STATE_CONNECTED = "connected";
     public static final String STATE_RECONNECTING = "reconnecting";
-    // Use a new channel id so devices that already created the old muted
-    // channel get the new importance instead of keeping its user-visible
-    // settings forever.
-    private static final String CHANNEL_ID = "agent-terminal-connection-v2";
+    // Use a new channel id whenever the channel configuration changes so
+    // devices that already created an older channel get the new importance
+    // and sound behavior instead of keeping the user-visible immutable
+    // settings of the old channel forever.
+    private static final String CHANNEL_ID = "agent-terminal-connection-v3";
     private static final int NOTIFICATION_ID = 9001;
     private static final String PREFS = "connection-notification";
     private static final String PREF_HOST_NAME = "hostName";
@@ -57,7 +58,15 @@ public class ConnectionNotificationService extends Service {
         reconnectTimeoutHandler = new Handler(Looper.getMainLooper());
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            manager.createNotificationChannel(new NotificationChannel(CHANNEL_ID, "Terminal connection", NotificationManager.IMPORTANCE_DEFAULT));
+            // High importance (heads-up capable feature status, never muted)
+            // but silent: no sound, vibration, or lights, so the ongoing
+            // connection notification never interrupts but still ranks high.
+            NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "Terminal connection", NotificationManager.IMPORTANCE_HIGH);
+            channel.setSound(null, null);
+            channel.setVibrationEnabled(false);
+            channel.enableLights(false);
+            channel.setShowBadge(false);
+            manager.createNotificationChannel(channel);
         }
         registerNetworkCallback();
     }
@@ -111,7 +120,11 @@ public class ConnectionNotificationService extends Service {
             .setShowWhen(false)
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            // High priority, but silent: no sound or vibration for a status
+            // notification that is up for hours at a time. On pre-O devices
+            // the flags below take effect; on O+ the channel above governs.
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setSilent(true)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .addAction(new NotificationCompat.Action.Builder(0, "Disconnect", disconnectPendingIntent).build())
             .build();
@@ -134,6 +147,12 @@ public class ConnectionNotificationService extends Service {
                 // handoff. JavaScript still has to authenticate or complete
                 // a heartbeat before the notification returns to connected.
                 reconnectTimeoutHandler.removeCallbacks(networkUnavailable);
+                // The route is back; resume the give-up timer only if the
+                // WebView has not recovered on its own yet.
+                SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
+                if (STATE_RECONNECTING.equals(preferences.getString(PREF_STATE, null))) {
+                    scheduleReconnectTimeout();
+                }
             }
 
             @Override
@@ -141,8 +160,11 @@ public class ConnectionNotificationService extends Service {
                 // A WebSocket can remain OPEN after the underlying route is
                 // gone. Update the service-owned notification after a short
                 // handoff grace period; the WebView will move it back to
-                // connected after auth or a successful heartbeat.
+                // connected after auth or a successful heartbeat. Also pause
+                // the give-up timer: reconnects are deferred until the route
+                // returns, and give-up would only drain the battery.
                 reconnectTimeoutHandler.removeCallbacks(networkUnavailable);
+                cancelReconnectTimeout();
                 reconnectTimeoutHandler.postDelayed(networkUnavailable, NETWORK_LOSS_DEBOUNCE_MS);
             }
         };
@@ -160,10 +182,16 @@ public class ConnectionNotificationService extends Service {
         if (hostName == null || hostName.trim().isEmpty()) return;
         preferences.edit().putString(PREF_STATE, STATE_RECONNECTING).apply();
         renderNotification(hostName, STATE_RECONNECTING);
+        // The route is gone: wait for connectivity to return before giving up.
+        cancelReconnectTimeout();
     }
 
     private void scheduleReconnectTimeout() {
         if (reconnectTimeoutScheduled) return;
+        // Without an active network no reconnect attempt can succeed; holding
+        // the device awake just to give up would drain the battery. Wait for
+        // the route to return (onAvailable re-arms the timer) instead.
+        if (connectivityManager != null && connectivityManager.getActiveNetwork() == null) return;
         reconnectTimeoutScheduled = true;
         reconnectTimeoutHandler.postDelayed(reconnectTimeout, RECONNECT_TIMEOUT_MS);
     }
