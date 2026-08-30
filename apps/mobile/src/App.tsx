@@ -17,6 +17,7 @@ import { ConnectionNotification } from "./connection-notification";
 import { notificationStateFor, type ConnectionNotificationState } from "./connectionPolicy";
 import { deviceName } from "./device";
 import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_SLIDER_HORIZONTAL_BIAS } from "./gesture";
+import { effectiveDefaultShell } from "./defaultShell";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, SettingsIcon, TerminalIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
 
@@ -67,6 +68,7 @@ export function App() {
   const [projectToRename, setProjectToRename] = useState<Project | null>(null);
   const [sessionToClose, setSessionToClose] = useState<TerminalSession | null>(null);
   const [showTerminalSettings, setShowTerminalSettings] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [fontWidthPercent, setFontWidthPercent] = useState(100);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
@@ -79,8 +81,8 @@ export function App() {
   connectionRef.current = connection;
   const screenAwakeRef = useRef(true);
   const deviceSleepingRef = useRef(false);
-  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings });
-  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings };
+  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings });
+  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings };
   const projectDragRef = useRef<ProjectDragState | null>(null);
   const projectElementsRef = useRef(new Map<string, HTMLElement>());
   const swipeRef = useRef<SwipeState | null>(null);
@@ -117,6 +119,10 @@ export function App() {
       const navigation = navigationRef.current;
       if (navigation.showTerminalSettings) {
         setShowTerminalSettings(false);
+        return;
+      }
+      if (navigation.showSettings) {
+        setShowSettings(false);
         return;
       }
       if (navigation.projectToRename) {
@@ -494,7 +500,7 @@ export function App() {
       swipeRef.current = next;
       return;
     }
-    if (showTerminalSettings || projectToRename || sessionToClose || showCreateProject) return;
+    if (showTerminalSettings || showSettings || projectToRename || sessionToClose || showCreateProject) return;
     const terminalText = target?.closest(".xterm-accessibility-tree");
     const selection = document.getSelection();
     const draggingTerminalSelection = Boolean(terminalText && selection && !selection.isCollapsed && selection.anchorNode && terminalText.contains(selection.anchorNode));
@@ -694,6 +700,7 @@ export function App() {
   }
 
   function dismissActiveSheet() {
+    if (showSettings) { setShowSettings(false); return; }
     if (showTerminalSettings) { setShowTerminalSettings(false); return; }
     if (projectToRename) { setProjectToRename(null); return; }
     if (sessionToClose) { setSessionToClose(null); return; }
@@ -719,7 +726,7 @@ export function App() {
         <RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} />
         <header className="home-header">
           <div><span className="eyebrow">Connected desktop</span><h1>{snapshot.host.name}</h1><span className="connection-label"><i /> Online · {snapshot.sessions.filter((s) => s.status === "running").length} sessions</span></div>
-          <button className="round-button" onClick={() => void forgetHost()} title="Host options"><MoreIcon /></button>
+          <button className="round-button" onClick={() => setShowSettings(true)} title="Settings" aria-label="App settings"><MoreIcon /></button>
         </header>
         <section className="home-content">
           <div className="section-title"><span>Projects</span><button onClick={() => setShowCreateProject(true)}><PlusIcon /> New</button></div>
@@ -740,6 +747,7 @@ export function App() {
     {projectToRename && activeProject?.id === projectToRename.id && <RenameProjectSheet project={activeProject} connection={connection} onClose={() => setProjectToRename(null)} />}
     {sessionToClose && activeSession?.id === sessionToClose.id && <CloseSessionSheet session={activeSession} onClose={() => setSessionToClose(null)} onConfirm={() => closeSession(activeSession)} />}
     {showTerminalSettings && <TerminalSettingsSheet value={fontWidthPercent} onChange={(value) => { setFontWidthPercent(value); void Preferences.set({ key: TERMINAL_FONT_WIDTH_KEY, value: String(value) }); }} onClose={() => setShowTerminalSettings(false)} />}
+    {showSettings && <SettingsSheet snapshot={snapshot} connection={connection} fontWidthPercent={fontWidthPercent} onFontWidthChange={(value) => { setFontWidthPercent(value); void Preferences.set({ key: TERMINAL_FONT_WIDTH_KEY, value: String(value) }); }} onClose={() => setShowSettings(false)} />}
   </div>;
 }
 
@@ -829,7 +837,28 @@ function ProjectCard({ project, sessions, dragging, reordering, transform, eleme
 }
 
 function TerminalSettingsSheet({ value, onChange, onClose }: { value: number; onChange: (value: number) => void; onClose: () => void }) {
-  return <div className="sheet-backdrop" onClick={onClose}><section className="bottom-sheet terminal-settings-sheet" data-no-swipe onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Terminal display</span><h2>Fit more text</h2><p>Squish characters horizontally while keeping their height readable. The terminal refits to show more columns.</p><label className="font-width-control"><span><strong>Character width</strong><output>{value}%</output></span><input type="range" min="65" max="100" step="1" value={value} onChange={(event) => onChange(Number(event.target.value))} /></label><div className="font-width-preview"><span className="font-width-preview-text" style={{ transform: `scaleX(${value / 100})` }}>C:\project&gt; npm run dev</span></div><button className="mobile-primary full" onClick={onClose}>Done</button></section></div>;
+  return <div className="sheet-backdrop" onClick={onClose}><section className="bottom-sheet terminal-settings-sheet" data-no-swipe onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Terminal display</span><h2>Fit more text</h2><p>Squish characters horizontally while keeping their height readable. The terminal refits to show more columns.</p><FontWidthControl value={value} onChange={onChange} /><button className="mobile-primary full" onClick={onClose}>Done</button></section></div>;
+}
+
+function FontWidthControl({ value, onChange }: { value: number; onChange: (value: number) => void }) {
+  return <><label className="font-width-control"><span><strong>Character width</strong><output>{value}%</output></span><input type="range" min="65" max="100" step="1" value={value} onChange={(event) => onChange(Number(event.target.value))} /></label><div className="font-width-preview"><span className="font-width-preview-text" style={{ transform: `scaleX(${value / 100})` }}>C:\project&gt; npm run dev</span></div></>;
+}
+
+function SettingsSheet({ snapshot, connection, fontWidthPercent, onFontWidthChange, onClose }: { snapshot: HostSnapshot; connection: HostConnection; fontWidthPercent: number; onFontWidthChange: (value: number) => void; onClose: () => void }) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const selectedShellId = effectiveDefaultShell(snapshot.shells, snapshot.defaultShellId);
+  async function syncDefaultShell(shellId: string) {
+    setSaving(true); setError("");
+    try {
+      await connection.request({ type: "shell.default", requestId: createRequestId(), shellId });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not change the default terminal.");
+    } finally {
+      setSaving(false);
+    }
+  }
+  return <div className="sheet-backdrop" data-busy={saving ? "" : undefined} onClick={saving ? undefined : onClose}><section className="bottom-sheet" data-no-swipe onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Settings</span><h2>Preferences</h2><label className="shell-control"><span><strong>Default terminal</strong><small>New sessions use this shell, on the phone and the desktop</small></span><select value={selectedShellId} disabled={saving || !snapshot.shells.length} onChange={(event) => void syncDefaultShell(event.target.value)}>{snapshot.shells.map((shell) => <option key={shell.id} value={shell.id}>{shell.name}</option>)}</select></label>{!snapshot.shells.length && <div className="form-error">No terminal profiles are available on the desktop.</div>}{error && <div className="form-error">{error}</div>}<FontWidthControl value={fontWidthPercent} onChange={onFontWidthChange} /><button className="mobile-primary full" onClick={onClose}>Done</button></section></div>;
 }
 
 function CreateProjectSheet({ connection, onClose }: { connection: HostConnection; onClose: () => void }) {
@@ -892,7 +921,7 @@ function MobileHeader({ title, subtitle, onBack, trailing }: { title: string; su
 }
 
 function PairScreen({ error, manualCode, showManual, onManualCode, onShowManual, onScan, onPair }: { error: string; manualCode: string; showManual: boolean; onManualCode: (value: string) => void; onShowManual: () => void; onScan: () => void; onPair: () => void }) {
-  return <div className="onboarding"><div className="ambient one"/><div className="ambient two"/><div className="onboarding-top"><span className="logo"><TerminalIcon /></span><strong>Agent Terminal</strong></div><section className="pair-copy"><span className="eyebrow">Desktop, untethered</span><h1>Your Windows terminal.<br/><em>Now in your pocket.</em></h1><p>Scan once to authorize this phone. It stays paired until you remove it from the desktop.</p></section><div className="scan-illustration"><span className="scan-corner tl"/><span className="scan-corner tr"/><span className="scan-corner bl"/><span className="scan-corner br"/><div className="qr-art"><i/><i/><i/><i/><i/><i/><i/><i/><i/></div><div className="scan-line"/></div>{error && <div className="pair-error">{error}</div>}<section className="pair-actions"><button className="scan-button" onClick={onScan}><ScanIcon /> Authorize this phone</button>{showManual ? <div className="manual-pair"><textarea value={manualCode} onChange={(event) => onManualCode(event.target.value)} placeholder="Paste setup QR data"/><button onClick={onPair}>Authorize</button></div> : <button className="manual-link" onClick={onShowManual}>Enter setup data manually</button>}<small>Future connections work automatically from any network.</small></section></div>;
+  return <div className="onboarding"><div className="ambient one"/><div className="ambient two"/><div className="onboarding-top"><span className="logo"><TerminalIcon /></span><strong>Agent Terminal</strong></div><section className="pair-copy"><span className="eyebrow">Desktop, untethered</span><h1>Your Windows terminal.<br/><em>Now in your pocket.</em></h1><p>Scan once while both devices are on the same network to authorize this phone. Once paired, connect to your desktop from anywhere.</p></section><div className="scan-illustration"><span className="scan-corner tl"/><span className="scan-corner tr"/><span className="scan-corner bl"/><span className="scan-corner br"/><div className="qr-art"><i/><i/><i/><i/><i/><i/><i/><i/><i/></div><div className="scan-line"/></div>{error && <div className="pair-error">{error}</div>}<section className="pair-actions"><button className="scan-button" onClick={onScan}><ScanIcon /> Authorize this phone</button>{showManual ? <div className="manual-pair"><textarea value={manualCode} onChange={(event) => onManualCode(event.target.value)} placeholder="Paste setup QR data"/><button onClick={onPair}>Authorize</button></div> : <button className="manual-link" onClick={onShowManual}>Enter setup data manually</button>}<small>Future connections work automatically from any network.</small></section></div>;
 }
 
 function Splash({ label }: { label: string }) { return <div className="splash"><span className="logo large"><TerminalIcon /></span><strong>Agent Terminal</strong><small>{label}…</small><i className="loader" /></div>; }

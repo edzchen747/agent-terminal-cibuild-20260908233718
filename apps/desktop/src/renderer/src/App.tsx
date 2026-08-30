@@ -794,7 +794,7 @@ export function App() {
         <button className="modal-close icon-button" onClick={() => setModal(null)}><CloseIcon /></button>
         <div className="modal-kicker"><PhoneIcon /> Connect your phone</div>
         <h1>Pair once. Reconnect anytime.</h1>
-        <p>Scan this QR once to add your phone as an authorized device. It stays paired across every network until you revoke it in Settings.</p>
+        <p>Scan this QR once to add your phone as an authorized device. It stays paired across every network until you revoke it in Settings. Note: Both devices must be connected to the same Wi-Fi network for the initial setup.</p>
         <div className={`qr-frame ${pairError ? "has-error" : ""}`}>{qr ? <img src={qr} alt="Mobile pairing QR" /> : pairError ? <div className="pair-error">{pairError}</div> : <div className="qr-loading">Preparing secure pairing…</div>}</div>
         <div className="pair-details"><span><i /> This phone stays authorized</span><span>Reconnect from anywhere</span></div>
       </section></div>}

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, applyTerminalModifiers, decodeClientMessage, encodeMessage, encodePairingPayload, findHttpLinks, parsePairingPayload, parseTerminalWorkingDirectories } from "./index.js";
+import type { ClientMessage } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -94,6 +95,23 @@ test("messages encode as JSON", () => {
     encodeMessage({ type: "directory.list", requestId: "r4", path: "C:\\Users\\Ada" }),
     '{"type":"directory.list","requestId":"r4","path":"C:\\\\Users\\\\Ada"}'
   );
+});
+
+test("the default terminal syncs through a shell.default message", () => {
+  const message: ClientMessage = { type: "shell.default", requestId: "r9", shellId: "git-bash" };
+  const encoded = encodeMessage(message);
+  assert.equal(encoded, '{"type":"shell.default","requestId":"r9","shellId":"git-bash"}');
+  assert.deepEqual(decodeClientMessage(encoded), message);
+});
+
+test("shell.default survives adversarial ids and empty request ids", () => {
+  const message: ClientMessage = { type: "shell.default", requestId: "", shellId: "cmd \" % \\\\ ;" };
+  assert.deepEqual(decodeClientMessage(encodeMessage(message)), message);
+});
+
+test("shell.default decoding tolerates unknown fields added by newer clients", () => {
+  const decoded = decodeClientMessage({ type: "shell.default", requestId: "r9", shellId: "cmd", shellArgs: ["-NoLogo"] });
+  assert.deepEqual(decoded, { type: "shell.default", requestId: "r9", shellId: "cmd", shellArgs: ["-NoLogo"] });
 });
 
 test("mobile terminal modifiers encode control characters", () => {

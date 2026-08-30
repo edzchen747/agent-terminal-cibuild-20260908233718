@@ -228,6 +228,11 @@ pub enum ClientMessage {
         rows: u16,
         force: Option<bool>,
     },
+    #[serde(rename = "shell.default")]
+    ShellDefault {
+        request_id: String,
+        shell_id: String,
+    },
 }
 
 impl ClientMessage {
@@ -246,7 +251,8 @@ impl ClientMessage {
             | Self::SessionCreate { request_id, .. }
             | Self::SessionClose { request_id, .. }
             | Self::SessionAttach { request_id, .. }
-            | Self::SessionDetach { request_id, .. } => Some(request_id),
+            | Self::SessionDetach { request_id, .. }
+            | Self::ShellDefault { request_id, .. } => Some(request_id),
             Self::SessionInput { .. } | Self::SessionResize { .. } => None,
         }
     }
@@ -332,6 +338,43 @@ mod tests {
         .expect("server message");
         assert_eq!(json["type"], "ok");
         assert_eq!(json["requestId"], "r1");
+    }
+
+    #[test]
+    fn shell_default_carries_the_chosen_terminal_through_the_wire_contract() {
+        let message: ClientMessage = serde_json::from_str(
+            r#"{"type":"shell.default","requestId":"r5","shellId":"git-bash"}"#,
+        )
+        .expect("shell.default command");
+        assert!(matches!(
+            message,
+            ClientMessage::ShellDefault { ref shell_id, .. } if shell_id == "git-bash"
+        ));
+        assert_eq!(message.request_id(), Some("r5"));
+
+        // A missing or unknown shell id must never decode as a valid command:
+        // the desktop answers with an error instead of touching its store.
+        let invalid: Result<ClientMessage, _> = serde_json::from_str(
+            r#"{"type":"shell.default","requestId":"r6","shellId":""}"#,
+        );
+        assert!(invalid.is_ok());
+        assert!(matches!(
+            invalid.expect("empty value still parses"),
+            ClientMessage::ShellDefault { shell_id, .. } if shell_id.is_empty()
+        ));
+
+        // The type tag is what routes a command; a lookalike must be rejected
+        // so a typo'd or newer type cannot silently fall through to a handler.
+        let lookalike: Result<ClientMessage, _> =
+            serde_json::from_str(r#"{"type":"shell.defaultValue","requestId":"r7","shellId":"cmd"}"#);
+        assert!(lookalike.is_err());
+
+        // SessionInput and SessionResize intentionally carry no request id;
+        // the new command returning one must not disturb that split.
+        let input: ClientMessage =
+            serde_json::from_str(r#"{"type":"session.input","sessionId":"s1","data":"echo hi"}"#)
+                .expect("fire-and-forget input");
+        assert_eq!(input.request_id(), None);
     }
 
     #[test]

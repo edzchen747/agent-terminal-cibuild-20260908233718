@@ -2094,6 +2094,13 @@ impl Core {
                 self.close_session(&session_id);
                 Some(ServerMessage::Ok { request_id })
             }
+            ClientMessage::ShellDefault { request_id, shell_id } => {
+                self.set_default_shell(&shell_id)?;
+                Some(ServerMessage::Snapshot {
+                    request_id: Some(request_id),
+                    snapshot: self.snapshot(),
+                })
+            }
             ClientMessage::SessionAttach {
                 request_id,
                 session_id,
@@ -3010,5 +3017,105 @@ mod tests {
             .unwrap(),
             "Custom name"
         );
+    }
+
+    #[test]
+    fn snapshot_reports_the_valid_default_shell_and_falls_back_on_a_stale_one() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
+        let shells = vec![
+            shell_profile("powershell"),
+            shell_profile("cmd"),
+            shell_profile("git-bash"),
+        ];
+        store
+            .set_default_shell("git-bash".into())
+            .expect("pick a known shell");
+
+        let mut inner = test_inner(store, shells.clone());
+        assert_eq!(
+            snapshot_from_inner(&inner, &HashSet::new()).default_shell_id,
+            "git-bash",
+            "the stored default name is reported unchanged"
+        );
+
+        // A shell profile that later disappears must not leak into snapshots:
+        // the first available shell becomes the honest default instead.
+        inner.store.set_default_shell("removed-profile".into()).expect("stale value");
+        assert_eq!(
+            snapshot_from_inner(&inner, &HashSet::new()).default_shell_id,
+            "powershell",
+            "a stale default falls back to the first available shell"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn snapshot_without_shell_profiles_falls_back_to_cmd() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let store = DesktopStore::load(state_path.clone()).expect("initial store");
+        let inner = test_inner(store, Vec::new());
+        assert_eq!(
+            snapshot_from_inner(&inner, &HashSet::new()).default_shell_id,
+            "cmd",
+            "an empty shell list still reports a usable default"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn the_default_shell_survives_a_store_reload() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        {
+            let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
+            store
+                .set_default_shell("cmd".into())
+                .expect("change the default");
+        }
+        {
+            let shell = shell_profile("cmd");
+            let store = DesktopStore::load(state_path.clone()).expect("reload store");
+            let inner = test_inner(store, vec![shell]);
+            assert_eq!(
+                snapshot_from_inner(&inner, &HashSet::new()).default_shell_id,
+                "cmd",
+                "the desktop option persists across restarts so a phone pick sticks"
+            );
+        }
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    fn shell_profile(id: &str) -> crate::models::ShellProfile {
+        crate::models::ShellProfile {
+            id: id.into(),
+            name: id.into(),
+            executable: id.into(),
+            args: Vec::new(),
+        }
+    }
+
+    fn test_inner(store: DesktopStore, shells: Vec<crate::models::ShellProfile>) -> Inner {
+        Inner {
+            store,
+            shells,
+            temporary_projects: HashMap::new(),
+            project_order: Vec::new(),
+            sessions: HashMap::new(),
+            session_order: Vec::new(),
+            windows: WindowClients::default(),
+            pairing_grants: HashMap::new(),
+        }
     }
 }

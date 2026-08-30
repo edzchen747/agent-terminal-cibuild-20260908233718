@@ -222,7 +222,8 @@ export type ClientMessage =
   | { type: "session.attach"; requestId: string; sessionId: string; cols: number; rows: number }
   | { type: "session.detach"; requestId: string; sessionId: string }
   | { type: "session.input"; sessionId: string; data: string }
-  | { type: "session.resize"; sessionId: string; cols: number; rows: number; force?: boolean };
+  | { type: "session.resize"; sessionId: string; cols: number; rows: number; force?: boolean }
+  | { type: "shell.default"; requestId: string; shellId: string };
 
 export type ServerMessage =
   | { type: "pair.accepted"; requestId: string; deviceToken: string; snapshot: HostSnapshot }
