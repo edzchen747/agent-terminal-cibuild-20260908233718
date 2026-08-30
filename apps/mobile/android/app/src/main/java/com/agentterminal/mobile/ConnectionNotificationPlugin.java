@@ -62,7 +62,8 @@ public class ConnectionNotificationPlugin extends Plugin {
         String hostName = call.getString("hostName", "Agent Terminal");
         String state = call.getString("state", ConnectionNotificationService.STATE_RECONNECTING);
         if (!ConnectionNotificationService.STATE_CONNECTED.equals(state) &&
-            !ConnectionNotificationService.STATE_RECONNECTING.equals(state)) {
+            !ConnectionNotificationService.STATE_RECONNECTING.equals(state) &&
+            !ConnectionNotificationService.STATE_OFFLINE.equals(state)) {
             call.reject("The connection notification state is invalid.");
             return;
         }

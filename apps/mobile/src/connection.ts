@@ -2,6 +2,7 @@ import { Preferences } from "@capacitor/preferences";
 import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage } from "@agentterminal/protocol";
 import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN } from "@agentterminal/protocol";
 import { deviceName } from "./device";
+import { canAttemptConnection, heartbeatActive, nextReconnectDelay, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS } from "./connectionPolicy";
 import { EmbeddedNodeEngine, type EmbeddedNodeState } from "./embedded-engine";
 import { isDroppedNodeEnrollmentError } from "./nodeEnrollment";
 
@@ -10,8 +11,6 @@ const REQUEST_TIMEOUT_MS = 12_000;
 // A heartbeat every minute keeps sockets sufficient liveness detection without
 // waking the radio three times a minute while the device is in active use.
 const HEARTBEAT_INTERVAL_MS = MOBILE_HEARTBEAT_INTERVAL_MS;
-const RECONNECT_BASE_DELAY_MS = 1_000;
-const RECONNECT_MAX_DELAY_MS = 30_000;
 const RECONNECT_TIMEOUT_MS = 30_000;
 const DROPPED_MOBILE_NODE_MESSAGE = "This phone's remote node is no longer registered. Reconnect to the desktop on LAN; remote registration will refresh automatically.";
 
@@ -454,10 +453,11 @@ export class HostConnection {
 
   private async checkHeartbeat(): Promise<void> {
     if (this.heartbeatInFlight || !this.isConnected()) return;
-    // Liveness work is pointless while the page is hidden: the socket stays
-    // open, the native service covers route-loss detection, and timers are
-    // throttled/paused in the background anyway. Resuming restarts it.
-    if (document.hidden) return;
+    // Liveness work is pointless while the page is hidden or the route is
+    // gone: the socket stays open, the native service covers route-loss
+    // detection, and background timers are throttled/paused anyway. Resuming
+    // or the online event restarts it.
+    if (!heartbeatActive(document.hidden, navigator.onLine)) return;
     this.heartbeatInFlight = true;
     try {
       const response = await this.request({ type: "snapshot.request", requestId: createRequestId() });
@@ -481,7 +481,7 @@ export class HostConnection {
     const delayMs = delayOverride ?? this.reconnectDelay;
     this.reconnectAttempt += 1;
     this.emit("reconnecting", { attempt: this.reconnectAttempt, delayMs });
-    this.reconnectDelay = Math.min(RECONNECT_MAX_DELAY_MS, Math.max(RECONNECT_BASE_DELAY_MS, this.reconnectDelay * 2));
+    this.reconnectDelay = nextReconnectDelay(this.reconnectDelay);
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = undefined;
       void this.connect().catch(() => undefined);
@@ -560,7 +560,7 @@ function defaultRemoteEndpoint(hostId: string): string {
 }
 
 function hasInternet(): boolean {
-  return navigator.onLine;
+  return canAttemptConnection(navigator.onLine);
 }
 
 function isEmbeddedNodeConfigurationError(error: unknown): boolean {

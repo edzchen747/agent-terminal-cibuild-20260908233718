@@ -14,13 +14,13 @@ import type { DirectoryListing, HostSnapshot, PairingPayload, Platform, Project,
 import { createRequestId, MAX_PROJECT_NAME_LENGTH, parsePairingPayload } from "@agentterminal/protocol";
 import { HostConnection, type RemoteRegistrationState } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
+import { notificationStateFor, type ConnectionNotificationState } from "./connectionPolicy";
 import { deviceName } from "./device";
 import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldSwallowTrailingClick } from "./gesture";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, SettingsIcon, TerminalIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
 
 type View = { type: "home" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
-type ConnectionNotificationState = "connected" | "reconnecting";
 const TERMINAL_FONT_WIDTH_KEY = "agent-terminal-font-width-percent";
 const SWALLOW_CLICK_LINGER_MS = 600;
 const SWALLOW_CLICK_DISTANCE_PX = 48;
@@ -183,12 +183,17 @@ export function App() {
     const listener = CapacitorApp.addListener("appStateChange", ({ isActive }) => {
       if (isActive) connectionRef.current?.retryNow();
     });
-    const handleOnline = () => connectionRef.current?.retryNow();
+    const handleOnline = () => {
+      const current = connectionRef.current;
+      if (!current) return;
+      current.retryNow();
+      if (!current.isConnected()) void updateConnectionNotification(current.host.name, notificationStateFor(true, false));
+    };
     const handleOffline = () => {
       const current = connectionRef.current;
       if (!current) return;
       current.notifyNetworkLost();
-      void updateConnectionNotification(current.host.name, "reconnecting");
+      void updateConnectionNotification(current.host.name, notificationStateFor(false, false));
     };
     window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
@@ -226,7 +231,7 @@ export function App() {
           setStatus("error");
           return;
         }
-        void updateConnectionNotification(current.host.name, "reconnecting");
+        void updateConnectionNotification(current.host.name, notificationStateFor(navigator.onLine, false));
         setError("The desktop connection could not be opened. Retrying…");
         setStatus("connecting");
       }
@@ -257,7 +262,7 @@ export function App() {
     const offReconnecting = connection.on("reconnecting", ({ attempt }) => {
       setError(attempt === 1 ? "The desktop connection was lost. Reconnecting…" : "Still trying to reach the desktop…");
       setStatus("connecting");
-      void updateConnectionNotification(connection.host.name, "reconnecting");
+      void updateConnectionNotification(connection.host.name, notificationStateFor(navigator.onLine, false));
     });
     const offReconnectFailed = connection.on("reconnectFailed", (cause) => {
       setSnapshot(null);
@@ -268,7 +273,7 @@ export function App() {
     const offDisconnect = connection.on("disconnected", () => {
       setError("The desktop connection was lost. Reconnecting…");
       setStatus("connecting");
-      void updateConnectionNotification(connection.host.name, "reconnecting");
+      void updateConnectionNotification(connection.host.name, notificationStateFor(navigator.onLine, false));
     });
     const offRemoteRegistration = connection.on("remoteRegistration", setRemoteRegistration);
     setRemoteRegistration(connection.remoteRegistrationState());

@@ -28,6 +28,7 @@ public class ConnectionNotificationService extends Service {
     public static final String EXTRA_STATE = "state";
     public static final String STATE_CONNECTED = "connected";
     public static final String STATE_RECONNECTING = "reconnecting";
+    public static final String STATE_OFFLINE = "offline";
     // Use a new channel id whenever the channel configuration changes so
     // devices that already created an older channel get the new importance
     // and sound behavior instead of keeping the user-visible immutable
@@ -91,7 +92,7 @@ public class ConnectionNotificationService extends Service {
         }
         if (hostName == null || hostName.trim().isEmpty()) hostName = "Agent Terminal";
         String state = intent == null ? preferences.getString(PREF_STATE, STATE_RECONNECTING) : intent.getStringExtra(EXTRA_STATE);
-        if (!STATE_CONNECTED.equals(state) && !STATE_RECONNECTING.equals(state)) state = STATE_CONNECTED;
+        if (!STATE_CONNECTED.equals(state) && !STATE_RECONNECTING.equals(state) && !STATE_OFFLINE.equals(state)) state = STATE_CONNECTED;
         // A sticky service restart means the WebView and its socket may have
         // died with the old process. Never recreate a notification claiming
         // that the desktop is connected until the WebView authenticates again.
@@ -126,7 +127,7 @@ public class ConnectionNotificationService extends Service {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setSilent(true)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .addAction(new NotificationCompat.Action.Builder(0, "Disconnect", disconnectPendingIntent).build())
+            .addAction(new NotificationCompat.Action.Builder(0, STATE_CONNECTED.equals(state) ? "Disconnect" : "Cancel", disconnectPendingIntent).build())
             .build();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING);
@@ -147,10 +148,19 @@ public class ConnectionNotificationService extends Service {
                 // handoff. JavaScript still has to authenticate or complete
                 // a heartbeat before the notification returns to connected.
                 reconnectTimeoutHandler.removeCallbacks(networkUnavailable);
-                // The route is back; resume the give-up timer only if the
-                // WebView has not recovered on its own yet.
+                // The route is back. A "waiting for internet" notification
+                // upgrades to reconnecting so it never lingers past the
+                // handoff; the give-up timer resumes only if the WebView has
+                // not recovered on its own yet.
                 SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
-                if (STATE_RECONNECTING.equals(preferences.getString(PREF_STATE, null))) {
+                String storedState = preferences.getString(PREF_STATE, null);
+                if (STATE_OFFLINE.equals(storedState)) {
+                    String hostName = preferences.getString(PREF_HOST_NAME, null);
+                    if (hostName != null && !hostName.trim().isEmpty()) {
+                        preferences.edit().putString(PREF_STATE, STATE_RECONNECTING).apply();
+                        renderNotification(hostName, STATE_RECONNECTING);
+                    }
+                } else if (STATE_RECONNECTING.equals(storedState)) {
                     scheduleReconnectTimeout();
                 }
             }
@@ -222,10 +232,25 @@ public class ConnectionNotificationService extends Service {
         context.getSharedPreferences(PREFS, MODE_PRIVATE).edit().clear().apply();
     }
 
-    private static String notificationText(String hostName, String state) {
+    private String notificationText(String hostName, String state) {
+        if (STATE_OFFLINE.equals(state)) return "Waiting for an internet connection to " + hostName + "…";
+        if (STATE_RECONNECTING.equals(state) && !hasActiveNetwork()) {
+            // The route is gone but the WebView has not called back yet: the
+            // reconnect loop is paused by design, so do not promise a retry.
+            return "Waiting for an internet connection to " + hostName + "…";
+        }
         return STATE_RECONNECTING.equals(state)
             ? "Reconnecting to " + hostName + "…"
             : "Connected to " + hostName;
+    }
+
+    private boolean hasActiveNetwork() {
+        if (connectivityManager == null) return true;
+        try {
+            return connectivityManager.getActiveNetwork() != null;
+        } catch (RuntimeException ignored) {
+            return true;
+        }
     }
 
     @Override
