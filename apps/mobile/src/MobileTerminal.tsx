@@ -10,6 +10,7 @@ import type { TimedTerminalInput } from "./terminalInput";
 import { shouldSendResize } from "./terminalResize";
 import { TERMINAL_FONT_SIZE, squishFontSize as squishFontSizeValue, squishInverse as squishInverseValue, squishLineHeight as squishLineHeightValue, squishWidthPercent } from "./terminalSquish";
 import { activateTerminalCursor, deactivateTerminalCursor } from "./terminalCursor";
+import { guardUtilityKeySelection } from "./utilityKeySelection";
 import { createUtilityKeyPad, type KeyPadResult, type UtilityKey } from "./utilityKeys";
 import "@xterm/xterm/css/xterm.css";
 
@@ -648,7 +649,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
   return <div className="mobile-terminal-shell">
     <input ref={inputRef} className="mobile-terminal-input" type="text" inputMode="text" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} aria-label="Terminal input" />
     <div ref={hostRef} className="mobile-terminal" style={{ width: squishWidthPercent(fontWidthScale), transform: `scaleX(${fontWidthScale})`, transformOrigin: "left center", "--terminal-squish-font-size": squishFontSize, "--terminal-squish-line-height": squishLineHeight, "--terminal-squish-inverse": `${squishInverse}` } as CSSProperties} />
-    <div className="extra-keys" data-no-swipe aria-label="Terminal function keys">
+    <div className="extra-keys" data-no-swipe aria-label="Terminal function keys" ref={(element) => guardUtilityKeySelection(element)}>
       {ACCESSIBILITY_KEY_ROWS.map((row, rowIndex) => <div className="key-row" key={rowIndex}>{row.map((key) => {
         const selected = selectedKeyIds.has(key.id);
         const held = heldKeyIds.has(key.id);
