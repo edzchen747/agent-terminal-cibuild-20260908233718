@@ -38,6 +38,19 @@ export function classifyGestureAxis(deltaX: number, deltaY: number, horizontalBi
 export const SHEET_SLIDER_HORIZONTAL_BIAS = 0.6;
 
 /**
+ * Whether the chain of ancestors from a tap up to an overlay's sheet root
+ * contains a scrolling section. Only an ordered overflow-y chain is needed:
+ * the first auto/scroll container marks a region that scrolls natively (the
+ * folder picker's directory list), in which case the swipe-down dismissal
+ * must not be registered. A chain of only visible/hidden/clip values leaves
+ * the gesture free, so a swipe down starting on the character-width slider
+ * still dismisses.
+ */
+export function hasScrollableSheetAncestor(overflowYChain: readonly string[]): boolean {
+  return overflowYChain.some((value) => value === "auto" || value === "scroll");
+}
+
+/**
  * Whether a pointer-up is a taut tap whose activation must be fired directly,
  * because Chromium's fling recognizer may swallow the click it would normally
  * deliver after a touch drag. When true the caller runs the click activation
