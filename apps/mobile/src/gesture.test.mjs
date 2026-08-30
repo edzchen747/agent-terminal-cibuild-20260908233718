@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyGestureAxis, shouldBridgeTapClick, TAP_MAX_DURATION_MS, TAP_MAX_MOVE_PX } from "./gesture.ts";
+import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldSwallowTrailingClick, TAP_MAX_DURATION_MS, TAP_MAX_MOVE_PX } from "./gesture.ts";
 
 test("gesture intent waits through initial touch jitter", () => {
   assert.equal(classifyGestureAxis(5, 4), "pending");
@@ -46,4 +46,45 @@ test("mouse, secondary pointers, cancels and moves are ignored", () => {
   assert.equal(shouldBridgeTapClick({ ...baseTap, pointerType: "mouse" }), false);
   assert.equal(shouldBridgeTapClick({ ...baseTap, isPrimary: false }), false);
   assert.equal(shouldBridgeTapClick({ ...baseTap, eventType: "pointercancel" }), false);
+});
+
+const plainControl = {
+  nearestControl: "button",
+  insideBottomSheet: false,
+  insideExtraKeys: false,
+  isDragHandle: false
+};
+
+test("the first tap after a simulated fast flick is bridged on a plain button", () => {
+  assert.equal(shouldBridgeTapClick(baseTap), true);
+  assert.equal(shouldBridgeTapControl(plainControl), true);
+});
+
+test("the first tap after a simulated fast flick is bridged on links, labels, summaries and role buttons", () => {
+  for (const nearestControl of ["link", "label", "summary", "roleButton"]) {
+    assert.equal(shouldBridgeTapControl({ ...plainControl, nearestControl }), true);
+  }
+});
+
+test("a tap on sheet content is not turned into a backdrop dismissal", () => {
+  assert.equal(shouldBridgeTapControl({ ...plainControl, nearestControl: "backdrop", insideBottomSheet: true }), false);
+  assert.equal(shouldBridgeTapControl({ ...plainControl, nearestControl: "backdrop", insideBottomSheet: false }), true);
+});
+
+test("controls that own their pointer sequence are never double-activated", () => {
+  assert.equal(shouldBridgeTapControl({ ...plainControl, insideExtraKeys: true }), false);
+  assert.equal(shouldBridgeTapControl({ ...plainControl, isDragHandle: true }), false);
+});
+
+test("no control under the tap means nothing is synthesized", () => {
+  assert.equal(shouldBridgeTapControl({ ...plainControl, nearestControl: null }), false);
+});
+
+test("the trailing click of a bridged tap is swallowed only near the tap", () => {
+  assert.equal(shouldSwallowTrailingClick({ armed: true, nearTap: true }), true);
+  assert.equal(shouldSwallowTrailingClick({ armed: true, nearTap: false }), false);
+});
+
+test("an unarmed guard never swallows a click", () => {
+  assert.equal(shouldSwallowTrailingClick({ armed: false, nearTap: true }), false);
 });

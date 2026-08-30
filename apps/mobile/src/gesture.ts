@@ -34,3 +34,40 @@ export function shouldBridgeTapClick(input: {
     && input.now - input.startedAt <= TAP_MAX_DURATION_MS
     && input.movePx <= TAP_MAX_MOVE_PX;
 }
+
+export interface TapControlInfo {
+  /** The tap's own closest interactive ancestor kind, or null. */
+  nearestControl: "button" | "link" | "summary" | "label" | "roleButton" | "backdrop" | null;
+  /** Whether the tap itself landed on bottom-sheet content. */
+  insideBottomSheet: boolean;
+  /** Whether the tap landed inside the terminal function key rows. */
+  insideExtraKeys: boolean;
+  /** Whether the nearest control is the project reorder handle. */
+  isDragHandle: boolean;
+}
+
+/**
+ * Whether the control under a bridged tap may be activated by synthesizing a
+ * click. Only real interactive controls qualify; controls that own their
+ * pointer sequence (terminal function keys, reorder handles) would run twice,
+ * and a tap on sheet content must not be turned into a backdrop dismissal.
+ */
+export function shouldBridgeTapControl(control: TapControlInfo): boolean {
+  if (!control.nearestControl) return false;
+  if (control.nearestControl === "backdrop" && control.insideBottomSheet) return false;
+  if (control.insideExtraKeys) return false;
+  if (control.isDragHandle) return false;
+  return true;
+}
+
+/**
+ * Whether a click event that trails a bridged tap must be swallowed. The
+ * guard is one-shot: if the click is not the one it waits for, it still
+ * disarms and the fresh interaction passes through.
+ */
+export function shouldSwallowTrailingClick(input: {
+  armed: boolean;
+  nearTap: boolean;
+}): boolean {
+  return input.armed && input.nearTap;
+}

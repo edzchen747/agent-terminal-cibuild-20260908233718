@@ -14,7 +14,7 @@ import type { DirectoryListing, HostSnapshot, PairingPayload, Platform, Project,
 import { createRequestId, MAX_PROJECT_NAME_LENGTH, parsePairingPayload } from "@agentterminal/protocol";
 import { HostConnection, type RemoteRegistrationState } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
-import { classifyGestureAxis, shouldBridgeTapClick } from "./gesture";
+import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldSwallowTrailingClick } from "./gesture";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, SettingsIcon, TerminalIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
 
@@ -501,17 +501,21 @@ export function App() {
       movePx: Math.hypot(event.clientX - state.startX, event.clientY - state.startY)
     })) return;
     const target = event.target instanceof Element ? event.target : undefined;
-    const control = target?.closest("button, a, summary, label, [role=button], .sheet-backdrop");
+    if (!target) return;
+    const control = target.closest("button, a, summary, label, [role=button], .sheet-backdrop");
     if (!(control instanceof HTMLElement)) return;
     // A click inside a bottom sheet is stopped by the sheet section; only a
-    // tap on the backdrop itself dismisses it. Do not synthesize a backdrop
-    // dismissal for taps that a real click would not deliver there either.
-    if (control.classList.contains("sheet-backdrop") && target?.closest(".bottom-sheet")) return;
-    // Controls that own their pointer sequence (terminal function keys, project
-    // reorder handles) already activate without a click; a synthetic click
-    // would run them a second time.
-    if (control.closest(".extra-keys")) return;
-    if (control.matches(".mobile-project-drag")) return;
+    // tap on the backdrop itself dismisses it. Controls that own their pointer
+    // sequence (terminal function keys, project reorder handles) already
+    // activate without a click and a synthetic click would run them twice.
+    if (!shouldBridgeTapControl({
+      nearestControl: control.classList.contains("sheet-backdrop")
+        ? "backdrop"
+        : control.matches("a") ? "link" : control.matches("summary") ? "summary" : control.matches("label") ? "label" : control.matches("button") ? "button" : "roleButton",
+      insideBottomSheet: Boolean(target.closest(".bottom-sheet")),
+      insideExtraKeys: Boolean(target.closest(".extra-keys")),
+      isDragHandle: control.matches(".mobile-project-drag")
+    })) return;
     control.click();
     swallowTapClickRef.current = true;
     swallowTapClickAtRef.current = { x: event.clientX, y: event.clientY };
@@ -526,25 +530,21 @@ export function App() {
   function suppressSwipeClick(event: React.MouseEvent<HTMLDivElement>) {
     if (swallowTapClickRef.current) {
       const nearTap = Math.hypot(event.clientX - swallowTapClickAtRef.current.x, event.clientY - swallowTapClickAtRef.current.y) <= SWALLOW_CLICK_DISTANCE_PX;
-      if (nearTap) {
-        // The browser click that trails a bridged tap (or the compatibility
-        // click of the gesture itself). The synthetic click already ran the
-        // control's action; swallow this one so it cannot fire twice.
-        swallowTapClickRef.current = false;
-        swallowTapClickAtRef.current = { x: 0, y: 0 };
-        if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current);
-        swallowTapClickTimerRef.current = undefined;
-        event.preventDefault();
-        event.stopPropagation();
-        return;
-      }
-      // A real click on another page/control must pass. The delayed click this
-      // guard waits for targets the tap position, so a far-away click is a
-      // fresh, unrelated interaction.
+      const swallow = shouldSwallowTrailingClick({ armed: swallowTapClickRef.current, nearTap });
+      // The guard is one-shot: whether or not this is the click it waited
+      // for, it never outlives this event. A far-away click is a fresh,
+      // unrelated interaction that must pass through.
       swallowTapClickRef.current = false;
       swallowTapClickAtRef.current = { x: 0, y: 0 };
       if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current);
       swallowTapClickTimerRef.current = undefined;
+      if (swallow) {
+        // The browser click that trails a bridged tap (or the compatibility
+        // click of the gesture itself). The synthetic click already ran the
+        // control's action; swallow this one so it cannot fire twice.
+        event.preventDefault();
+        event.stopPropagation();
+      }
       return;
     }
     if (!suppressSwipeClickRef.current) return;
