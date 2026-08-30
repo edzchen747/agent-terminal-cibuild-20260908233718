@@ -9,6 +9,7 @@ import { claimNativeInput, isCursorPositionReport, mobileTerminalKeydownInput, n
 import type { TimedTerminalInput } from "./terminalInput";
 import { shouldSendResize } from "./terminalResize";
 import { TERMINAL_FONT_SIZE, squishFontSize as squishFontSizeValue, squishInverse as squishInverseValue, squishLineHeight as squishLineHeightValue, squishWidthPercent } from "./terminalSquish";
+import { TERMINAL_FONT_FAMILY, preloadTerminalFonts } from "./terminalFonts";
 import { activateTerminalCursor, deactivateTerminalCursor } from "./terminalCursor";
 import { guardUtilityKeySelection } from "./utilityKeySelection";
 import { createUtilityKeyPad, type KeyPadResult, type UtilityKey } from "./utilityKeys";
@@ -16,7 +17,9 @@ import "@xterm/xterm/css/xterm.css";
 
 interface Props { connection: HostConnection; session: TerminalSession; active: boolean; fontWidthScale: number; }
 
-const TERMINAL_FONT_FAMILY = '"Cascadia Mono", "Roboto Mono", monospace';
+// Start fetching the terminal font faces as soon as the app loads so xterm
+// never measures with device fallback glyphs (see fonts.test.mjs).
+void preloadTerminalFonts();
 
 function openExternalLink(uri: string): void {
   try {
@@ -111,16 +114,20 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const hostElement = hostRef.current;
     const inputElement = inputRef.current;
     if (!hostElement || !inputElement) return;
-    const focusInput = () => {
-      inputElement.focus({ preventScroll: true });
-      inputElement.setSelectionRange(inputElement.value.length, inputElement.value.length);
-      // The xterm textarea is display:none and cannot be focused, so xterm
-      // never sees a focus event and its cursor cell stays uninitialized.
-      // Make it believe it owns focus while the IME field actually does.
-      activateTerminalCursor(terminal.textarea);
-    };
-    focusInputRef.current = focusInput;
-    const terminal = new Terminal({
+    let disposed = false;
+    let cleanup: (() => void) | undefined;
+    void preloadTerminalFonts().then(() => {
+      if (disposed) return;
+      const focusInput = () => {
+        inputElement.focus({ preventScroll: true });
+        inputElement.setSelectionRange(inputElement.value.length, inputElement.value.length);
+        // The xterm textarea is display:none and cannot be focused, so xterm
+        // never sees a focus event and its cursor cell stays uninitialized.
+        // Make it believe it owns focus while the IME field actually does.
+        activateTerminalCursor(terminal.textarea);
+      };
+      focusInputRef.current = focusInput;
+      const terminal = new Terminal({
       cursorBlink: true,
       cursorStyle: "bar",
       fontFamily: TERMINAL_FONT_FAMILY,
@@ -365,7 +372,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     inputElement.addEventListener("beforeinput", handleNativeBeforeInput, true);
     inputElement.addEventListener("input", handleNativeInput);
     inputElement.addEventListener("compositionend", handleCompositionEnd);
-    let disposed = false;
     const pendingOutput: string[] = [];
     const output = connection.on("output", (event) => {
       if (event.sessionId !== session.id) return;
@@ -580,7 +586,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     }).catch((cause) => {
       if (!disposed) terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
     });
-    return () => {
+      cleanup = () => {
       disposed = true;
       void attachment.finally(() => connection.send({ type: "session.detach", requestId: createRequestId(), sessionId: session.id }));
       observer.disconnect();
@@ -601,6 +607,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       input.dispose(); output(); httpLinkProvider.dispose(); terminal.dispose(); terminalRef.current = null;
       resizeRef.current = () => undefined;
       focusInputRef.current = () => undefined;
+      };
+    });
+    return () => {
+      disposed = true;
+      cleanup?.();
     };
   }, [connection, session.id]);
 
