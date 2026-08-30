@@ -48,12 +48,12 @@ const ACCESSIBILITY_KEY_ROWS: UtilityKey[][] = [
   [
     { id: "page-up", label: "PgUp", value: "\x1b[5~" },
     { id: "page-down", label: "PgDn", value: "\x1b[6~" },
-    { id: "word-left", label: "⌃←", value: "\x1b[1;5D", instant: true },
-    { id: "left", label: "←", value: "\x1b[D", instant: true },
-    { id: "up", label: "↑", value: "\x1b[A", instant: true },
-    { id: "down", label: "↓", value: "\x1b[B", instant: true },
-    { id: "right", label: "→", value: "\x1b[C", instant: true },
-    { id: "word-right", label: "⌃→", value: "\x1b[1;5C", instant: true }
+    { id: "word-left", label: "⌃←", value: "\x1b[1;5D" },
+    { id: "left", label: "←", value: "\x1b[D" },
+    { id: "up", label: "↑", value: "\x1b[A" },
+    { id: "down", label: "↓", value: "\x1b[B" },
+    { id: "right", label: "→", value: "\x1b[C" },
+    { id: "word-right", label: "⌃→", value: "\x1b[1;5C" }
   ]
 ];
 
@@ -70,14 +70,12 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
   const focusInputRef = useRef<() => void>(() => undefined);
   const keyPadRef = useRef<ReturnType<typeof createUtilityKeyPad> | null>(null);
   if (keyPadRef.current === null) keyPadRef.current = createUtilityKeyPad();
-  const countdownTimerRef = useRef<number | undefined>(undefined);
-  const [selectedKeyIds, setSelectedKeyIds] = useState<ReadonlySet<string>>(new Set());
+  const [latchedKeyIds, setLatchedKeyIds] = useState<ReadonlySet<string>>(new Set());
   const [heldKeyIds, setHeldKeyIds] = useState<ReadonlySet<string>>(new Set());
-  const [countdownVersion, setCountdownVersion] = useState(0);
 
   const syncKeyPad = () => {
     const current = keyPadRef.current!.state();
-    setSelectedKeyIds(new Set(current.selected));
+    setLatchedKeyIds(new Set(current.latched));
     setHeldKeyIds(new Set(current.held));
     return current;
   };
@@ -92,25 +90,18 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     connection.send({ type: "session.input", sessionId: session.id, data });
   };
 
-  const restartCountdown = (selected: readonly string[]) => {
-    if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
-    setCountdownVersion((version) => version + 1);
-    if (!selected.length) {
-      countdownTimerRef.current = undefined;
-      return;
+  const vibrate = () => {
+    try {
+      navigator.vibrate(20);
+    } catch {
+      // WebViews without the VIBRATE permission (or without hardware support)
+      // reject the call; the key press still works silently.
     }
-    countdownTimerRef.current = window.setTimeout(() => {
-      countdownTimerRef.current = undefined;
-      const result = keyPadRef.current!.expire();
-      syncKeyPad();
-      sendKeyData(result.data ?? "");
-    }, 3000);
   };
 
   const applyKeyPadResult = (result: KeyPadResult) => {
     syncKeyPad();
     if (result.data) sendKeyData(result.data);
-    restartCountdown(result.state.selected);
   };
 
   useLayoutEffect(() => {
@@ -294,10 +285,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       resize(true);
       const result = keyPadRef.current!.consume(data);
       syncKeyPad();
-      if (result.state.selected.length === 0 && countdownTimerRef.current !== undefined) {
-        window.clearTimeout(countdownTimerRef.current);
-        countdownTimerRef.current = undefined;
-      }
       if (result.data) connection.send({ type: "session.input", sessionId: session.id, data: result.data });
     };
     const flushPendingInput = () => {
@@ -651,7 +638,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       hostElement.removeEventListener("touchend", handleTouchEnd);
       hostElement.removeEventListener("touchcancel", handleTouchCancel);
       clearLongPressTimer();
-      if (countdownTimerRef.current !== undefined) window.clearTimeout(countdownTimerRef.current);
       input.dispose(); output(); httpLinkProvider.dispose(); terminal.dispose(); terminalRef.current = null;
       resizeRef.current = () => undefined;
       focusInputRef.current = () => undefined;
@@ -700,6 +686,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
 
   function pressAccessibilityKey(key: UtilityKey) {
     if (!activeRef.current) return;
+    // Tapping a non-modifier key fires a chord, so give a quick buzz;
+    // modifiers only arm and wait, so they stay silent.
+    if (!key.modifier) vibrate();
     applyKeyPadResult(keyPadRef.current!.press(key));
     focusInputRef.current();
   }
@@ -718,13 +707,13 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     <div ref={hostRef} className="mobile-terminal" style={{ width: squishWidthPercent(fontWidthScale), transform: `scaleX(${fontWidthScale})`, transformOrigin: "left center", "--terminal-squish-font-size": squishFontSize, "--terminal-squish-line-height": squishLineHeight, "--terminal-squish-inverse": `${squishInverse}` } as CSSProperties} />
     <div className="extra-keys" data-no-swipe aria-label="Terminal function keys" ref={(element) => guardUtilityKeySelection(element)}>
       {ACCESSIBILITY_KEY_ROWS.map((row, rowIndex) => <div className="key-row" key={rowIndex}>{row.map((key) => {
-        const selected = selectedKeyIds.has(key.id);
+        const latched = latchedKeyIds.has(key.id);
         const held = heldKeyIds.has(key.id);
         return <button
           key={key.id}
           type="button"
-          aria-pressed={selected || held}
-          className={`${selected ? "latched chord-pending" : ""}${held ? " held" : ""}`}
+          aria-pressed={latched || held}
+          className={`${latched ? "latched chord-pending" : ""}${held ? " held" : ""}`}
           onPointerDown={(event) => {
             event.preventDefault();
             event.currentTarget.setPointerCapture(event.pointerId);
@@ -737,11 +726,12 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
             // a keyboard click has detail 0 and no pointer hold, so press and
             // release in one activation.
             if (event.detail === 0) {
+              if (!key.modifier) vibrate();
               applyKeyPadResult(keyPadRef.current!.press(key));
               applyKeyPadResult(keyPadRef.current!.release(key.id));
             }
           }}
-        ><span>{key.label}</span>{selected && <i key={countdownVersion} className="key-countdown" />}</button>;
+        ><span>{key.label}</span></button>;
       })}</div>)}
     </div>
   </div>;

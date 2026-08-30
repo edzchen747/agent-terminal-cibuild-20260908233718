@@ -154,8 +154,6 @@ button { color: inherit; }
 .key-row button, .key-row button > span { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 .key-row button:active, .key-row button.latched, .key-row button.held { color: #8ce0cf; border-color: #3a7065; background: #1c302b; transform: translateY(1px); box-shadow: none; }
 .key-row button.chord-pending { animation: key-armed-pulse .7s ease-in-out infinite alternate; }
-.key-countdown { position: absolute; z-index: 2; left: 0; bottom: 0; width: 100%; height: 3px; background: #91f0da; box-shadow: 0 0 8px #74dec6; pointer-events: none; animation: key-countdown 3s linear forwards; }
-@keyframes key-countdown { from { width: 100%; opacity: 1; } to { width: 0; opacity: .35; } }
 @keyframes key-armed-pulse { from { border-color: #3a7065; } to { border-color: #75cbb9; box-shadow: inset 0 0 10px #72d5c028; } }
 .sheet-backdrop { position: fixed; inset: 0; z-index: 20; display: flex; align-items: flex-end; background: #020407b8; backdrop-filter: blur(3px); touch-action: pan-x; }
 .sheet-backdrop .bottom-sheet { transform: translateY(var(--sheet-drag-y, 0px)); transition: transform .25s cubic-bezier(.2,.8,.2,1); }
