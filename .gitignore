@@ -23,6 +23,9 @@ apps/mobile/android/.gradle/
 apps/mobile/android/app/build/
 apps/mobile/android/build/
 apps/mobile/.capacitor/
+# Android release signing material is local-only.
+apps/mobile/android/keystore/
+apps/mobile/android/keystore.properties
 # Local environment files; templates stay tracked.
 .env
 .env.*

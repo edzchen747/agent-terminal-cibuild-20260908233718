@@ -122,6 +122,30 @@ npm run android:open
 
 Then build/run from Android Studio. The QR scanner requires a physical device or an emulator with camera support.
 
+### Android release signing
+
+Android updates must use the same signing identity as the installed APK. Create the local, ignored keystore and Gradle properties once:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-android-signing.ps1
+```
+
+The generated files under `apps/mobile/android/keystore/` and `apps/mobile/android/keystore.properties` are ignored and must be backed up securely. A local release build uses them automatically:
+
+```powershell
+Push-Location apps/mobile/android
+./gradlew assembleRelease
+Pop-Location
+```
+
+The GitHub Actions workflow cannot access a workstation-local file, so configure these repository secrets with the same signing identity before pushing a release: `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`. Encode the local keystore for the first secret with:
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes('apps/mobile/android/keystore/agent-terminal-release.jks'))
+```
+
+Pushes to `main` and manual workflow runs then restore the keystore and upload a signed release APK. Pull requests intentionally build only a debug APK so untrusted code cannot access the signing key.
+
 ## Pairing and use
 
 1. Start Agent Terminal on Windows.

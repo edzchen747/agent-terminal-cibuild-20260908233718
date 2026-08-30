@@ -30,8 +30,10 @@ permissions:
 
 jobs:
   android:
-    name: Android debug APK
+    name: Android APK
     runs-on: ubuntu-latest
+    env:
+      ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/apps/mobile/android/keystore/agent-terminal-release.jks
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -71,11 +73,62 @@ jobs:
       - name: Build and sync Capacitor Android project
         run: npm run android:sync
 
+      - name: Verify Android release signing secrets
+        if: ${{ github.event_name != 'pull_request' }}
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            printf 'Missing required Android signing secrets: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Restore Android release keystore
+        if: ${{ github.event_name != 'pull_request' }}
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$ANDROID_KEYSTORE_PATH")"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_PATH"
+          chmod 600 "$ANDROID_KEYSTORE_PATH"
+
+      - name: Assemble signed release APK
+        if: ${{ github.event_name != 'pull_request' }}
+        working-directory: apps/mobile/android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: bash ./gradlew assembleRelease --no-daemon -PrequireReleaseSigning=true
+
       - name: Assemble debug APK
+        if: ${{ github.event_name == 'pull_request' }}
         working-directory: apps/mobile/android
         run: bash ./gradlew assembleDebug --no-daemon
 
-      - name: Upload Android APK
+      - name: Upload signed Android release APK
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-terminal-android-release
+          path: apps/mobile/android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+
+      - name: Upload Android debug APK
+        if: ${{ github.event_name == 'pull_request' }}
         uses: actions/upload-artifact@v4
         with:
           name: agent-terminal-android-debug

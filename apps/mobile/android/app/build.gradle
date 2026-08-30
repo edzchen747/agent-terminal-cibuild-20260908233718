@@ -1,5 +1,23 @@
 apply plugin: 'com.android.application'
 
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file('keystore.properties')
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
+}
+
+def releaseStoreFileValue = keystoreProperties.getProperty('storeFile') ?: System.getenv('ANDROID_KEYSTORE_PATH')
+def releaseStorePassword = keystoreProperties.getProperty('storePassword') ?: System.getenv('ANDROID_KEYSTORE_PASSWORD')
+def releaseKeyAlias = keystoreProperties.getProperty('keyAlias') ?: System.getenv('ANDROID_KEY_ALIAS')
+def releaseKeyPassword = keystoreProperties.getProperty('keyPassword') ?: System.getenv('ANDROID_KEY_PASSWORD')
+def releaseSigningConfigured = [
+    releaseStoreFileValue,
+    releaseStorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword
+].every { it != null && !it.trim().isEmpty() }
+def releaseStoreFile = releaseStoreFileValue ? rootProject.file(releaseStoreFileValue) : null
+
 android {
     namespace = "com.agentterminal.mobile"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -16,6 +34,16 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        release {
+            if (releaseSigningConfigured) {
+                storeFile releaseStoreFile
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
     packagingOptions {
         jniLibs {
             useLegacyPackaging true
@@ -25,7 +53,20 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            if (releaseSigningConfigured) {
+                signingConfig signingConfigs.release
+            }
         }
+    }
+}
+
+def releaseBuildRequested = gradle.startParameter.taskNames.any { it.toLowerCase().contains('release') }
+if (project.hasProperty('requireReleaseSigning') || releaseBuildRequested) {
+    if (!releaseSigningConfigured) {
+        throw new GradleException('Release signing is required, but keystore.properties or the ANDROID_KEYSTORE_* environment variables are incomplete.')
+    }
+    if (!releaseStoreFile.isFile()) {
+        throw new GradleException("Release signing keystore was not found: ${releaseStoreFile}")
     }
 }
 
