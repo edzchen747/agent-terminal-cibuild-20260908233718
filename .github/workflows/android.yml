@@ -24,6 +24,14 @@ on:
       - 'tsconfig.base.json'
       - '.github/workflows/android.yml'
   workflow_dispatch:
+    inputs:
+      build_variant:
+        description: APK variant to build
+        type: choice
+        default: debug
+        options:
+          - debug
+          - release
 
 permissions:
   contents: read
@@ -73,8 +81,25 @@ jobs:
       - name: Build and sync Capacitor Android project
         run: npm run android:sync
 
+      - name: Determine build variant
+        id: variant
+        shell: bash
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request)
+              variant=debug
+              ;;
+            workflow_dispatch)
+              variant="${{ inputs.build_variant }}"
+              ;;
+            *)
+              variant=release
+              ;;
+          esac
+          echo "variant=${variant}" >> "$GITHUB_OUTPUT"
+
       - name: Verify Android release signing secrets
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ steps.variant.outputs.variant == 'release' }}
         shell: bash
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -95,7 +120,7 @@ jobs:
           fi
 
       - name: Restore Android release keystore
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ steps.variant.outputs.variant == 'release' }}
         shell: bash
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -106,7 +131,7 @@ jobs:
           chmod 600 "$ANDROID_KEYSTORE_PATH"
 
       - name: Assemble signed release APK
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ steps.variant.outputs.variant == 'release' }}
         working-directory: apps/mobile/android
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -115,12 +140,12 @@ jobs:
         run: bash ./gradlew assembleRelease --no-daemon -PrequireReleaseSigning=true
 
       - name: Assemble debug APK
-        if: ${{ github.event_name == 'pull_request' }}
+        if: ${{ steps.variant.outputs.variant == 'debug' }}
         working-directory: apps/mobile/android
         run: bash ./gradlew assembleDebug --no-daemon
 
       - name: Upload signed Android release APK
-        if: ${{ github.event_name != 'pull_request' }}
+        if: ${{ steps.variant.outputs.variant == 'release' }}
         uses: actions/upload-artifact@v4
         with:
           name: agent-terminal-android-release
@@ -128,7 +153,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload Android debug APK
-        if: ${{ github.event_name == 'pull_request' }}
+        if: ${{ steps.variant.outputs.variant == 'debug' }}
         uses: actions/upload-artifact@v4
         with:
           name: agent-terminal-android-debug
