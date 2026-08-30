@@ -52,6 +52,10 @@ jobs:
         with:
           go-version: '1.24.x'
 
+      - name: Prepare embedded node dependencies
+        working-directory: apps/embedded-node
+        run: go mod tidy
+
       - name: Install JavaScript dependencies
         run: npm ci
 

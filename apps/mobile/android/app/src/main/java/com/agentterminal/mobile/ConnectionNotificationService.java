@@ -72,7 +72,7 @@ public class ConnectionNotificationService extends Service {
         if (!probeArmed.get() || probeRunning.get()) return;
         String endpoint = endpointFrom(getSharedPreferences(PREFS, MODE_PRIVATE));
         if (endpoint.isEmpty()) {
-            reconnectTimeoutHandler.postDelayed(probeLoop, PROBE_INTERVAL_MS);
+            resumeProbeLoop();
             return;
         }
         probeRunning.set(true);
@@ -81,10 +81,14 @@ public class ConnectionNotificationService extends Service {
             reconnectTimeoutHandler.post(() -> {
                 probeRunning.set(false);
                 if (!alive && STATE_CONNECTED.equals(storedState())) markUnavailable();
-                if (probeArmed.get()) reconnectTimeoutHandler.postDelayed(probeLoop, PROBE_INTERVAL_MS);
+                if (probeArmed.get()) resumeProbeLoop();
             });
         });
     };
+
+    private void resumeProbeLoop() {
+        reconnectTimeoutHandler.postDelayed(probeLoop, PROBE_INTERVAL_MS);
+    }
     private final Runnable networkUnavailable = () -> markNetworkUnavailable();
     private final Runnable reconnectTimeout = () -> {
         reconnectTimeoutScheduled = false;
