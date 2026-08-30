@@ -108,7 +108,7 @@ public class EmbeddedNodePlugin extends Plugin {
             builder.redirectError(ProcessBuilder.Redirect.appendTo(new File(getContext().getFilesDir(), "embedded-node.log")));
             Process process = builder.start();
             nodeProcess = process;
-            Log.i(TAG, "node process started pid=" + process.pid() + " remote=" + remoteHost + ":" + remotePort + " dns=" + dnsServers);
+            Log.i(TAG, "node process started " + process + " remote=" + remoteHost + ":" + remotePort + " dns=" + dnsServers);
             watchProcess(process);
             JSObject result = readStatus(stateDir, nodeId);
             if (rejectForStatus(call, result)) {
@@ -148,7 +148,7 @@ public class EmbeddedNodePlugin extends Plugin {
         Process process = nodeProcess;
         nodeProcess = null;
         if (process == null) return;
-        Log.i(TAG, "stopping node process pid=" + process.pid());
+        Log.i(TAG, "stopping node process " + process);
         process.destroy();
         boolean exited;
         try {
@@ -172,7 +172,7 @@ public class EmbeddedNodePlugin extends Plugin {
             synchronized (EmbeddedNodePlugin.this) {
                 if (nodeProcess == process) nodeProcess = null;
             }
-            Log.i(TAG, "node process exited pid=" + process.pid() + " exit=" + process.exitValue());
+            Log.i(TAG, "node process exited exit=" + process.exitValue());
         });
     }
 
