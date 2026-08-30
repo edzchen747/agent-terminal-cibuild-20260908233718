@@ -98,6 +98,11 @@ public class EmbeddedNodePlugin extends Plugin {
                 "--proxy-listen", "127.0.0.1:0"
             );
             builder.environment().put("AGENT_TERMINAL_NODE_PRIVATE_KEY", privateKey == null ? "" : privateKey);
+            // Android app processes have no writable HOME/TMPDIR, which makes
+            // tailscale's logpolicy panic ("no safe place found to store log
+            // state"). Pin the log state directory to our app-private state
+            // dir, which is guaranteed to exist and be writable.
+            builder.environment().put("TS_LOGS_DIR", stateDir.getAbsolutePath());
             String dnsServers = activeDnsServers();
             if (!dnsServers.isEmpty()) {
                 builder.environment().put("AGENT_TERMINAL_DNS_SERVERS", dnsServers);
