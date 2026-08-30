@@ -39,41 +39,52 @@ public class EmbeddedNodePlugin extends Plugin {
         String nodeId = call.getString("nodeId");
         String remoteEndpoint = call.getString("remoteEndpoint");
         String authKey = call.getString("authKey");
+        boolean hasAuthKey = authKey != null && !authKey.isEmpty();
+        Log.i(TAG, "start requested: control=" + (controlUrl == null ? "null" : controlUrl) + " remote=" + (remoteEndpoint == null ? "null" : remoteEndpoint) + " authKey=" + (hasAuthKey ? "present" : "EMPTY") + " nodeId=" + (nodeId == null ? "null" : nodeId));
         File executable = bundledExecutable();
+        Log.i(TAG, "bundledExecutable: " + executable.getAbsolutePath() + " isFile=" + executable.isFile() + " canExecute=" + executable.canExecute());
         if (!executable.isFile()) {
+            Log.e(TAG, "embedded node executable missing at " + executable.getAbsolutePath());
             call.reject("The embedded node engine is not included in this build.");
             return;
         }
         if (!executable.canExecute()) {
+            Log.e(TAG, "embedded node executable not executable at " + executable.getAbsolutePath());
             call.reject("The embedded node engine is not executable in this build.");
             return;
         }
         if (nodeProcess != null && nodeProcess.isAlive()) {
-            if (authKey == null || authKey.isEmpty()) {
+            if (!hasAuthKey) {
+                Log.i(TAG, "node process already running; returning saved status");
                 JSObject result = readStatus(new File(getContext().getFilesDir(), "embedded-node-state"), nodeId);
                 if (rejectForStatus(call, result)) return;
+                logStatus(result);
                 call.resolve(result);
                 return;
             }
             // A fresh one-time key means the WebView detected that the saved
             // Headscale node was removed. Restart tsnet so the key is applied
             // instead of returning the stale process status.
+            Log.i(TAG, "node process running with new auth key; restarting to re-register");
             stopNodeProcess();
         }
         try {
             File stateDir = new File(getContext().getFilesDir(), "embedded-node-state");
             if (!stateDir.exists() && !stateDir.mkdirs()) {
+                Log.e(TAG, "could not create state directory: " + stateDir.getAbsolutePath());
                 call.reject("Could not create embedded node state directory.");
                 return;
             }
             File statusFile = new File(stateDir, "status.json");
             if (statusFile.exists() && !statusFile.delete()) {
+                Log.e(TAG, "could not reset status file: " + statusFile.getAbsolutePath());
                 call.reject("Could not reset the embedded node status.");
                 return;
             }
             URI remote = new URI(remoteEndpoint);
             String remoteHost = remote.getHost();
             if (remoteHost == null) {
+                Log.e(TAG, "invalid remote endpoint: " + remoteEndpoint);
                 call.reject("The remote node endpoint is invalid.");
                 return;
             }
@@ -91,15 +102,17 @@ public class EmbeddedNodePlugin extends Plugin {
             if (!dnsServers.isEmpty()) {
                 builder.environment().put("AGENT_TERMINAL_DNS_SERVERS", dnsServers);
             }
-            if (authKey != null && !authKey.isEmpty()) {
+            if (hasAuthKey) {
                 builder.environment().put("AGENT_TERMINAL_NODE_AUTH_KEY", authKey);
             }
             builder.redirectError(ProcessBuilder.Redirect.appendTo(new File(getContext().getFilesDir(), "embedded-node.log")));
             Process process = builder.start();
             nodeProcess = process;
+            Log.i(TAG, "node process started pid=" + process.pid() + " remote=" + remoteHost + ":" + remotePort + " dns=" + dnsServers);
             watchProcess(process);
             JSObject result = readStatus(stateDir, nodeId);
             if (rejectForStatus(call, result)) {
+                logStatus(result);
                 process.destroy();
                 nodeProcess = null;
                 return;
@@ -108,11 +121,13 @@ public class EmbeddedNodePlugin extends Plugin {
                 String message = process.isAlive()
                     ? "The embedded network node did not become ready."
                     : "The embedded network node stopped before becoming ready.";
+                Log.e(TAG, message);
                 process.destroy();
                 nodeProcess = null;
                 call.reject(message);
                 return;
             }
+            logStatus(result);
             call.resolve(result);
         } catch (Exception error) {
             Log.e(TAG, "Could not start the embedded node engine", error);
@@ -133,13 +148,17 @@ public class EmbeddedNodePlugin extends Plugin {
         Process process = nodeProcess;
         nodeProcess = null;
         if (process == null) return;
+        Log.i(TAG, "stopping node process pid=" + process.pid());
         process.destroy();
+        boolean exited;
         try {
-            if (!process.waitFor(2, TimeUnit.SECONDS)) process.destroyForcibly();
+            exited = process.waitFor(2, TimeUnit.SECONDS);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
-            process.destroyForcibly();
+            exited = false;
         }
+        if (!exited) process.destroyForcibly();
+        if (exited) Log.i(TAG, "node process stopped exit=" + process.exitValue());
     }
 
     private void watchProcess(Process process) {
@@ -148,15 +167,28 @@ public class EmbeddedNodePlugin extends Plugin {
                 process.waitFor();
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
+                return;
             }
             synchronized (EmbeddedNodePlugin.this) {
                 if (nodeProcess == process) nodeProcess = null;
             }
+            Log.i(TAG, "node process exited pid=" + process.pid() + " exit=" + process.exitValue());
         });
+    }
+
+    private void logStatus(JSObject result) {
+        String nodeId = result.optString("nodeId", "");
+        String tailnetAddress = result.optString("tailnetAddress", "");
+        String errorCode = result.optString("errorCode", "");
+        String errorMessage = result.optString("errorMessage", "");
+        String errorDetail = result.optString("errorDetail", "");
+        String endpoint = result.optString("endpoint", "");
+        Log.i(TAG, "status: nodeId=" + nodeId + " tailnetAddress=" + tailnetAddress + " endpoint=" + endpoint + " errorCode=" + errorCode + " errorMessage=" + errorMessage + " errorDetail=" + errorDetail);
     }
 
     @Override
     protected synchronized void handleOnDestroy() {
+        Log.i(TAG, "bridge destroyed; stopping node process");
         stopNodeProcess();
         processWatcher.shutdownNow();
         super.handleOnDestroy();
