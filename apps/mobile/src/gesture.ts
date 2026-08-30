@@ -25,10 +25,17 @@ export function shouldCommitSheetDismiss(input: {
   return input.velocityPxPerMs >= SHEET_DISMISS_VELOCITY_PX_MS && input.distancePx >= SHEET_DISMISS_MIN_FLICK_PX;
 }
 
-export function classifyGestureAxis(deltaX: number, deltaY: number): GestureAxis {
+export function classifyGestureAxis(deltaX: number, deltaY: number, horizontalBias: number = HORIZONTAL_BIAS): GestureAxis {
   if (Math.hypot(deltaX, deltaY) <= INTENT_THRESHOLD_PX) return "pending";
-  return Math.abs(deltaX) > Math.abs(deltaY) * HORIZONTAL_BIAS ? "horizontal" : "vertical";
+  return Math.abs(deltaX) > Math.abs(deltaY) * horizontalBias ? "horizontal" : "vertical";
 }
+
+/**
+ * A drag that begins on the character-width slider is a thumb pull along the
+ * track: any downward drift must not claim the sheet-dismissal gesture, so
+ * the horizontal axis wins until the movement is clearly vertical.
+ */
+export const SHEET_SLIDER_HORIZONTAL_BIAS = 0.6;
 
 /**
  * Whether a pointer-up is a taut tap whose activation must be fired directly,

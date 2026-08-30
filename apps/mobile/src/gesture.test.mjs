@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_DISMISS_DISTANCE_PX, TAP_MAX_DURATION_MS, TAP_MAX_MOVE_PX } from "./gesture.ts";
+import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_DISMISS_DISTANCE_PX, SHEET_SLIDER_HORIZONTAL_BIAS, TAP_MAX_DURATION_MS, TAP_MAX_MOVE_PX } from "./gesture.ts";
 
 test("gesture intent waits through initial touch jitter", () => {
   assert.equal(classifyGestureAxis(5, 4), "pending");
+  assert.equal(classifyGestureAxis(5, 4, SHEET_SLIDER_HORIZONTAL_BIAS), "pending");
 });
 
 test("vertical terminal scrolling tolerates horizontal finger drift", () => {
@@ -14,6 +15,15 @@ test("vertical terminal scrolling tolerates horizontal finger drift", () => {
 test("a clearly horizontal movement selects page navigation", () => {
   assert.equal(classifyGestureAxis(13, 5), "horizontal");
   assert.equal(classifyGestureAxis(-13, 5), "horizontal");
+});
+
+test("a slider thumb pull stays horizontal despite downward drift", () => {
+  assert.equal(classifyGestureAxis(30, 25, SHEET_SLIDER_HORIZONTAL_BIAS), "horizontal");
+  assert.equal(classifyGestureAxis(20, 30, SHEET_SLIDER_HORIZONTAL_BIAS), "horizontal");
+});
+
+test("only a clearly vertical movement claims a drag that started on the slider", () => {
+  assert.equal(classifyGestureAxis(10, 30, SHEET_SLIDER_HORIZONTAL_BIAS), "vertical");
 });
 
 const baseTap = {

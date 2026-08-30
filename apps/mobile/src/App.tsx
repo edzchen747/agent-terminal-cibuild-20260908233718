@@ -16,7 +16,7 @@ import { HostConnection, type RemoteRegistrationState } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
 import { notificationStateFor, type ConnectionNotificationState } from "./connectionPolicy";
 import { deviceName } from "./device";
-import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick } from "./gesture";
+import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_SLIDER_HORIZONTAL_BIAS } from "./gesture";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, SettingsIcon, TerminalIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
 
@@ -50,6 +50,8 @@ interface SwipeState {
   /** Whether the gesture is currently dragging a sheet downward. */
   sheetDragging: boolean;
   deltaY: number;
+  /** Whether the pointer went down on the character-width range input. */
+  onSlider: boolean;
 }
 
 export function App() {
@@ -481,7 +483,7 @@ export function App() {
     if (sheetRoot) {
       const busy = Boolean(target?.closest(".sheet-backdrop[data-busy]"));
       const scrollable = target ? sheetTargetScrollable(target, sheetRoot) : false;
-      const next: SwipeState = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startedAt: performance.now(), deltaX: 0, horizontal: false, overlay: true, blocked: busy || scrollable, sheetDragging: false, deltaY: 0 };
+      const next: SwipeState = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startedAt: performance.now(), deltaX: 0, horizontal: false, overlay: true, blocked: busy || scrollable, sheetDragging: false, deltaY: 0, onSlider: Boolean(target?.closest('input[type="range"]')) };
       swipeRef.current = next;
       return;
     }
@@ -490,7 +492,7 @@ export function App() {
     const selection = document.getSelection();
     const draggingTerminalSelection = Boolean(terminalText && selection && !selection.isCollapsed && selection.anchorNode && terminalText.contains(selection.anchorNode));
     if (draggingTerminalSelection) return;
-    const next: SwipeState = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startedAt: performance.now(), deltaX: 0, horizontal: false, overlay: false, blocked: false, sheetDragging: false, deltaY: 0 };
+    const next: SwipeState = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startedAt: performance.now(), deltaX: 0, horizontal: false, overlay: false, blocked: false, sheetDragging: false, deltaY: 0, onSlider: false };
     swipeRef.current = next;
   }
 
@@ -502,7 +504,10 @@ export function App() {
     if (current.overlay) {
       if (current.blocked) return;
       if (!current.sheetDragging) {
-        const axis = classifyGestureAxis(rawX, deltaY);
+        // A drag on the character-width slider is a thumb pull, not a swipe:
+        // let it win on slight downward drift too, so only a clearly vertical
+        // movement claims the sheet dismissal.
+        const axis = classifyGestureAxis(rawX, deltaY, current.onSlider ? SHEET_SLIDER_HORIZONTAL_BIAS : undefined);
         if (axis === "pending") return;
         if (axis === "horizontal" || deltaY <= 0) {
           // A horizontal move starts no sheet drag and no page navigation.

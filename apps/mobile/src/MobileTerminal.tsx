@@ -616,6 +616,14 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
   }, [connection, session.id]);
 
   useLayoutEffect(() => {
+    // Adjusting the character-width slider changes this value on every tick
+    // while the settings sheet is up. Refit so the squished columns stay
+    // correct, but never steal focus from the sheet: refocusing the IME
+    // field would pop Android's keyboard over the overlay.
+    if (activeRef.current) resizeRef.current(true);
+  }, [fontWidthScale]);
+
+  useLayoutEffect(() => {
     if (!activeRef.current) {
       // Dropping a finger on a bare page change would otherwise keep a held
       // modifier engaged (and its chord alive) for the next session.
@@ -640,7 +648,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     });
     resizeRef.current(true);
     return () => window.cancelAnimationFrame(focusFrame);
-  }, [active, fontWidthScale]);
+  }, [active]);
 
   function pressAccessibilityKey(key: UtilityKey) {
     if (!activeRef.current) return;
