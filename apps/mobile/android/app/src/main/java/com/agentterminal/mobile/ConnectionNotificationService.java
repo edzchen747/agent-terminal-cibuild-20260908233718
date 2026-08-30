@@ -63,7 +63,7 @@ public class ConnectionNotificationService extends Service {
             // connection notification never interrupts but still ranks high.
             NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "Terminal connection", NotificationManager.IMPORTANCE_HIGH);
             channel.setSound(null, null);
-            channel.setVibrationEnabled(false);
+            channel.enableVibration(false);
             channel.enableLights(false);
             channel.setShowBadge(false);
             manager.createNotificationChannel(channel);

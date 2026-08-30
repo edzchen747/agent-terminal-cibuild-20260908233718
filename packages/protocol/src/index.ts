@@ -200,7 +200,7 @@ export interface PairingPayload {
 
 export type ClientMessage =
   | { type: "pair"; requestId: string; token: string; device: DeviceIdentity }
-  | { type: "auth"; requestId: string; deviceId: string; deviceToken: string }
+  | { type: "auth"; requestId: string; deviceId: string; deviceToken: string; name?: string }
   | { type: "node.enroll"; requestId: string; nonce: string }
   | { type: "snapshot.request"; requestId: string }
   | { type: "project.create"; requestId: string; name: string; path: string }
