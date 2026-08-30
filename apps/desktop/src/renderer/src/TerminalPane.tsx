@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { applyTerminalModifiers, findHttpLinks, type TerminalModifier } from "@agentterminal/protocol";
+import { applyTerminalModifiers, findHttpLinks, TERMINAL_ANSI_THEME, type TerminalModifier } from "@agentterminal/protocol";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { sessionId: string; visible: boolean; active: boolean; confirmExternalLinks: boolean; }
@@ -90,15 +90,16 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
         activate: (_event, uri) => activateLink(uri)
       },
       theme: {
-        background: "#090b10",
-        foreground: "#d9deea",
-        cursor: "#89e6d1",
-        cursorAccent: "#090b10",
-        selectionBackground: "#315b64aa",
-        black: "#11141b", red: "#f07178", green: "#8bd49c", yellow: "#e5c07b",
-        blue: "#7aa2f7", magenta: "#c099ff", cyan: "#79d4d4", white: "#d9deea",
-        brightBlack: "#646b7a", brightRed: "#ff8b92", brightGreen: "#a5e8b3", brightYellow: "#f5d598",
-        brightBlue: "#9ab7ff", brightMagenta: "#d5b3ff", brightCyan: "#9ce6e6", brightWhite: "#ffffff"
+        // Match the native Windows terminal (Windows Terminal's default
+        // "Campbell" scheme) so shell output looks identical to the
+        // original terminal. TERMINAL_ANSI_THEME carries the 16 ANSI
+        // colors; keep it in sync with that scheme.
+        background: "#0C0C0C",
+        foreground: "#CCCCCC",
+        cursor: "#FFFFFF",
+        cursorAccent: "#0C0C0C",
+        selectionBackground: "#FFFFFF",
+        ...TERMINAL_ANSI_THEME
       }
     });
     terminalRef.current = terminal;

@@ -18,6 +18,38 @@ export const MOBILE_HEARTBEAT_INTERVAL_MS = 60_000 as const;
 export type Platform = "android" | "ios" | "web";
 export type TerminalModifier = "ctrl" | "alt" | "shift";
 
+/**
+ * The 16 ANSI colors the desktop terminal renders with. These are the
+ * "Campbell" scheme that Windows Terminal ships as its default, so the
+ * desktop terminal colors shell output the same way the native Windows
+ * terminal does (this machine's Windows Terminal uses the stock defaults:
+ * no custom schemes or per-profile color overrides). xterm's built-in
+ * palette is noticeably lighter than Campbell, which is why the desktop
+ * terminal looked washed out next to the native terminal. Keep this list
+ * in sync with Windows Terminal's Campbell scheme if it ever changes.
+ *
+ * Spread it into the xterm v6 `ITheme` (which uses named color keys, not an
+ * `ansi` array).
+ */
+export const TERMINAL_ANSI_THEME = {
+  black: "#0C0C0C",
+  red: "#C50F1F",
+  green: "#13A10E",
+  yellow: "#C19C00",
+  blue: "#0037DA",
+  magenta: "#881798",
+  cyan: "#3A96DD",
+  white: "#CCCCCC",
+  brightBlack: "#767676",
+  brightRed: "#E74856",
+  brightGreen: "#16C60C",
+  brightYellow: "#F9F1A5",
+  brightBlue: "#3B78FF",
+  brightMagenta: "#B4009E",
+  brightCyan: "#61D6D6",
+  brightWhite: "#F2F2F2"
+} as const;
+
 export interface HttpLinkMatch {
   text: string;
   start: number;

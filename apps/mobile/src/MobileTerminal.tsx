@@ -1,7 +1,7 @@
 import { useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { applyTerminalModifiers, createRequestId, findHttpLinks } from "@agentterminal/protocol";
+import { applyTerminalModifiers, createRequestId, findHttpLinks, TERMINAL_ANSI_THEME } from "@agentterminal/protocol";
 import type { TerminalModifier, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
 import { classifyGestureAxis, type GestureAxis } from "./gesture";
@@ -139,7 +139,16 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       scrollback: 5000,
       screenReaderMode: true,
       smoothScrollDuration: 75,
-      theme: { background: "#080b0f", foreground: "#d7dce6", cursor: "#79ddc7", selectionBackground: "#315b64aa" }
+      theme: {
+        // The same Windows Terminal "Campbell" palette the desktop terminal
+        // uses, so the same session renders identically on every client.
+        background: "#0C0C0C",
+        foreground: "#CCCCCC",
+        cursor: "#FFFFFF",
+        cursorAccent: "#0C0C0C",
+        selectionBackground: "#315b64aa",
+        ...TERMINAL_ANSI_THEME
+      }
     });
     terminalRef.current = terminal;
     const fit = new FitAddon();

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, applyTerminalModifiers, decodeClientMessage, encodeMessage, encodePairingPayload, findHttpLinks, parsePairingPayload, parseTerminalWorkingDirectories } from "./index.js";
+import { LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, applyTerminalModifiers, decodeClientMessage, encodeMessage, encodePairingPayload, findHttpLinks, parsePairingPayload, parseTerminalWorkingDirectories, TERMINAL_ANSI_THEME } from "./index.js";
 import type { ClientMessage } from "./index.js";
 
 test("pairing payloads round-trip", () => {
@@ -173,4 +173,93 @@ test("auth messages carry an optional display name through the wire contract", (
   assert.equal(decoded.type, "auth");
   if (decoded.type !== "auth") assert.fail("expected an auth message");
   assert.equal(decoded.name, "Pixel 9");
+});
+
+// Windows Terminal ships "Campbell" as its default scheme (microsoft/terminal
+// TerminalSettingsModel/defaults.json + the conhost color table). The desktop
+// and mobile terminals must both pin these exact values, so shell color
+// output looks the same in this app as in the native Windows terminal.
+const CAMPBELL_ANSI_THEME = {
+  black: "#0C0C0C",
+  red: "#C50F1F",
+  green: "#13A10E",
+  yellow: "#C19C00",
+  blue: "#0037DA",
+  magenta: "#881798",
+  cyan: "#3A96DD",
+  white: "#CCCCCC",
+  brightBlack: "#767676",
+  brightRed: "#E74856",
+  brightGreen: "#16C60C",
+  brightYellow: "#F9F1A5",
+  brightBlue: "#3B78FF",
+  brightMagenta: "#B4009E",
+  brightCyan: "#61D6D6",
+  brightWhite: "#F2F2F2"
+} as const;
+
+test("the terminal ANSI theme pins the Windows Terminal Campbell palette", () => {
+  assert.deepEqual({ ...TERMINAL_ANSI_THEME }, { ...CAMPBELL_ANSI_THEME });
+});
+
+test("the terminal ANSI theme only carries valid xterm v6 color keys and hex values", () => {
+  const keys = Object.keys(TERMINAL_ANSI_THEME).sort();
+  assert.deepEqual(keys, [
+    "black",
+    "blue",
+    "brightBlack",
+    "brightBlue",
+    "brightCyan",
+    "brightGreen",
+    "brightMagenta",
+    "brightRed",
+    "brightWhite",
+    "brightYellow",
+    "cyan",
+    "green",
+    "magenta",
+    "red",
+    "white",
+    "yellow"
+  ]);
+  for (const [key, value] of Object.entries(TERMINAL_ANSI_THEME)) {
+    assert.match(String(value), /^#[0-9a-f]{6}$/i, `${key} must be a 6-digit hex color`);
+  }
+});
+
+test("the terminal ANSI theme has no duplicate colors", () => {
+  const seen = new Set<string>();
+  for (const [key, value] of Object.entries(TERMINAL_ANSI_THEME)) {
+    const hex = String(value).toLowerCase();
+    assert.ok(!seen.has(hex), `${key} duplicates the color of an earlier entry (${hex})`);
+    seen.add(hex);
+  }
+});
+
+test("the terminal ANSI theme bright variants are brighter than their normal pair", () => {
+  const luminance = (hex: string): number => {
+    const channel = (index: number): number => {
+      const v = Number.parseInt(hex.slice(index, index + 2), 16) / 255;
+      return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+    };
+    return 0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5);
+  };
+  const pairs = [
+    ["black", "brightBlack"],
+    ["red", "brightRed"],
+    ["green", "brightGreen"],
+    ["yellow", "brightYellow"],
+    ["blue", "brightBlue"],
+    ["magenta", "brightMagenta"],
+    ["cyan", "brightCyan"],
+    ["white", "brightWhite"]
+  ] as const;
+  for (const [normalKey, brightKey] of pairs) {
+    const normal = TERMINAL_ANSI_THEME[normalKey];
+    const bright = TERMINAL_ANSI_THEME[brightKey];
+    assert.ok(
+      luminance(bright) > luminance(normal),
+      `${brightKey} (${bright}) must be brighter than ${normalKey} (${normal})`
+    );
+  }
 });
