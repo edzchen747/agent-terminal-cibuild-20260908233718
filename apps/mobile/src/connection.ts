@@ -472,6 +472,9 @@ export class HostConnection {
       const response = await this.request({ type: "snapshot.request", requestId: createRequestId() });
       if (response.type === "snapshot") this.emit("heartbeat", response.snapshot);
     } catch {
+      // The desktop is gone even though the socket reports OPEN (half-open
+      // through the overlay proxy). forceSocketClose treats the timeout as
+      // the authoritative disconnect: it does not wait for onclose to fire.
       if (!this.closed) this.forceSocketClose();
     } finally {
       this.heartbeatInFlight = false;
@@ -564,7 +567,22 @@ export class HostConnection {
   }
 
   private forceSocketClose(): void {
-    if (this.socket?.readyState === WebSocket.OPEN) this.socket.close();
+    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    // A dead desktop leaves the socket half-open: the close handshake never
+    // completes and onclose may never fire, so the request timeout is the
+    // authoritative disconnect. Bump the generation so the late close event
+    // is ignored, then run the teardown onclose would have run.
+    this.socketGeneration += 1;
+    const socket = this.socket;
+    this.socket = undefined;
+    this.authenticated = false;
+    this.stopHeartbeat();
+    socket.close();
+    this.rejectAll(new Error("Desktop disconnected."));
+    if (!this.closed) {
+      this.emit("disconnected", undefined);
+      this.scheduleReconnect();
+    }
   }
 
   private abortSocket(): void {
