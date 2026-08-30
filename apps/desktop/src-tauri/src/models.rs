@@ -18,6 +18,9 @@ pub struct AuthorizedDevice {
     pub platform: String,
     pub added_at: String,
     pub last_seen_at: String,
+    /// Whether the device currently holds an authenticated connection.
+    #[serde(default)]
+    pub online: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,6 +154,10 @@ pub enum ClientMessage {
         request_id: String,
         device_id: String,
         device_token: String,
+        /// Optional display name so a stored device keeps a fresh identity
+        /// without needing to be paired again.
+        #[serde(default)]
+        name: Option<String>,
     },
     #[serde(rename = "node.enroll")]
     NodeEnroll { request_id: String, nonce: String },

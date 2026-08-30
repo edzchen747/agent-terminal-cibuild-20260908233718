@@ -1,6 +1,6 @@
 import { Preferences } from "@capacitor/preferences";
 import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage } from "@agentterminal/protocol";
-import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN } from "@agentterminal/protocol";
+import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN } from "@agentterminal/protocol";
 import { deviceName } from "./device";
 import { EmbeddedNodeEngine, type EmbeddedNodeState } from "./embedded-engine";
 import { isDroppedNodeEnrollmentError } from "./nodeEnrollment";
@@ -9,7 +9,7 @@ const HOST_KEY = "agent-terminal-host";
 const REQUEST_TIMEOUT_MS = 12_000;
 // A heartbeat every minute keeps sockets sufficient liveness detection without
 // waking the radio three times a minute while the device is in active use.
-const HEARTBEAT_INTERVAL_MS = 60_000;
+const HEARTBEAT_INTERVAL_MS = MOBILE_HEARTBEAT_INTERVAL_MS;
 const RECONNECT_BASE_DELAY_MS = 1_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const RECONNECT_TIMEOUT_MS = 30_000;

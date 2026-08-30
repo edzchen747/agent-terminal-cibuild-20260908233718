@@ -40,6 +40,22 @@ use crate::{
 const MAX_SCROLLBACK_BYTES: usize = 512_000;
 const MAX_CONTROL_BYTES: usize = 8_192;
 const MAX_PROJECT_NAME_CHARACTERS: usize = 100;
+/// Keep in sync with MOBILE_HEARTBEAT_INTERVAL_MS in packages/protocol/src/index.ts.
+const MOBILE_HEARTBEAT_INTERVAL_MS: i64 = 60_000;
+/// A paired device counts as connected while it has sent anything within this
+/// window, so silently dropped sockets turn red instead of staying green.
+const PRESENCE_WINDOW_MS: i64 = 2 * MOBILE_HEARTBEAT_INTERVAL_MS;
+/// How often to re-check liveness so the indicator flips without waiting for
+/// an unrelated broadcast.
+const PRESENCE_REFRESH_INTERVAL_MS: u64 = (MOBILE_HEARTBEAT_INTERVAL_MS / 2) as u64;
+
+fn presence_now_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+fn presence_alive(last_seen_at_ms: i64, now_ms: i64) -> bool {
+    now_ms.saturating_sub(last_seen_at_ms) <= PRESENCE_WINDOW_MS
+}
 
 fn is_cursor_position_report(data: &str) -> bool {
     let bytes = data.as_bytes();
@@ -128,6 +144,7 @@ struct RemoteClient {
     paired_connection: bool,
     enrollment_requests: u8,
     attached_sessions: HashSet<String>,
+    last_seen_at_ms: i64,
     sink: ClientSink,
 }
 
@@ -161,6 +178,9 @@ pub struct Core {
     app: AppHandle,
     inner: Mutex<Inner>,
     clients: Mutex<HashMap<String, RemoteClient>>,
+    /// Last online-device set observed by the presence refresher, so the
+    /// periodic check only broadcasts when liveness actually changed.
+    presence_cache: Mutex<Option<HashSet<String>>>,
     embedded_node: Mutex<Option<Child>>,
     desktop_enrollment_running: AtomicBool,
     remote_port: AtomicU16,
@@ -176,7 +196,7 @@ impl Core {
             .iter()
             .map(|project| project.id.clone())
             .collect();
-        Arc::new(Self {
+        let core = Arc::new(Self {
             app,
             inner: Mutex::new(Inner {
                 store,
@@ -194,7 +214,10 @@ impl Core {
             remote_port: AtomicU16::new(remote_port),
             direct_server_ready: AtomicBool::new(false),
             exit_requested: AtomicBool::new(false),
-        })
+            presence_cache: Mutex::new(None),
+        });
+        core.spawn_presence_refresh();
+        core
     }
 
     pub fn initialize(self: &Arc<Self>) -> Result<()> {
@@ -660,8 +683,9 @@ impl Core {
             .project_for_window(label)
             .map(str::to_owned)
             .unwrap_or_default();
+        let online_device_ids = self.online_device_ids();
         DesktopState {
-            snapshot: snapshot_from_inner(&inner),
+            snapshot: snapshot_from_inner(&inner, &online_device_ids),
             current_project_id,
             open_projects_in_new_windows: inner.store.settings().open_projects_in_new_windows,
             confirm_external_links: inner.store.settings().confirm_external_links,
@@ -674,7 +698,43 @@ impl Core {
 
     pub fn snapshot(&self) -> HostSnapshot {
         let inner = self.inner.lock().expect("desktop state poisoned");
-        snapshot_from_inner(&inner)
+        let online_device_ids = self.online_device_ids();
+        snapshot_from_inner(&inner, &online_device_ids)
+    }
+
+    fn online_device_ids(&self) -> HashSet<String> {
+        let now_ms = presence_now_ms();
+        self.clients
+            .lock()
+            .expect("remote clients poisoned")
+            .values()
+            .filter(|client| client.device_id.is_some())
+            .filter(|client| presence_alive(client.last_seen_at_ms, now_ms))
+            .filter_map(|client| client.device_id.clone())
+            .collect()
+    }
+
+    fn spawn_presence_refresh(self: &Arc<Self>) {
+        let core = Arc::clone(self);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(
+                PRESENCE_REFRESH_INTERVAL_MS,
+            ));
+            core.refresh_online_presence();
+        });
+    }
+
+    fn refresh_online_presence(self: &Arc<Self>) {
+        let online = self.online_device_ids();
+        let mut cache = self
+            .presence_cache
+            .lock()
+            .expect("presence cache poisoned");
+        if cache.as_ref() != Some(&online) {
+            *cache = Some(online);
+            drop(cache);
+            self.broadcast();
+        }
     }
 
     pub fn broadcast(&self) {
@@ -1565,25 +1625,40 @@ impl Core {
                     paired_connection: false,
                     enrollment_requests: 0,
                     attached_sessions: HashSet::new(),
+                    last_seen_at_ms: presence_now_ms(),
                     sink: ClientSink::Direct { messages, close },
                 },
             );
     }
 
     pub fn remove_client(&self, id: &str) {
-        self.clients
+        let device_id = self
+            .clients
             .lock()
             .expect("remote clients poisoned")
-            .remove(id);
+            .remove(id)
+            .and_then(|client| client.device_id);
         let mut inner = self.inner.lock().expect("desktop state poisoned");
         for session in inner.sessions.values_mut() {
             if session.terminal_controller == Some(TerminalController::Remote(id.to_string())) {
                 session.terminal_controller = None;
             }
         }
+        drop(inner);
+        if device_id.is_some() {
+            self.broadcast();
+        }
     }
 
     pub fn handle_client_raw(self: &Arc<Self>, client_id: &str, raw: &str) {
+        if let Some(client) = self
+            .clients
+            .lock()
+            .expect("remote clients poisoned")
+            .get_mut(client_id)
+        {
+            client.last_seen_at_ms = presence_now_ms();
+        }
         let message = match serde_json::from_str::<ClientMessage>(raw) {
             Ok(message) => message,
             Err(_) => {
@@ -1712,6 +1787,7 @@ impl Core {
                 request_id,
                 device_id,
                 device_token,
+                name,
             } => {
                 let accepted = self
                     .inner
@@ -1733,6 +1809,15 @@ impl Core {
                 {
                     let mut inner = self.inner.lock().expect("desktop state poisoned");
                     let _ = inner.store.touch_device(&device_id);
+                    if let Some(name) = name {
+                        if inner
+                            .store
+                            .update_device_name(&device_id, &name)
+                            .unwrap_or(false)
+                        {
+                            eprintln!("device {device_id} display name updated to '{name}'");
+                        }
+                    }
                 }
                 if let Some(client) = self
                     .clients
@@ -1945,6 +2030,7 @@ impl Core {
             platform: device.platform.clone(),
             added_at: now.to_rfc3339(),
             last_seen_at: now.to_rfc3339(),
+            online: false,
         };
         inner
             .store
@@ -2250,7 +2336,7 @@ impl Core {
     }
 }
 
-fn snapshot_from_inner(inner: &Inner) -> HostSnapshot {
+fn snapshot_from_inner(inner: &Inner, online_device_ids: &HashSet<String>) -> HostSnapshot {
     let default_shell_id = if inner
         .shells
         .iter()
@@ -2300,7 +2386,11 @@ fn snapshot_from_inner(inner: &Inner) -> HostSnapshot {
             .store
             .devices()
             .iter()
-            .map(|device| device.device.clone())
+            .map(|device| {
+                let mut entry = device.device.clone();
+                entry.online = online_device_ids.contains(&entry.id);
+                entry
+            })
             .collect(),
         shells: inner.shells.clone(),
         default_shell_id,
@@ -2558,10 +2648,20 @@ mod tests {
     use super::{
         EmbeddedNodeStatus, PairingGrant, is_cursor_position_report, is_dropped_node_status,
         is_within_project, parse_terminal_titles, parse_working_directories,
-        project_name_or_folder, record_cursor_position_requests, take_valid_pairing_grant,
-        validate_project_name,
+        presence_alive, project_name_or_folder, record_cursor_position_requests,
+        take_valid_pairing_grant, validate_project_name, PRESENCE_WINDOW_MS,
     };
     use std::{collections::HashMap, path::Path};
+
+    #[test]
+    fn presence_alive_covers_the_heartbeat_window_boundaries() {
+        let now = 1_000_000_i64;
+        assert!(presence_alive(now, now));
+        assert!(presence_alive(now - PRESENCE_WINDOW_MS, now));
+        assert!(!presence_alive(now - PRESENCE_WINDOW_MS - 1, now));
+        // A clock that predates the last-seen stamp must not overflow.
+        assert!(presence_alive(now, now - PRESENCE_WINDOW_MS - 1));
+    }
 
     #[test]
     fn parses_windows_terminal_working_directory_reports() {

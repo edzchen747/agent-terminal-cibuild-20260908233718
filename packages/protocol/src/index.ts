@@ -8,6 +8,12 @@ export const OVERLAY_TAILNET_DOMAIN = "agent-terminal.internal" as const;
 export const LAN_CONNECT_TIMEOUT_MS = 1_500 as const;
 export const NODE_INACTIVITY_TIMEOUT_DAYS = 30 as const;
 export const MAX_PROJECT_NAME_LENGTH = 100 as const;
+/**
+ * How often the mobile client sends a `snapshot.request` heartbeat while it
+ * is visible. The desktop treats a paired device as connected while it has
+ * received any message within a small multiple of this interval.
+ */
+export const MOBILE_HEARTBEAT_INTERVAL_MS = 60_000 as const;
 
 export type Platform = "android" | "ios" | "web";
 export type TerminalModifier = "ctrl" | "alt" | "shift";
@@ -130,6 +136,8 @@ export interface DeviceIdentity {
 export interface AuthorizedDevice extends DeviceIdentity {
   addedAt: string;
   lastSeenAt: string;
+  /** True while the device holds an authenticated connection to the desktop. */
+  online?: boolean;
 }
 
 export interface Project {

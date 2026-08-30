@@ -215,6 +215,10 @@ button { color: inherit; }
 .device-row:last-child { border: 0; }
 .device-avatar { width: 28px; height: 28px; border-radius: 7px; display: grid; place-items: center; background: #1d2927; color: #78d9c4; }
 .device-avatar svg { width: 15px; }
+.device-name { display: inline-flex; align-items: center; gap: 7px; }
+.device-status { width: 8px; height: 8px; flex: none; border-radius: 50%; }
+.device-status.is-online { background: #69d58a; box-shadow: 0 0 8px #69d58a88; }
+.device-status.is-offline { background: #d96f6f; box-shadow: 0 0 8px #d96f6f66; }
 .danger-icon { width: 29px; height: 29px; border: 0; border-radius: 6px; background: transparent; color: #7a6268; display: grid; place-items: center; cursor: pointer; }
 .danger-icon:hover { color: #ff8c98; background: #29191d; }
 .danger-icon svg { width: 15px; }

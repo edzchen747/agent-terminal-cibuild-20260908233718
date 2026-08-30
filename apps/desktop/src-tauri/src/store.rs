@@ -236,6 +236,27 @@ impl DesktopStore {
         Ok(())
     }
 
+    /// Returns true when the stored display name actually changed.
+    pub fn update_device_name(&mut self, device_id: &str, name: &str) -> Result<bool> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(false);
+        }
+        if let Some(device) = self
+            .state
+            .devices
+            .iter_mut()
+            .find(|item| item.device.id == device_id)
+        {
+            if device.device.name != name {
+                device.device.name = name.to_owned();
+                self.write()?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn revoke_device(&mut self, device_id: &str) -> Result<()> {
         self.state
             .devices
@@ -414,6 +435,7 @@ mod tests {
             platform: "android".into(),
             added_at: "2026-08-27T00:00:00Z".into(),
             last_seen_at: "2026-08-27T00:00:00Z".into(),
+            online: false,
         };
 
         let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
