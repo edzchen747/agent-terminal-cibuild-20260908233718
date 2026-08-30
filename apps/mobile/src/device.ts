@@ -11,9 +11,10 @@ function fallbackDeviceName(): string {
  * native device plugin is unavailable, e.g. "Mozilla/5.0 (Linux; Android 14;
  * Pixel 8 Build/...; wv)". This keeps names per-device without native code.
  */
-function userAgentModel(): string | null {
-  const match = navigator.userAgent.match(/Android \d+(?:\.\d+)?;\s*([^;)]+)/);
-  return match?.[1]?.trim() || null;
+export function userAgentModel(userAgent = navigator.userAgent): string | null {
+  const match = userAgent.match(/Android \d+(?:\.\d+)?;\s*([^;)]+)/);
+  const model = match?.[1]?.split(" Build")[0]?.trim();
+  return model || null;
 }
 
 /**

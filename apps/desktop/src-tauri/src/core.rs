@@ -2646,12 +2646,22 @@ fn is_dropped_node_status(status: &EmbeddedNodeStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        EmbeddedNodeStatus, PairingGrant, is_cursor_position_report, is_dropped_node_status,
+        EmbeddedNodeStatus, Inner, PairingGrant, is_cursor_position_report, is_dropped_node_status,
         is_within_project, parse_terminal_titles, parse_working_directories,
         presence_alive, project_name_or_folder, record_cursor_position_requests,
-        take_valid_pairing_grant, validate_project_name, PRESENCE_WINDOW_MS,
+        snapshot_from_inner, take_valid_pairing_grant, validate_project_name, PRESENCE_WINDOW_MS,
     };
-    use std::{collections::HashMap, path::Path};
+    use crate::{
+        models::AuthorizedDevice,
+        store::DesktopStore,
+        window_clients::WindowClients,
+    };
+    use std::{
+        collections::{HashMap, HashSet},
+        fs,
+        path::{Path, PathBuf},
+    };
+    use uuid::Uuid;
 
     #[test]
     fn presence_alive_covers_the_heartbeat_window_boundaries() {
@@ -2661,6 +2671,55 @@ mod tests {
         assert!(!presence_alive(now - PRESENCE_WINDOW_MS - 1, now));
         // A clock that predates the last-seen stamp must not overflow.
         assert!(presence_alive(now, now - PRESENCE_WINDOW_MS - 1));
+    }
+
+    #[test]
+    fn snapshot_marks_only_devices_currently_reachable_as_online() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
+        let device = |id: &str, name: &str| AuthorizedDevice {
+            id: id.into(),
+            name: name.into(),
+            platform: "android".into(),
+            added_at: "2026-08-27T00:00:00Z".into(),
+            last_seen_at: "2026-08-27T00:00:00Z".into(),
+            online: false,
+        };
+        store
+            .authorize_device(device("phone-a", "Pixel 7"), "cred-a")
+            .expect("authorize first device");
+        store
+            .authorize_device(device("phone-b", "Galaxy S23"), "cred-b")
+            .expect("authorize second device");
+
+        let inner = Inner {
+            store,
+            shells: Vec::new(),
+            temporary_projects: HashMap::new(),
+            project_order: Vec::new(),
+            sessions: HashMap::new(),
+            session_order: Vec::new(),
+            windows: WindowClients::default(),
+            pairing_grants: HashMap::new(),
+        };
+
+        let online = HashSet::from(["phone-a".to_string()]);
+        let snapshot = snapshot_from_inner(&inner, &online);
+        assert_eq!(snapshot.devices.len(), 2);
+        assert_eq!(snapshot.devices[0].online, true);
+        assert_eq!(snapshot.devices[1].online, false);
+
+        let nobody = HashSet::new();
+        let snapshot = snapshot_from_inner(&inner, &nobody);
+        assert!(
+            snapshot.devices.iter().all(|device| !device.online),
+            "devices outside the presence window are offline"
+        );
+        fs::remove_file(state_path).expect("remove test state");
     }
 
     #[test]

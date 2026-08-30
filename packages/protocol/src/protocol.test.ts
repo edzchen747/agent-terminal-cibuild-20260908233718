@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, applyTerminalModifiers, encodeMessage, encodePairingPayload, findHttpLinks, parsePairingPayload, parseTerminalWorkingDirectories } from "./index.js";
+import { LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, applyTerminalModifiers, decodeClientMessage, encodeMessage, encodePairingPayload, findHttpLinks, parsePairingPayload, parseTerminalWorkingDirectories } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -135,4 +135,24 @@ test("shell working-directory reports parse from Windows Terminal OSC sequences"
     parseTerminalWorkingDirectories("\x1b]7;file:///C:/Users/Ada/Project%20One\x1b\\"),
     ["C:/Users/Ada/Project One"]
   );
+});
+
+test("the mobile heartbeat interval is the desktop presence window source", () => {
+  // The desktop Rust core counts as connected any device heard from within
+  // 2x this value, so these two sides must share one constant.
+  assert.equal(MOBILE_HEARTBEAT_INTERVAL_MS, 60_000);
+});
+
+test("auth messages carry an optional display name through the wire contract", () => {
+  const wire = encodeMessage({
+    type: "auth",
+    requestId: "r1",
+    deviceId: "d1",
+    deviceToken: "t1",
+    name: "Pixel 9"
+  });
+  const decoded = decodeClientMessage(JSON.parse(wire));
+  assert.equal(decoded.type, "auth");
+  if (decoded.type !== "auth") assert.fail("expected an auth message");
+  assert.equal(decoded.name, "Pixel 9");
 });

@@ -333,4 +333,25 @@ mod tests {
         assert_eq!(json["type"], "ok");
         assert_eq!(json["requestId"], "r1");
     }
+
+    #[test]
+    fn auth_message_accepts_an_optional_display_name() {
+        let with_name: ClientMessage = serde_json::from_str(
+            r#"{"type":"auth","requestId":"r1","deviceId":"d1","deviceToken":"t1","name":"Pixel 9"}"#,
+        )
+        .expect("auth with a display name");
+        assert!(matches!(
+            with_name,
+            ClientMessage::Auth { name: Some(name), .. } if name == "Pixel 9"
+        ));
+
+        let legacy: ClientMessage = serde_json::from_str(
+            r#"{"type":"auth","requestId":"r1","deviceId":"d1","deviceToken":"t1"}"#,
+        )
+        .expect("auth without a display name");
+        assert!(matches!(
+            legacy,
+            ClientMessage::Auth { name: None, .. }
+        ));
+    }
 }

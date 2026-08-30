@@ -481,4 +481,64 @@ mod tests {
         assert_eq!(reloaded.network().node_id.as_deref(), Some("node-1"));
         fs::remove_file(state_path).expect("remove test state");
     }
+
+    fn store_with_device(name: &str) -> (PathBuf, DesktopStore) {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let device = AuthorizedDevice {
+            id: "phone-1".into(),
+            name: name.into(),
+            platform: "android".into(),
+            added_at: "2026-08-27T00:00:00Z".into(),
+            last_seen_at: "2026-08-27T00:00:00Z".into(),
+            online: false,
+        };
+        let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
+        store
+            .authorize_device(device, "device-credential")
+            .expect("authorize device");
+        (state_path, store)
+    }
+
+    #[test]
+    fn update_device_name_changes_and_persists_across_reloads() {
+        let (state_path, mut store) = store_with_device("Android phone");
+
+        assert!(store
+            .update_device_name("phone-1", "Pixel 9 Pro")
+            .expect("rename device"));
+        assert_eq!(store.devices()[0].device.name, "Pixel 9 Pro");
+        assert_eq!(store.devices().len(), 1);
+
+        drop(store);
+        let reloaded = DesktopStore::load(state_path.clone()).expect("reloaded store");
+        assert_eq!(reloaded.devices()[0].device.name, "Pixel 9 Pro");
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn update_device_name_trims_blanks_and_ignores_unknown_or_unchanged() {
+        let (_state_path, mut store) = store_with_device("Android phone");
+
+        assert!(store
+            .update_device_name("phone-1", "  Pixel 9 Pro  ")
+            .expect("trimmed rename"));
+        assert_eq!(store.devices()[0].device.name, "Pixel 9 Pro");
+        // A repeated rename is a no-op rather than a write.
+        assert!(!store
+            .update_device_name("phone-1", "Pixel 9 Pro")
+            .expect("unchanged rename"));
+        // Blank names are rejected, keeping the previous name in place.
+        assert!(!store
+            .update_device_name("phone-1", "   ")
+            .expect("blank rename"));
+        assert_eq!(store.devices()[0].device.name, "Pixel 9 Pro");
+        // Unknown device ids are ignored instead of failing the auth flow.
+        assert!(!store
+            .update_device_name("phone-missing", "Other phone")
+            .expect("unknown device rename"));
+    }
 }
