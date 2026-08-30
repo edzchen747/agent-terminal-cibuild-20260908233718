@@ -1,8 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
-    path::PathBuf,
-    process::{Command, Stdio},
+    ffi::OsStr,
+    path::{Path, PathBuf},
 };
 
 use portable_pty::CommandBuilder;
@@ -117,13 +117,28 @@ pub fn command_for(shell: &ShellProfile, cwd: &str) -> CommandBuilder {
 }
 
 fn command_exists(command: &str) -> bool {
-    Command::new("where.exe")
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    executable_on_path(command, env::var_os("PATH").as_deref())
+}
+
+fn executable_on_path(command: &str, path: Option<&OsStr>) -> bool {
+    // `where.exe` is a console-subsystem binary: launching it from the
+    // GUI-subsystem host allocates a visible console window per lookup, so
+    // every shell probe flashed a cmd window on startup. A PATH scan finds
+    // the same executables without spawning a process at all.
+    let names = if cfg!(windows) && Path::new(command).extension().is_none() {
+        vec![command.to_string(), format!("{command}.exe")]
+    } else {
+        vec![command.to_string()]
+    };
+    path.map(std::env::split_paths)
+        .map(|mut dirs| {
+            dirs.any(|dir| {
+                names
+                    .iter()
+                    .any(|name| dir.join(name).is_file())
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn profile(id: &str, name: &str, executable: impl ToString, args: &[&str]) -> ShellProfile {
@@ -132,5 +147,114 @@ fn profile(id: &str, name: &str, executable: impl ToString, args: &[&str]) -> Sh
         name: name.into(),
         executable: executable.to_string(),
         args: args.iter().map(|arg| (*arg).to_string()).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::executable_on_path;
+    use std::{
+        env,
+        ffi::{OsStr, OsString},
+        fs,
+        path::PathBuf,
+    };
+    use uuid::Uuid;
+
+    fn temp_dir() -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state")
+            .join(format!("shells-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create shell test directory");
+        dir
+    }
+
+    fn joined_path(dirs: impl IntoIterator<Item = PathBuf>) -> OsString {
+        env::join_paths(dirs).expect("join test path")
+    }
+
+    #[test]
+    fn finds_an_executable_in_a_path_directory() {
+        let dir = temp_dir();
+        fs::write(dir.join("sample-tool.exe"), b"").expect("write executable");
+        let path = joined_path([dir.clone()]);
+        assert!(executable_on_path("sample-tool.exe", Some(&path)));
+        fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn misses_a_missing_executable() {
+        let dir = temp_dir();
+        let path = joined_path([dir.clone()]);
+        assert!(!executable_on_path("missing-tool.exe", Some(&path)));
+        fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn no_path_environment_means_not_found() {
+        assert!(!executable_on_path("sample-tool.exe", None));
+    }
+
+    #[test]
+    fn empty_path_means_not_found() {
+        assert!(!executable_on_path("sample-tool.exe", Some(OsStr::new(""))));
+    }
+
+    #[test]
+    fn later_path_directories_are_searched() {
+        let first = temp_dir();
+        let second = temp_dir();
+        fs::write(second.join("later-tool.exe"), b"").expect("write executable");
+        let path = joined_path([first.clone(), second.clone()]);
+        assert!(executable_on_path("later-tool.exe", Some(&path)));
+        fs::remove_dir_all(&first).expect("clean up");
+        fs::remove_dir_all(&second).expect("clean up");
+    }
+
+    #[test]
+    fn a_directory_does_not_count_as_an_executable() {
+        let dir = temp_dir();
+        fs::create_dir(dir.join("sample-tool.exe")).expect("create directory");
+        let path = joined_path([dir.clone()]);
+        assert!(!executable_on_path("sample-tool.exe", Some(&path)));
+        fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn an_explicit_extension_matches_only_that_name() {
+        let dir = temp_dir();
+        fs::write(dir.join("sample-tool"), b"").expect("write file");
+        let path = joined_path([dir.clone()]);
+        assert!(!executable_on_path("sample-tool.exe", Some(&path)));
+        fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn a_name_with_an_extension_never_appends_exe() {
+        let dir = temp_dir();
+        fs::write(dir.join("tool.cmd"), b"").expect("write file");
+        let path = joined_path([dir.clone()]);
+        assert!(executable_on_path("tool.cmd", Some(&path)));
+        fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn an_extensionless_name_matches_a_same_named_file() {
+        let dir = temp_dir();
+        fs::write(dir.join("sample-tool"), b"").expect("write file");
+        let path = joined_path([dir.clone()]);
+        assert!(executable_on_path("sample-tool", Some(&path)));
+        fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_extensionless_name_matches_its_exe_sibling() {
+        let dir = temp_dir();
+        fs::write(dir.join("sample-tool.exe"), b"").expect("write executable");
+        let path = joined_path([dir.clone()]);
+        assert!(executable_on_path("sample-tool", Some(&path)));
+        fs::remove_dir_all(&dir).expect("clean up");
     }
 }
