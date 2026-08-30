@@ -14,13 +14,15 @@ import type { DirectoryListing, HostSnapshot, PairingPayload, Platform, Project,
 import { createRequestId, MAX_PROJECT_NAME_LENGTH, parsePairingPayload } from "@agentterminal/protocol";
 import { HostConnection, type RemoteRegistrationState } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
-import { classifyGestureAxis } from "./gesture";
+import { classifyGestureAxis, shouldBridgeTapClick } from "./gesture";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, SettingsIcon, TerminalIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
 
 type View = { type: "home" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
 type ConnectionNotificationState = "connected" | "reconnecting";
 const TERMINAL_FONT_WIDTH_KEY = "agent-terminal-font-width-percent";
+const SWALLOW_CLICK_LINGER_MS = 600;
+const SWALLOW_CLICK_DISTANCE_PX = 48;
 
 interface ProjectDragState {
   projectId: string;
@@ -72,6 +74,9 @@ export function App() {
   const suppressSwipeClickRef = useRef(false);
   const swipeClickPageRef = useRef<number | null>(null);
   const swipeClickTimerRef = useRef<number | undefined>(undefined);
+  const swallowTapClickRef = useRef(false);
+  const swallowTapClickAtRef = useRef({ x: 0, y: 0 });
+  const swallowTapClickTimerRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     void Preferences.get({ key: TERMINAL_FONT_WIDTH_KEY }).then(({ value }) => {
@@ -400,6 +405,9 @@ export function App() {
     // compatibility click from an earlier page transition consume this one.
     if (swipeClickTimerRef.current !== undefined) window.clearTimeout(swipeClickTimerRef.current);
     swipeClickTimerRef.current = undefined;
+    if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current);
+    swallowTapClickTimerRef.current = undefined;
+    swallowTapClickRef.current = false;
     suppressSwipeClickRef.current = false;
     swipeClickPageRef.current = null;
     // Start tracking every touch, including touches that begin on a button.
@@ -445,7 +453,8 @@ export function App() {
   function finishSwipe(event: ReactPointerEvent<HTMLDivElement>, cancelled = false) {
     const current = swipeRef.current;
     if (!current || current.pointerId !== event.pointerId) return;
-    const velocity = Math.abs(current.deltaX) / Math.max(1, performance.now() - current.startedAt);
+    const elapsed = Math.max(1, performance.now() - current.startedAt);
+    const velocity = Math.abs(current.deltaX) / elapsed;
     const canNavigate = current.deltaX > 0 ? currentPage > 0 : currentPage < pageCount - 1;
     const commit = !cancelled && current.horizontal && canNavigate && (Math.abs(current.deltaX) > window.innerWidth * .22 || velocity > .55);
     const targetPage = commit ? currentPage + (current.deltaX < 0 ? 1 : -1) : currentPage;
@@ -469,9 +478,75 @@ export function App() {
     if (targetPage === 0) setView({ type: "home" });
     else if (targetPage === 1 && activeProject) setView({ type: "project", projectId: activeProject.id });
     else if (targetPage === 2 && activeProject && activeSession) setView({ type: "terminal", projectId: activeProject.id, sessionId: activeSession.id });
+    // Chromium's fling recognizer can swallow the click of a tap that follows
+    // any touch drag, regardless of speed, for longer than a tap-pacing window.
+    // Handle every taut tap from its pointer-up directly, so a control works on
+    // the first attempt right after the user lets go.
+    if (!cancelled) bridgeTapClick(event, current);
+  }
+
+  function bridgeTapClick(event: ReactPointerEvent<HTMLDivElement>, state: SwipeState) {
+    // A taut tap may never deliver its click (Chromium eats the first click
+    // after a dragged gesture to settle the fling). Running the control's
+    // activation at pointer-up means the tap works immediately on let-go; the
+    // guard below then drops the click the WebView emits if/when it recovers,
+    // so the action still fires at most once.
+    if (!shouldBridgeTapClick({
+      eventType: event.type,
+      pointerType: event.pointerType,
+      isPrimary: event.isPrimary,
+      horizontal: state.horizontal,
+      now: performance.now(),
+      startedAt: state.startedAt,
+      movePx: Math.hypot(event.clientX - state.startX, event.clientY - state.startY)
+    })) return;
+    const target = event.target instanceof Element ? event.target : undefined;
+    const control = target?.closest("button, a, summary, label, [role=button], .sheet-backdrop");
+    if (!(control instanceof HTMLElement)) return;
+    // A click inside a bottom sheet is stopped by the sheet section; only a
+    // tap on the backdrop itself dismisses it. Do not synthesize a backdrop
+    // dismissal for taps that a real click would not deliver there either.
+    if (control.classList.contains("sheet-backdrop") && target?.closest(".bottom-sheet")) return;
+    // Controls that own their pointer sequence (terminal function keys, project
+    // reorder handles) already activate without a click; a synthetic click
+    // would run them a second time.
+    if (control.closest(".extra-keys")) return;
+    if (control.matches(".mobile-project-drag")) return;
+    control.click();
+    swallowTapClickRef.current = true;
+    swallowTapClickAtRef.current = { x: event.clientX, y: event.clientY };
+    if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current);
+    swallowTapClickTimerRef.current = window.setTimeout(() => {
+      swallowTapClickRef.current = false;
+      swallowTapClickAtRef.current = { x: 0, y: 0 };
+      swallowTapClickTimerRef.current = undefined;
+    }, SWALLOW_CLICK_LINGER_MS);
   }
 
   function suppressSwipeClick(event: React.MouseEvent<HTMLDivElement>) {
+    if (swallowTapClickRef.current) {
+      const nearTap = Math.hypot(event.clientX - swallowTapClickAtRef.current.x, event.clientY - swallowTapClickAtRef.current.y) <= SWALLOW_CLICK_DISTANCE_PX;
+      if (nearTap) {
+        // The browser click that trails a bridged tap (or the compatibility
+        // click of the gesture itself). The synthetic click already ran the
+        // control's action; swallow this one so it cannot fire twice.
+        swallowTapClickRef.current = false;
+        swallowTapClickAtRef.current = { x: 0, y: 0 };
+        if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current);
+        swallowTapClickTimerRef.current = undefined;
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      // A real click on another page/control must pass. The delayed click this
+      // guard waits for targets the tap position, so a far-away click is a
+      // fresh, unrelated interaction.
+      swallowTapClickRef.current = false;
+      swallowTapClickAtRef.current = { x: 0, y: 0 };
+      if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current);
+      swallowTapClickTimerRef.current = undefined;
+      return;
+    }
     if (!suppressSwipeClickRef.current) return;
     const target = event.target instanceof Element ? event.target.closest(".mobile-page") : null;
     const pageIndex = target?.parentElement ? Array.prototype.indexOf.call(target.parentElement.children, target) : null;
@@ -493,7 +568,7 @@ export function App() {
     event.stopPropagation();
   }
 
-  return <div className="mobile-pager" onPointerDownCapture={beginSwipe} onTouchStartCapture={() => { suppressSwipeClickRef.current = false; swipeClickPageRef.current = null; if (swipeClickTimerRef.current !== undefined) window.clearTimeout(swipeClickTimerRef.current); swipeClickTimerRef.current = undefined; }} onPointerMoveCapture={moveSwipe} onPointerUpCapture={(event) => finishSwipe(event)} onPointerCancelCapture={(event) => finishSwipe(event)} onClickCapture={suppressSwipeClick}>
+  return <div className="mobile-pager" onPointerDownCapture={beginSwipe} onTouchStartCapture={() => { suppressSwipeClickRef.current = false; swipeClickPageRef.current = null; if (swipeClickTimerRef.current !== undefined) window.clearTimeout(swipeClickTimerRef.current); swipeClickTimerRef.current = undefined; swallowTapClickRef.current = false; if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current); swallowTapClickTimerRef.current = undefined; }} onPointerMoveCapture={moveSwipe} onPointerUpCapture={(event) => finishSwipe(event)} onPointerCancelCapture={(event) => finishSwipe(event)} onClickCapture={suppressSwipeClick}>
     <div className={`mobile-page-track ${swipe?.horizontal ? "is-dragging" : ""}`} style={{ transform: `translate3d(calc(${-currentPage * 100}% + ${swipe?.deltaX ?? 0}px),0,0)` }}>
       <div className="mobile-page"><div className="mobile-app home-view">
         <RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} />
