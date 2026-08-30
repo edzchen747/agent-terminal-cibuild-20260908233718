@@ -6,6 +6,25 @@ const HORIZONTAL_BIAS = 1.2;
 export const TAP_MAX_MOVE_PX = 12;
 export const TAP_MAX_DURATION_MS = 400;
 
+export const SHEET_DISMISS_DISTANCE_PX = 72;
+export const SHEET_DISMISS_MIN_FLICK_PX = 24;
+export const SHEET_DISMISS_VELOCITY_PX_MS = 0.55;
+
+/**
+ * Whether a tracked vertical swipe over an overlay has enough distance or
+ * speed to commit its dismissal. Short drags snap the sheet back; a quick
+ * flick closes it even when the distance is small.
+ */
+export function shouldCommitSheetDismiss(input: {
+  cancelled: boolean;
+  distancePx: number;
+  velocityPxPerMs: number;
+}): boolean {
+  if (input.cancelled || input.distancePx <= 0) return false;
+  if (input.distancePx >= SHEET_DISMISS_DISTANCE_PX) return true;
+  return input.velocityPxPerMs >= SHEET_DISMISS_VELOCITY_PX_MS && input.distancePx >= SHEET_DISMISS_MIN_FLICK_PX;
+}
+
 export function classifyGestureAxis(deltaX: number, deltaY: number): GestureAxis {
   if (Math.hypot(deltaX, deltaY) <= INTENT_THRESHOLD_PX) return "pending";
   return Math.abs(deltaX) > Math.abs(deltaY) * HORIZONTAL_BIAS ? "horizontal" : "vertical";

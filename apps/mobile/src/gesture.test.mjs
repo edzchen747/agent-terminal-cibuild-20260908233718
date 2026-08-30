@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldSwallowTrailingClick, TAP_MAX_DURATION_MS, TAP_MAX_MOVE_PX } from "./gesture.ts";
+import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_DISMISS_DISTANCE_PX, TAP_MAX_DURATION_MS, TAP_MAX_MOVE_PX } from "./gesture.ts";
 
 test("gesture intent waits through initial touch jitter", () => {
   assert.equal(classifyGestureAxis(5, 4), "pending");
@@ -87,4 +87,25 @@ test("the trailing click of a bridged tap is swallowed only near the tap", () =>
 
 test("an unarmed guard never swallows a click", () => {
   assert.equal(shouldSwallowTrailingClick({ armed: false, nearTap: true }), false);
+});
+
+test("a sheet drag past the distance threshold commits the dismissal", () => {
+  assert.equal(shouldCommitSheetDismiss({ cancelled: false, distancePx: SHEET_DISMISS_DISTANCE_PX + 1, velocityPxPerMs: 0.01 }), true);
+});
+
+test("a slow short sheet drag snaps back", () => {
+  assert.equal(shouldCommitSheetDismiss({ cancelled: false, distancePx: 30, velocityPxPerMs: 0.1 }), false);
+});
+
+test("a quick flick commits even when the sheet moved only a little", () => {
+  assert.equal(shouldCommitSheetDismiss({ cancelled: false, distancePx: 26, velocityPxPerMs: 1.1 }), true);
+});
+
+test("a flick that barely moves is not enough to dismiss", () => {
+  assert.equal(shouldCommitSheetDismiss({ cancelled: false, distancePx: 5, velocityPxPerMs: 3 }), false);
+});
+
+test("cancelled or non-moving sheet gestures never dismiss", () => {
+  assert.equal(shouldCommitSheetDismiss({ cancelled: true, distancePx: 200, velocityPxPerMs: 2 }), false);
+  assert.equal(shouldCommitSheetDismiss({ cancelled: false, distancePx: 0, velocityPxPerMs: 0 }), false);
 });

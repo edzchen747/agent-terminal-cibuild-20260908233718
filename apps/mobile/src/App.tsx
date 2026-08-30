@@ -16,7 +16,7 @@ import { HostConnection, type RemoteRegistrationState } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
 import { notificationStateFor, type ConnectionNotificationState } from "./connectionPolicy";
 import { deviceName } from "./device";
-import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldSwallowTrailingClick } from "./gesture";
+import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick } from "./gesture";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, SettingsIcon, TerminalIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
 
@@ -43,6 +43,13 @@ interface SwipeState {
   startedAt: number;
   deltaX: number;
   horizontal: boolean;
+  /** Whether an overlay sheet was active when this pointer went down. */
+  overlay: boolean;
+  /** Whether the marked-for-dismiss or scrollable region disallows the drag. */
+  blocked: boolean;
+  /** Whether the gesture is currently dragging a sheet downward. */
+  sheetDragging: boolean;
+  deltaY: number;
 }
 
 export function App() {
@@ -65,6 +72,7 @@ export function App() {
   const [projectDrag, setProjectDrag] = useState<ProjectDragState | null>(null);
   const [projectReordering, setProjectReordering] = useState(false);
   const [swipe, setSwipe] = useState<SwipeState | null>(null);
+  const [sheetDragY, setSheetDragY] = useState(0);
   const connectionRef = useRef<HostConnection | null>(null);
   connectionRef.current = connection;
   const screenAwakeRef = useRef(true);
@@ -464,11 +472,25 @@ export function App() {
     // We only turn it into a pager gesture after movement is classified as
     // horizontal, so a normal button tap keeps its native click behavior.
     const target = event.target instanceof Element ? event.target : undefined;
+    if (swipeRef.current || event.pointerType === "mouse") return;
+    const sheetRoot = target?.closest(".sheet-backdrop");
+    // While an overlay is open its content owns the pointer sequence. The
+    // page pager must not navigate, and the sheet's own vertical swipe-down
+    // dismissal is tracked instead. Taps are still tracked so a control in
+    // the sheet keeps working when Chromium eats the first click after a drag.
+    if (sheetRoot) {
+      const busy = Boolean(target?.closest(".sheet-backdrop[data-busy]"));
+      const scrollable = target ? sheetTargetScrollable(target, sheetRoot) : false;
+      const next: SwipeState = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startedAt: performance.now(), deltaX: 0, horizontal: false, overlay: true, blocked: busy || scrollable, sheetDragging: false, deltaY: 0 };
+      swipeRef.current = next;
+      return;
+    }
+    if (showTerminalSettings || projectToRename || sessionToClose || showCreateProject) return;
     const terminalText = target?.closest(".xterm-accessibility-tree");
     const selection = document.getSelection();
     const draggingTerminalSelection = Boolean(terminalText && selection && !selection.isCollapsed && selection.anchorNode && terminalText.contains(selection.anchorNode));
-    if (swipeRef.current || event.pointerType === "mouse" || draggingTerminalSelection) return;
-    const next: SwipeState = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startedAt: performance.now(), deltaX: 0, horizontal: false };
+    if (draggingTerminalSelection) return;
+    const next: SwipeState = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startedAt: performance.now(), deltaX: 0, horizontal: false, overlay: false, blocked: false, sheetDragging: false, deltaY: 0 };
     swipeRef.current = next;
   }
 
@@ -477,6 +499,30 @@ export function App() {
     if (!current || current.pointerId !== event.pointerId) return;
     const rawX = event.clientX - current.startX;
     const deltaY = event.clientY - current.startY;
+    if (current.overlay) {
+      if (current.blocked) return;
+      if (!current.sheetDragging) {
+        const axis = classifyGestureAxis(rawX, deltaY);
+        if (axis === "pending") return;
+        if (axis === "horizontal" || deltaY <= 0) {
+          // A horizontal move starts no sheet drag and no page navigation.
+          // An upward move does not dismiss; the sheet content is not a
+          // scroll region here, so there is nothing to do with the gesture.
+          swipeRef.current = null;
+          setSwipe(null);
+          return;
+        }
+        const next = { ...current, sheetDragging: true, deltaY };
+        swipeRef.current = next;
+        setSheetDragY(deltaY);
+        return;
+      }
+      const next = { ...current, deltaY };
+      swipeRef.current = next;
+      setSheetDragY(Math.max(0, deltaY));
+      event.preventDefault();
+      return;
+    }
     if (!current.horizontal) {
       const selection = document.getSelection();
       if (selection && !selection.isCollapsed && selection.anchorNode instanceof Node && (event.target instanceof Element ? event.target.closest(".xterm-accessibility-tree")?.contains(selection.anchorNode) : false)) {
@@ -503,6 +549,23 @@ export function App() {
   function finishSwipe(event: ReactPointerEvent<HTMLDivElement>, cancelled = false) {
     const current = swipeRef.current;
     if (!current || current.pointerId !== event.pointerId) return;
+    if (current.overlay) {
+      swipeRef.current = null;
+      setSwipe(null);
+      if (current.sheetDragging && !cancelled && !current.blocked) {
+        const elapsed = Math.max(1, performance.now() - current.startedAt);
+        const distancePx = Math.max(0, event.clientY - current.startY);
+        if (shouldCommitSheetDismiss({ cancelled, distancePx, velocityPxPerMs: distancePx / elapsed }) && !document.querySelector(".sheet-backdrop[data-busy]")) {
+          dismissActiveSheet();
+          squashSwipeClick(event);
+        }
+      }
+      setSheetDragY(0);
+      // Taps inside the sheet still need the click bridge: a taut tap on a
+      // sheet control is fired directly so it works right after a drag.
+      if (!cancelled) bridgeTapClick(event, current);
+      return;
+    }
     const elapsed = Math.max(1, performance.now() - current.startedAt);
     const velocity = Math.abs(current.deltaX) / elapsed;
     const canNavigate = current.deltaX > 0 ? currentPage > 0 : currentPage < pageCount - 1;
@@ -618,7 +681,27 @@ export function App() {
     event.stopPropagation();
   }
 
-  return <div className="mobile-pager" onPointerDownCapture={beginSwipe} onTouchStartCapture={() => { suppressSwipeClickRef.current = false; swipeClickPageRef.current = null; if (swipeClickTimerRef.current !== undefined) window.clearTimeout(swipeClickTimerRef.current); swipeClickTimerRef.current = undefined; swallowTapClickRef.current = false; if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current); swallowTapClickTimerRef.current = undefined; }} onPointerMoveCapture={moveSwipe} onPointerUpCapture={(event) => finishSwipe(event)} onPointerCancelCapture={(event) => finishSwipe(event)} onClickCapture={suppressSwipeClick}>
+  function dismissActiveSheet() {
+    if (showTerminalSettings) { setShowTerminalSettings(false); return; }
+    if (projectToRename) { setProjectToRename(null); return; }
+    if (sessionToClose) { setSessionToClose(null); return; }
+    if (showCreateProject) { setShowCreateProject(false); return; }
+  }
+
+  function squashSwipeClick(event: ReactPointerEvent<HTMLDivElement>) {
+    // A drag that dismisses the sheet must not land a click on whatever
+    // becomes exposed underneath. Swallow the compatibility click it trails.
+    swallowTapClickRef.current = true;
+    swallowTapClickAtRef.current = { x: event.clientX, y: event.clientY };
+    if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current);
+    swallowTapClickTimerRef.current = window.setTimeout(() => {
+      swallowTapClickRef.current = false;
+      swallowTapClickAtRef.current = { x: 0, y: 0 };
+      swallowTapClickTimerRef.current = undefined;
+    }, SWALLOW_CLICK_LINGER_MS);
+  }
+
+  return <div className={`mobile-pager ${sheetDragY > 0 ? "is-sheet-dragging" : ""}`} style={{ ["--sheet-drag-y" as string]: `${sheetDragY}px` } as React.CSSProperties} onPointerDownCapture={beginSwipe} onTouchStartCapture={() => { suppressSwipeClickRef.current = false; swipeClickPageRef.current = null; if (swipeClickTimerRef.current !== undefined) window.clearTimeout(swipeClickTimerRef.current); swipeClickTimerRef.current = undefined; swallowTapClickRef.current = false; if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current); swallowTapClickTimerRef.current = undefined; }} onPointerMoveCapture={moveSwipe} onPointerUpCapture={(event) => finishSwipe(event)} onPointerCancelCapture={(event) => finishSwipe(event)} onClickCapture={suppressSwipeClick}>
     <div className={`mobile-page-track ${swipe?.horizontal ? "is-dragging" : ""}`} style={{ transform: `translate3d(calc(${-currentPage * 100}% + ${swipe?.deltaX ?? 0}px),0,0)` }}>
       <div className="mobile-page"><div className="mobile-app home-view">
         <RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} />
@@ -646,6 +729,24 @@ export function App() {
     {sessionToClose && activeSession?.id === sessionToClose.id && <CloseSessionSheet session={activeSession} onClose={() => setSessionToClose(null)} onConfirm={() => closeSession(activeSession)} />}
     {showTerminalSettings && <TerminalSettingsSheet value={fontWidthPercent} onChange={(value) => { setFontWidthPercent(value); void Preferences.set({ key: TERMINAL_FONT_WIDTH_KEY, value: String(value) }); }} onClose={() => setShowTerminalSettings(false)} />}
   </div>;
+}
+
+function sheetTargetScrollable(target: Element, sheetRoot: Element): boolean {
+  // A swipe-down dismissal must never fight a native scroll inside the sheet.
+  // Walk from the tap up to the sheet root: the first overflow-y auto/scroll
+  // ancestor marks a scrolling section (the directory list) that keeps the
+  // gesture, so it does not close the overlay. The character-width range
+  // input has no scrollable ancestor, so a swipe down starting on it still
+  // dismisses.
+  let element: Element | null = target;
+  while (element && element !== sheetRoot) {
+    if (element instanceof HTMLElement) {
+      const style = getComputedStyle(element);
+      if (style.overflowY === "auto" || style.overflowY === "scroll") return true;
+    }
+    element = element.parentElement;
+  }
+  return false;
 }
 
 function RemoteRegistrationBanner({ state, onRetry }: { state: RemoteRegistrationState; onRetry: () => void }) {
@@ -760,7 +861,7 @@ function RenameProjectSheet({ project, connection, onClose }: { project: Project
       setSaving(false);
     }
   }
-  return <div className="sheet-backdrop" onClick={saving ? undefined : onClose}><section className="bottom-sheet" onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Project name</span><h2>Rename project</h2><p>The desktop folder stays at {project.path}. Leave the name blank to use the folder name.</p><label>Name<input autoFocus maxLength={MAX_PROJECT_NAME_LENGTH} value={name} onChange={(event) => setName(event.target.value)} /></label>{error && <div className="form-error">{error}</div>}<button className="mobile-primary full" disabled={saving} onClick={() => void submit()}>{saving ? "Renaming…" : "Save name"}</button><button className="text-button" disabled={saving} onClick={onClose}>Cancel</button></section></div>;
+  return <div className="sheet-backdrop" data-busy={saving ? "" : undefined} onClick={saving ? undefined : onClose}><section className="bottom-sheet" onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Project name</span><h2>Rename project</h2><p>The desktop folder stays at {project.path}. Leave the name blank to use the folder name.</p><label>Name<input autoFocus maxLength={MAX_PROJECT_NAME_LENGTH} value={name} onChange={(event) => setName(event.target.value)} /></label>{error && <div className="form-error">{error}</div>}<button className="mobile-primary full" disabled={saving} onClick={() => void submit()}>{saving ? "Renaming…" : "Save name"}</button><button className="text-button" disabled={saving} onClick={onClose}>Cancel</button></section></div>;
 }
 
 function CloseSessionSheet({ session, onClose, onConfirm }: { session: TerminalSession; onClose: () => void; onConfirm: () => Promise<void> }) {
@@ -771,7 +872,7 @@ function CloseSessionSheet({ session, onClose, onConfirm }: { session: TerminalS
     try { await onConfirm(); }
     catch (cause) { setError(cause instanceof Error ? cause.message : "Could not close the terminal session."); setClosing(false); }
   }
-  return <div className="sheet-backdrop" onClick={closing ? undefined : onClose}><section className="bottom-sheet confirm-sheet" onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Close terminal</span><h2>End this session?</h2><p>This will terminate <strong title={session.title}>{session.title}</strong> and remove its tab from the desktop and phone.</p>{error && <div className="form-error">{error}</div>}<button className="danger-button" disabled={closing} onClick={() => void confirm()}>{closing ? "Closing…" : "Close terminal"}</button><button className="text-button" disabled={closing} onClick={onClose}>Cancel</button></section></div>;
+  return <div className="sheet-backdrop" data-busy={closing ? "" : undefined} onClick={closing ? undefined : onClose}><section className="bottom-sheet confirm-sheet" onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Close terminal</span><h2>End this session?</h2><p>This will terminate <strong title={session.title}>{session.title}</strong> and remove its tab from the desktop and phone.</p>{error && <div className="form-error">{error}</div>}<button className="danger-button" disabled={closing} onClick={() => void confirm()}>{closing ? "Closing…" : "Close terminal"}</button><button className="text-button" disabled={closing} onClick={onClose}>Cancel</button></section></div>;
 }
 
 function MobileHeader({ title, subtitle, onBack, trailing }: { title: string; subtitle: string; onBack: () => void; trailing?: React.ReactNode }) {

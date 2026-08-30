@@ -157,7 +157,9 @@ button { color: inherit; }
 .key-countdown { position: absolute; z-index: 2; left: 0; bottom: 0; width: 100%; height: 3px; background: #91f0da; box-shadow: 0 0 8px #74dec6; pointer-events: none; animation: key-countdown 3s linear forwards; }
 @keyframes key-countdown { from { width: 100%; opacity: 1; } to { width: 0; opacity: .35; } }
 @keyframes key-armed-pulse { from { border-color: #3a7065; } to { border-color: #75cbb9; box-shadow: inset 0 0 10px #72d5c028; } }
-.sheet-backdrop { position: fixed; inset: 0; z-index: 20; display: flex; align-items: flex-end; background: #020407b8; backdrop-filter: blur(3px); }
+.sheet-backdrop { position: fixed; inset: 0; z-index: 20; display: flex; align-items: flex-end; background: #020407b8; backdrop-filter: blur(3px); touch-action: pan-x; }
+.sheet-backdrop .bottom-sheet { transform: translateY(var(--sheet-drag-y, 0px)); transition: transform .25s cubic-bezier(.2,.8,.2,1); }
+.mobile-pager.is-sheet-dragging .sheet-backdrop .bottom-sheet { transition: none; }
 .bottom-sheet { width: 100%; padding: 11px 20px calc(18px + env(safe-area-inset-bottom)); border: 1px solid #29303a; border-bottom: 0; border-radius: 22px 22px 0 0; background: #12171e; box-shadow: 0 -20px 60px #0009; }
 .sheet-handle { display: block; width: 38px; height: 4px; margin: 0 auto 21px; border-radius: 2px; background: #343b46; }
 .bottom-sheet h2 { margin: 7px 0 5px; color: #edf0f5; font-size: 23px; }
