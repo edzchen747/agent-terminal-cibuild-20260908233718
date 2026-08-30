@@ -8,7 +8,7 @@ import { classifyGestureAxis, type GestureAxis } from "./gesture";
 import { claimNativeInput, isCursorPositionReport, mobileTerminalKeydownInput, nativeTerminalInput } from "./terminalInput";
 import type { TimedTerminalInput } from "./terminalInput";
 import { shouldSendResize } from "./terminalResize";
-import { TERMINAL_FONT_SIZE, squishFontSize as squishFontSizeValue, squishInverse as squishInverseValue, squishLineHeight as squishLineHeightValue, squishWidthPercent } from "./terminalSquish";
+import { TERMINAL_FONT_SIZE, calibratedSquishFontSize, squishAdvanceRatio, squishInverse as squishInverseValue, squishLineHeight as squishLineHeightValue, squishWidthPercent } from "./terminalSquish";
 import { TERMINAL_FONT_FAMILY, preloadTerminalFonts } from "./terminalFonts";
 import { activateTerminalCursor, deactivateTerminalCursor } from "./terminalCursor";
 import { guardUtilityKeySelection } from "./utilityKeySelection";
@@ -63,6 +63,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
   const terminalRef = useRef<Terminal | null>(null);
   const activeRef = useRef(active);
   activeRef.current = active;
+  const fontWidthScaleRef = useRef(fontWidthScale);
+  fontWidthScaleRef.current = fontWidthScale;
+  const a11yAdvanceRatioRef = useRef<number | undefined>(undefined);
   const resizeRef = useRef<(force?: boolean) => void>(() => undefined);
   const focusInputRef = useRef<() => void>(() => undefined);
   const keyPadRef = useRef<ReturnType<typeof createUtilityKeyPad> | null>(null);
@@ -156,6 +159,40 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     if (activeRef.current) focusInput();
     fit.fit();
 
+    // The accessibility layer's rows must paint and anchor at the same advance
+    // the squished canvas cells have. Rather than trusting the font metrics to
+    // scale linearly between the canvas measurement and the screen-reader
+    // layer, measure what this WebView actually reports: xterm paints the
+    // accessibility container at cellWidth * cols (its own css-pixel cell
+    // size), and a mirror span inside the accessibility tree yields the real
+    // DOM advance at the base font size. The ratio reconciles the two so the
+    // squished font size lands every accessibility character on its canvas
+    // cell, whatever face or rounding the WebView applies to the layer.
+    const calibrateAccessibilityMetrics = () => {
+      const a11y = hostElement.querySelector<HTMLElement>(".xterm-accessibility");
+      const tree = hostElement.querySelector<HTMLElement>(".xterm-accessibility-tree");
+      if (!a11y || !tree || terminal.cols <= 0) return;
+      const containerWidth = Number.parseFloat(a11y.style.width);
+      if (!(containerWidth > 0)) return;
+      const cellWidth = containerWidth / terminal.cols;
+      const mirror = document.createElement("span");
+      mirror.className = "xterm-char-measure-element";
+      mirror.style.fontFamily = TERMINAL_FONT_FAMILY;
+      mirror.style.fontSize = `${TERMINAL_FONT_SIZE}px`;
+      mirror.style.fontKerning = "none";
+      mirror.style.whiteSpace = "pre";
+      mirror.textContent = "W".repeat(32);
+      tree.appendChild(mirror);
+      // The wrapper scale composed with the accessibility layer's inverse is
+      // net identity, so the mirror's transformed rect still reports its true
+      // layout width and keeps the sub-pixel precision offsetWidth lacks.
+      const domAdvance = mirror.getBoundingClientRect().width / 32;
+      mirror.remove();
+      a11yAdvanceRatioRef.current = squishAdvanceRatio(cellWidth, domAdvance);
+      hostElement.style.setProperty("--terminal-squish-font-size", calibratedSquishFontSize(fontWidthScaleRef.current, a11yAdvanceRatioRef.current));
+    };
+    calibrateAccessibilityMetrics();
+
     let resizeFrame: number | undefined;
     let forceResizePending = false;
     let lastSize = { cols: 0, rows: 0 };
@@ -172,6 +209,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         forceResizePending = false;
         try {
           fit.fit();
+          calibrateAccessibilityMetrics();
           if (shouldSendResize(true, terminal.cols, terminal.rows, lastSize)) {
             lastSize = { cols: terminal.cols, rows: terminal.rows };
             connection.send({ type: "session.resize", sessionId: session.id, cols: terminal.cols, rows: terminal.rows, force: true });
@@ -193,6 +231,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         forceResizePending = false;
         try {
           fit.fit();
+          calibrateAccessibilityMetrics();
           if (shouldSendResize(shouldForce, terminal.cols, terminal.rows, lastSize)) {
             lastSize = { cols: terminal.cols, rows: terminal.rows };
             connection.send({ type: "session.resize", sessionId: session.id, cols: terminal.cols, rows: terminal.rows, force: shouldForce });
@@ -662,7 +701,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     focusInputRef.current();
   }
 
-  const squishFontSize = squishFontSizeValue(fontWidthScale);
+  const squishFontSize = calibratedSquishFontSize(fontWidthScale, a11yAdvanceRatioRef.current);
   const squishLineHeight = squishLineHeightValue(fontWidthScale);
   const squishInverse = squishInverseValue(fontWidthScale);
   return <div className="mobile-terminal-shell">
