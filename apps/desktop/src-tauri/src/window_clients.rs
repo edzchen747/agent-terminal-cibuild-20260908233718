@@ -129,6 +129,10 @@ impl WindowClients {
         }
     }
 
+    pub fn clear_attachments(&mut self, label: &str) {
+        self.attached_sessions.remove(label);
+    }
+
     pub fn subscribers(&self, session_id: &str) -> Vec<String> {
         self.attached_sessions
             .iter()

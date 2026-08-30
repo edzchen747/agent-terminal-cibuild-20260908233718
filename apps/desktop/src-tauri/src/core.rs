@@ -263,39 +263,11 @@ impl Core {
     }
 
     pub fn initialize(self: &Arc<Self>) -> Result<()> {
-        let start_folder = canonical_directory(
-            std::env::var("USERPROFILE")
-                .map(PathBuf::from)
-                .unwrap_or(std::env::current_dir()?),
-        )?;
         let project = {
-            let inner = self.inner.lock().expect("desktop state poisoned");
-            inner
-                .store
-                .projects()
-                .iter()
-                .find(|saved| {
-                    normalized_path(Path::new(&saved.path)) == normalized_path(&start_folder)
-                })
-                .cloned()
-                .unwrap_or_else(|| Project {
-                    id: format!("temporary-{}", Uuid::new_v4()),
-                    name: folder_name(&start_folder),
-                    path: start_folder.to_string_lossy().into_owned(),
-                    persistent: false,
-                    created_at: None,
-                })
-        };
-        {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             inner.store.ensure_network_identity()?;
-            if !project.persistent {
-                inner
-                    .temporary_projects
-                    .insert(project.id.clone(), project.clone());
-                inner.project_order.push(project.id.clone());
-            }
-        }
+            ensure_home_project(&mut inner)?
+        };
         self.create_session(&project.id, None)?;
         Ok(())
     }
@@ -912,30 +884,9 @@ impl Core {
 
     pub fn show_terminal_window(self: &Arc<Self>) {
         let (label, fallback_project) = {
-            let inner = self.inner.lock().expect("desktop state poisoned");
-            let preferred = inner
-                .windows
-                .last_project()
-                .filter(|project_id| project_by_id(&inner, project_id).is_some())
-                .map(str::to_owned)
-                .or_else(|| {
-                    inner
-                        .sessions
-                        .values()
-                        .filter(|session| session.metadata.status == "running")
-                        .max_by(|left, right| {
-                            left.metadata.created_at.cmp(&right.metadata.created_at)
-                        })
-                        .map(|session| session.metadata.project_id.clone())
-                });
-            (
-                inner.windows.last_or_any(),
-                preferred.or_else(|| {
-                    public_projects(&inner)
-                        .first()
-                        .map(|project| project.id.clone())
-                }),
-            )
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let fallback_project = preferred_project(&mut inner).map(|project| project.id);
+            (inner.windows.last_or_any(), fallback_project)
         };
         if let Some(label) = label
             && let Some(window) = self.app.get_webview_window(&label)
@@ -2427,31 +2378,47 @@ impl Core {
     }
 
     fn cleanup_empty_temporary_project(&self, project_id: &str) {
-        let label = {
+        let (window_label, replacement) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
-            if !inner.temporary_projects.contains_key(project_id)
-                || inner
-                    .sessions
-                    .values()
-                    .any(|session| session.metadata.project_id == project_id)
-            {
-                return;
+            match retire_empty_temporary_project(&mut inner, project_id) {
+                RetireOutcome::NotEligible => return,
+                RetireOutcome::Removed {
+                    window_label,
+                    replacement,
+                } => (window_label, replacement),
             }
-            inner.temporary_projects.remove(project_id);
-            inner.project_order.retain(|id| id != project_id);
-            let label = inner
-                .windows
-                .window_for_project(project_id)
-                .map(str::to_owned);
-            if let Some(label) = &label {
-                inner.windows.remove_window(label);
-            }
-            label
         };
-        if let Some(label) = label
-            && let Some(window) = self.app.get_webview_window(&label)
+        let Some(window_label) = window_label else {
+            return;
+        };
+        let Some(replacement) = replacement else {
+            // The window cannot stay attached to a project: using a bare
+            // WebviewWindow would render an unowned empty state, so the last
+            // resort is closing it (the tray can always reopen the window).
+            if let Some(window) = self.app.get_webview_window(&window_label) {
+                let _ = window.destroy();
+            }
+            return;
+        };
+        let displaced = {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            inner.windows.clear_attachments(&window_label);
+            inner
+                .windows
+                .assign(&window_label, &replacement.id)
+                .displaced_window
+        };
+        if let Some(displaced) = displaced
+            && let Some(window) = self.app.get_webview_window(&displaced)
         {
             let _ = window.destroy();
+        }
+        if let Some(window) = self.app.get_webview_window(&window_label) {
+            let _ = window.set_title(&format!("{} — Agent Terminal", replacement.name));
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+            self.mark_window_focused(&window_label);
         }
     }
 
@@ -2582,6 +2549,143 @@ fn project_by_id(inner: &Inner, project_id: &str) -> Option<Project> {
         .find(|project| project.id == project_id)
         .cloned()
         .or_else(|| inner.temporary_projects.get(project_id).cloned())
+}
+
+/// Resolves the startup (home directory) project, reusing a saved or
+/// temporary project that already covers it and creating a new temporary
+/// project when none exists. Guarantees the app always has a default project
+/// to fall back on, even after every unsaved project has been closed.
+fn ensure_home_project(inner: &mut Inner) -> Result<Project> {
+    let start_folder = canonical_directory(
+        std::env::var("USERPROFILE")
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_dir()?),
+    )?;
+    if let Some(project) = inner
+        .store
+        .projects()
+        .iter()
+        .find(|saved| normalized_path(Path::new(&saved.path)) == normalized_path(&start_folder))
+        .cloned()
+        .or_else(|| {
+            inner
+                .temporary_projects
+                .values()
+                .find(|project| {
+                    normalized_path(Path::new(&project.path)) == normalized_path(&start_folder)
+                })
+                .cloned()
+        })
+    {
+        return Ok(project);
+    }
+    let project = Project {
+        id: format!("temporary-{}", Uuid::new_v4()),
+        name: folder_name(&start_folder),
+        path: start_folder.to_string_lossy().into_owned(),
+        persistent: false,
+        created_at: None,
+    };
+    inner
+        .temporary_projects
+        .insert(project.id.clone(), project.clone());
+    inner.project_order.push(project.id.clone());
+    Ok(project)
+}
+
+/// A saved project is always usable; a temporary project is only usable while
+/// it still has a session or an open window.
+fn project_is_usable(inner: &Inner, project_id: &str) -> bool {
+    if inner
+        .store
+        .projects()
+        .iter()
+        .any(|project| project.id == project_id)
+    {
+        return true;
+    }
+    if !inner.temporary_projects.contains_key(project_id) {
+        return false;
+    }
+    inner
+        .sessions
+        .values()
+        .any(|session| session.metadata.project_id == project_id)
+        || inner.windows.has_project(project_id)
+}
+
+#[derive(Debug)]
+enum RetireOutcome {
+    /// The project is not an empty temporary project; nothing was removed.
+    NotEligible,
+    /// The empty temporary project was removed. When a registered window was
+    /// still attached to it, `window_label` and the requested replacement
+    /// project are returned so the caller can hand the window over.
+    Removed {
+        window_label: Option<String>,
+        replacement: Option<Project>,
+    },
+}
+
+/// Removes an empty temporary project from the registry. The replacement is
+/// only requested when the project still had a window, so a windowless
+/// temporary project (for example one left behind after its window was
+/// destroyed) is retired without spawning a window.
+fn retire_empty_temporary_project(inner: &mut Inner, project_id: &str) -> RetireOutcome {
+    if !inner.temporary_projects.contains_key(project_id)
+        || inner
+            .sessions
+            .values()
+            .any(|session| session.metadata.project_id == project_id)
+    {
+        return RetireOutcome::NotEligible;
+    }
+    inner.temporary_projects.remove(project_id);
+    inner.project_order.retain(|id| id != project_id);
+    let window_label = inner
+        .windows
+        .window_for_project(project_id)
+        .map(str::to_owned);
+    let replacement = window_label.as_ref().and_then(|_| preferred_project(inner));
+    RetireOutcome::Removed {
+        window_label,
+        replacement,
+    }
+}
+
+/// Picks the project a window should fall back to when its current project is
+/// being removed: the last focused project still in use, the most recently
+/// created running session's project, or the first public project. As a last
+/// resort the home directory project is created so a window always has a
+/// project to attach to.
+fn preferred_project(inner: &mut Inner) -> Option<Project> {
+    if let Some(project_id) = inner
+        .windows
+        .last_project()
+        .filter(|project_id| project_is_usable(inner, project_id))
+        .map(str::to_owned)
+    {
+        return project_by_id(inner, &project_id);
+    }
+    newest_running_session_project_id(inner.sessions.values().map(|session| &session.metadata))
+        .or_else(|| {
+            public_projects(inner)
+                .first()
+                .map(|project| project.id.clone())
+        })
+        .and_then(|project_id| project_by_id(inner, &project_id))
+        .or_else(|| ensure_home_project(inner).ok())
+}
+
+/// The project that owns the most recently created running session. Exited
+/// sessions are ignored, so a dead terminal cannot resurrect a project.
+fn newest_running_session_project_id<'a>(
+    sessions: impl Iterator<Item = &'a TerminalSession>,
+) -> Option<String> {
+    sessions
+        .filter(|session| session.status == "running")
+        .max_by(|left, right| left.created_at.cmp(&right.created_at))
+        .map(|session| session.project_id.clone())
 }
 
 fn canonical_directory(value: impl AsRef<Path>) -> Result<PathBuf> {
@@ -2785,14 +2889,16 @@ fn registration_status_for_display(online: bool, stored: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectivityAction, ConnectivityTracker, EmbeddedNodeStatus, Inner, PairingGrant,
-        is_cursor_position_report, is_dropped_node_status, is_within_project,
-        parse_terminal_titles, parse_working_directories, presence_alive, project_name_or_folder,
-        record_cursor_position_requests, registration_status_for_display, snapshot_from_inner,
-        take_valid_pairing_grant, validate_project_name, PRESENCE_WINDOW_MS,
+        ConnectivityAction, ConnectivityTracker, EmbeddedNodeStatus, Inner, PRESENCE_WINDOW_MS,
+        PairingGrant, RetireOutcome, ensure_home_project, folder_name, is_cursor_position_report,
+        is_dropped_node_status, is_within_project, newest_running_session_project_id,
+        parse_terminal_titles, parse_working_directories, preferred_project, presence_alive,
+        project_is_usable, project_name_or_folder, record_cursor_position_requests,
+        registration_status_for_display, retire_empty_temporary_project, snapshot_from_inner,
+        take_valid_pairing_grant, validate_project_name,
     };
     use crate::{
-        models::AuthorizedDevice,
+        models::{AuthorizedDevice, Project, TerminalSession},
         store::DesktopStore,
         window_clients::WindowClients,
     };
@@ -3103,6 +3209,353 @@ mod tests {
             name: id.into(),
             executable: id.into(),
             args: Vec::new(),
+        }
+    }
+
+    fn test_project(inner: &mut Inner, id: &str, path: &str, persistent: bool) -> Project {
+        let project = Project {
+            id: id.into(),
+            name: id.into(),
+            path: path.into(),
+            persistent,
+            created_at: Some("2026-08-27T00:00:00Z".into()),
+        };
+        if persistent {
+            inner
+                .store
+                .save_project(project.clone())
+                .expect("save test project");
+        } else {
+            inner
+                .temporary_projects
+                .insert(project.id.clone(), project.clone());
+            inner.project_order.push(project.id.clone());
+        }
+        project
+    }
+
+    #[test]
+    fn temporary_projects_are_only_usable_with_a_session_or_window() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let store = DesktopStore::load(state_path.clone()).expect("initial store");
+        let mut inner = test_inner(store, Vec::new());
+
+        test_project(&mut inner, "saved-a", "C:\\Work\\SavedA", true);
+        assert!(
+            project_is_usable(&inner, "saved-a"),
+            "saved projects stay usable"
+        );
+
+        // A temporary project that lost its window and sessions is not usable.
+        test_project(&mut inner, "temp-gone", "C:\\Work\\TempGone", false);
+        assert!(!project_is_usable(&inner, "temp-gone"));
+
+        // ...but it stays usable while it still has an open window.
+        inner.windows.assign("window-a", "temp-gone");
+        assert!(project_is_usable(&inner, "temp-gone"));
+
+        // Once the window goes away too, only the saved project remains.
+        inner.windows.remove_window("window-a");
+        assert!(!project_is_usable(&inner, "temp-gone"));
+
+        assert!(!project_is_usable(&inner, "missing"));
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn preferred_project_prefers_the_last_focused_usable_project() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let store = DesktopStore::load(state_path.clone()).expect("initial store");
+        let mut inner = test_inner(store, Vec::new());
+
+        let saved_a = test_project(&mut inner, "saved-a", "C:\\Work\\SavedA", true);
+        inner.windows.assign("window-a", &saved_a.id);
+        inner.windows.mark_focused("window-a");
+        let saved_b = test_project(&mut inner, "saved-b", "C:\\Work\\SavedB", true);
+        inner.windows.assign("window-b", &saved_b.id);
+        inner.windows.mark_focused("window-b");
+
+        assert_eq!(preferred_project(&mut inner).unwrap().id, "saved-b");
+
+        // A last-focused project that was removed is skipped.
+        inner.windows.assign("window-b", "temp-c");
+        inner.windows.mark_focused("window-b");
+        assert_eq!(preferred_project(&mut inner).unwrap().id, "saved-a");
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn preferred_project_falls_back_to_the_home_project_when_nothing_else_remains() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let store = DesktopStore::load(state_path.clone()).expect("initial store");
+        let mut inner = test_inner(store, Vec::new());
+
+        inner.windows.assign("window-a", "temp-only");
+        inner.windows.mark_focused("window-a");
+
+        let home = preferred_project(&mut inner).expect("home fallback project");
+        assert!(!home.persistent, "home fallback is a temporary project");
+        assert_eq!(
+            home.name,
+            folder_name(Path::new(&home.path)),
+            "home name matches its folder"
+        );
+        assert!(
+            inner.temporary_projects.contains_key(&home.id),
+            "the home fallback is registered"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn ensure_home_project_reuses_an_existing_saved_home_project() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
+        let home_path = std::env::var("USERPROFILE")
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_dir().expect("current directory"));
+        let saved = Project {
+            id: "saved-home".into(),
+            name: "Home".into(),
+            path: home_path.to_string_lossy().into_owned(),
+            persistent: true,
+            created_at: Some("2026-08-27T00:00:00Z".into()),
+        };
+        store
+            .save_project(saved.clone())
+            .expect("save home project");
+        let mut inner = test_inner(store, Vec::new());
+
+        let home = ensure_home_project(&mut inner).expect("home project");
+        assert_eq!(home.id, "saved-home", "the saved home project is reused");
+        assert!(inner.temporary_projects.is_empty());
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn newest_running_session_project_id_ignores_exited_sessions() {
+        let sessions = [
+            session("s-old", "project-old", "exited", "2026-08-30T00:00:01Z"),
+            session(
+                "s-latest",
+                "project-latest",
+                "running",
+                "2026-08-30T00:00:03Z",
+            ),
+            session("s-mid", "project-mid", "running", "2026-08-30T00:00:02Z"),
+        ];
+        let newest = newest_running_session_project_id(sessions.iter());
+        assert_eq!(
+            newest,
+            Some("project-latest".into()),
+            "the newest running session wins and exited sessions are skipped"
+        );
+
+        let only_exited = [session(
+            "s-dead",
+            "project-dead",
+            "exited",
+            "2026-08-30T00:00:00Z",
+        )];
+        assert_eq!(
+            newest_running_session_project_id(only_exited.iter()),
+            None,
+            "a project with no running sessions must not be selected"
+        );
+        assert_eq!(newest_running_session_project_id(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn retire_keeps_a_persistent_project_without_its_window() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let store = DesktopStore::load(state_path.clone()).expect("initial store");
+        let mut inner = test_inner(store, Vec::new());
+
+        let saved = test_project(&mut inner, "saved-a", "C:\\Work\\SavedA", true);
+        inner.windows.assign("window-a", &saved.id);
+
+        assert!(matches!(
+            retire_empty_temporary_project(&mut inner, &saved.id),
+            RetireOutcome::NotEligible
+        ));
+        assert!(
+            inner
+                .store
+                .projects()
+                .iter()
+                .any(|project| project.id == saved.id),
+            "the saved project stays in the store"
+        );
+        assert_eq!(
+            inner.windows.project_for_window("window-a"),
+            Some(saved.id.as_str()),
+            "the window registration is untouched"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn retire_reuses_the_current_window_for_another_project() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let store = DesktopStore::load(state_path.clone()).expect("initial store");
+        let mut inner = test_inner(store, Vec::new());
+
+        let closed = test_project(&mut inner, "temp-closed", "C:\\Work\\TempClosed", false);
+        inner.windows.assign("window-a", &closed.id);
+        inner.windows.mark_focused("window-a");
+        let saved = test_project(&mut inner, "saved-a", "C:\\Work\\SavedA", true);
+        inner.windows.assign("window-b", &saved.id);
+
+        let RetireOutcome::Removed {
+            window_label,
+            replacement,
+        } = retire_empty_temporary_project(&mut inner, &closed.id)
+        else {
+            panic!("the empty temporary project must be retired");
+        };
+        assert_eq!(
+            window_label,
+            Some("window-a".into()),
+            "the window survives and moves to the last focused project"
+        );
+        assert_eq!(
+            replacement.map(|project| project.id),
+            Some("saved-a".into()),
+            "the replacement is the last focused project"
+        );
+        assert!(!inner.temporary_projects.contains_key(&closed.id));
+        assert!(!inner.project_order.iter().any(|id| id == &closed.id));
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn retire_without_any_other_project_falls_back_to_the_home_project() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let store = DesktopStore::load(state_path.clone()).expect("initial store");
+        let mut inner = test_inner(store, Vec::new());
+
+        let closed = test_project(&mut inner, "temp-closed", "C:\\Work\\TempClosed", false);
+        inner.windows.assign("window-a", &closed.id);
+        inner.windows.mark_focused("window-a");
+
+        let RetireOutcome::Removed {
+            window_label,
+            replacement,
+        } = retire_empty_temporary_project(&mut inner, &closed.id)
+        else {
+            panic!("the empty temporary project must be retired");
+        };
+        assert_eq!(window_label, Some("window-a".into()));
+        let replacement = replacement.expect("a fallback project is always provided");
+        assert!(
+            !replacement.persistent,
+            "the fallback is the temporary home project, never a dead one"
+        );
+        assert!(
+            inner.temporary_projects.contains_key(&replacement.id),
+            "the fallback project is registered so the tray can reuse it"
+        );
+        assert_ne!(
+            replacement.path, closed.path,
+            "the home fallback must not reuse the closed project's directory"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn retire_without_a_registered_window_removes_the_project_quietly() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let store = DesktopStore::load(state_path.clone()).expect("initial store");
+        let mut inner = test_inner(store, Vec::new());
+
+        let closed = test_project(&mut inner, "temp-closed", "C:\\Work\\TempClosed", false);
+        // No window was ever registered: for example the project was created by
+        // a `cd` report and its window was later destroyed.
+        let RetireOutcome::Removed {
+            window_label,
+            replacement,
+        } = retire_empty_temporary_project(&mut inner, &closed.id)
+        else {
+            panic!("the empty temporary project must be retired");
+        };
+        assert_eq!(
+            window_label, None,
+            "retiring a windowless project must not manufacture a window"
+        );
+        assert!(replacement.is_none());
+        assert!(!inner.temporary_projects.contains_key(&closed.id));
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn retire_is_a_noop_for_unknown_projects() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let store = DesktopStore::load(state_path.clone()).expect("initial store");
+        let mut inner = test_inner(store, Vec::new());
+
+        test_project(&mut inner, "saved-a", "C:\\Work\\SavedA", true);
+        assert!(matches!(
+            retire_empty_temporary_project(&mut inner, "does-not-exist"),
+            RetireOutcome::NotEligible,
+        ));
+        assert!(inner.project_order.is_empty());
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    fn session(id: &str, project_id: &str, status: &str, created_at: &str) -> TerminalSession {
+        TerminalSession {
+            id: id.into(),
+            project_id: project_id.into(),
+            title: "PowerShell".into(),
+            cwd: "C:\\".into(),
+            shell_id: "powershell".into(),
+            status: status.into(),
+            created_at: created_at.into(),
+            exit_code: None,
         }
     }
 
