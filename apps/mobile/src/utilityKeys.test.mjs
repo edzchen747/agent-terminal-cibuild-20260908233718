@@ -10,6 +10,7 @@ const pipe = { id: "pipe", label: "|", value: "|" };
 const left = { id: "left", label: "←", value: "\x1b[D" };
 const up = { id: "up", label: "↑", value: "\x1b[A" };
 const right = { id: "right", label: "→", value: "\x1b[C" };
+const down = { id: "down", label: "↓", value: "\x1b[B" };
 
 test("pressing a modifier sends no input on its own", () => {
   const pad = createUtilityKeyPad();
@@ -138,4 +139,122 @@ test("reset drops every held and latched key without firing anything", () => {
   pad.press(tab);
   assert.deepEqual(pad.reset(), { state: { held: [], latched: [] }, data: null });
   assert.deepEqual(pad.press(left), { state: { held: ["left"], latched: [] }, data: "\x1b[D" });
+});
+
+test("releasing after a reset is a no-op even for keys that were held", () => {
+  const pad = createUtilityKeyPad();
+  pad.press(ctrl);
+  pad.reset();
+  assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: [] }, data: null });
+});
+
+test("holding a latched modifier and releasing it cancels the latch without re-latching", () => {
+  const pad = createUtilityKeyPad();
+  pad.press(ctrl);
+  pad.release("ctrl");
+  assert.deepEqual(pad.state(), { held: [], latched: ["ctrl"] });
+  // Going down on the already-latched key records the latch; lifting must
+  // toggle it off, not stack a second latch on top.
+  assert.deepEqual(pad.press(ctrl), { state: { held: ["ctrl"], latched: ["ctrl"] }, data: null });
+  assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: [] }, data: null });
+  assert.deepEqual(pad.press(up), { state: { held: ["up"], latched: [] }, data: "\x1b[A" });
+});
+
+test("tapping one of several latched modifiers toggles only that one off", () => {
+  const pad = createUtilityKeyPad();
+  pad.press(ctrl);
+  pad.release("ctrl");
+  pad.press(alt);
+  pad.release("alt");
+  assert.deepEqual(pad.state(), { held: [], latched: ["ctrl", "alt"] });
+  pad.press(ctrl);
+  assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: ["alt"] }, data: null });
+  // Only alt survives: the chord carries alt (code 3), not ctrl.
+  assert.deepEqual(pad.press(down), { state: { held: ["down"], latched: [] }, data: "\x1b[1;3B" });
+});
+
+test("two held modifiers re-latch in release order and the next chord carries both", () => {
+  const pad = createUtilityKeyPad();
+  pad.press(ctrl);
+  pad.press(alt);
+  assert.deepEqual(pad.press(up), { state: { held: ["ctrl", "alt", "up"], latched: [] }, data: "\x1b[1;7A" });
+  pad.release("up");
+  pad.release("alt");
+  pad.release("ctrl");
+  assert.deepEqual(pad.state(), { held: [], latched: ["alt", "ctrl"] });
+  assert.deepEqual(pad.press(right), { state: { held: ["right"], latched: [] }, data: "\x1b[1;7C" });
+  pad.release("right");
+  // Both chords consumed the state; the next press is plain.
+  assert.deepEqual(pad.press(down), { state: { held: ["down"], latched: [] }, data: "\x1b[B" });
+});
+
+test("a held modifier interleaved with a latched one resets together on a keypress", () => {
+  const pad = createUtilityKeyPad();
+  pad.press(alt);
+  pad.release("alt");
+  pad.press(ctrl);
+  assert.deepEqual(pad.state(), { held: ["ctrl"], latched: ["alt"] });
+  assert.deepEqual(pad.press(up), { state: { held: ["ctrl", "up"], latched: [] }, data: "\x1b[1;7A" });
+  pad.release("up");
+  // The latched alt was consumed; lifting the held ctrl re-latches exactly ctrl.
+  assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: ["ctrl"] }, data: null });
+  assert.deepEqual(pad.press(down), { state: { held: ["down"], latched: [] }, data: "\x1b[1;5B" });
+});
+
+test("all three latched modifiers combine into one arrow chord", () => {
+  const pad = createUtilityKeyPad();
+  pad.press(ctrl);
+  pad.release("ctrl");
+  pad.press(alt);
+  pad.release("alt");
+  pad.press(shift);
+  pad.release("shift");
+  assert.deepEqual(pad.state(), { held: [], latched: ["ctrl", "alt", "shift"] });
+  // shift(1) + alt(2) + ctrl(4) + base 1 = modifier code 8.
+  assert.deepEqual(pad.press(up), { state: { held: ["up"], latched: [] }, data: "\x1b[1;8A" });
+  pad.release("up");
+  assert.deepEqual(pad.state(), { held: [], latched: [] });
+});
+
+test("a latched modifier fires a non-arrow chord and then stops applying", () => {
+  const pad = createUtilityKeyPad();
+  pad.press(shift);
+  pad.release("shift");
+  assert.deepEqual(pad.press(tab), { state: { held: ["tab"], latched: [] }, data: "\x1b[Z" });
+  pad.release("tab");
+  // The latch was consumed by the shift-tab chord: the next tab is plain.
+  assert.deepEqual(pad.press(tab), { state: { held: ["tab"], latched: [] }, data: "\t" });
+});
+
+test("a latched alt escapes a plain character", () => {
+  const pad = createUtilityKeyPad();
+  pad.press(alt);
+  pad.release("alt");
+  assert.deepEqual(pad.press(pipe), { state: { held: ["pipe"], latched: [] }, data: "\x1b|" });
+});
+
+test("only the first typed character of a burst receives the latched modifier", () => {
+  const pad = createUtilityKeyPad();
+  pad.press(ctrl);
+  pad.release("ctrl");
+  assert.deepEqual(pad.consume("c"), { state: { held: [], latched: [] }, data: "\x03" });
+  assert.deepEqual(pad.consume("d"), { state: { held: [], latched: [] }, data: "d" });
+});
+
+test("pressing a value key that is already held is a no-op", () => {
+  const pad = createUtilityKeyPad();
+  assert.deepEqual(pad.press(pipe), { state: { held: ["pipe"], latched: [] }, data: "|" });
+  assert.deepEqual(pad.press(pipe), { state: { held: ["pipe"], latched: [] }, data: null });
+  assert.deepEqual(pad.release("pipe"), { state: { held: [], latched: [] }, data: null });
+});
+
+test("state snapshots are independent of later mutation", () => {
+  const pad = createUtilityKeyPad();
+  pad.press(ctrl);
+  pad.release("ctrl");
+  const snapshot = pad.state();
+  pad.press(up);
+  pad.release("up");
+  assert.deepEqual(snapshot, { held: [], latched: ["ctrl"] });
+  assert.deepEqual(pad.state(), { held: [], latched: [] });
 });
