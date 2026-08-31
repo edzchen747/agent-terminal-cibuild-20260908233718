@@ -18,7 +18,7 @@ import { notificationStateFor, type ConnectionNotificationState } from "./connec
 import { isRetryingSavedHost } from "./connectionFlow";
 import { lastConnectedLabel, sortHostsByLastConnected } from "./hostSelection";
 import { backButtonAction } from "./navigationPolicy";
-import { deviceName } from "./device";
+import { deviceIdentity } from "./device";
 import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_SLIDER_HORIZONTAL_BIAS } from "./gesture";
 import { effectiveDefaultShell } from "./defaultShell";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, SettingsIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
@@ -96,10 +96,17 @@ export function App() {
   const deviceSleepingRef = useRef(false);
   const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts });
   navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts };
-  // The status captured when the user leaves the hosts page for the pairing
-  // screen, so pressing back restores the same screen (the try-again screen
-  // when the hosts page was reached from there).
+  // The status and error message captured when the user leaves the hosts
+  // page for the pairing screen, so pressing back restores the same screen
+  // (the try-again screen with its original message when the hosts page was
+  // reached from there).
   const prePairStatusRef = useRef<"connected" | "error">("connected");
+  const prePairErrorRef = useRef("");
+  // Mirror of the pairFromHosts flag for the connection event handlers
+  // below: while the pairing screen is open from the hosts page, this
+  // connection's events must not clobber the pairing status.
+  const pairFromHostsRef = useRef(false);
+  pairFromHostsRef.current = pairFromHosts;
   const projectDragRef = useRef<ProjectDragState | null>(null);
   const projectElementsRef = useRef(new Map<string, HTMLElement>());
   const swipeRef = useRef<SwipeState | null>(null);
@@ -351,9 +358,11 @@ export function App() {
 
   useEffect(() => {
     if (!connection) return;
+    const pairingHolds = () => pairFromHostsRef.current;
     const offSnapshot = connection.on("snapshot", setSnapshot);
     const offConnected = connection.on("connected", (nextSnapshot) => {
       setSnapshot(nextSnapshot);
+      if (pairingHolds()) return;
       setError("");
       setStatus("connected");
       void startConnectionNotification(connection.host.name, connection.endpoint());
@@ -362,22 +371,26 @@ export function App() {
       // The native service can detect a route loss while the WebSocket still
       // reports OPEN. A successful heartbeat is the authoritative recovery
       // signal for the notification in that case.
+      if (pairingHolds()) return;
       setError("");
       setStatus("connected");
       void updateConnectionNotification(connection.host.name, "connected", connection.endpoint());
     });
     const offReconnecting = connection.on("reconnecting", ({ attempt }) => {
+      if (pairingHolds()) return;
       setError(attempt === 1 ? "The desktop connection was lost. Reconnecting…" : "Still trying to reach the desktop…");
       setStatus("connecting");
       void updateConnectionNotification(connection.host.name, notificationStateFor(navigator.onLine, false), connection.endpoint());
     });
     const offReconnectFailed = connection.on("reconnectFailed", (cause) => {
+      if (pairingHolds()) return;
       setSnapshot(null);
       setError(cause.message);
       setStatus("error");
       void stopConnectionNotification();
     });
     const offDisconnect = connection.on("disconnected", () => {
+      if (pairingHolds()) return;
       setError("The desktop connection was lost. Reconnecting…");
       setStatus("connecting");
       void updateConnectionNotification(connection.host.name, notificationStateFor(navigator.onLine, false), connection.endpoint());
@@ -392,7 +405,7 @@ export function App() {
     try {
       const payload: PairingPayload = parsePairingPayload(raw.trim());
       const platform = (Capacitor.getPlatform() === "ios" ? "ios" : Capacitor.getPlatform() === "android" ? "android" : "web") as Platform;
-      const next = await HostConnection.pair(payload, { id: crypto.randomUUID(), name: await deviceName(), platform });
+      const next = await HostConnection.pair(payload, await deviceIdentity(platform));
       connection?.close();
       next.startAutoReconnect();
       next.setScreenAwake(screenAwakeRef.current);
@@ -456,22 +469,43 @@ export function App() {
     void stopConnectionNotification();
   }
 
-  // The hosts page's "Pair a new desktop" action. It captures the status so
-  // back can restore it, and no record changes happen on the way in: a
-  // pairing only commits when it succeeds (HostConnection.pair).
+  // The hosts page's "Pair a new desktop" action. It captures the status and
+  // the try-again message so back can restore them, clears the error so the
+  // pairing screen opens clean (a failed connection must not be read as a
+  // failed pairing), and no record changes happen on the way in: a pairing
+  // only commits when it succeeds (HostConnection.pair).
   function enterPairFromHosts() {
     prePairStatusRef.current = status === "error" ? "error" : "connected";
+    prePairErrorRef.current = error;
+    setError("");
     setPairFromHosts(true);
     setStatus("pairing");
   }
 
   // Shared by the pairing screen's back button and the Android back key:
-  // return to the hosts page with the pre-pair status restored, so whatever
-  // was behind it (the live connection, or the try-again screen) comes back
-  // exactly as it was.
+  // return to the hosts page. While the pairing screen was open the live
+  // connection's events were held back (pairFromHostsRef), so the restored
+  // status is re-evaluated from the connection's current reality instead of
+  // trusting the captured one: a live desktop comes back connected, a lost
+  // one is reconnected now, and a session that started on the try-again
+  // screen goes back to it with its original message.
   function backFromPairing() {
     setPairFromHosts(false);
-    setStatus(prePairStatusRef.current);
+    if (prePairStatusRef.current === "error") {
+      setError(prePairErrorRef.current);
+      setStatus("error");
+      return;
+    }
+    const live = connectionRef.current;
+    if (live && !live.isClosed() && live.snapshot) {
+      setError("");
+      setStatus("connected");
+      return;
+    }
+    void HostConnection.saved().then((host) => {
+      if (host) void startHostConnection(host);
+      else setStatus("pairing");
+    });
   }
 
   // Tapping a desktop on the hosts page switches to it. The chosen desktop
@@ -801,10 +835,19 @@ export function App() {
     }, SWALLOW_CLICK_LINGER_MS);
   }
 
-  function suppressSwipeClick(event: React.MouseEvent<HTMLDivElement>) {
-    if (swallowTapClickRef.current) {
+  // The compatibility click that trails a bridged tap can outlive the view it
+  // started in: tapping the "Hosts" nav button switches the view at pointer-up,
+  // so the click the WebView emits afterwards lands on the newly mounted hosts
+  // page ("Pair a new desktop" sits right where the finger let go) and would
+  // fire it. Swallowing therefore happens at the document root, where it
+  // survives the view swap; React attaches its listeners below the document,
+  // so a stopped event never reaches them. The bridged tap's own synthetic
+  // click is always dispatched before this guard arms, so it passes through.
+  useEffect(() => {
+    const swallow = (event: MouseEvent) => {
+      if (!swallowTapClickRef.current) return;
       const nearTap = Math.hypot(event.clientX - swallowTapClickAtRef.current.x, event.clientY - swallowTapClickAtRef.current.y) <= SWALLOW_CLICK_DISTANCE_PX;
-      const swallow = shouldSwallowTrailingClick({ armed: swallowTapClickRef.current, nearTap });
+      const swallowTrailing = shouldSwallowTrailingClick({ armed: true, nearTap });
       // The guard is one-shot: whether or not this is the click it waited
       // for, it never outlives this event. A far-away click is a fresh,
       // unrelated interaction that must pass through.
@@ -812,15 +855,19 @@ export function App() {
       swallowTapClickAtRef.current = { x: 0, y: 0 };
       if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current);
       swallowTapClickTimerRef.current = undefined;
-      if (swallow) {
-        // The browser click that trails a bridged tap (or the compatibility
-        // click of the gesture itself). The synthetic click already ran the
-        // control's action; swallow this one so it cannot fire twice.
+      if (swallowTrailing) {
         event.preventDefault();
         event.stopPropagation();
       }
-      return;
-    }
+    };
+    document.addEventListener("click", swallow, true);
+    return () => document.removeEventListener("click", swallow, true);
+  }, []);
+
+  function suppressSwipeClick(event: React.MouseEvent<HTMLDivElement>) {
+    // Trailing-click swallowing of bridged taps runs at the document root
+    // (above), where it survives view swaps. This pager-level handler only
+    // owns the post-swipe guard below.
     if (!suppressSwipeClickRef.current) return;
     const target = event.target instanceof Element ? event.target.closest(".mobile-page") : null;
     const pageIndex = target?.parentElement ? Array.prototype.indexOf.call(target.parentElement.children, target) : null;

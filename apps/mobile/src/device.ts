@@ -1,5 +1,37 @@
 import { Capacitor } from "@capacitor/core";
 import { Device } from "@capacitor/device";
+import { Preferences } from "@capacitor/preferences";
+import type { DeviceIdentity, Platform } from "@agentterminal/protocol";
+
+const DEVICE_IDENTITY_KEY = "agent-terminal-device-identity";
+
+/**
+ * The identity this install presents to every desktop: one stable id for the
+ * life of the app, with a freshly resolved name each time. A stable id keeps
+ * a re-pairing from orphaning the desktop's record of this phone (desktops
+ * dedupe authorized devices by id), so every pairing and reconnection speaks
+ * as the same device instead of minting a new one.
+ */
+export async function deviceIdentity(platform: Platform): Promise<DeviceIdentity> {
+  return { id: await stableDeviceId(), name: await deviceName(), platform };
+}
+
+async function stableDeviceId(): Promise<string> {
+  try {
+    const { value } = await Preferences.get({ key: DEVICE_IDENTITY_KEY });
+    if (value) return value;
+  } catch {
+    // Storage is unavailable: an in-memory id still pairs this session; it
+    // just regenerates on the next launch.
+  }
+  const id = crypto.randomUUID();
+  try {
+    await Preferences.set({ key: DEVICE_IDENTITY_KEY, value: id });
+  } catch {
+    // An unpersisted id still works for this session; see above.
+  }
+  return id;
+}
 
 function fallbackDeviceName(): string {
   const platform = Capacitor.getPlatform();
