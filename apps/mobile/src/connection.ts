@@ -381,11 +381,12 @@ export class HostConnection {
    * Launch-time parity with the desktop: instead of trusting the persisted
    * enrollment flag, start this host's saved node identity against the
    * control plane and confirm it still comes back. A node the control plane
-   * proves removed is re-enrolled automatically with a fresh key (the
-   * run-through of the Retry chain); a transient failure restores the saved
-   * verdict so the badge is not left on "Registering" for it.
+   * proves removed is re-enrolled automatically with a fresh key; a
+   * transient failure behaves like the desktop resume - the badge stays on
+   * Registering, gets one automatic retry, and only then surfaces the
+   * failure with the Retry banner.
    */
-  private async verifySavedNodeOnLaunch(): Promise<void> {
+  private async verifySavedNodeOnLaunch(retryOnTransientFailure = true): Promise<void> {
     this.setRemoteRegistration({ status: "pending" });
     const engine = new EmbeddedNodeEngine(this.host.id);
     try {
@@ -412,8 +413,20 @@ export class HostConnection {
         // The first re-registration of the launch is automatic: the key
         // request travels over the live LAN session the phone just opened.
         queueMicrotask(() => { void this.retryRemoteRegistration().catch(() => undefined); });
+      } else if (retryOnTransientFailure) {
+        // A freshly opened app can race its Wi-Fi, DNS and DERP routes: the
+        // control plane was not reached, not that the node is missing. Keep
+        // the badge on Registering and retry once (desktop behavior) before
+        // any failure is surfaced.
+        window.setTimeout(() => {
+          if (this.closed || !this.isConnected()) return;
+          void this.verifySavedNodeOnLaunch(false).catch(() => undefined);
+        }, 4_000);
       } else {
-        this.setRemoteRegistration({ status: this.host.remoteEnrolled ? "enrolled" : "unregistered" });
+        this.setRemoteRegistration({
+          status: "failed",
+          error: "Remote connection registration failed. LAN access is still available."
+        });
       }
     } finally {
       await engine.stop();
