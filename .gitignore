@@ -34,3 +34,4 @@ apps/mobile/android/keystore.properties
 !.env.example
 
 coverage/
+.at-debug/

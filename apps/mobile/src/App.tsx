@@ -293,6 +293,38 @@ export function App() {
     };
   }, []);
 
+  // The compatibility click that trails a bridged tap can outlive the view it
+  // started in: tapping the "Hosts" nav button switches the view at pointer-up,
+  // so the click the WebView emits afterwards lands on the newly mounted hosts
+  // page ("Pair a new desktop" sits right where the finger let go) and would
+  // fire it. Swallowing therefore happens at the document root, where it
+  // survives the view swap; React attaches its listeners below the document,
+  // so a stopped event never reaches them. The bridged tap's own synthetic
+  // click is always dispatched before this guard arms, so it passes through.
+  // This effect must stay above every early return below: a render that
+  // returns early must run exactly the same hook sequence as a render that
+  // reaches the pager, or React throws (fewer/more hooks) and blanks the app.
+  useEffect(() => {
+    const swallow = (event: MouseEvent) => {
+      if (!swallowTapClickRef.current) return;
+      const nearTap = Math.hypot(event.clientX - swallowTapClickAtRef.current.x, event.clientY - swallowTapClickAtRef.current.y) <= SWALLOW_CLICK_DISTANCE_PX;
+      const swallowTrailing = shouldSwallowTrailingClick({ armed: true, nearTap });
+      // The guard is one-shot: whether or not this is the click it waited
+      // for, it never outlives this event. A far-away click is a fresh,
+      // unrelated interaction that must pass through.
+      swallowTapClickRef.current = false;
+      swallowTapClickAtRef.current = { x: 0, y: 0 };
+      if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current);
+      swallowTapClickTimerRef.current = undefined;
+      if (swallowTrailing) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+    document.addEventListener("click", swallow, true);
+    return () => document.removeEventListener("click", swallow, true);
+  }, []);
+
   // Opens a live connection to the chosen desktop and runs the same
   // success/failure state machine as the launch path. An attempt that was
   // superseded (a newer selection, or the app going away) never touches
@@ -835,36 +867,7 @@ export function App() {
     }, SWALLOW_CLICK_LINGER_MS);
   }
 
-  // The compatibility click that trails a bridged tap can outlive the view it
-  // started in: tapping the "Hosts" nav button switches the view at pointer-up,
-  // so the click the WebView emits afterwards lands on the newly mounted hosts
-  // page ("Pair a new desktop" sits right where the finger let go) and would
-  // fire it. Swallowing therefore happens at the document root, where it
-  // survives the view swap; React attaches its listeners below the document,
-  // so a stopped event never reaches them. The bridged tap's own synthetic
-  // click is always dispatched before this guard arms, so it passes through.
-  useEffect(() => {
-    const swallow = (event: MouseEvent) => {
-      if (!swallowTapClickRef.current) return;
-      const nearTap = Math.hypot(event.clientX - swallowTapClickAtRef.current.x, event.clientY - swallowTapClickAtRef.current.y) <= SWALLOW_CLICK_DISTANCE_PX;
-      const swallowTrailing = shouldSwallowTrailingClick({ armed: true, nearTap });
-      // The guard is one-shot: whether or not this is the click it waited
-      // for, it never outlives this event. A far-away click is a fresh,
-      // unrelated interaction that must pass through.
-      swallowTapClickRef.current = false;
-      swallowTapClickAtRef.current = { x: 0, y: 0 };
-      if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current);
-      swallowTapClickTimerRef.current = undefined;
-      if (swallowTrailing) {
-        event.preventDefault();
-        event.stopPropagation();
-      }
-    };
-    document.addEventListener("click", swallow, true);
-    return () => document.removeEventListener("click", swallow, true);
-  }, []);
-
-  function suppressSwipeClick(event: React.MouseEvent<HTMLDivElement>) {
+    function suppressSwipeClick(event: React.MouseEvent<HTMLDivElement>) {
     // Trailing-click swallowing of bridged taps runs at the document root
     // (above), where it survives view swaps. This pager-level handler only
     // owns the post-swipe guard below.
