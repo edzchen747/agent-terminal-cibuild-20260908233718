@@ -194,7 +194,7 @@ fn start_pairing(state: State<'_, Arc<Core>>) -> Result<PairingPayload, String> 
 #[tauri::command]
 fn retry_remote_registration(state: State<'_, Arc<Core>>) -> Result<(), String> {
     Arc::clone(state.inner())
-        .retry_desktop_enrollment()
+        .retry_remote_registration()
         .map_err(error_string)
 }
 

@@ -185,6 +185,10 @@ pub struct Core {
     presence_cache: Mutex<Option<HashSet<String>>>,
     embedded_node: Mutex<Option<Child>>,
     desktop_enrollment_running: AtomicBool,
+    /// A saved remote identity re-verification run is in flight. The stored
+    /// verdict is stale for its duration, so the badge stays on "pending"
+    /// (Registering) until the task reports its terminal state.
+    remote_verification_running: AtomicBool,
     remote_port: AtomicU16,
     direct_server_ready: AtomicBool,
     exit_requested: AtomicBool,
@@ -252,6 +256,7 @@ impl Core {
             clients: Mutex::new(HashMap::new()),
             embedded_node: Mutex::new(None),
             desktop_enrollment_running: AtomicBool::new(false),
+            remote_verification_running: AtomicBool::new(false),
             remote_port: AtomicU16::new(remote_port),
             direct_server_ready: AtomicBool::new(false),
             exit_requested: AtomicBool::new(false),
@@ -624,16 +629,31 @@ impl Core {
         Ok(())
     }
 
-    pub fn retry_desktop_enrollment(self: &Arc<Self>) -> Result<()> {
-        let device_id = self
-            .paired_device_id()
-            .ok_or_else(|| anyhow!("Pair a mobile device before enabling remote access."))?;
-        self.start_desktop_enrollment(device_id, true)
+    /// The badge's Retry action. Re-verifies the saved registration first
+    /// (a transient failure needs no new key and never will); the verify
+    /// itself escalates to a fresh enrollment only when the control plane
+    /// proves the saved node was removed.
+    pub fn retry_remote_registration(self: &Arc<Self>) -> Result<()> {
+        if self.desktop_enrollment_running.load(Ordering::Acquire)
+            || self.remote_verification_running.load(Ordering::Acquire)
+        {
+            // A run is already resolving the registration; a second one
+            // would only race its result.
+            return Ok(());
+        }
+        if self.prepare_remote_verification() {
+            self.verify_remote_node(true, false);
+            return Ok(());
+        }
+        Err(anyhow!("Remote access has not been set up yet."))
     }
 
     pub fn resume_remote_node(self: &Arc<Self>) {
         if self.prepare_remote_verification() {
-            self.verify_remote_node(false);
+            // The launch resume is rung while the machine may still be
+            // bringing its routes up, so a transient failure gets one
+            // automatic retry before the badge shows the failure.
+            self.verify_remote_node(false, true);
         }
     }
 
@@ -650,7 +670,7 @@ impl Core {
             return Ok(());
         }
         if self.prepare_remote_verification() {
-            self.verify_remote_node(true);
+            self.verify_remote_node(true, false);
         }
         Ok(())
     }
@@ -678,9 +698,16 @@ impl Core {
         true
     }
 
-    fn verify_remote_node(self: &Arc<Self>, force_restart: bool) {
+    fn verify_remote_node(self: &Arc<Self>, force_restart: bool, retry_on_transient_failure: bool) {
+        self.remote_verification_running.store(true, Ordering::Release);
         let core = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
+            // The flag makes the badge show "Registering" while this run is
+            // in flight (the renderer may first paint mid-run at launch); it
+            // must be cleared right before the terminal broadcast so the last
+            // state the window sees carries the real verdict. The guard is a
+            // safety net for any other exit path.
+            let _guard = RemoteVerificationGuard(Arc::clone(&core));
             if force_restart {
                 // A still-running node never rewrites its status file, so the
                 // server verdict must come from a fresh process.
@@ -696,6 +723,7 @@ impl Core {
                         true,
                         None,
                     );
+                    core.remote_verification_running.store(false, Ordering::Release);
                     core.broadcast();
                     return;
                 }
@@ -707,6 +735,7 @@ impl Core {
                     true,
                     None,
                 );
+                core.remote_verification_running.store(false, Ordering::Release);
                 core.broadcast();
                 return;
             }
@@ -714,6 +743,7 @@ impl Core {
             match core.wait_for_embedded_node().await {
                 Ok(node) => {
                     let _ = core.set_remote_registration("enrolled", None, true, Some(&node));
+                    core.remote_verification_running.store(false, Ordering::Release);
                     core.broadcast();
                 }
                 Err(error) => {
@@ -748,6 +778,22 @@ impl Core {
                                 None,
                             );
                         }
+                    } else if retry_on_transient_failure {
+                        // A freshly launched machine can race its Wi-Fi, DNS
+                        // and DERP connectivity: the first resume of a
+                        // known-good node is often failing only because the
+                        // route was not up yet. Retry once automatically
+                        // before declaring the failure, and keep the badge on
+                        // Registering during the wait (the stored verdict is
+                        // still pending).
+                        eprintln!(
+                            "Agent Terminal embedded network node did not resume: {error:#}; retrying once"
+                        );
+                        let retry_core = Arc::clone(&core);
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_secs(4));
+                            retry_core.verify_remote_node(true, false);
+                        });
                     } else {
                         eprintln!(
                             "Agent Terminal embedded network node did not resume: {error:#}"
@@ -759,6 +805,7 @@ impl Core {
                             None,
                         );
                     }
+                    core.remote_verification_running.store(false, Ordering::Release);
                     core.broadcast();
                 }
             }
@@ -783,6 +830,8 @@ impl Core {
                 status: registration_status_for_display(
                     self.network_online.load(Ordering::Acquire),
                     &network.registration_status,
+                    self.remote_verification_running.load(Ordering::Acquire)
+                        || self.desktop_enrollment_running.load(Ordering::Acquire),
                 ),
                 error: network.registration_error.clone(),
             },
@@ -1898,6 +1947,14 @@ impl Core {
                     .get_mut(client_id)
                 {
                     client.device_id = Some(device_id);
+                    // An authenticated device was paired on an earlier
+                    // session. The enrollment gate is about device
+                    // authorization, not socket locality, so enrollments are
+                    // allowed on this session too: without this a node that
+                    // was revoked or expired can never re-register on a
+                    // reconnect, and the mobile Retry button is denied
+                    // instantly while its banner says pairing is required.
+                    client.paired_connection = true;
                 }
                 self.send_to_client(
                     client_id,
@@ -2875,14 +2932,28 @@ fn is_dropped_node_status(status: &EmbeddedNodeStatus) -> bool {
     matches!(status.error_code.as_str(), "preauth_missing" | "preauth_rejected")
 }
 
+/// Clears the in-flight verification flag when its task exits on a path that
+/// did not reach a terminal broadcast (unexpected return or panic).
+struct RemoteVerificationGuard(Arc<Core>);
+impl Drop for RemoteVerificationGuard {
+    fn drop(&mut self) {
+        self.0.remote_verification_running.store(false, Ordering::Release);
+    }
+}
+
 /// The badge status for a given connectivity reading: while the machine has
 /// no internet the stored registration verdict is hidden and the badge shows
-/// "No internet" instead of a stale enrolled/pending/failed state.
-fn registration_status_for_display(online: bool, stored: &str) -> String {
-    if online {
-        stored.to_owned()
-    } else {
+/// "No internet" instead of a stale enrolled/pending/failed state. An
+/// in-flight verification or enrollment run keeps the badge on "pending":
+/// the stored verdict is stale for its whole duration, and a first render
+/// that lands mid-run must not skip straight back to the saved state.
+fn registration_status_for_display(online: bool, stored: &str, verifying: bool) -> String {
+    if !online {
         "offline".to_owned()
+    } else if verifying {
+        "pending".to_owned()
+    } else {
+        stored.to_owned()
     }
 }
 
@@ -3067,11 +3138,22 @@ mod tests {
     fn offline_always_overrides_the_stored_registration_status() {
         for stored in ["unregistered", "pending", "enrolled", "failed"] {
             assert_eq!(
-                registration_status_for_display(false, stored),
+                registration_status_for_display(false, stored, false),
                 "offline",
                 "offline must hide a stored {stored} status"
             );
-            assert_eq!(registration_status_for_display(true, stored), stored);
+            assert_eq!(registration_status_for_display(true, stored, false), stored);
+        }
+    }
+
+    #[test]
+    fn a_running_verification_holds_the_badge_on_pending() {
+        for stored in ["unregistered", "pending", "enrolled", "failed"] {
+            assert_eq!(
+                registration_status_for_display(true, stored, true),
+                "pending",
+                "an in-flight run must override a stored {stored} status"
+            );
         }
     }
 
