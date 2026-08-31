@@ -122,6 +122,18 @@ npm run android:open
 
 Then build/run from Android Studio. The QR scanner requires a physical device or an emulator with camera support.
 
+For a command-line APK build, use `scripts/build-android.ps1`. It auto-detects a usable JDK (Java 21 preferred) and the Android SDK, writes the ignored `local.properties`, rebuilds `libembedded-node.so` when Go is installed (otherwise reuses the existing `jniLibs` binary), syncs the web bundle, and runs Gradle:
+
+```powershell
+# Unsigned, sideloadable debug APK
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android.ps1 -Debug
+
+# Signed release APK (keystore secrets via $env: or the User registry scope)
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android.ps1
+```
+
+The APK lands in `apps/mobile/android/app/build/outputs/apk/{debug,release}/`. The script accepts `-JavaHome` and `-KeyStoreName` overrides.
+
 ### Android release signing
 
 Android updates must use the same signing identity as the installed APK. Create the local, ignored keystore and Gradle properties once:
