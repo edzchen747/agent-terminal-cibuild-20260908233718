@@ -17,7 +17,7 @@ import { ConnectionNotification } from "./connection-notification";
 import { notificationStateFor, type ConnectionNotificationState } from "./connectionPolicy";
 import { isRetryingSavedHost } from "./connectionFlow";
 import { hostRowRegistrationStatus, lastConnectedLabel, type HostCheckState, type RegistrationDisplayStatus, sortHostsByLastConnected } from "./hostSelection";
-import { backButtonAction } from "./navigationPolicy";
+import { backButtonAction, pairingReconnectStep, pairingRestoreDecision } from "./navigationPolicy";
 import { deviceIdentity } from "./device";
 import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_SLIDER_HORIZONTAL_BIAS } from "./gesture";
 import { effectiveDefaultShell } from "./defaultShell";
@@ -94,6 +94,9 @@ export function App() {
   // The user reached the pairing screen from the hosts page; back restores
   // the pre-pair status captured in prePairStatusRef.
   const [pairFromHosts, setPairFromHosts] = useState(false);
+  // The user reached the pairing screen from the home view's bottom nav;
+  // back returns to the home view.
+  const [pairFromHome, setPairFromHome] = useState(false);
   const [remoteRegistration, setRemoteRegistration] = useState<RemoteRegistrationState>({ status: "unregistered" });
   // The phone's raw route state: while offline the registration verdict on
   // top is stale, so the badge falls back to "Offline" (desktop parity).
@@ -118,8 +121,8 @@ export function App() {
   connectionRef.current = connection;
   const screenAwakeRef = useRef(true);
   const deviceSleepingRef = useRef(false);
-  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts });
-  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts };
+  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts, pairFromHome });
+  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts, pairFromHome };
   // The status and error message captured when the user leaves the hosts
   // page for the pairing screen, so pressing back restores the same screen
   // (the try-again screen with its original message when the hosts page was
@@ -131,6 +134,9 @@ export function App() {
   // connection's events must not clobber the pairing status.
   const pairFromHostsRef = useRef(false);
   pairFromHostsRef.current = pairFromHosts;
+  // Same hold for the bottom-nav path.
+  const pairFromHomeRef = useRef(false);
+  pairFromHomeRef.current = pairFromHome;
   const projectDragRef = useRef<ProjectDragState | null>(null);
   const projectElementsRef = useRef(new Map<string, HTMLElement>());
   const swipeRef = useRef<SwipeState | null>(null);
@@ -176,7 +182,8 @@ export function App() {
         hasRenameSheet: navigation.projectToRename !== null,
         hasCloseSessionSheet: navigation.sessionToClose !== null,
         showCreateProject: navigation.showCreateProject,
-        pairFromHosts: navigation.pairFromHosts
+        pairFromHosts: navigation.pairFromHosts,
+        pairFromHome: navigation.pairFromHome
       })) {
         case "closeTerminalSettings":
           setShowTerminalSettings(false);
@@ -446,7 +453,7 @@ export function App() {
 
   useEffect(() => {
     if (!connection) return;
-    const pairingHolds = () => pairFromHostsRef.current;
+    const pairingHolds = () => pairFromHostsRef.current || pairFromHomeRef.current;
     const offSnapshot = connection.on("snapshot", setSnapshot);
     const offConnected = connection.on("connected", (nextSnapshot) => {
       setSnapshot(nextSnapshot);
@@ -501,7 +508,7 @@ export function App() {
       // Pairing succeeded: HostConnection.pair persisted the newly paired
       // desktop as the launch default and added it to the previously paired
       // list; every other desktop stays listed.
-      setConnection(next); setSnapshot(next.snapshot ?? null); setRemoteRegistration(next.remoteRegistrationState()); setStatus("connected"); setView({ type: "home" }); setHostName(next.host.name); setPairFromHosts(false);
+      setConnection(next); setSnapshot(next.snapshot ?? null); setRemoteRegistration(next.remoteRegistrationState()); setStatus("connected"); setView({ type: "home" }); setHostName(next.host.name); setPairFromHosts(false); setPairFromHome(false);
       await startConnectionNotification(next.host.name, next.endpoint());
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Pairing failed."); setStatus("pairing");
@@ -570,29 +577,49 @@ export function App() {
     setStatus("pairing");
   }
 
+  // The home view's bottom-nav "Pair" button. The home view only renders
+  // while connected, so back always returns to it: no pre-pair capture is
+  // needed beyond pinning the restore ref to "connected".
+  function enterPairFromHome() {
+    prePairStatusRef.current = "connected";
+    setError("");
+    setPairFromHome(true);
+    setStatus("pairing");
+  }
+
   // Shared by the pairing screen's back button and the Android back key:
-  // return to the hosts page. While the pairing screen was open the live
-  // connection's events were held back (pairFromHostsRef), so the restored
-  // status is re-evaluated from the connection's current reality instead of
-  // trusting the captured one: a live desktop comes back connected, a lost
-  // one is reconnected now, and a session that started on the try-again
-  // screen goes back to it with its original message.
+  // return to the page the pairing screen was opened from (the hosts page or
+  // the home view). While the pairing screen was open the live
+  // connection's events were held back (pairFromHostsRef / pairFromHomeRef),
+  // so the restored status is re-evaluated from the connection's current
+  // reality instead of trusting the captured one: a live desktop comes back
+  // connected, a lost one is reconnected now, and a session that started on
+  // the try-again screen goes back to it with its original message. The
+  // branch choices themselves live in navigationPolicy so they stay tested;
+  // this only executes the chosen branch.
   function backFromPairing() {
     setPairFromHosts(false);
-    if (prePairStatusRef.current === "error") {
+    setPairFromHome(false);
+    const live = connectionRef.current;
+    const decision = pairingRestoreDecision({
+      prePairStatus: prePairStatusRef.current,
+      liveConnectionOpen: Boolean(live && !live.isClosed()),
+      liveHasSnapshot: Boolean(live && live.snapshot)
+    });
+    if (decision === "restoreError") {
       setError(prePairErrorRef.current);
       setStatus("error");
       return;
     }
-    const live = connectionRef.current;
-    if (live && !live.isClosed() && live.snapshot) {
+    if (decision === "connected") {
       setError("");
       setStatus("connected");
       return;
     }
     void HostConnection.saved().then((host) => {
-      if (host) void startHostConnection(host);
-      else setStatus("pairing");
+      const step = pairingReconnectStep(host !== null);
+      if (step === "startHostConnection" && host) void startHostConnection(host);
+      else if (step === "stayOnPairing") setStatus("pairing");
     });
   }
 
@@ -719,7 +746,7 @@ export function App() {
     const retryingSavedHost = isRetryingSavedHost(status, connection !== null);
     return <Splash label={status === "loading" ? "Opening Agent Terminal" : error || "Connecting to desktop"} hostName={retryingSavedHost ? hostName : undefined} onCancel={retryingSavedHost ? cancelConnection : undefined} />;
   }
-  if (status === "pairing") return <PairScreen error={error} manualCode={manualCode} showManual={showManual} onManualCode={setManualCode} onShowManual={() => setShowManual(true)} onScan={() => void scan()} onPair={() => void pair(manualCode)} onBack={pairFromHosts ? backFromPairing : undefined} />;
+  if (status === "pairing") return <PairScreen error={error} manualCode={manualCode} showManual={showManual} onManualCode={setManualCode} onShowManual={() => setShowManual(true)} onScan={() => void scan()} onPair={() => void pair(manualCode)} onBack={(pairFromHosts || pairFromHome) ? backFromPairing : undefined} />;
   if (view.type === "hosts" && (status === "connected" || status === "error")) {
     // Reached from home the live connection stays open and its row carries
     // the "connected" indicator; reached from the try-again screen the error
@@ -986,7 +1013,7 @@ export function App() {
           </div>
           {!snapshot.projects.length && <div className="mobile-empty"><FolderIcon /><h2>No projects yet</h2><p>Add a folder from your desktop to begin.</p></div>}
         </section>
-        <nav className="bottom-nav"><button className="active"><FolderIcon /><span>Projects</span></button><button onClick={() => void scan()}><ScanIcon /><span>Pair</span></button><button onClick={openHosts}><WifiIcon /><span>Hosts</span></button></nav>
+        <nav className="bottom-nav"><button className="active"><FolderIcon /><span>Projects</span></button><button onClick={enterPairFromHome}><ScanIcon /><span>Pair</span></button><button onClick={openHosts}><WifiIcon /><span>Hosts</span></button></nav>
       </div></div>
       {activeProject && <div className="mobile-page"><ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={navigateBack} onRename={() => setProjectToRename(activeProject)} onOpen={openTerminal} /></div>}
       {activeProject && activeSession && <div className="mobile-page"><div className="mobile-app terminal-view">
