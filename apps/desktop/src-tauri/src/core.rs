@@ -3500,6 +3500,144 @@ mod tests {
         fs::remove_file(state_path).expect("remove test state");
     }
 
+    fn home_path() -> PathBuf {
+        std::env::var("USERPROFILE")
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_dir().expect("current directory"))
+    }
+
+    fn store_with_cleanup() -> (DesktopStore, PathBuf) {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let store = DesktopStore::load(state_path.clone()).expect("initial store");
+        (store, state_path)
+    }
+
+    #[test]
+    fn ensure_home_project_reuses_saved_projects_with_other_case_or_separators() {
+        let home = home_path().to_string_lossy().into_owned();
+        for variant in [
+            home.to_lowercase(),
+            home.replace('\\', "/"),
+            format!("{home}\\"),
+        ] {
+            let (store, state_path) = store_with_cleanup();
+            let mut inner = test_inner(store, Vec::new());
+            test_project(&mut inner, "saved-home", &variant, true);
+
+            let home = ensure_home_project(&mut inner).expect("home project");
+            assert_eq!(
+                home.id, "saved-home",
+                "the saved project matches {variant:?} case-insensitively"
+            );
+            assert!(
+                inner.temporary_projects.is_empty(),
+                "no duplicate temporary project is created"
+            );
+            fs::remove_file(state_path).expect("remove test state");
+        }
+    }
+
+    #[test]
+    fn ensure_home_project_reuses_an_existing_temporary_home_project() {
+        let (store, state_path) = store_with_cleanup();
+        let mut inner = test_inner(store, Vec::new());
+        let variant = home_path().to_string_lossy().to_lowercase();
+        let temporary = test_project(&mut inner, "temp-home", &variant, false);
+
+        let home = ensure_home_project(&mut inner).expect("home project");
+        assert_eq!(
+            home.id, temporary.id,
+            "the existing temporary home project is reused, not duplicated"
+        );
+        assert_eq!(
+            inner.temporary_projects.len(),
+            1,
+            "no second home project appears"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn ensure_home_project_prefers_a_saved_home_project_over_a_temporary_one() {
+        let (store, state_path) = store_with_cleanup();
+        let mut inner = test_inner(store, Vec::new());
+        let home = home_path().to_string_lossy().into_owned();
+        let temporary = test_project(
+            &mut inner,
+            "temp-home",
+            home.to_lowercase().as_str(),
+            false,
+        );
+
+        let result = ensure_home_project(&mut inner).expect("home project");
+        assert_eq!(
+            result.id, temporary.id,
+            "while nothing is saved the temporary home project is reused"
+        );
+
+        test_project(&mut inner, "saved-home", &home, true);
+        let result = ensure_home_project(&mut inner).expect("home project");
+        assert_eq!(
+            result.id, "saved-home",
+            "once a saved project covers the home path it wins over the temporary duplicate"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn ensure_home_project_creates_a_single_temporary_project_when_none_covers_home() {
+        let (store, state_path) = store_with_cleanup();
+        let mut inner = test_inner(store, Vec::new());
+        test_project(&mut inner, "saved-elsewhere", "C:\\Work\\Other", true);
+
+        let created = ensure_home_project(&mut inner).expect("home project");
+        assert!(
+            created.id.starts_with("temporary-"),
+            "the home fallback is a temporary project"
+        );
+        assert!(!created.persistent);
+        assert_eq!(created.name, folder_name(Path::new(&created.path)));
+        assert!(inner.temporary_projects.contains_key(&created.id));
+        assert!(inner.project_order.contains(&created.id));
+
+        let again = ensure_home_project(&mut inner).expect("home project");
+        assert_eq!(
+            again.id, created.id,
+            "re-running initialization reuses the fallback instead of duplicating it"
+        );
+        assert_eq!(
+            inner.temporary_projects.len(),
+            1,
+            "exactly one home project exists"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn ensure_home_project_ignores_saved_projects_in_subdirectories() {
+        let (store, state_path) = store_with_cleanup();
+        let mut inner = test_inner(store, Vec::new());
+        let nested = home_path().join("nested").to_string_lossy().into_owned();
+        test_project(&mut inner, "saved-nested", &nested, true);
+
+        let created = ensure_home_project(&mut inner).expect("home project");
+        assert_ne!(
+            created.id, "saved-nested",
+            "a project in a subfolder of the home directory is not the home project"
+        );
+        assert!(created.id.starts_with("temporary-"));
+        assert!(inner.temporary_projects.contains_key(&created.id));
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
     #[test]
     fn newest_running_session_project_id_ignores_exited_sessions() {
         let sessions = [
