@@ -17,6 +17,8 @@ button { color: inherit; }
 .host-online { display: flex; align-items: center; gap: 7px; margin-right: 8px; padding: 4px 9px; border: 1px solid #263129; border-radius: 99px; color: #89918f; font-size: 11px; }
 .host-online i, .status-dot, .pair-details i { width: 6px; height: 6px; border-radius: 50%; background: #69d58a; box-shadow: 0 0 8px #69d58a88; }
 .host-online.is-unregistered i { background: #778294; box-shadow: none; }
+.host-online.is-unpaired { border-color: #3a4a44; background: #14201d; color: #9fdbc9; }
+.host-online.is-unpaired i { background: #6fd6c0; box-shadow: 0 0 8px #6fd6c066; }
 .host-online.is-pending i { width: 11px; height: 11px; border: 2px solid #e2b66d44; border-top-color: #e2b66d; background: none; box-shadow: none; animation: remote-registering .8s linear infinite; }
 @keyframes remote-registering { to { transform: rotate(360deg); } }
 .host-online.is-offline { border-color: #2c2f36; color: #757c85; }

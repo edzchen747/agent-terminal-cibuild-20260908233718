@@ -561,10 +561,6 @@ impl Core {
         inner.store.save_network(network)
     }
 
-    pub fn begin_desktop_enrollment(self: &Arc<Self>, device_id: String) -> Result<()> {
-        self.start_desktop_enrollment(device_id, false)
-    }
-
     fn start_desktop_enrollment(
         self: &Arc<Self>,
         device_id: String,
@@ -677,13 +673,21 @@ impl Core {
 
     /// Writes the pending state and reports whether a verification may begin.
     /// Nothing is ever verified for a host that has never paired, which keeps
-    /// the badge on "LAN access ready".
+    /// the badge on "Pair a device"; a host whose last device was revoked
+    /// falls into the same bucket. Registration starts on the first pairing
+    /// instead (the pair flow forces the enrollment run).
     fn prepare_remote_verification(&self) -> bool {
         let network = self.network_state();
         let has_known_registration = network.enrolled
             || network.node_id.is_some()
             || network.registration_status != "unregistered";
         if !has_known_registration {
+            return false;
+        }
+        if self.paired_device_id().is_none() {
+            // Without a device nothing can use the overlay route, so there is
+            // nothing to verify; the badge shows "Pair a device" and the node
+            // stays off until the first pairing re-registers it fresh.
             return false;
         }
         // Never trust the last stored verdict: the node may have been revoked
@@ -821,18 +825,26 @@ impl Core {
             .unwrap_or_default();
         let online_device_ids = self.online_device_ids();
         let network = inner.store.network();
+        // With no authorized device there is nobody the overlay route could
+        // serve, so the badge says "Pair a device" regardless of any stored
+        // verdict from an older session.
+        let remote_status = if inner.store.devices().is_empty() {
+            "unpaired".to_owned()
+        } else {
+            registration_status_for_display(
+                self.network_online.load(Ordering::Acquire),
+                &network.registration_status,
+                self.remote_verification_running.load(Ordering::Acquire)
+                    || self.desktop_enrollment_running.load(Ordering::Acquire),
+            )
+        };
         DesktopState {
             snapshot: snapshot_from_inner(&inner, &online_device_ids),
             current_project_id,
             open_projects_in_new_windows: inner.store.settings().open_projects_in_new_windows,
             confirm_external_links: inner.store.settings().confirm_external_links,
             remote_registration: RemoteRegistration {
-                status: registration_status_for_display(
-                    self.network_online.load(Ordering::Acquire),
-                    &network.registration_status,
-                    self.remote_verification_running.load(Ordering::Acquire)
-                        || self.desktop_enrollment_running.load(Ordering::Acquire),
-                ),
+                status: remote_status,
                 error: network.registration_error.clone(),
             },
         }
@@ -1720,12 +1732,20 @@ impl Core {
     }
 
     pub fn revoke_device(&self, device_id: &str) -> Result<()> {
-        self.inner
-            .lock()
-            .expect("desktop state poisoned")
-            .store
-            .revoke_device(device_id)?;
+        let no_devices_left = {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            inner.store.revoke_device(device_id)?;
+            inner.store.devices().is_empty()
+        };
         self.disconnect_device(device_id);
+        if no_devices_left {
+            // No device is left that could use the overlay route, so the node
+            // has nobody to serve. The badge itself switches to "Pair a
+            // device" (derived from the device list, not from the stored
+            // verdict), the node stays off, and the next pairing re-registers
+            // it fresh even though the saved verdict is stale.
+            self.stop_embedded_node();
+        }
         self.broadcast();
         Ok(())
     }
@@ -1802,6 +1822,14 @@ impl Core {
                 token,
                 device,
             } => {
+                // The very first pairing is the moment remote access becomes
+                // meaningful: it must always launch a fresh registration even
+                // when a stale verdict was left behind by an older session
+                // (the enrollment only skips a healthy, current node).
+                let first_device = {
+                    let inner = self.inner.lock().expect("desktop state poisoned");
+                    inner.store.devices().is_empty()
+                };
                 let Some(device_token) = self.consume_pairing_grant(&token, &device) else {
                     self.send_to_client(client_id, ServerMessage::Error {
                         request_id: Some(request_id), code: "PAIRING_DENIED".into(),
@@ -1830,7 +1858,7 @@ impl Core {
                 );
                 let _ = self.app.emit("pairing-succeeded", paired_device_id.clone());
                 self.broadcast();
-                let _ = self.begin_desktop_enrollment(paired_device_id);
+                let _ = self.start_desktop_enrollment(paired_device_id, first_device);
                 return;
             }
             ClientMessage::NodeEnroll { request_id, nonce } => {

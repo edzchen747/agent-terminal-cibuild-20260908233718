@@ -5,7 +5,7 @@ export interface DesktopState extends HostSnapshot {
   openProjectsInNewWindows: boolean;
   confirmExternalLinks: boolean;
   remoteRegistration: {
-    status: "unregistered" | "pending" | "enrolled" | "failed" | "offline";
+    status: "unregistered" | "pending" | "enrolled" | "failed" | "offline" | "unpaired";
     error?: string;
   };
 }
