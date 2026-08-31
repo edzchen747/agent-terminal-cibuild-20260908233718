@@ -20,6 +20,32 @@ test("hosts list: an empty list stays empty", () => {
   assert.deepEqual(sortHostsByLastConnected([]), []);
 });
 
+test("hosts list: equal timestamps keep insertion order", () => {
+  const hosts = [
+    { id: "x", lastConnectedAt: NOW - 2 * day },
+    { id: "y", lastConnectedAt: NOW - 2 * day }
+  ];
+  assert.deepEqual(sortHostsByLastConnected(hosts).map((host) => host.id), ["x", "y"]);
+});
+
+test("hosts list: a zero timestamp sorts as never connected", () => {
+  const hosts = [
+    { id: "a", lastConnectedAt: 0 },
+    { id: "b", lastConnectedAt: NOW - 1 * day }
+  ];
+  assert.deepEqual(sortHostsByLastConnected(hosts).map((host) => host.id), ["b", "a"]);
+});
+
+test("hosts list: sorting never mutates the caller's array", () => {
+  const hosts = [
+    { id: "a", lastConnectedAt: NOW - 3 * day },
+    { id: "b", lastConnectedAt: NOW - 1 * day }
+  ];
+  const snapshot = JSON.stringify(hosts);
+  sortHostsByLastConnected(hosts);
+  assert.equal(JSON.stringify(hosts), snapshot);
+});
+
 test("default host after removal is the most recent survivor", () => {
   const remaining = [
     { id: "a", lastConnectedAt: NOW - 5 * day },
@@ -40,12 +66,39 @@ test("default host after removal: a missing timestamp counts as oldest", () => {
   assert.equal(defaultHostAfterRemoval(remaining)?.id, "b");
 });
 
+test("default host after removal: a tied most-recent timestamp picks the first survivor", () => {
+  const remaining = [
+    { id: "a", lastConnectedAt: NOW - 1 * day },
+    { id: "b", lastConnectedAt: NOW - 1 * day }
+  ];
+  assert.equal(defaultHostAfterRemoval(remaining)?.id, "a");
+});
+
 test("last connected label uses relative buckets", () => {
   assert.equal(lastConnectedLabel(undefined, NOW), "Never");
   assert.equal(lastConnectedLabel(NOW - 30_000, NOW), "Just now");
   assert.equal(lastConnectedLabel(NOW - 9 * 60_000, NOW), "9 min ago");
   assert.equal(lastConnectedLabel(NOW - 5 * 3_600_000, NOW), "5 hours ago");
   assert.equal(lastConnectedLabel(NOW - 3 * day, NOW), "3 days ago");
+});
+
+test("last connected label snaps every bucket boundary", () => {
+  assert.equal(lastConnectedLabel(NOW, NOW), "Just now");
+  assert.equal(lastConnectedLabel(NOW - 59_999, NOW), "Just now");
+  assert.equal(lastConnectedLabel(NOW - 60_000, NOW), "1 min ago");
+  assert.equal(lastConnectedLabel(NOW - 3_599_999, NOW), "59 min ago");
+  assert.equal(lastConnectedLabel(NOW - 3_600_000, NOW), "1 hours ago");
+  assert.equal(lastConnectedLabel(NOW - 86_399_999, NOW), "23 hours ago");
+  assert.equal(lastConnectedLabel(NOW - 86_400_000, NOW), "1 days ago");
+  assert.equal(lastConnectedLabel(NOW - 6 * day, NOW), "6 days ago");
+});
+
+test("a future timestamp clamps to 'Just now' like a clock-skewed host", () => {
+  assert.equal(lastConnectedLabel(NOW + 3_600_000, NOW), "Just now");
+});
+
+test("a zero timestamp is treated as never", () => {
+  assert.equal(lastConnectedLabel(0, NOW), "Never");
 });
 
 test("last connected label falls back to a date for old hosts", () => {
