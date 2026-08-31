@@ -6,7 +6,8 @@ import type { DesktopState } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
 import type { SplitGroup, SplitLayout } from "./split-tabs";
-import { nextModalAfterPairing, nextModalOnEscape, type Modal } from "./modal-navigation";
+import { deviceListEntryModal, nextModalAfterPairing, nextModalOnEscape, pairModalEscapeTarget, type Modal } from "./modal-navigation";
+import { loadSidebarPreferences, saveSidebarPreferences, shouldCollapseSidebar } from "./sidebar";
 import { TerminalPane } from "./TerminalPane";
 
 interface TabDragState {
@@ -63,12 +64,14 @@ export function App() {
   const [splitMenu, setSplitMenu] = useState<SplitMenu | null>(null);
   const [splitDropSide, setSplitDropSide] = useState<SplitDropSide>(null);
   const [resizingSplitId, setResizingSplitId] = useState<string | null>(null);
+  const [autoCollapseSidebar, setAutoCollapseSidebar] = useState(() => loadSidebarPreferences().autoCollapse);
   const tabDragRef = useRef<TabDragState | null>(null);
   const tabElementsRef = useRef(new Map<string, HTMLButtonElement>());
   const pendingTabPositionsRef = useRef<Map<string, number> | null>(null);
   const suppressTabClickRef = useRef(false);
   const projectDragRef = useRef<ProjectDragState | null>(null);
   const projectElementsRef = useRef(new Map<string, HTMLDivElement>());
+  const sidebarRef = useRef<HTMLElement>(null);
   const terminalStackRef = useRef<HTMLDivElement>(null);
   const splitButtonRef = useRef<HTMLButtonElement>(null);
   const splitMenuRef = useRef<HTMLDivElement>(null);
@@ -91,11 +94,28 @@ export function App() {
     const handleKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
-      setModal(nextModalOnEscape(modal, renaming));
+      setModal(nextModalOnEscape(modal, renaming, state?.devices.length ?? 0));
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [modal, renaming]);
+  }, [modal, renaming, state?.devices.length]);
+
+  useEffect(() => {
+    saveSidebarPreferences({ autoCollapse: autoCollapseSidebar });
+  }, [autoCollapseSidebar]);
+
+  useEffect(() => {
+    if (!sidebarOpen || !autoCollapseSidebar) return;
+    const handleClick = (event: MouseEvent) => {
+      const target = event.target instanceof Element ? event.target : event.target instanceof Node ? event.target.parentElement : null;
+      const inside = sidebarRef.current?.contains(target) ?? false;
+      const isProject = Boolean(target && inside && target.closest(".project-item"));
+      const isToggle = Boolean(target?.closest(".title-action"));
+      if (shouldCollapseSidebar(sidebarOpen, autoCollapseSidebar, inside, isProject, isToggle)) setSidebarOpen(false);
+    };
+    document.addEventListener("click", handleClick);
+    return () => document.removeEventListener("click", handleClick);
+  }, [sidebarOpen, autoCollapseSidebar]);
 
   const currentProject = state?.projects.find((project) => project.id === state.currentProjectId);
   const unorderedProjectSessions = useMemo(
@@ -680,13 +700,13 @@ export function App() {
             <button onClick={() => void window.agentTerminal.retryRemoteRegistration()}>Retry</button>
           </span>}
           {currentProject && <button className={`project-persistence-action ${currentProject.persistent ? "is-saved" : ""}`} onClick={() => void toggleProjectPersistence()} title={currentProject.persistent ? "Stop saving this project" : "Save this temporary project"}>{currentProject.persistent ? <BookmarkIcon /> : <ClockIcon />}<span>{currentProject.persistent ? "Unsave" : "Save project"}</span></button>}
-          <button className="icon-button" onClick={() => setModal("devices")} title="Connected devices"><PhoneIcon /></button>
+          <button className="icon-button" onClick={() => setModal(deviceListEntryModal(state.devices.length))} title="Connected devices"><PhoneIcon /></button>
           <button className="icon-button" onClick={() => setModal("settings")} title="Settings"><SettingsIcon /></button>
         </div>
       </header>
 
       <div className="workspace">
-        <aside className={`sidebar ${sidebarOpen ? "" : "is-collapsed"}`}>
+        <aside ref={sidebarRef} className={`sidebar ${sidebarOpen ? "" : "is-collapsed"}`}>
           <div className="sidebar-heading"><span>Projects</span><button className="icon-button small" onClick={() => void window.agentTerminal.createProject()} title="Add project"><PlusIcon /></button></div>
           <nav className="project-list">
             {state.projects.map((project, index) => {
@@ -802,8 +822,8 @@ export function App() {
         </>}
       </div>}
 
-      {modal === "pair" && <div className="modal-backdrop" onMouseDown={() => setModal("devices")}><section className="modal pair-modal" onMouseDown={(event) => event.stopPropagation()}>
-        <button className="modal-close icon-button" onClick={() => setModal("devices")}><CloseIcon /></button>
+      {modal === "pair" && <div className="modal-backdrop" onMouseDown={() => setModal(pairModalEscapeTarget(state.devices.length))}><section className="modal pair-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="modal-close icon-button" onClick={() => setModal(pairModalEscapeTarget(state.devices.length))}><CloseIcon /></button>
         <div className="modal-kicker"><PhoneIcon /> Connect your phone</div>
         <h1>Pair once. Reconnect anytime.</h1>
         <p>Scan this QR once to add your phone as an authorized device. It stays paired across every network until you revoke it in Devices. Note: Both devices must be connected to the same Wi-Fi network for the initial setup.</p>
@@ -820,6 +840,7 @@ export function App() {
         <label className="settings-row settings-toggle"><span><strong>Move tabs to the matching project</strong><small>Turn off to keep a terminal tab in its current project even when the folder changes</small></span><input type="checkbox" checked={state.followWorkingDirectory} onChange={(event) => void window.agentTerminal.setFollowWorkingDirectory(event.target.checked)} /><i /></label>
         <label className="settings-row settings-toggle"><span><strong>Warn before opening external links</strong><small>Ask for confirmation before sending terminal links to your browser</small></span><input type="checkbox" checked={state.confirmExternalLinks} onChange={(event) => void window.agentTerminal.setConfirmExternalLinks(event.target.checked)} /><i /></label>
         <label className="settings-row settings-toggle"><span><strong>Drag tabs to split</strong><small>Drop a tab on the left or right edge of the terminal</small></span><input type="checkbox" checked={allowSplitEdgeDrop} onChange={(event) => setAllowSplitEdgeDrop(event.target.checked)} /><i /></label>
+        <label className="settings-row settings-toggle"><span><strong>Auto collapse project sidebar</strong><small>Collapse the project list when you click elsewhere or open a project</small></span><input type="checkbox" checked={autoCollapseSidebar} onChange={(event) => setAutoCollapseSidebar(event.target.checked)} /><i /></label>
       </section></div>}
 
       {modal === "devices" && <div className="modal-backdrop" onMouseDown={() => setModal(null)}><section className="modal devices-modal" onMouseDown={(event) => event.stopPropagation()}>
