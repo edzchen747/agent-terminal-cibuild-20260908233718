@@ -16,7 +16,7 @@ import { HostConnection, type RemoteRegistrationState, type SavedHost, type Save
 import { ConnectionNotification } from "./connection-notification";
 import { notificationStateFor, type ConnectionNotificationState } from "./connectionPolicy";
 import { isRetryingSavedHost } from "./connectionFlow";
-import { lastConnectedLabel, sortHostsByLastConnected } from "./hostSelection";
+import { hostRowRegistrationStatus, lastConnectedLabel, type HostCheckState, type RegistrationDisplayStatus, sortHostsByLastConnected } from "./hostSelection";
 import { backButtonAction } from "./navigationPolicy";
 import { deviceIdentity } from "./device";
 import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_SLIDER_HORIZONTAL_BIAS } from "./gesture";
@@ -62,7 +62,7 @@ interface SwipeState {
 // connection carries its own enrollment verdict; while the phone has no
 // internet that verdict is stale, so the badge shows "Offline" instead
 // (the desktop does the same for its own connectivity reading).
-type RemoteDisplayStatus = "unregistered" | "pending" | "enrolled" | "failed" | "offline";
+type RemoteDisplayStatus = RegistrationDisplayStatus;
 const REMOTE_STATUS_LABELS: Record<RemoteDisplayStatus, string> = {
   unregistered: "LAN only",
   pending: "Registering",
@@ -86,6 +86,11 @@ export function App() {
   // the page is entered so a freshly paired desktop shows up.
   const [hostRecords, setHostRecords] = useState<SavedHostRecord[]>([]);
   const [hostsLoaded, setHostsLoaded] = useState(false);
+  // Background registration checks for every registered non-connected host,
+  // run once per hosts-page opening: a row only shows Ready after its node
+  // actually came back from the control plane.
+  const [hostChecks, setHostChecks] = useState<Map<string, HostCheckState>>(() => new Map());
+  const hostChecksStartedRef = useRef(false);
   // The user reached the pairing screen from the hosts page; back restores
   // the pre-pair status captured in prePairStatusRef.
   const [pairFromHosts, setPairFromHosts] = useState(false);
@@ -409,6 +414,34 @@ export function App() {
     return () => { disposed = true; };
   }, [view.type, status]);
 
+  // Opening the hosts page verifies every registered host's phone-side node
+  // against the control plane. The persisted enrollment flag is not trusted
+  // (a node can be revoked or expire), so a row shows Ready only after its
+  // check came back; hosts that were never registered stay LAN only without
+  // ever starting a node. The live desktop is already verified by being
+  // connected, so it is skipped.
+  useEffect(() => {
+    if (view.type !== "hosts" || hostChecksStartedRef.current) return;
+    hostChecksStartedRef.current = true;
+    let disposed = false;
+    void HostConnection.savedHostRecords().then(async (records) => {
+      if (disposed) return;
+      for (const record of records) {
+        if (disposed) break;
+        if (record.remoteEnrolled !== true) continue;
+        if (record.id === connectionRef.current?.host.id) continue;
+        setHostChecks((current) => new Map(current).set(record.id, "checking"));
+        const verdict = await HostConnection.verifySavedHostRegistration(record);
+        if (disposed) continue;
+        setHostChecks((current) => new Map(current).set(record.id, verdict));
+      }
+    });
+    return () => {
+      disposed = true;
+      hostChecksStartedRef.current = false;
+    };
+  }, [view.type]);
+
   useEffect(() => {
     if (!connection) return;
     const pairingHolds = () => pairFromHostsRef.current;
@@ -689,7 +722,7 @@ export function App() {
     // Reached from home the live connection stays open and its row carries
     // the "connected" indicator; reached from the try-again screen the error
     // status is retained, so back returns there.
-    return <HostsPage records={hostRecords} loaded={hostsLoaded} connectedId={connection?.host.id ?? null} registration={remoteRegistration} online={online} onBack={navigateBack} onSelect={(record) => selectHost(record)} onRemove={(record) => void removeHost(record)} onPairNew={enterPairFromHosts} />;
+    return <HostsPage records={hostRecords} loaded={hostsLoaded} connectedId={connection?.host.id ?? null} registration={remoteRegistration} online={online} checks={hostChecks} onBack={navigateBack} onSelect={(record) => selectHost(record)} onRemove={(record) => void removeHost(record)} onPairNew={enterPairFromHosts} />;
   }
   if (status === "error") return <ErrorScreen message={error} hostName={hostName || undefined} onRetry={() => window.location.reload()} onConnectDifferent={openHosts} />;
   if (!connection || !snapshot) return null;
@@ -1144,7 +1177,7 @@ function Splash({ label, hostName, onCancel }: { label: string; hostName?: strin
   const status = label.endsWith("…") ? label : `${label}…`;
   return <div className="splash"><span className="logo large"><TerminalIcon /></span><strong>Agent Terminal</strong>{hostName && <span className="splash-host">Connecting to {hostName}</span>}<small>{status}</small><i className="loader" />{onCancel && <button className="text-button" onClick={onCancel}>Cancel</button>}</div>;
 }
-function HostsPage({ records, loaded, connectedId, registration, online, onBack, onSelect, onRemove, onPairNew }: { records: SavedHostRecord[]; loaded: boolean; connectedId: string | null; registration: RemoteRegistrationState; online: boolean; onBack: () => void; onSelect: (record: SavedHostRecord) => void; onRemove: (record: SavedHostRecord) => void; onPairNew: () => void }) {
+function HostsPage({ records, loaded, connectedId, registration, online, checks, onBack, onSelect, onRemove, onPairNew }: { records: SavedHostRecord[]; loaded: boolean; connectedId: string | null; registration: RemoteRegistrationState; online: boolean; checks: ReadonlyMap<string, HostCheckState>; onBack: () => void; onSelect: (record: SavedHostRecord) => void; onRemove: (record: SavedHostRecord) => void; onPairNew: () => void }) {
   const ordered = sortHostsByLastConnected(records);
   return <div className="mobile-app hosts-page">
     <MobileHeader title="Hosts" subtitle={loaded ? `${records.length} paired desktop${records.length === 1 ? "" : "s"}` : "Previously paired desktops"} onBack={onBack} />
@@ -1154,13 +1187,20 @@ function HostsPage({ records, loaded, connectedId, registration, online, onBack,
       : <div className="host-list">
         {ordered.map((record) => {
           const isCurrent = record.id === connectedId;
-          // The live connection owns the verdict for the connected desktop;
-          // other rows read the persisted enrollment flag from the last
-          // pairing/sync so the user sees which host remote registration is
-          // set up for.
-          const registrationStatus: RemoteDisplayStatus = isCurrent
-            ? remoteDisplayStatus(registration, online)
-            : record.remoteEnrolled ? "enrolled" : "unregistered";
+          // The live connection owns the verdict for the connected desktop
+          // (it is verified by being connected). Every other registered host
+          // must have its own background check come back before the row may
+          // show Ready; a host that was never registered shows LAN only
+          // immediately.
+          const registrationStatus = hostRowRegistrationStatus({
+            remoteEnrolled: record.remoteEnrolled,
+            isCurrent,
+            liveStatus: remoteDisplayStatus(registration, online),
+            check: checks.get(record.id)
+          });
+          const label = isCurrent
+            ? REMOTE_STATUS_LABELS[registrationStatus]
+            : registrationStatus === "pending" ? "Checking" : REMOTE_STATUS_LABELS[registrationStatus];
           return (
             <div key={record.id} className={`host-row${isCurrent ? " is-connected" : ""}`}>
               <button className="host-main" onClick={() => onSelect(record)} aria-label={isCurrent ? `Connected to ${record.name}` : `Connect to ${record.name}`}>
@@ -1169,7 +1209,7 @@ function HostsPage({ records, loaded, connectedId, registration, online, onBack,
                   <strong className="display-name" title={record.name}>{record.name}</strong>
                   <small className={isCurrent ? "is-connected" : ""}>{isCurrent ? "Connected now" : `Last connected ${lastConnectedLabel(record.lastConnectedAt)}`}</small>
                 </span>
-                <span className={`host-registration is-${registrationStatus}`}><i />{REMOTE_STATUS_LABELS[registrationStatus]}</span>
+                <span className={`host-registration is-${registrationStatus}`}><i />{label}</span>
                 <i className={`host-status${isCurrent ? " is-online" : ""}`} />
                 <ChevronIcon />
               </button>

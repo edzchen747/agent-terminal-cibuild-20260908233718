@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sortHostsByLastConnected, defaultHostAfterRemoval, lastConnectedLabel } from "./hostSelection.ts";
+import { sortHostsByLastConnected, defaultHostAfterRemoval, lastConnectedLabel, hostRowRegistrationStatus } from "./hostSelection.ts";
 
 const day = 86_400_000;
 const NOW = 1_000_000_000_000;
@@ -50,4 +50,28 @@ test("last connected label uses relative buckets", () => {
 
 test("last connected label falls back to a date for old hosts", () => {
   assert.equal(lastConnectedLabel(NOW - 30 * day, NOW), new Date(NOW - 30 * day).toLocaleDateString());
+});
+
+test("host row registration: a never-registered host shows LAN only immediately", () => {
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: undefined, isCurrent: false, liveStatus: "enrolled", check: undefined }), "unregistered");
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: false, isCurrent: false, liveStatus: "enrolled", check: undefined }), "unregistered");
+});
+
+test("host row registration: a registered host stays checking until the check returns", () => {
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "enrolled", check: undefined }), "pending");
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "enrolled", check: "checking" }), "pending");
+});
+
+test("host row registration: only a verified check shows ready", () => {
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "unregistered", check: "verified" }), "enrolled");
+});
+
+test("host row registration: a failed check falls back to LAN only even when previously registered", () => {
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "enrolled", check: "lanOnly" }), "unregistered");
+});
+
+test("host row registration: the connected desktop uses its live registration state", () => {
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: true, liveStatus: "pending", check: undefined }), "pending");
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: true, liveStatus: "failed", check: undefined }), "failed");
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: false, isCurrent: true, liveStatus: "offline", check: undefined }), "offline");
 });

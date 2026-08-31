@@ -1,4 +1,5 @@
 import { Preferences } from "@capacitor/preferences";
+import { Capacitor } from "@capacitor/core";
 import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage } from "@agentterminal/protocol";
 import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN } from "@agentterminal/protocol";
 import { deviceName } from "./device";
@@ -168,6 +169,50 @@ export class HostConnection {
       else await this.forget();
     }
     return remaining;
+  }
+
+  /**
+   * Re-verifies a previously paired desktop's phone-side node registration
+   * against the control plane. The persisted `remoteEnrolled` flag is never
+   * trusted: the node may have been revoked or expired since it was written,
+   * so the hosts page only shows "Ready" for a host whose node actually
+   * comes back. A host that was never registered never starts a node.
+   */
+  static async verifySavedHostRegistration(record: SavedHostRecord): Promise<"verified" | "lanOnly"> {
+    if (record.remoteEnrolled !== true) return "lanOnly";
+    if (!Capacitor.isNativePlatform()) return "verified";
+    const engine = new EmbeddedNodeEngine(record.id);
+    try {
+      const state = await engine.start(
+        record.controlUrl ?? OVERLAY_CONTROL_URL,
+        record.remoteEndpoint ?? defaultRemoteEndpoint(record.id),
+        record.remoteTransport ?? "overlay"
+      );
+      if (state.engineStarted) return "verified";
+    } catch (error) {
+      if (isDroppedNodeEnrollmentError(error)) await this.markSavedHostUnregistered(record);
+      return "lanOnly";
+    } finally {
+      await engine.stop();
+    }
+    return "lanOnly";
+  }
+
+  /** A node was revoked or expired: clear both persisted enrollment flags. */
+  private static async markSavedHostUnregistered(record: SavedHostRecord): Promise<void> {
+    const records = await this.savedHostRecords();
+    const index = records.findIndex((entry) => entry.id === record.id);
+    if (index >= 0) {
+      const entry = records[index];
+      if (entry && entry.remoteEnrolled !== false) {
+        records[index] = { ...entry, remoteEnrolled: false };
+        await Preferences.set({ key: HOSTS_KEY, value: JSON.stringify(records) });
+      }
+    }
+    const saved = await this.saved();
+    if (saved?.id === record.id && saved.remoteEnrolled === true) {
+      await this.saveHost({ ...saved, remoteEnrolled: false });
+    }
   }
 
   static async pair(payload: PairingPayload, device: DeviceIdentity): Promise<HostConnection> {

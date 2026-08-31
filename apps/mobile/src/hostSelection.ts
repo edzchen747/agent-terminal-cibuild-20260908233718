@@ -45,3 +45,27 @@ export function lastConnectedLabel(timestamp: number | undefined, now: number = 
   if (days < 7) return `${days} days ago`;
   return new Date(timestamp).toLocaleDateString();
 }
+
+/** Registration states shared with the desktop badge. */
+export type RegistrationDisplayStatus = "unregistered" | "pending" | "enrolled" | "failed" | "offline";
+
+/** Where a hosts-page row stands in its background registration check. */
+export type HostCheckState = "checking" | "verified" | "lanOnly";
+
+/**
+ * The registration badge shown for a hosts-page row. The connected desktop's
+ * badge follows its live connection state; every other row is only trusted
+ * after its own check ran: a never-registered host shows LAN only right away,
+ * a registered one stays "checking" until the verification comes back.
+ */
+export function hostRowRegistrationStatus(input: {
+  remoteEnrolled?: boolean;
+  isCurrent: boolean;
+  liveStatus: RegistrationDisplayStatus;
+  check: HostCheckState | undefined;
+}): RegistrationDisplayStatus {
+  if (input.isCurrent) return input.liveStatus;
+  if (input.check === "verified") return "enrolled";
+  if (input.check === "lanOnly" || input.remoteEnrolled !== true) return "unregistered";
+  return "pending";
+}
