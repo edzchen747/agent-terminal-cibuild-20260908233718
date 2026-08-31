@@ -6,9 +6,8 @@ import type { DesktopState } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
 import type { SplitGroup, SplitLayout } from "./split-tabs";
+import { nextModalAfterPairing, nextModalOnEscape, type Modal } from "./modal-navigation";
 import { TerminalPane } from "./TerminalPane";
-
-type Modal = "pair" | "settings" | "rename" | null;
 
 interface TabDragState {
   sessionId: string;
@@ -82,10 +81,21 @@ export function App() {
   }, []);
 
   useEffect(() => window.agentTerminal.onPairingSucceeded(() => {
-    setModal((current) => current === "pair" ? null : current);
+    setModal((current) => nextModalAfterPairing(current));
     setQr("");
     setPairError("");
   }), []);
+
+  useEffect(() => {
+    if (!modal) return;
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setModal(nextModalOnEscape(modal, renaming));
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [modal, renaming]);
 
   const currentProject = state?.projects.find((project) => project.id === state.currentProjectId);
   const unorderedProjectSessions = useMemo(
@@ -670,8 +680,8 @@ export function App() {
             <button onClick={() => void window.agentTerminal.retryRemoteRegistration()}>Retry</button>
           </span>}
           {currentProject && <button className={`project-persistence-action ${currentProject.persistent ? "is-saved" : ""}`} onClick={() => void toggleProjectPersistence()} title={currentProject.persistent ? "Stop saving this project" : "Save this temporary project"}>{currentProject.persistent ? <BookmarkIcon /> : <ClockIcon />}<span>{currentProject.persistent ? "Unsave" : "Save project"}</span></button>}
-          <button className="icon-button" onClick={() => void showPairing()} title="Pair a mobile device"><PhoneIcon /></button>
-          <button className="icon-button" onClick={() => setModal("settings")} title="Settings and devices"><SettingsIcon /></button>
+          <button className="icon-button" onClick={() => setModal("devices")} title="Connected devices"><PhoneIcon /></button>
+          <button className="icon-button" onClick={() => setModal("settings")} title="Settings"><SettingsIcon /></button>
         </div>
       </header>
 
@@ -792,11 +802,11 @@ export function App() {
         </>}
       </div>}
 
-      {modal === "pair" && <div className="modal-backdrop" onMouseDown={() => setModal(null)}><section className="modal pair-modal" onMouseDown={(event) => event.stopPropagation()}>
-        <button className="modal-close icon-button" onClick={() => setModal(null)}><CloseIcon /></button>
+      {modal === "pair" && <div className="modal-backdrop" onMouseDown={() => setModal("devices")}><section className="modal pair-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="modal-close icon-button" onClick={() => setModal("devices")}><CloseIcon /></button>
         <div className="modal-kicker"><PhoneIcon /> Connect your phone</div>
         <h1>Pair once. Reconnect anytime.</h1>
-        <p>Scan this QR once to add your phone as an authorized device. It stays paired across every network until you revoke it in Settings. Note: Both devices must be connected to the same Wi-Fi network for the initial setup.</p>
+        <p>Scan this QR once to add your phone as an authorized device. It stays paired across every network until you revoke it in Devices. Note: Both devices must be connected to the same Wi-Fi network for the initial setup.</p>
         <div className={`qr-frame ${pairError ? "has-error" : ""}`}>{qr ? <img src={qr} alt="Mobile pairing QR" /> : pairError ? <div className="pair-error">{pairError}</div> : <div className="qr-loading">Preparing secure pairing…</div>}</div>
         <div className="pair-details"><span><i /> This phone stays authorized</span><span>Reconnect from anywhere</span></div>
       </section></div>}
@@ -810,11 +820,17 @@ export function App() {
         <label className="settings-row settings-toggle"><span><strong>Move tabs to the matching project</strong><small>Turn off to keep a terminal tab in its current project even when the folder changes</small></span><input type="checkbox" checked={state.followWorkingDirectory} onChange={(event) => void window.agentTerminal.setFollowWorkingDirectory(event.target.checked)} /><i /></label>
         <label className="settings-row settings-toggle"><span><strong>Warn before opening external links</strong><small>Ask for confirmation before sending terminal links to your browser</small></span><input type="checkbox" checked={state.confirmExternalLinks} onChange={(event) => void window.agentTerminal.setConfirmExternalLinks(event.target.checked)} /><i /></label>
         <label className="settings-row settings-toggle"><span><strong>Drag tabs to split</strong><small>Drop a tab on the left or right edge of the terminal</small></span><input type="checkbox" checked={allowSplitEdgeDrop} onChange={(event) => setAllowSplitEdgeDrop(event.target.checked)} /><i /></label>
-        <div className="section-label">Authorized devices</div>
+      </section></div>}
+
+      {modal === "devices" && <div className="modal-backdrop" onMouseDown={() => setModal(null)}><section className="modal devices-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="modal-close icon-button" onClick={() => setModal(null)}><CloseIcon /></button>
+        <div className="modal-kicker"><PhoneIcon /> Devices</div>
+        <h1>Connected devices</h1>
+        <p>Phones paired with this computer stay authorized until you revoke them. Pairing requires both devices on the same Wi-Fi network.</p>
         <div className="device-list">
           {state.devices.length ? state.devices.map((device) => <div className="device-row" key={device.id}><span className="device-avatar"><PhoneIcon /></span><span><strong className="device-name"><span className="display-name" title={device.name}>{device.name}</span><i className={`device-status ${device.online ? "is-online" : "is-offline"}`} title={device.online ? "Connected now" : "Not connected"} /></strong><small>{device.platform} · Last connected {new Date(device.lastSeenAt).toLocaleString()}</small></span><button className="danger-icon" title="Revoke device" onClick={() => void window.agentTerminal.revokeDevice(device.id)}><TrashIcon /></button></div>) : <div className="empty-devices">No mobile devices have been paired.</div>}
         </div>
-        <button className="primary wide" onClick={() => void showPairing()}><PhoneIcon /> Pair another device</button>
+        <button className="primary wide" onClick={() => void showPairing()}><PhoneIcon /> Pair new device</button>
       </section></div>}
 
       {modal === "rename" && renamingProject && <div className="modal-backdrop" onMouseDown={() => { if (!renaming) setModal(null); }}><form className="modal rename-modal" onMouseDown={(event) => event.stopPropagation()} onSubmit={(event) => { event.preventDefault(); void renameProject(); }}>
