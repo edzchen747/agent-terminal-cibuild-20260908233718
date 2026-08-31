@@ -377,6 +377,49 @@ export class HostConnection {
     return attempt;
   }
 
+  /**
+   * Launch-time parity with the desktop: instead of trusting the persisted
+   * enrollment flag, start this host's saved node identity against the
+   * control plane and confirm it still comes back. A node the control plane
+   * proves removed is re-enrolled automatically with a fresh key (the
+   * run-through of the Retry chain); a transient failure restores the saved
+   * verdict so the badge is not left on "Registering" for it.
+   */
+  private async verifySavedNodeOnLaunch(): Promise<void> {
+    this.setRemoteRegistration({ status: "pending" });
+    const engine = new EmbeddedNodeEngine(this.host.id);
+    try {
+      const state = await engine.start(
+        this.host.controlUrl ?? OVERLAY_CONTROL_URL,
+        this.host.remoteEndpoint ?? defaultRemoteEndpoint(this.host.id),
+        this.host.remoteTransport ?? "overlay"
+      );
+      if (state.engineStarted) {
+        if (!this.host.remoteEnrolled) {
+          this.host.remoteEnrolled = true;
+          await Preferences.set({ key: HOST_KEY, value: JSON.stringify(this.host) });
+          void this.syncHostRecordEnrollment();
+        }
+        this.setRemoteRegistration({ status: "enrolled" });
+      } else {
+        // No native engine (browser build) or the check was inconclusive:
+        // keep the verdict the record already carries.
+        this.setRemoteRegistration({ status: this.host.remoteEnrolled ? "enrolled" : "unregistered" });
+      }
+    } catch (error) {
+      if (isDroppedNodeEnrollmentError(error)) {
+        await this.markRemoteNodeDropped();
+        // The first re-registration of the launch is automatic: the key
+        // request travels over the live LAN session the phone just opened.
+        queueMicrotask(() => { void this.retryRemoteRegistration().catch(() => undefined); });
+      } else {
+        this.setRemoteRegistration({ status: this.host.remoteEnrolled ? "enrolled" : "unregistered" });
+      }
+    } finally {
+      await engine.stop();
+    }
+  }
+
   private async enrollMobile(): Promise<void> {
     const response = await this.request({
       type: "node.enroll",
@@ -490,8 +533,15 @@ export class HostConnection {
       void HostConnection.recordHost(this.host)
         .then(() => HostConnection.markHostConnected(this.host.id))
         .catch(() => undefined);
-      if (connectedOverLan && (this.host.remoteTransport ?? "overlay") === "overlay" && !this.host.remoteEnrolled) {
-        queueMicrotask(() => { void this.retryRemoteRegistration(); });
+      if (connectedOverLan && (this.host.remoteTransport ?? "overlay") === "overlay") {
+        if (this.host.remoteEnrolled) {
+          // Desktop parity: a launch must confirm the saved node still
+          // registers before the badge may stay on Ready. A dropped node is
+          // re-enrolled automatically below.
+          queueMicrotask(() => { void this.verifySavedNodeOnLaunch().catch(() => undefined); });
+        } else {
+          queueMicrotask(() => { void this.retryRemoteRegistration(); });
+        }
       }
       return response.snapshot;
     } catch (error) {
