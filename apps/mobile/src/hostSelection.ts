@@ -52,6 +52,36 @@ export type RegistrationDisplayStatus = "unregistered" | "pending" | "enrolled" 
 /** Where a hosts-page row stands in its background registration check. */
 export type HostCheckState = "checking" | "verified" | "lanOnly";
 
+/** Shorthand labels shown on the phone, mirroring the full desktop labels. */
+export const REGISTRATION_STATUS_LABELS: Record<RegistrationDisplayStatus, string> = {
+  unregistered: "LAN only",
+  pending: "Registering",
+  enrolled: "Ready",
+  failed: "Failed",
+  offline: "Offline"
+};
+
+/**
+ * The badge status for the connected desktop: its live enrollment verdict
+ * while the phone has a route, "Offline" while it does not (the desktop does
+ * the same with its own connectivity reading).
+ */
+export function registrationDisplayStatusFor(
+  live: "unregistered" | "pending" | "enrolled" | "failed",
+  online: boolean
+): RegistrationDisplayStatus {
+  return online ? live : "offline";
+}
+
+/**
+ * The badge label for a hosts-page row. A background-check row in the
+ * checking state says "Checking" (it is not actively enrolling); the
+ * connected row keeps the live "Registering" wording.
+ */
+export function hostRowStatusLabel(status: RegistrationDisplayStatus, isCurrent: boolean): string {
+  return isCurrent ? REGISTRATION_STATUS_LABELS[status] : status === "pending" ? "Checking" : REGISTRATION_STATUS_LABELS[status];
+}
+
 /**
  * The registration badge shown for a hosts-page row. The connected desktop's
  * badge follows its live connection state; every other row is only trusted

@@ -16,7 +16,7 @@ import { HostConnection, type RemoteRegistrationState, type SavedHost, type Save
 import { ConnectionNotification } from "./connection-notification";
 import { notificationStateFor, type ConnectionNotificationState } from "./connectionPolicy";
 import { isRetryingSavedHost } from "./connectionFlow";
-import { hostRowRegistrationStatus, lastConnectedLabel, type HostCheckState, type RegistrationDisplayStatus, sortHostsByLastConnected } from "./hostSelection";
+import { hostRowRegistrationStatus, hostRowStatusLabel, lastConnectedLabel, REGISTRATION_STATUS_LABELS, registrationDisplayStatusFor, type HostCheckState, type RegistrationDisplayStatus, sortHostsByLastConnected } from "./hostSelection";
 import { backButtonAction, pairingReconnectStep, pairingRestoreDecision } from "./navigationPolicy";
 import { deviceIdentity } from "./device";
 import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_SLIDER_HORIZONTAL_BIAS } from "./gesture";
@@ -62,17 +62,6 @@ interface SwipeState {
 // connection carries its own enrollment verdict; while the phone has no
 // internet that verdict is stale, so the badge shows "Offline" instead
 // (the desktop does the same for its own connectivity reading).
-type RemoteDisplayStatus = RegistrationDisplayStatus;
-const REMOTE_STATUS_LABELS: Record<RemoteDisplayStatus, string> = {
-  unregistered: "LAN only",
-  pending: "Registering",
-  enrolled: "Ready",
-  failed: "Failed",
-  offline: "Offline"
-};
-function remoteDisplayStatus(state: RemoteRegistrationState, online: boolean): RemoteDisplayStatus {
-  return online ? state.status : "offline";
-}
 
 export function App() {
   const [connection, setConnection] = useState<HostConnection | null>(null);
@@ -764,8 +753,8 @@ export function App() {
   const activeSession = snapshot.sessions.find((item) => item.id === requestedSessionId && (!activeProject || item.projectId === activeProject.id));
   const pageCount = 1 + (activeProject ? 1 : 0) + (activeProject && activeSession ? 1 : 0);
   const currentPage = Math.min(view.type === "terminal" ? 2 : view.type === "project" ? 1 : 0, pageCount - 1);
-  const remoteStatus = remoteDisplayStatus(remoteRegistration, online);
-  const remoteStatusLabel = REMOTE_STATUS_LABELS[remoteStatus];
+  const remoteStatus = registrationDisplayStatusFor(remoteRegistration.status, online);
+  const remoteStatusLabel = REGISTRATION_STATUS_LABELS[remoteStatus];
 
   function beginSwipe(event: ReactPointerEvent<HTMLDivElement>) {
     // A new pointer sequence is a fresh interaction. Do not let a delayed
@@ -1224,12 +1213,10 @@ function HostsPage({ records, loaded, connectedId, registration, online, checks,
           const registrationStatus = hostRowRegistrationStatus({
             remoteEnrolled: record.remoteEnrolled,
             isCurrent,
-            liveStatus: remoteDisplayStatus(registration, online),
+            liveStatus: registrationDisplayStatusFor(registration.status, online),
             check: checks.get(record.id)
           });
-          const label = isCurrent
-            ? REMOTE_STATUS_LABELS[registrationStatus]
-            : registrationStatus === "pending" ? "Checking" : REMOTE_STATUS_LABELS[registrationStatus];
+          const label = hostRowStatusLabel(registrationStatus, isCurrent);
           return (
             <div key={record.id} className={`host-row${isCurrent ? " is-connected" : ""}`}>
               <button className="host-main" onClick={() => onSelect(record)} aria-label={isCurrent ? `Connected to ${record.name}` : `Connect to ${record.name}`}>

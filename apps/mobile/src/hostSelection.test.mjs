@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sortHostsByLastConnected, defaultHostAfterRemoval, lastConnectedLabel, hostRowRegistrationStatus } from "./hostSelection.ts";
+import { sortHostsByLastConnected, defaultHostAfterRemoval, lastConnectedLabel, hostRowRegistrationStatus, hostRowStatusLabel, registrationDisplayStatusFor, REGISTRATION_STATUS_LABELS } from "./hostSelection.ts";
 
 const day = 86_400_000;
 const NOW = 1_000_000_000_000;
@@ -127,4 +127,46 @@ test("host row registration: the connected desktop uses its live registration st
   assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: true, liveStatus: "pending", check: undefined }), "pending");
   assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: true, liveStatus: "failed", check: undefined }), "failed");
   assert.equal(hostRowRegistrationStatus({ remoteEnrolled: false, isCurrent: true, liveStatus: "offline", check: undefined }), "offline");
+});
+
+test("registration labels cover every display status exactly once", () => {
+  assert.deepEqual(REGISTRATION_STATUS_LABELS, {
+    unregistered: "LAN only",
+    pending: "Registering",
+    enrolled: "Ready",
+    failed: "Failed",
+    offline: "Offline"
+  });
+});
+
+test("registration display status follows the live verdict while online", () => {
+  for (const status of ["unregistered", "pending", "enrolled", "failed"]) {
+    assert.equal(registrationDisplayStatusFor(status, true), status);
+  }
+});
+
+test("registration display status shows offline for every verdict while the phone has no route", () => {
+  for (const status of ["unregistered", "pending", "enrolled", "failed"]) {
+    assert.equal(registrationDisplayStatusFor(status, false), "offline");
+  }
+});
+
+test("host row labels: a checking row says Checking but the live row says Registering", () => {
+  assert.equal(hostRowStatusLabel("pending", true), "Registering");
+  assert.equal(hostRowStatusLabel("pending", false), "Checking");
+  assert.equal(hostRowStatusLabel("enrolled", false), "Ready");
+  assert.equal(hostRowStatusLabel("unregistered", false), "LAN only");
+  assert.equal(hostRowStatusLabel("failed", false), "Failed");
+  assert.equal(hostRowStatusLabel("offline", false), "Offline");
+});
+
+test("host row labels: a checked row with a live check verdict that never finished - edge cases", () => {
+  // A host whose check returned verified shows Ready even when the flag got
+  // cleared underneath it (the check result is the authoritative verdict).
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: false, isCurrent: false, liveStatus: "failed", check: "verified" }), "enrolled");
+  // A row the check explicitly marked LAN only never shows Ready, even when
+  // a stale flag says otherwise.
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "enrolled", check: "lanOnly" }), "unregistered");
+  // A registered host with no check result yet stays checking, not failed.
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "failed", check: undefined }), "pending");
 });

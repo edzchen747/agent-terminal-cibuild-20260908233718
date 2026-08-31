@@ -5,7 +5,7 @@ import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOU
 import { deviceName } from "./device";
 import { canAttemptConnection, heartbeatActive, heartbeatCatchUpNeeded, heartbeatIntervalMs, nextReconnectDelay, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS } from "./connectionPolicy";
 import { EmbeddedNodeEngine, type EmbeddedNodeState } from "./embedded-engine";
-import { isDroppedNodeEnrollmentError } from "./nodeEnrollment";
+import { enrollmentFailureMessage, isDroppedNodeEnrollmentError } from "./nodeEnrollment";
 import { defaultHostAfterRemoval } from "./hostSelection";
 
 const HOST_KEY = "agent-terminal-host";
@@ -356,9 +356,7 @@ export class HostConnection {
         const error = cause instanceof Error ? cause : new Error("Remote connection registration failed.");
         this.setRemoteRegistration({
           status: "failed",
-          error: /update the desktop app/i.test(error.message)
-            ? error.message
-            : "Remote connection registration failed. LAN access is still available."
+          error: enrollmentFailureMessage(error.message)
         });
         if (this.automaticRetryArmed) {
           this.automaticRetryArmed = false;
