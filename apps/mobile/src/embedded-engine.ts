@@ -21,7 +21,7 @@ interface EmbeddedNodePlugin {
     tailnetAddress?: string;
     endpoint?: string;
   }>;
-  stop(): Promise<void>;
+  stop(options?: { stateKey?: string }): Promise<void>;
 }
 
 const NativeEmbeddedNode = registerPlugin<EmbeddedNodePlugin>("EmbeddedNode");
@@ -91,18 +91,27 @@ export class EmbeddedNodeEngine {
     return state;
   }
 
+  /**
+   * Stops only this engine's own node process. The native plugin can run one
+   * node per paired desktop side by side (the live connection's node must
+   * survive background registration checks for other hosts); an engine
+   * without a host (legacy) stops every node.
+   */
   async stop(): Promise<void> {
     if (!Capacitor.isNativePlatform()) return;
-    try { await NativeEmbeddedNode.stop(); } catch { /* best effort */ }
+    try { await NativeEmbeddedNode.stop({ stateKey: this.hostId ?? "" }); } catch { /* best effort */ }
   }
 
   /**
-   * Drops the persisted identity of a desktop that was unpaired. The tsnet
-   * node it registered stays in the relay until inactivity expiry, so no
-   * relay-side cleanup is needed; only the local record goes away.
+   * Drops the persisted identity of a desktop that was unpaired and stops
+   * its node process. The tsnet node it registered stays in the relay until
+   * inactivity expiry, so no relay-side cleanup is needed; only the local
+   * record goes away.
    */
   static async forget(hostId: string): Promise<void> {
     await Preferences.remove({ key: `${ENGINE_STATE_KEY}-${hostId}` });
+    if (!Capacitor.isNativePlatform()) return;
+    try { await NativeEmbeddedNode.stop({ stateKey: hostId }); } catch { /* best effort */ }
   }
 
   private async load(): Promise<EmbeddedNodeState> {

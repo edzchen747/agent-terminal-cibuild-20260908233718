@@ -419,22 +419,24 @@ export function App() {
   // (a node can be revoked or expire), so a row shows Ready only after its
   // check came back; hosts that were never registered stay LAN only without
   // ever starting a node. The live desktop is already verified by being
-  // connected, so it is skipped.
+  // connected, so it is skipped. The native engine runs one node per host,
+  // so all checks run side by side instead of one after another.
   useEffect(() => {
     if (view.type !== "hosts" || hostChecksStartedRef.current) return;
     hostChecksStartedRef.current = true;
     let disposed = false;
     void HostConnection.savedHostRecords().then(async (records) => {
       if (disposed) return;
-      for (const record of records) {
-        if (disposed) break;
-        if (record.remoteEnrolled !== true) continue;
-        if (record.id === connectionRef.current?.host.id) continue;
+      const liveHostId = connectionRef.current?.host.id;
+      const pending = records.filter((record) => record.remoteEnrolled === true && record.id !== liveHostId);
+      for (const record of pending) {
         setHostChecks((current) => new Map(current).set(record.id, "checking"));
-        const verdict = await HostConnection.verifySavedHostRegistration(record);
-        if (disposed) continue;
-        setHostChecks((current) => new Map(current).set(record.id, verdict));
       }
+      await Promise.all(pending.map(async (record) => {
+        const verdict = await HostConnection.verifySavedHostRegistration(record);
+        if (disposed) return;
+        setHostChecks((current) => new Map(current).set(record.id, verdict));
+      }));
     });
     return () => {
       disposed = true;

@@ -15,6 +15,8 @@ import android.util.Log;
 import java.io.File;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -29,11 +31,11 @@ import org.json.JSONObject;
 @CapacitorPlugin(name = "EmbeddedNode")
 public class EmbeddedNodePlugin extends Plugin {
     private static final String TAG = "EmbeddedNode";
-    private Process nodeProcess;
-    // State directory (and therefore tsnet node identity) of the running
-    // process. Each paired desktop enrolls its own phone-side node, so a
-    // running process only satisfies a start request for its own host.
-    private File activeStateDir;
+    // One process-isolated tsnet node per paired desktop. Each process owns
+    // its own state directory (and therefore node identity); the map lets
+    // several hosts' nodes run side by side (e.g. hosts-page registration
+    // checks) without ever restarting the live host's node.
+    private final Map<File, Process> nodeProcesses = new HashMap<>();
     private final ExecutorService processWatcher = Executors.newSingleThreadExecutor();
 
     @PluginMethod
@@ -59,24 +61,24 @@ public class EmbeddedNodePlugin extends Plugin {
             call.reject("The embedded node engine is not executable in this build.");
             return;
         }
-        if (nodeProcess != null && nodeProcess.isAlive()) {
-            if (stateDir.equals(activeStateDir) && !hasAuthKey) {
-                // The running process is this host's own tsnet node; its
+        Process running = nodeProcesses.get(stateDir);
+        if (running != null && running.isAlive()) {
+            if (!hasAuthKey) {
+                // This host's own tsnet node is already running; its
                 // persisted identity and proxy endpoint are still valid.
                 Log.i(TAG, "node process already running for " + stateDir.getName() + "; returning saved status");
-                JSObject result = readStatus(activeStateDir, nodeId);
+                JSObject result = readStatus(stateDir, nodeId);
                 if (rejectForStatus(call, result)) return;
                 logStatus(result);
                 call.resolve(result);
                 return;
             }
-            // A different host means a different tsnet identity (different
-            // state directory), and a fresh one-time key means the saved
-            // Headscale node was removed. Either way the running process
-            // cannot be reused: restart so the requested identity is the
-            // one that gets registered.
-            Log.i(TAG, "node process running for " + (activeStateDir == null ? "unknown" : activeStateDir.getName()) + "; restarting for " + stateDir.getName() + (hasAuthKey ? " to re-register" : " to switch host identity"));
-            stopNodeProcess();
+            // A fresh one-time key means the saved Headscale node was
+            // removed. Only this host's process must restart so the new
+            // identity is the one that gets registered; every other host's
+            // node keeps running untouched.
+            Log.i(TAG, "node process running for " + stateDir.getName() + "; restarting it to re-register");
+            stopNodeProcess(stateDir);
         }
         try {
             if (!stateDir.exists() && !stateDir.mkdirs()) {
@@ -121,16 +123,13 @@ public class EmbeddedNodePlugin extends Plugin {
             }
             builder.redirectError(ProcessBuilder.Redirect.appendTo(new File(getContext().getFilesDir(), "embedded-node.log")));
             Process process = builder.start();
-            nodeProcess = process;
-            activeStateDir = stateDir;
+            nodeProcesses.put(stateDir, process);
             Log.i(TAG, "node process started " + process + " stateDir=" + stateDir.getName() + " remote=" + remoteHost + ":" + remotePort + " dns=" + dnsServers);
-            watchProcess(process);
+            watchProcess(process, stateDir);
             JSObject result = readStatus(stateDir, nodeId);
             if (rejectForStatus(call, result)) {
                 logStatus(result);
-                process.destroy();
-                nodeProcess = null;
-                activeStateDir = null;
+                destroyNodeProcess(stateDir);
                 return;
             }
             if (result.optString("endpoint", "").isEmpty()) {
@@ -138,9 +137,7 @@ public class EmbeddedNodePlugin extends Plugin {
                     ? "The embedded network node did not become ready."
                     : "The embedded network node stopped before becoming ready.";
                 Log.e(TAG, message);
-                process.destroy();
-                nodeProcess = null;
-                activeStateDir = null;
+                destroyNodeProcess(stateDir);
                 call.reject(message);
                 return;
             }
@@ -157,14 +154,29 @@ public class EmbeddedNodePlugin extends Plugin {
 
     @PluginMethod
     public synchronized void stop(PluginCall call) {
-        stopNodeProcess();
+        String stateKey = call.getString("stateKey");
+        if (stateKey == null || stateKey.isEmpty()) {
+            stopAllNodeProcesses();
+        } else {
+            // Only the host's own node is stopped, so background checks can
+            // tear down the node they started without touching the live
+            // connection's node.
+            stopNodeProcess(stateDirFor(stateKey));
+        }
         call.resolve();
     }
 
-    private void stopNodeProcess() {
-        Process process = nodeProcess;
-        nodeProcess = null;
-        activeStateDir = null;
+    private void stopNodeProcess(File stateDir) {
+        if (stateDir == null) return;
+        destroyNodeProcess(stateDir);
+    }
+
+    private void stopAllNodeProcesses() {
+        for (File stateDir : new HashMap<>(nodeProcesses).keySet()) destroyNodeProcess(stateDir);
+    }
+
+    private void destroyNodeProcess(File stateDir) {
+        Process process = nodeProcesses.remove(stateDir);
         if (process == null) return;
         Log.i(TAG, "stopping node process " + process);
         process.destroy();
@@ -179,7 +191,7 @@ public class EmbeddedNodePlugin extends Plugin {
         if (exited) Log.i(TAG, "node process stopped exit=" + process.exitValue());
     }
 
-    private void watchProcess(Process process) {
+    private void watchProcess(Process process, File stateDir) {
         processWatcher.execute(() -> {
             try {
                 process.waitFor();
@@ -188,10 +200,7 @@ public class EmbeddedNodePlugin extends Plugin {
                 return;
             }
             synchronized (EmbeddedNodePlugin.this) {
-                if (nodeProcess == process) {
-                    nodeProcess = null;
-                    activeStateDir = null;
-                }
+                if (nodeProcesses.get(stateDir) == process) nodeProcesses.remove(stateDir);
             }
             Log.i(TAG, "node process exited exit=" + process.exitValue());
         });
@@ -209,8 +218,8 @@ public class EmbeddedNodePlugin extends Plugin {
 
     @Override
     protected synchronized void handleOnDestroy() {
-        Log.i(TAG, "bridge destroyed; stopping node process");
-        stopNodeProcess();
+        Log.i(TAG, "bridge destroyed; stopping node processes");
+        stopAllNodeProcesses();
         processWatcher.shutdownNow();
         super.handleOnDestroy();
     }
