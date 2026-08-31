@@ -5,8 +5,10 @@ import { deviceName } from "./device";
 import { canAttemptConnection, heartbeatActive, heartbeatCatchUpNeeded, heartbeatIntervalMs, nextReconnectDelay, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS } from "./connectionPolicy";
 import { EmbeddedNodeEngine, type EmbeddedNodeState } from "./embedded-engine";
 import { isDroppedNodeEnrollmentError } from "./nodeEnrollment";
+import { defaultHostAfterRemoval } from "./hostSelection";
 
 const HOST_KEY = "agent-terminal-host";
+const HOSTS_KEY = "agent-terminal-hosts";
 const REQUEST_TIMEOUT_MS = 12_000;
 const RECONNECT_TIMEOUT_MS = 30_000;
 const DROPPED_MOBILE_NODE_MESSAGE = "This phone's remote node is no longer registered. Reconnect to the desktop on LAN; remote registration will refresh automatically.";
@@ -30,6 +32,11 @@ export type RemoteRegistrationState = {
   status: "unregistered" | "pending" | "enrolled" | "failed";
   error?: string;
 };
+
+/** A previously paired desktop: the full connection record plus the last time this phone connected to it. */
+export interface SavedHostRecord extends SavedHost {
+  lastConnectedAt?: number;
+}
 
 type EventMap = {
   snapshot: HostSnapshot;
@@ -89,6 +96,76 @@ export class HostConnection {
     await Preferences.remove({ key: HOST_KEY });
   }
 
+  /** Persists a desktop as the launch-time default connection. */
+  static async saveHost(host: SavedHost): Promise<void> {
+    await Preferences.set({ key: HOST_KEY, value: JSON.stringify(host) });
+  }
+
+  /**
+   * Previously paired desktop hosts, backing the hosts page. The single
+   * saved record above stays the launch default while this list remembers
+   * every desktop this phone has paired with.
+   */
+  static async savedHostRecords(): Promise<SavedHostRecord[]> {
+    const { value } = await Preferences.get({ key: HOSTS_KEY });
+    if (!value) return [];
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter((record): record is SavedHostRecord =>
+        Boolean(record) &&
+        typeof (record as SavedHostRecord).id === "string" &&
+        typeof (record as SavedHostRecord).name === "string"
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  /** Adds a desktop to the previously paired list, or refreshes its entry. */
+  static async recordHost(host: SavedHost): Promise<void> {
+    const records = await this.savedHostRecords();
+    const index = records.findIndex((record) => record.id === host.id);
+    const entry: SavedHostRecord = {
+      ...host,
+      lastConnectedAt: index >= 0 ? records[index]?.lastConnectedAt : undefined
+    };
+    if (index >= 0) records[index] = entry;
+    else records.push(entry);
+    await Preferences.set({ key: HOSTS_KEY, value: JSON.stringify(records) });
+  }
+
+  /** Notes a successful connection so the hosts page can show last connected. */
+  static async markHostConnected(id: string): Promise<void> {
+    const records = await this.savedHostRecords();
+    const index = records.findIndex((record) => record.id === id);
+    if (index < 0) return;
+    const record = records[index];
+    if (!record) return;
+    records[index] = { ...record, lastConnectedAt: Date.now() };
+    await Preferences.set({ key: HOSTS_KEY, value: JSON.stringify(records) });
+  }
+
+  /**
+   * Removes a previously paired desktop and returns the remaining list. If
+   * the removed entry was the launch default, the default is repointed to
+   * the most recently connected survivor, or dropped when none remain.
+   */
+  static async removeSavedHostRecord(id: string): Promise<SavedHostRecord[]> {
+    const records = await this.savedHostRecords();
+    const remaining = records.filter((record) => record.id !== id);
+    if (remaining.length !== records.length) {
+      await Preferences.set({ key: HOSTS_KEY, value: JSON.stringify(remaining) });
+    }
+    const saved = await this.saved();
+    if (saved?.id === id) {
+      const fallback = defaultHostAfterRemoval(remaining);
+      if (fallback) await this.saveHost(fallback);
+      else await this.forget();
+    }
+    return remaining;
+  }
+
   static async pair(payload: PairingPayload, device: DeviceIdentity): Promise<HostConnection> {
     const localEndpoint = payload.localEndpoint ?? payload.endpoint;
     if (payload.transport && payload.transport !== "direct" && !payload.localEndpoint) {
@@ -116,6 +193,9 @@ export class HostConnection {
       // Trusted LAN pairing is the commit point. Overlay registration happens
       // independently so provisioning outages never block terminal streaming.
       await Preferences.set({ key: HOST_KEY, value: JSON.stringify(temporary.host) });
+      // The new desktop joins the previously paired list here, so it stays
+      // listed even if this pairing session is later dropped.
+      await this.recordHost(temporary.host);
       temporary.startHeartbeat();
       queueMicrotask(() => { void temporary.retryRemoteRegistration(); });
       return temporary;
@@ -323,6 +403,13 @@ export class HostConnection {
       this.clearReconnectTimeout();
       this.startHeartbeat();
       this.emit("connected", response.snapshot);
+      // Bookkeeping only: make sure this desktop is in the previously paired
+      // list (upserting it when it was saved by an older build) and note
+      // when it was last seen, without ever risking the live connection over
+      // a storage write.
+      void HostConnection.recordHost(this.host)
+        .then(() => HostConnection.markHostConnected(this.host.id))
+        .catch(() => undefined);
       if (connectedOverLan && (this.host.remoteTransport ?? "overlay") === "overlay" && !this.host.remoteEnrolled) {
         queueMicrotask(() => { void this.retryRemoteRegistration(); });
       }

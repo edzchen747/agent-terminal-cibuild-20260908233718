@@ -238,3 +238,28 @@ button { color: inherit; }
 .error-screen .error-host strong { color: #e9ecf2; }
 @media (min-width: 700px) { .mobile-app,.onboarding,.splash,.error-screen { max-width: 520px; margin: auto; border-left: 1px solid #20252e; border-right: 1px solid #20252e; } }
 @media (prefers-reduced-motion: reduce) { .mobile-page-track, .project-card { transition-duration: 1ms; } }
+/* Hosts page: the list of previously paired desktops */
+.hosts-section { flex: 1; min-height: 0; padding: 17px 15px 10px; overflow-y: auto; touch-action: pan-y; }
+.hosts-loading { min-height: 120px; display: flex; align-items: center; justify-content: center; gap: 9px; color: #626c79; font-size: 10px; }
+.hosts-loading .loader { width: 14px; height: 14px; margin: 0; }
+.hosts-empty { padding: 30px; border: 1px dashed #282e38; border-radius: 12px; color: #616b79; text-align: center; font-size: 11px; }
+.host-list { margin-top: 10px; overflow: hidden; touch-action: pan-y; border: 1px solid #232934; border-radius: 13px; }
+.host-row { min-height: 63px; padding: 8px 11px; display: grid; grid-template-columns: minmax(0,1fr) 34px; gap: 9px; align-items: center; border-bottom: 1px solid #212630; background: #11151c; }
+.host-row:last-child { border-bottom: 0; }
+.host-main { min-width: 0; padding: 4px; display: grid; grid-template-columns: 37px minmax(0,1fr) 8px 15px; gap: 9px; align-items: center; border: 0; border-radius: 10px; background: transparent; text-align: left; cursor: pointer; }
+.host-main:active { background: #17231f; }
+.host-main:focus-visible { outline: 2px solid #65c5b3; outline-offset: -2px; }
+.host-avatar { width: 36px; height: 36px; display: grid; place-items: center; border-radius: 9px; background: #1b222b; color: #7f8999; }
+.host-avatar svg { width: 18px; }
+.host-row.is-connected .host-avatar { background: #14221d; color: #6fd091; }
+.host-copy { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.host-copy strong { color: #cdd2dc; font-size: 12px; }
+.host-copy small { color: #626b79; font-size: 9.5px; }
+.host-copy small.is-connected { color: #6fd091; }
+.host-status { width: 5px; height: 5px; flex: none; border-radius: 50%; background: #707887; }
+.host-status.is-online { background: #62d185; box-shadow: 0 0 6px #62d18588; }
+.host-main > svg { width: 15px; color: #525b69; }
+.host-remove { width: 34px; height: 34px; padding: 0; display: grid; place-items: center; border: 1px solid #3d2b31; border-radius: 9px; background: #1c1418; color: #b97884; cursor: pointer; }
+.host-remove:active { background: #321c23; transform: scale(.96); }
+.host-remove svg { width: 16px; height: 16px; }
+.hosts-actions { flex: none; padding: 11px 15px calc(14px + env(safe-area-inset-bottom)); border-top: 1px solid #1d232d; background: #0c1016; }

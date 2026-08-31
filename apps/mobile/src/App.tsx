@@ -12,16 +12,19 @@ import {
 } from "@capacitor/barcode-scanner";
 import type { DirectoryListing, HostSnapshot, PairingPayload, Platform, Project, TerminalSession } from "@agentterminal/protocol";
 import { createRequestId, MAX_PROJECT_NAME_LENGTH, parsePairingPayload } from "@agentterminal/protocol";
-import { HostConnection, type RemoteRegistrationState } from "./connection";
+import { HostConnection, type RemoteRegistrationState, type SavedHost, type SavedHostRecord } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
 import { notificationStateFor, type ConnectionNotificationState } from "./connectionPolicy";
+import { isRetryingSavedHost } from "./connectionFlow";
+import { lastConnectedLabel, sortHostsByLastConnected } from "./hostSelection";
+import { backButtonAction } from "./navigationPolicy";
 import { deviceName } from "./device";
 import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_SLIDER_HORIZONTAL_BIAS } from "./gesture";
 import { effectiveDefaultShell } from "./defaultShell";
-import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, SettingsIcon, TerminalIcon, WifiIcon } from "./icons";
+import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, SettingsIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
 
-type View = { type: "home" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
+type View = { type: "home" } | { type: "hosts" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
 const TERMINAL_FONT_WIDTH_KEY = "agent-terminal-font-width-percent";
 const SWALLOW_CLICK_LINGER_MS = 600;
 const SWALLOW_CLICK_DISTANCE_PX = 48;
@@ -63,9 +66,13 @@ export function App() {
   // The desktop every connection attempt targets, kept so the connecting and
   // try-again screens can name it even after the connection object is gone.
   const [hostName, setHostName] = useState("");
-  // The user chose "Pair a different desktop": the saved record is kept until
-  // a new desktop is successfully paired (or the user presses back).
-  const [pendingNewDesktop, setPendingNewDesktop] = useState(false);
+  // The previously paired desktops shown on the hosts page, re-read each time
+  // the page is entered so a freshly paired desktop shows up.
+  const [hostRecords, setHostRecords] = useState<SavedHostRecord[]>([]);
+  const [hostsLoaded, setHostsLoaded] = useState(false);
+  // The user reached the pairing screen from the hosts page; back restores
+  // the pre-pair status captured in prePairStatusRef.
+  const [pairFromHosts, setPairFromHosts] = useState(false);
   const [remoteRegistration, setRemoteRegistration] = useState<RemoteRegistrationState>({ status: "unregistered" });
   const [manualCode, setManualCode] = useState("");
   const [showManual, setShowManual] = useState(false);
@@ -87,11 +94,12 @@ export function App() {
   connectionRef.current = connection;
   const screenAwakeRef = useRef(true);
   const deviceSleepingRef = useRef(false);
-  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pendingNewDesktop });
-  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pendingNewDesktop };
-  // The try-again message captured when the user moves on to pair a different
-  // desktop, so pressing back restores the same try-again page.
-  const pendingPairErrorRef = useRef("");
+  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts });
+  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts };
+  // The status captured when the user leaves the hosts page for the pairing
+  // screen, so pressing back restores the same screen (the try-again screen
+  // when the hosts page was reached from there).
+  const prePairStatusRef = useRef<"connected" | "error">("connected");
   const projectDragRef = useRef<ProjectDragState | null>(null);
   const projectElementsRef = useRef(new Map<string, HTMLElement>());
   const swipeRef = useRef<SwipeState | null>(null);
@@ -126,41 +134,52 @@ export function App() {
     if (Capacitor.getPlatform() !== "android") return;
     const listener = CapacitorApp.addListener("backButton", () => {
       const navigation = navigationRef.current;
-      if (navigation.showTerminalSettings) {
-        setShowTerminalSettings(false);
-        return;
+      // Every back-key decision lives in navigationPolicy.backButtonAction so
+      // the priority order and the pair-a-different-desktop path stay tested;
+      // this switch only executes the chosen action.
+      switch (backButtonAction({
+        status: navigation.status,
+        viewType: navigation.view.type,
+        showTerminalSettings: navigation.showTerminalSettings,
+        showSettings: navigation.showSettings,
+        hasRenameSheet: navigation.projectToRename !== null,
+        hasCloseSessionSheet: navigation.sessionToClose !== null,
+        showCreateProject: navigation.showCreateProject,
+        pairFromHosts: navigation.pairFromHosts
+      })) {
+        case "closeTerminalSettings":
+          setShowTerminalSettings(false);
+          return;
+        case "closeSettings":
+          setShowSettings(false);
+          return;
+        case "closeRenameSheet":
+          setProjectToRename(null);
+          return;
+        case "closeSessionSheet":
+          setSessionToClose(null);
+          return;
+        case "closeCreateProject":
+          setShowCreateProject(false);
+          return;
+        case "backFromPairing":
+          backFromPairing();
+          return;
+        case "navToProject":
+          // The action is only ever chosen for a terminal view; re-narrow here
+          // because the switch does not carry the policy's viewType guard.
+          if (navigation.view.type === "terminal") setView({ type: "project", projectId: navigation.view.projectId });
+          return;
+        case "navToHome":
+          setView({ type: "home" });
+          return;
+        case "exitApp":
+          void stopConnectionNotification();
+          void CapacitorApp.exitApp();
+          return;
+        case "ignore":
+          return;
       }
-      if (navigation.showSettings) {
-        setShowSettings(false);
-        return;
-      }
-      if (navigation.projectToRename) {
-        setProjectToRename(null);
-        return;
-      }
-      if (navigation.sessionToClose) {
-        setSessionToClose(null);
-        return;
-      }
-      if (navigation.showCreateProject) {
-        setShowCreateProject(false);
-        return;
-      }
-      if (navigation.status === "pairing" && navigation.pendingNewDesktop) {
-        backFromPairDifferentDesktop();
-        return;
-      }
-      if (navigation.status !== "connected") return;
-      if (navigation.view.type === "terminal") {
-        setView({ type: "project", projectId: navigation.view.projectId });
-        return;
-      }
-      if (navigation.view.type === "project") {
-        setView({ type: "home" });
-        return;
-      }
-      void stopConnectionNotification();
-      void CapacitorApp.exitApp();
     });
     return () => { void listener.then((handle) => handle.remove()); };
   }, []);
@@ -267,46 +286,68 @@ export function App() {
     };
   }, []);
 
+  // Opens a live connection to the chosen desktop and runs the same
+  // success/failure state machine as the launch path. An attempt that was
+  // superseded (a newer selection, or the app going away) never touches
+  // state.
+  async function startHostConnection(host: SavedHost) {
+    const next = new HostConnection(host);
+    connectionRef.current = next;
+    next.setScreenAwake(screenAwakeRef.current);
+    next.setDeviceSleeping(deviceSleepingRef.current);
+    setRemoteRegistration(next.remoteRegistrationState());
+    next.startAutoReconnect();
+    setConnection(next);
+    setHostName(next.host.name);
+    setStatus("connecting");
+    void updateConnectionNotification(next.host.name, "reconnecting", next.endpoint());
+    const stale = () => next.isClosed() || connectionRef.current !== next;
+    try {
+      const nextSnapshot = await next.connect();
+      if (stale()) return;
+      setSnapshot(nextSnapshot);
+      await startConnectionNotification(next.host.name, next.endpoint());
+      setStatus("connected");
+      setView({ type: "home" });
+    } catch (cause) {
+      if (stale()) return;
+      if (isAuthorizationError(cause) || isEmbeddedNodeConfigurationError(cause)) {
+        next.stopAutoReconnect();
+        await stopConnectionNotification();
+        setError(cause instanceof Error ? cause.message : "Could not connect to the saved desktop.");
+        setStatus("error");
+        return;
+      }
+      void updateConnectionNotification(next.host.name, notificationStateFor(navigator.onLine, false), next.endpoint());
+      setError("The desktop connection could not be opened. Retrying…");
+      setStatus("connecting");
+    }
+  }
+
   useEffect(() => {
     let disposed = false;
-    let current: HostConnection | null = null;
     void HostConnection.saved().then(async (host) => {
       if (disposed) return;
       if (!host) { setStatus("pairing"); return; }
-      setStatus("connecting");
-      current = new HostConnection(host);
-      setHostName(current.host.name);
-      current.setScreenAwake(screenAwakeRef.current);
-      current.setDeviceSleeping(deviceSleepingRef.current);
-      setRemoteRegistration(current.remoteRegistrationState());
-      current.startAutoReconnect();
-      setConnection(current);
-      void updateConnectionNotification(current.host.name, "reconnecting", current.endpoint());
-      try {
-        const nextSnapshot = await current.connect();
-        if (disposed) return;
-        setSnapshot(nextSnapshot);
-        await startConnectionNotification(current.host.name, current.endpoint());
-        setStatus("connected");
-      } catch (cause) {
-        if (disposed || current.isClosed()) return;
-        if (isAuthorizationError(cause) || isEmbeddedNodeConfigurationError(cause)) {
-          current.stopAutoReconnect();
-          await stopConnectionNotification();
-          setError(cause instanceof Error ? cause.message : "Could not connect to the saved desktop.");
-          setStatus("error");
-          return;
-        }
-        void updateConnectionNotification(current.host.name, notificationStateFor(navigator.onLine, false), current.endpoint());
-        setError("The desktop connection could not be opened. Retrying…");
-        setStatus("connecting");
-      }
+      void startHostConnection(host);
     });
     return () => {
       disposed = true;
-      current?.close();
+      connectionRef.current?.close();
     };
   }, []);
+
+  // Re-read the previously paired desktop list whenever the hosts page is
+  // entered (or its background status changes), so a just-paired desktop
+  // shows up when the user comes back from the pairing screen.
+  useEffect(() => {
+    if (view.type !== "hosts") return;
+    let disposed = false;
+    void HostConnection.savedHostRecords().then((records) => {
+      if (!disposed) { setHostRecords(records); setHostsLoaded(true); }
+    });
+    return () => { disposed = true; };
+  }, [view.type, status]);
 
   useEffect(() => {
     if (!connection) return;
@@ -356,9 +397,10 @@ export function App() {
       next.startAutoReconnect();
       next.setScreenAwake(screenAwakeRef.current);
       next.setDeviceSleeping(deviceSleepingRef.current);
-      // Pairing succeeded: HostConnection.pair has already overwritten the
-      // saved host record, so any previously kept desktop is wiped now.
-      setConnection(next); setSnapshot(next.snapshot ?? null); setRemoteRegistration(next.remoteRegistrationState()); setStatus("connected"); setView({ type: "home" }); setHostName(next.host.name); setPendingNewDesktop(false);
+      // Pairing succeeded: HostConnection.pair persisted the newly paired
+      // desktop as the launch default and added it to the previously paired
+      // list; every other desktop stays listed.
+      setConnection(next); setSnapshot(next.snapshot ?? null); setRemoteRegistration(next.remoteRegistrationState()); setStatus("connected"); setView({ type: "home" }); setHostName(next.host.name); setPairFromHosts(false);
       await startConnectionNotification(next.host.name, next.endpoint());
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Pairing failed."); setStatus("pairing");
@@ -388,9 +430,19 @@ export function App() {
     }
   }
 
-  async function forgetHost() {
-    connection?.close(); await stopConnectionNotification(); await HostConnection.forget();
-    setConnection(null); setSnapshot(null); setRemoteRegistration({ status: "unregistered" }); setError(""); setHostName(""); setPendingNewDesktop(false); setStatus("pairing"); setView({ type: "home" });
+  // Open the hosts page. From home the live connection keeps running, so the
+  // connected desktop's row shows its "connected" indicator. From the
+  // try-again screen the dead attempt is dropped and the error status stays
+  // put, so back from the page lands back on the try-again screen.
+  function openHosts() {
+    if (status === "error") {
+      connectionRef.current?.close();
+      connectionRef.current = null;
+      setConnection(null);
+      setSnapshot(null);
+      setRemoteRegistration({ status: "unregistered" });
+    }
+    setView({ type: "hosts" });
   }
 
   // Stop the retry loop and land on the try-again screen. The saved desktop
@@ -404,26 +456,51 @@ export function App() {
     void stopConnectionNotification();
   }
 
-  // Move to the pairing screen without wiping the saved desktop: the record
-  // survives until a new desktop is successfully paired, and back returns to
-  // the try-again page with the original error.
-  function pairDifferentDesktop() {
-    connectionRef.current?.close();
-    connectionRef.current = null;
-    pendingPairErrorRef.current = error;
-    setConnection(null); setSnapshot(null); setRemoteRegistration({ status: "unregistered" });
-    setPendingNewDesktop(true);
+  // The hosts page's "Pair a new desktop" action. It captures the status so
+  // back can restore it, and no record changes happen on the way in: a
+  // pairing only commits when it succeeds (HostConnection.pair).
+  function enterPairFromHosts() {
+    prePairStatusRef.current = status === "error" ? "error" : "connected";
+    setPairFromHosts(true);
     setStatus("pairing");
-    void stopConnectionNotification();
   }
 
-  // The pairing screen's back button and the Android back key share this:
-  // restore the captured try-again error and return to that page. The saved
-  // record is untouched, so "Try again" still targets the old desktop.
-  function backFromPairDifferentDesktop() {
-    setPendingNewDesktop(false);
-    setError(pendingPairErrorRef.current);
-    setStatus("error");
+  // Shared by the pairing screen's back button and the Android back key:
+  // return to the hosts page with the pre-pair status restored, so whatever
+  // was behind it (the live connection, or the try-again screen) comes back
+  // exactly as it was.
+  function backFromPairing() {
+    setPairFromHosts(false);
+    setStatus(prePairStatusRef.current);
+  }
+
+  // Tapping a desktop on the hosts page switches to it. The chosen desktop
+  // becomes the launch default right away, so a later "Try again" (which
+  // reloads the app) targets it too; every other previously paired desktop
+  // stays in the hosts list. Tapping the already-connected desktop is a
+  // no-op.
+  function selectHost(record: SavedHostRecord) {
+    if (connection?.host.id === record.id) return;
+    connection?.close();
+    connectionRef.current = null;
+    setConnection(null);
+    setSnapshot(null);
+    setRemoteRegistration({ status: "unregistered" });
+    setError("");
+    setView({ type: "home" });
+    void stopConnectionNotification();
+    void HostConnection.saveHost(record);
+    void startHostConnection(record);
+  }
+
+  // Remove a desktop from the previously paired list. When the removed entry
+  // is the launch default, the default is repointed to the most recently
+  // connected survivor, or dropped when none remain (see
+  // HostConnection.removeSavedHostRecord). A live session to the removed
+  // desktop keeps running until the next launch; only the saved record is
+  // removed.
+  async function removeHost(record: SavedHostRecord) {
+    setHostRecords(await HostConnection.removeSavedHostRecord(record.id));
   }
 
   function openProject(projectId: string) {
@@ -441,6 +518,9 @@ export function App() {
   function navigateBack() {
     if (view.type === "terminal") setView({ type: "project", projectId: view.projectId });
     else if (view.type === "project") setView({ type: "home" });
+    // The hosts page keeps the app status, so "home" lands on the home view
+    // when connected and on the try-again screen when not.
+    else if (view.type === "hosts") setView({ type: "home" });
   }
 
   function beginProjectDrag(event: ReactPointerEvent<HTMLElement>, projectId: string, index: number) {
@@ -514,14 +594,22 @@ export function App() {
     // The cancel control only makes sense while a saved desktop connection is
     // being retried; a pairing attempt (connection is null) keeps the plain
     // splash so cancelling it cannot drop the user into the try-again page.
-    const retryingSavedHost = status === "connecting" && connection !== null;
+    const retryingSavedHost = isRetryingSavedHost(status, connection !== null);
     return <Splash label={status === "loading" ? "Opening Agent Terminal" : error || "Connecting to desktop"} hostName={retryingSavedHost ? hostName : undefined} onCancel={retryingSavedHost ? cancelConnection : undefined} />;
   }
-  if (status === "pairing") return <PairScreen error={error} manualCode={manualCode} showManual={showManual} onManualCode={setManualCode} onShowManual={() => setShowManual(true)} onScan={() => void scan()} onPair={() => void pair(manualCode)} onBack={pendingNewDesktop ? backFromPairDifferentDesktop : undefined} />;
-  if (status === "error") return <ErrorScreen message={error} hostName={hostName || undefined} onRetry={() => window.location.reload()} onForget={pairDifferentDesktop} />;
+  if (status === "pairing") return <PairScreen error={error} manualCode={manualCode} showManual={showManual} onManualCode={setManualCode} onShowManual={() => setShowManual(true)} onScan={() => void scan()} onPair={() => void pair(manualCode)} onBack={pairFromHosts ? backFromPairing : undefined} />;
+  if (view.type === "hosts" && (status === "connected" || status === "error")) {
+    // Reached from home the live connection stays open and its row carries
+    // the "connected" indicator; reached from the try-again screen the error
+    // status is retained, so back returns there.
+    return <HostsPage records={hostRecords} loaded={hostsLoaded} connectedId={connection?.host.id ?? null} onBack={navigateBack} onSelect={(record) => selectHost(record)} onRemove={(record) => void removeHost(record)} onPairNew={enterPairFromHosts} />;
+  }
+  if (status === "error") return <ErrorScreen message={error} hostName={hostName || undefined} onRetry={() => window.location.reload()} onConnectDifferent={openHosts} />;
   if (!connection || !snapshot) return null;
 
-  const requestedProjectId = view.type === "home" ? selectedProjectId : view.projectId;
+  // The "hosts" case is unreachable here (the hosts branch returned above);
+  // listing it keeps the union exhaustive for the type checker.
+  const requestedProjectId = view.type === "home" || view.type === "hosts" ? selectedProjectId : view.projectId;
   const activeProject = snapshot.projects.find((item) => item.id === requestedProjectId);
   const requestedSessionId = view.type === "terminal" ? view.sessionId : selectedSessionId;
   const activeSession = snapshot.sessions.find((item) => item.id === requestedSessionId && (!activeProject || item.projectId === activeProject.id));
@@ -790,7 +878,7 @@ export function App() {
           </div>
           {!snapshot.projects.length && <div className="mobile-empty"><FolderIcon /><h2>No projects yet</h2><p>Add a folder from your desktop to begin.</p></div>}
         </section>
-        <nav className="bottom-nav"><button className="active"><FolderIcon /><span>Projects</span></button><button onClick={() => void scan()}><ScanIcon /><span>Pair</span></button><button onClick={() => void forgetHost()}><WifiIcon /><span>Host</span></button></nav>
+        <nav className="bottom-nav"><button className="active"><FolderIcon /><span>Projects</span></button><button onClick={() => void scan()}><ScanIcon /><span>Pair</span></button><button onClick={openHosts}><WifiIcon /><span>Hosts</span></button></nav>
       </div></div>
       {activeProject && <div className="mobile-page"><ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={navigateBack} onRename={() => setProjectToRename(activeProject)} onOpen={openTerminal} /></div>}
       {activeProject && activeSession && <div className="mobile-page"><div className="mobile-app terminal-view">
@@ -983,4 +1071,35 @@ function Splash({ label, hostName, onCancel }: { label: string; hostName?: strin
   const status = label.endsWith("…") ? label : `${label}…`;
   return <div className="splash"><span className="logo large"><TerminalIcon /></span><strong>Agent Terminal</strong>{hostName && <span className="splash-host">Connecting to {hostName}</span>}<small>{status}</small><i className="loader" />{onCancel && <button className="text-button" onClick={onCancel}>Cancel</button>}</div>;
 }
-function ErrorScreen({ message, hostName, onRetry, onForget }: { message: string; hostName?: string; onRetry: () => void; onForget: () => void }) { return <div className="error-screen"><span className="offline-icon"><WifiIcon /></span><h1>Desktop unavailable</h1>{hostName && <p className="error-host">Trying to connect to <strong>{hostName}</strong></p>}<p>{message}</p><button className="mobile-primary full" onClick={onRetry}>Try again</button><button className="text-button" onClick={onForget}>Pair a different desktop</button></div>; }
+function HostsPage({ records, loaded, connectedId, onBack, onSelect, onRemove, onPairNew }: { records: SavedHostRecord[]; loaded: boolean; connectedId: string | null; onBack: () => void; onSelect: (record: SavedHostRecord) => void; onRemove: (record: SavedHostRecord) => void; onPairNew: () => void }) {
+  const ordered = sortHostsByLastConnected(records);
+  return <div className="mobile-app hosts-page">
+    <MobileHeader title="Hosts" subtitle={loaded ? `${records.length} paired desktop${records.length === 1 ? "" : "s"}` : "Previously paired desktops"} onBack={onBack} />
+    <section className="hosts-section">
+      {!loaded ? <div className="hosts-loading"><i className="loader" />Loading paired desktops…</div>
+      : !ordered.length ? <div className="hosts-empty">No paired desktops yet. Pair one below to connect your desktop.</div>
+      : <div className="host-list">
+        {ordered.map((record) => {
+          const isCurrent = record.id === connectedId;
+          return (
+            <div key={record.id} className={`host-row${isCurrent ? " is-connected" : ""}`}>
+              <button className="host-main" onClick={() => onSelect(record)} aria-label={isCurrent ? `Connected to ${record.name}` : `Connect to ${record.name}`}>
+                <span className="host-avatar"><TerminalIcon /></span>
+                <span className="host-copy">
+                  <strong className="display-name" title={record.name}>{record.name}</strong>
+                  <small className={isCurrent ? "is-connected" : ""}>{isCurrent ? "Connected now" : `Last connected ${lastConnectedLabel(record.lastConnectedAt)}`}</small>
+                </span>
+                <i className={`host-status${isCurrent ? " is-online" : ""}`} />
+                <ChevronIcon />
+              </button>
+              <button className="host-remove" onClick={() => onRemove(record)} aria-label={`Remove ${record.name}`} title="Remove desktop"><TrashIcon /></button>
+            </div>
+          );
+        })}
+      </div>}
+    </section>
+    <footer className="hosts-actions"><button className="mobile-primary full" onClick={onPairNew}><PlusIcon /> Pair a new desktop</button></footer>
+  </div>;
+}
+
+function ErrorScreen({ message, hostName, onRetry, onConnectDifferent }: { message: string; hostName?: string; onRetry: () => void; onConnectDifferent: () => void }) { return <div className="error-screen"><span className="offline-icon"><WifiIcon /></span><h1>Desktop unavailable</h1>{hostName && <p className="error-host">Trying to connect to <strong>{hostName}</strong></p>}<p>{message}</p><button className="mobile-primary full" onClick={onRetry}>Try again</button><button className="text-button" onClick={onConnectDifferent}>Connect to a different desktop</button></div>; }
