@@ -29,6 +29,16 @@ button { color: inherit; }
 .home-header h1 { margin: 5px 0 7px; color: #f2f4f8; font-size: 27px; letter-spacing: -.04em; }
 .connection-label { display: flex; align-items: center; gap: 6px; color: #697383; font-size: 11px; }
 .connection-label i { width: 6px; height: 6px; border-radius: 50%; background: #64d487; box-shadow: 0 0 8px #64d48799; }
+.home-header-actions { display: flex; align-items: center; gap: 9px; }
+.mobile-remote-status { height: 26px; flex: none; padding: 0 10px; display: flex; align-items: center; gap: 6px; border: 1px solid #26302e; border-radius: 99px; background: #141a18; color: #8fd9c8; font-size: 9px; font-weight: 700; white-space: nowrap; }
+.mobile-remote-status i { width: 6px; height: 6px; border-radius: 50%; background: #69d58a; box-shadow: 0 0 8px #69d58a88; }
+.mobile-remote-status.is-unregistered { border-color: #2a2f37; background: #161a20; color: #848d9b; }
+.mobile-remote-status.is-unregistered i { background: #778294; box-shadow: none; }
+.mobile-remote-status.is-failed { border-color: #59313a; background: #271619; color: #e098a4; }
+.mobile-remote-status.is-failed i { background: #e27682; box-shadow: 0 0 8px #e2768266; }
+.mobile-remote-status.is-offline { border-color: #2a2d32; background: #15171b; color: #7c838d; }
+.mobile-remote-status.is-offline i { background: #51565f; box-shadow: none; }
+.mobile-remote-status.is-pending i { width: 10px; height: 10px; border: 2px solid #e2b66d44; border-top-color: #e2b66d; background: none; box-shadow: none; animation: spin .8s linear infinite; }
 .home-content { flex: 1; min-height: 0; padding: 21px 16px 100px; overflow-y: auto; touch-action: pan-y; }
 .section-title { min-height: 35px; padding: 0 4px; display: flex; align-items: center; justify-content: space-between; color: #8891a0; font-size: 11px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
 .section-title > button { height: 31px; padding: 0 11px; border: 1px solid #29443e; border-radius: 9px; background: #15231f; color: #82dbc8; display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; letter-spacing: 0; text-transform: none; }
@@ -246,7 +256,7 @@ button { color: inherit; }
 .host-list { margin-top: 10px; overflow: hidden; touch-action: pan-y; border: 1px solid #232934; border-radius: 13px; }
 .host-row { min-height: 63px; padding: 8px 11px; display: grid; grid-template-columns: minmax(0,1fr) 34px; gap: 9px; align-items: center; border-bottom: 1px solid #212630; background: #11151c; }
 .host-row:last-child { border-bottom: 0; }
-.host-main { min-width: 0; padding: 4px; display: grid; grid-template-columns: 37px minmax(0,1fr) 8px 15px; gap: 9px; align-items: center; border: 0; border-radius: 10px; background: transparent; text-align: left; cursor: pointer; }
+.host-main { min-width: 0; padding: 4px; display: grid; grid-template-columns: 37px minmax(0,1fr) auto 8px 15px; gap: 9px; align-items: center; border: 0; border-radius: 10px; background: transparent; text-align: left; cursor: pointer; }
 .host-main:active { background: #17231f; }
 .host-main:focus-visible { outline: 2px solid #65c5b3; outline-offset: -2px; }
 .host-avatar { width: 36px; height: 36px; display: grid; place-items: center; border-radius: 9px; background: #1b222b; color: #7f8999; }
@@ -258,6 +268,15 @@ button { color: inherit; }
 .host-copy small.is-connected { color: #6fd091; }
 .host-status { width: 5px; height: 5px; flex: none; border-radius: 50%; background: #707887; }
 .host-status.is-online { background: #62d185; box-shadow: 0 0 6px #62d18588; }
+.host-registration { flex: none; display: flex; align-items: center; gap: 5px; padding: 3px 8px; border: 1px solid #26302e; border-radius: 99px; background: #14201d; color: #8fdac9; font-size: 8.5px; font-weight: 700; white-space: nowrap; }
+.host-registration i { width: 5px; height: 5px; border-radius: 50%; background: #69d58a; box-shadow: 0 0 6px #69d58a88; }
+.host-registration.is-unregistered { border-color: #2a2f37; background: #161a20; color: #848d9b; }
+.host-registration.is-unregistered i { background: #778294; box-shadow: none; }
+.host-registration.is-failed { border-color: #59313a; background: #271619; color: #e098a4; }
+.host-registration.is-failed i { background: #e27682; box-shadow: 0 0 6px #e2768266; }
+.host-registration.is-offline { border-color: #2a2d32; background: #15171b; color: #7c838d; }
+.host-registration.is-offline i { background: #51565f; box-shadow: none; }
+.host-registration.is-pending i { width: 8px; height: 8px; border: 1.5px solid #e2b66d44; border-top-color: #e2b66d; background: none; box-shadow: none; animation: spin .8s linear infinite; }
 .host-main > svg { width: 15px; color: #525b69; }
 .host-remove { width: 34px; height: 34px; padding: 0; display: grid; place-items: center; border: 1px solid #3d2b31; border-radius: 9px; background: #1c1418; color: #b97884; cursor: pointer; }
 .host-remove:active { background: #321c23; transform: scale(.96); }
