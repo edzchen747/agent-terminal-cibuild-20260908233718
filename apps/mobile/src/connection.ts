@@ -6,6 +6,8 @@ import { deviceName } from "./device";
 import { canAttemptConnection, heartbeatActive, heartbeatCatchUpNeeded, heartbeatIntervalMs, nextReconnectDelay, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS } from "./connectionPolicy";
 import { EmbeddedNodeEngine, type EmbeddedNodeState } from "./embedded-engine";
 import { enrollmentFailureMessage, isDroppedNodeEnrollmentError } from "./nodeEnrollment";
+import { forgetRegistrationVerdict, readRegistrationVerdict, rememberRegistrationVerdict } from "./registrationCache";
+import { registrationCheckPlan, type RegistrationCheckPlan } from "./registrationFlow";
 import { defaultHostAfterRemoval } from "./hostSelection";
 
 const HOST_KEY = "agent-terminal-host";
@@ -165,6 +167,7 @@ export class HostConnection {
     if (remaining.length !== records.length) {
       await Preferences.set({ key: HOSTS_KEY, value: JSON.stringify(remaining) });
       await EmbeddedNodeEngine.forget(id);
+      void forgetRegistrationVerdict(id);
     }
     const saved = await this.saved();
     if (saved?.id === id) {
@@ -382,36 +385,82 @@ export class HostConnection {
    * proves removed is re-enrolled automatically with a fresh key; a
    * transient failure behaves like the desktop resume - the badge stays on
    * Registering, gets one automatic retry, and only then surfaces the
-   * failure with the Retry banner.
+   * failure with the Retry banner. The verdict is cached per host for an
+   * hour, so a recent launch (or a failed re-registration) is not re-pinged
+   * again within that window.
    */
   private async verifySavedNodeOnLaunch(retryOnTransientFailure = true): Promise<void> {
+    const cached = await readRegistrationVerdict("nodeCheck", this.host.id);
+    const cachedPlan = registrationCheckPlan({
+      cached,
+      engineStarted: false,
+      failed: false,
+      dropped: false,
+      retryOnTransientFailure
+    });
+    switch (cachedPlan) {
+      case "stayEnrolled":
+        this.setRemoteRegistration({ status: "enrolled" });
+        return;
+      case "reEnroll":
+        // A recent run already proved the node is gone; skip the resume ping
+        // and go straight to the automatic re-registration.
+        await this.markRemoteNodeDropped();
+        queueMicrotask(() => { void this.retryRemoteRegistration().catch(() => undefined); });
+        return;
+    }
+
     this.setRemoteRegistration({ status: "pending" });
     const engine = new EmbeddedNodeEngine(this.host.id);
+    let plan: RegistrationCheckPlan;
     try {
       const state = await engine.start(
         this.host.controlUrl ?? OVERLAY_CONTROL_URL,
         this.host.remoteEndpoint ?? defaultRemoteEndpoint(this.host.id),
         this.host.remoteTransport ?? "overlay"
       );
-      if (state.engineStarted) {
+      plan = registrationCheckPlan({
+        cached: null,
+        engineStarted: state.engineStarted === true,
+        failed: false,
+        dropped: false,
+        retryOnTransientFailure
+      });
+    } catch (error) {
+      plan = registrationCheckPlan({
+        cached: null,
+        engineStarted: false,
+        failed: true,
+        dropped: isDroppedNodeEnrollmentError(error),
+        retryOnTransientFailure
+      });
+    } finally {
+      await engine.stop();
+    }
+
+    switch (plan) {
+      case "markEnrolled": {
         if (!this.host.remoteEnrolled) {
           this.host.remoteEnrolled = true;
           await Preferences.set({ key: HOST_KEY, value: JSON.stringify(this.host) });
           void this.syncHostRecordEnrollment();
         }
+        void rememberRegistrationVerdict("nodeCheck", this.host.id, "verified");
         this.setRemoteRegistration({ status: "enrolled" });
-      } else {
+        return;
+      }
+      case "keepStored":
         // No native engine (browser build) or the check was inconclusive:
         // keep the verdict the record already carries.
         this.setRemoteRegistration({ status: this.host.remoteEnrolled ? "enrolled" : "unregistered" });
-      }
-    } catch (error) {
-      if (isDroppedNodeEnrollmentError(error)) {
-        await this.markRemoteNodeDropped();
+        return;
+      case "reEnroll":
         // The first re-registration of the launch is automatic: the key
         // request travels over the live LAN session the phone just opened.
+        await this.markRemoteNodeDropped();
         queueMicrotask(() => { void this.retryRemoteRegistration().catch(() => undefined); });
-      } else if (retryOnTransientFailure) {
+        return;
+      case "retryOnce":
         // A freshly opened app can race its Wi-Fi, DNS and DERP routes: the
         // control plane was not reached, not that the node is missing. Keep
         // the badge on Registering and retry once (desktop behavior) before
@@ -420,14 +469,17 @@ export class HostConnection {
           if (this.closed || !this.isConnected()) return;
           void this.verifySavedNodeOnLaunch(false).catch(() => undefined);
         }, 4_000);
-      } else {
+        return;
+      case "showFailed":
         this.setRemoteRegistration({
           status: "failed",
           error: "Remote connection registration failed. LAN access is still available."
         });
-      }
-    } finally {
-      await engine.stop();
+        return;
+      case "stayEnrolled":
+        // Unreachable after the engine ran (the cache was null): kept for
+        // exhaustiveness.
+        return;
     }
   }
 
@@ -454,6 +506,7 @@ export class HostConnection {
       this.host.remoteEnrolled = true;
       await Preferences.set({ key: HOST_KEY, value: JSON.stringify(this.host) });
       void this.syncHostRecordEnrollment();
+      void rememberRegistrationVerdict("nodeCheck", this.host.id, "verified");
       this.setRemoteRegistration({ status: "enrolled" });
     } finally {
       authKey = undefined;
@@ -469,6 +522,7 @@ export class HostConnection {
     this.host.remoteEnrolled = false;
     await Preferences.set({ key: HOST_KEY, value: JSON.stringify(this.host) });
     void this.syncHostRecordEnrollment();
+    void rememberRegistrationVerdict("nodeCheck", this.host.id, "lanOnly");
     this.setRemoteRegistration({ status: "failed", error: DROPPED_MOBILE_NODE_MESSAGE });
   }
 

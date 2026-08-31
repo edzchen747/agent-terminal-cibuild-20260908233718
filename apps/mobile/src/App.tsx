@@ -17,6 +17,7 @@ import { ConnectionNotification } from "./connection-notification";
 import { notificationStateFor, type ConnectionNotificationState } from "./connectionPolicy";
 import { isRetryingSavedHost } from "./connectionFlow";
 import { hostRowRegistrationStatus, hostRowStatusLabel, lastConnectedLabel, REGISTRATION_STATUS_LABELS, registrationDisplayStatusFor, type HostCheckState, type RegistrationDisplayStatus, sortHostsByLastConnected } from "./hostSelection";
+import { readRegistrationVerdict, rememberRegistrationVerdict, type RegistrationVerdict } from "./registrationCache";
 import { backButtonAction, pairingReconnectStep, pairingRestoreDecision } from "./navigationPolicy";
 import { deviceIdentity } from "./device";
 import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_SLIDER_HORIZONTAL_BIAS } from "./gesture";
@@ -416,7 +417,9 @@ export function App() {
   // check came back; hosts that were never registered stay LAN only without
   // ever starting a node. The live desktop is already verified by being
   // connected, so it is skipped. The native engine runs one node per host,
-  // so all checks run side by side instead of one after another.
+  // so all checks run side by side instead of one after another, and each
+  // verdict is cached per host for a minute so revisiting the page does not
+  // re-ping hosts that were just checked.
   useEffect(() => {
     if (view.type !== "hosts" || hostChecksStartedRef.current) return;
     hostChecksStartedRef.current = true;
@@ -425,12 +428,22 @@ export function App() {
       if (disposed) return;
       const liveHostId = connectionRef.current?.host.id;
       const pending = records.filter((record) => record.remoteEnrolled === true && record.id !== liveHostId);
+      const cachedVerdicts = new Map<string, RegistrationVerdict>();
       for (const record of pending) {
+        const verdict = await readRegistrationVerdict("hostPing", record.id);
+        if (verdict) cachedVerdicts.set(record.id, verdict);
+      }
+      for (const [hostId, verdict] of cachedVerdicts) {
+        setHostChecks((current) => new Map(current).set(hostId, verdict));
+      }
+      const uncached = pending.filter((record) => !cachedVerdicts.has(record.id));
+      for (const record of uncached) {
         setHostChecks((current) => new Map(current).set(record.id, "checking"));
       }
-      await Promise.all(pending.map(async (record) => {
+      await Promise.all(uncached.map(async (record) => {
         const verdict = await HostConnection.verifySavedHostRegistration(record);
         if (disposed) return;
+        void rememberRegistrationVerdict("hostPing", record.id, verdict);
         setHostChecks((current) => new Map(current).set(record.id, verdict));
       }));
     });
