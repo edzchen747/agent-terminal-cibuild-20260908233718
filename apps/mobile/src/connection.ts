@@ -69,6 +69,10 @@ export class HostConnection {
   private autoReconnect = false;
   private readonly embeddedEngine: EmbeddedNodeEngine;
   private enrollmentPromise?: Promise<void>;
+  // One automatic re-attempt per connection: the first registration failure
+  // (launch race, provisioning hiccup) retries itself; any further failure
+  // waits for the user (desktop parity).
+  private automaticRetryArmed = false;
   private remoteRegistration: RemoteRegistrationState;
   private pending = new Map<string, { resolve: (message: ServerMessage) => void; reject: (error: Error) => void }>();
   private listeners = new Map<keyof EventMap, Set<(value: never) => void>>();
@@ -239,6 +243,7 @@ export class HostConnection {
       temporary.host.deviceToken = response.deviceToken;
       temporary.snapshot = response.snapshot;
       temporary.authenticated = true;
+      temporary.automaticRetryArmed = true;
       // Trusted LAN pairing is the commit point. Overlay registration happens
       // independently so provisioning outages never block terminal streaming.
       await Preferences.set({ key: HOST_KEY, value: JSON.stringify(temporary.host) });
@@ -355,6 +360,13 @@ export class HostConnection {
             ? error.message
             : "Remote connection registration failed. LAN access is still available."
         });
+        if (this.automaticRetryArmed) {
+          this.automaticRetryArmed = false;
+          window.setTimeout(() => {
+            if (this.closed || !this.authenticated || this.socket?.readyState !== WebSocket.OPEN) return;
+            void this.retryRemoteRegistration().catch(() => undefined);
+          }, 5_000);
+        }
         throw error;
       })
       .finally(() => { this.enrollmentPromise = undefined; });
@@ -465,6 +477,7 @@ export class HostConnection {
       if (response.type !== "auth.accepted") throw new Error("This phone is not authorized by the desktop.");
       this.snapshot = response.snapshot;
       this.authenticated = true;
+      this.automaticRetryArmed = true;
       this.reconnectAttempt = 0;
       this.reconnectDelay = RECONNECT_BASE_DELAY_MS;
       this.clearReconnectTimeout();
