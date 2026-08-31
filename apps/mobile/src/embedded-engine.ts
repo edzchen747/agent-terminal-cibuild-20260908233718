@@ -16,7 +16,7 @@ export interface EmbeddedNodeState {
 }
 
 interface EmbeddedNodePlugin {
-  start(options: { controlUrl: string; privateKey: string; nodeId: string; remoteEndpoint: string; authKey?: string }): Promise<{
+  start(options: { controlUrl: string; privateKey: string; nodeId: string; remoteEndpoint: string; authKey?: string; stateKey?: string }): Promise<{
     nodeId?: string;
     tailnetAddress?: string;
     endpoint?: string;
@@ -31,9 +31,25 @@ const NativeEmbeddedNode = registerPlugin<EmbeddedNodePlugin>("EmbeddedNode");
  * Native builds may provide the process-isolated engine plugin; browser
  * builds still retain the identity and report that an embedded node is
  * required for off-LAN connections.
+ *
+ * Each paired desktop gets its own identity: the relay isolates every
+ * pairing group in its own Headscale user, so a phone-side tsnet node
+ * enrolled under one host's user can only ever reach that host's desktop
+ * node. One shared phone node therefore could only ever belong to one
+ * host, which is exactly why every host but the last-enrolled one failed
+ * over tsnet. Persisting the identity per host (and running the native
+ * engine in a matching per-host state directory via `stateKey`) lets each
+ * host keep its own phone-side node.
  */
 export class EmbeddedNodeEngine {
   private state?: EmbeddedNodeState;
+  private readonly hostId?: string;
+  private readonly storageKey: string;
+
+  constructor(hostId?: string) {
+    this.hostId = hostId;
+    this.storageKey = hostId ? `${ENGINE_STATE_KEY}-${hostId}` : ENGINE_STATE_KEY;
+  }
 
   async start(controlUrl: string = OVERLAY_CONTROL_URL, remoteEndpoint?: string, transport: "direct" | "overlay" = "overlay", authKey?: string): Promise<EmbeddedNodeState> {
     const current = await this.load();
@@ -52,7 +68,11 @@ export class EmbeddedNodeEngine {
           privateKey: state.privateKey,
           nodeId: state.nodeId,
           remoteEndpoint,
-          authKey
+          authKey,
+          // The native process persists the tsnet node key in its state
+          // directory; the per-host key keeps one host's enrollment from
+          // ever being resumed by another host's process.
+          stateKey: this.hostId
         });
         state.nodeId = result.nodeId ?? state.nodeId;
         state.tailnetAddress = result.tailnetAddress ?? state.tailnetAddress;
@@ -76,9 +96,18 @@ export class EmbeddedNodeEngine {
     try { await NativeEmbeddedNode.stop(); } catch { /* best effort */ }
   }
 
+  /**
+   * Drops the persisted identity of a desktop that was unpaired. The tsnet
+   * node it registered stays in the relay until inactivity expiry, so no
+   * relay-side cleanup is needed; only the local record goes away.
+   */
+  static async forget(hostId: string): Promise<void> {
+    await Preferences.remove({ key: `${ENGINE_STATE_KEY}-${hostId}` });
+  }
+
   private async load(): Promise<EmbeddedNodeState> {
     if (this.state) return this.state;
-    const { value } = await Preferences.get({ key: ENGINE_STATE_KEY });
+    const { value } = await Preferences.get({ key: this.storageKey });
     if (value) {
       try {
         const parsed = JSON.parse(value) as Partial<EmbeddedNodeState>;
@@ -108,7 +137,7 @@ export class EmbeddedNodeEngine {
 
   private async save(state: EmbeddedNodeState): Promise<void> {
     this.state = state;
-    await Preferences.set({ key: ENGINE_STATE_KEY, value: JSON.stringify(state) });
+    await Preferences.set({ key: this.storageKey, value: JSON.stringify(state) });
   }
 }
 

@@ -66,7 +66,7 @@ export class HostConnection {
   private reconnectAttempt = 0;
   private reconnectDelay = RECONNECT_BASE_DELAY_MS;
   private autoReconnect = false;
-  private readonly embeddedEngine = new EmbeddedNodeEngine();
+  private readonly embeddedEngine: EmbeddedNodeEngine;
   private enrollmentPromise?: Promise<void>;
   private remoteRegistration: RemoteRegistrationState;
   private pending = new Map<string, { resolve: (message: ServerMessage) => void; reject: (error: Error) => void }>();
@@ -74,6 +74,9 @@ export class HostConnection {
   snapshot?: HostSnapshot;
 
   constructor(public readonly host: SavedHost) {
+    // Each desktop has its own phone-side tsnet identity (see
+    // EmbeddedNodeEngine); the engine is bound to this host's record.
+    this.embeddedEngine = new EmbeddedNodeEngine(this.host.id);
     this.remoteRegistration = { status: host.remoteEnrolled ? "enrolled" : "unregistered" };
   }
 
@@ -156,6 +159,7 @@ export class HostConnection {
     const remaining = records.filter((record) => record.id !== id);
     if (remaining.length !== records.length) {
       await Preferences.set({ key: HOSTS_KEY, value: JSON.stringify(remaining) });
+      await EmbeddedNodeEngine.forget(id);
     }
     const saved = await this.saved();
     if (saved?.id === id) {
@@ -338,6 +342,7 @@ export class HostConnection {
       }
       this.host.remoteEnrolled = true;
       await Preferences.set({ key: HOST_KEY, value: JSON.stringify(this.host) });
+      void this.syncHostRecordEnrollment();
       this.setRemoteRegistration({ status: "enrolled" });
     } finally {
       authKey = undefined;
@@ -352,7 +357,24 @@ export class HostConnection {
   private async markRemoteNodeDropped(): Promise<void> {
     this.host.remoteEnrolled = false;
     await Preferences.set({ key: HOST_KEY, value: JSON.stringify(this.host) });
+    void this.syncHostRecordEnrollment();
     this.setRemoteRegistration({ status: "failed", error: DROPPED_MOBILE_NODE_MESSAGE });
+  }
+
+  /**
+   * Keeps the previously paired record's enrollment flag current. The launch
+   * default (HOST_KEY) and the hosts-page list (HOSTS_KEY) are separate
+   * records; host switching starts from a hosts-page record, so a stale
+   * flag there would make a still-enrolled host demand a LAN reconnect.
+   */
+  private async syncHostRecordEnrollment(): Promise<void> {
+    const records = await HostConnection.savedHostRecords();
+    const index = records.findIndex((record) => record.id === this.host.id);
+    if (index < 0) return;
+    const record = records[index];
+    if (!record || record.remoteEnrolled === this.host.remoteEnrolled) return;
+    records[index] = { ...record, remoteEnrolled: this.host.remoteEnrolled };
+    await Preferences.set({ key: HOSTS_KEY, value: JSON.stringify(records) });
   }
 
   private async connectOnce(): Promise<HostSnapshot> {

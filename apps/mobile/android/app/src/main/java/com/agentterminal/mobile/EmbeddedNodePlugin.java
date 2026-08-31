@@ -30,6 +30,10 @@ import org.json.JSONObject;
 public class EmbeddedNodePlugin extends Plugin {
     private static final String TAG = "EmbeddedNode";
     private Process nodeProcess;
+    // State directory (and therefore tsnet node identity) of the running
+    // process. Each paired desktop enrolls its own phone-side node, so a
+    // running process only satisfies a start request for its own host.
+    private File activeStateDir;
     private final ExecutorService processWatcher = Executors.newSingleThreadExecutor();
 
     @PluginMethod
@@ -39,8 +43,10 @@ public class EmbeddedNodePlugin extends Plugin {
         String nodeId = call.getString("nodeId");
         String remoteEndpoint = call.getString("remoteEndpoint");
         String authKey = call.getString("authKey");
+        String stateKey = call.getString("stateKey");
         boolean hasAuthKey = authKey != null && !authKey.isEmpty();
-        Log.i(TAG, "start requested: control=" + (controlUrl == null ? "null" : controlUrl) + " remote=" + (remoteEndpoint == null ? "null" : remoteEndpoint) + " authKey=" + (hasAuthKey ? "present" : "EMPTY") + " nodeId=" + (nodeId == null ? "null" : nodeId));
+        File stateDir = stateDirFor(stateKey);
+        Log.i(TAG, "start requested: control=" + (controlUrl == null ? "null" : controlUrl) + " remote=" + (remoteEndpoint == null ? "null" : remoteEndpoint) + " authKey=" + (hasAuthKey ? "present" : "EMPTY") + " nodeId=" + (nodeId == null ? "null" : nodeId) + " stateDir=" + stateDir.getName());
         File executable = bundledExecutable();
         Log.i(TAG, "bundledExecutable: " + executable.getAbsolutePath() + " isFile=" + executable.isFile() + " canExecute=" + executable.canExecute());
         if (!executable.isFile()) {
@@ -54,22 +60,25 @@ public class EmbeddedNodePlugin extends Plugin {
             return;
         }
         if (nodeProcess != null && nodeProcess.isAlive()) {
-            if (!hasAuthKey) {
-                Log.i(TAG, "node process already running; returning saved status");
-                JSObject result = readStatus(new File(getContext().getFilesDir(), "embedded-node-state"), nodeId);
+            if (stateDir.equals(activeStateDir) && !hasAuthKey) {
+                // The running process is this host's own tsnet node; its
+                // persisted identity and proxy endpoint are still valid.
+                Log.i(TAG, "node process already running for " + stateDir.getName() + "; returning saved status");
+                JSObject result = readStatus(activeStateDir, nodeId);
                 if (rejectForStatus(call, result)) return;
                 logStatus(result);
                 call.resolve(result);
                 return;
             }
-            // A fresh one-time key means the WebView detected that the saved
-            // Headscale node was removed. Restart tsnet so the key is applied
-            // instead of returning the stale process status.
-            Log.i(TAG, "node process running with new auth key; restarting to re-register");
+            // A different host means a different tsnet identity (different
+            // state directory), and a fresh one-time key means the saved
+            // Headscale node was removed. Either way the running process
+            // cannot be reused: restart so the requested identity is the
+            // one that gets registered.
+            Log.i(TAG, "node process running for " + (activeStateDir == null ? "unknown" : activeStateDir.getName()) + "; restarting for " + stateDir.getName() + (hasAuthKey ? " to re-register" : " to switch host identity"));
             stopNodeProcess();
         }
         try {
-            File stateDir = new File(getContext().getFilesDir(), "embedded-node-state");
             if (!stateDir.exists() && !stateDir.mkdirs()) {
                 Log.e(TAG, "could not create state directory: " + stateDir.getAbsolutePath());
                 call.reject("Could not create embedded node state directory.");
@@ -113,13 +122,15 @@ public class EmbeddedNodePlugin extends Plugin {
             builder.redirectError(ProcessBuilder.Redirect.appendTo(new File(getContext().getFilesDir(), "embedded-node.log")));
             Process process = builder.start();
             nodeProcess = process;
-            Log.i(TAG, "node process started " + process + " remote=" + remoteHost + ":" + remotePort + " dns=" + dnsServers);
+            activeStateDir = stateDir;
+            Log.i(TAG, "node process started " + process + " stateDir=" + stateDir.getName() + " remote=" + remoteHost + ":" + remotePort + " dns=" + dnsServers);
             watchProcess(process);
             JSObject result = readStatus(stateDir, nodeId);
             if (rejectForStatus(call, result)) {
                 logStatus(result);
                 process.destroy();
                 nodeProcess = null;
+                activeStateDir = null;
                 return;
             }
             if (result.optString("endpoint", "").isEmpty()) {
@@ -129,6 +140,7 @@ public class EmbeddedNodePlugin extends Plugin {
                 Log.e(TAG, message);
                 process.destroy();
                 nodeProcess = null;
+                activeStateDir = null;
                 call.reject(message);
                 return;
             }
@@ -152,6 +164,7 @@ public class EmbeddedNodePlugin extends Plugin {
     private void stopNodeProcess() {
         Process process = nodeProcess;
         nodeProcess = null;
+        activeStateDir = null;
         if (process == null) return;
         Log.i(TAG, "stopping node process " + process);
         process.destroy();
@@ -175,7 +188,10 @@ public class EmbeddedNodePlugin extends Plugin {
                 return;
             }
             synchronized (EmbeddedNodePlugin.this) {
-                if (nodeProcess == process) nodeProcess = null;
+                if (nodeProcess == process) {
+                    nodeProcess = null;
+                    activeStateDir = null;
+                }
             }
             Log.i(TAG, "node process exited exit=" + process.exitValue());
         });
@@ -201,6 +217,23 @@ public class EmbeddedNodePlugin extends Plugin {
 
     private File bundledExecutable() {
         return new File(getContext().getApplicationInfo().nativeLibraryDir, "libembedded-node.so");
+    }
+
+    /**
+     * One tsnet state directory per paired desktop. The state directory is
+     * where tsnet persists the node key, so this is what makes every host
+     * keep its own phone-side node (enrolled under that host's Headscale
+     * user) instead of sharing one identity that can only ever belong to a
+     * single pairing group. The legacy shared directory is kept as the
+     * fallback so an old web layer still works.
+     */
+    private File stateDirFor(String stateKey) {
+        String suffix = "";
+        if (stateKey != null) {
+            String sanitized = stateKey.replaceAll("[^A-Za-z0-9-]", "");
+            if (!sanitized.isEmpty() && sanitized.length() <= 64) suffix = "-host-" + sanitized;
+        }
+        return new File(getContext().getFilesDir(), "embedded-node-state" + suffix);
     }
 
     private String activeDnsServers() {
