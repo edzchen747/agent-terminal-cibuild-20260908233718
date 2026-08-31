@@ -828,16 +828,13 @@ impl Core {
         // With no authorized device there is nobody the overlay route could
         // serve, so the badge says "Pair a device" regardless of any stored
         // verdict from an older session.
-        let remote_status = if inner.store.devices().is_empty() {
-            "unpaired".to_owned()
-        } else {
-            registration_status_for_display(
-                self.network_online.load(Ordering::Acquire),
-                &network.registration_status,
-                self.remote_verification_running.load(Ordering::Acquire)
-                    || self.desktop_enrollment_running.load(Ordering::Acquire),
-            )
-        };
+        let remote_status = registration_status_for_display(
+            !inner.store.devices().is_empty(),
+            self.network_online.load(Ordering::Acquire),
+            &network.registration_status,
+            self.remote_verification_running.load(Ordering::Acquire)
+                || self.desktop_enrollment_running.load(Ordering::Acquire),
+        );
         DesktopState {
             snapshot: snapshot_from_inner(&inner, &online_device_ids),
             current_project_id,
@@ -2969,14 +2966,23 @@ impl Drop for RemoteVerificationGuard {
     }
 }
 
-/// The badge status for a given connectivity reading: while the machine has
-/// no internet the stored registration verdict is hidden and the badge shows
-/// "No internet" instead of a stale enrolled/pending/failed state. An
-/// in-flight verification or enrollment run keeps the badge on "pending":
-/// the stored verdict is stale for its whole duration, and a first render
-/// that lands mid-run must not skip straight back to the saved state.
-fn registration_status_for_display(online: bool, stored: &str, verifying: bool) -> String {
-    if !online {
+/// The badge status for a given connectivity reading: no authorized device
+/// means nobody can use the overlay route, so the badge says "Pair a device"
+/// regardless of any stored verdict; while the machine has no internet the
+/// stored registration verdict is hidden and the badge shows "No internet"
+/// instead of a stale enrolled/pending/failed state; an in-flight
+/// verification or enrollment run keeps the badge on "pending": the stored
+/// verdict is stale for its whole duration, and a first render that lands
+/// mid-run must not skip straight back to the saved state.
+fn registration_status_for_display(
+    has_devices: bool,
+    online: bool,
+    stored: &str,
+    verifying: bool,
+) -> String {
+    if !has_devices {
+        "unpaired".to_owned()
+    } else if !online {
         "offline".to_owned()
     } else if verifying {
         "pending".to_owned()
@@ -3166,11 +3172,11 @@ mod tests {
     fn offline_always_overrides_the_stored_registration_status() {
         for stored in ["unregistered", "pending", "enrolled", "failed"] {
             assert_eq!(
-                registration_status_for_display(false, stored, false),
+                registration_status_for_display(true, false, stored, false),
                 "offline",
                 "offline must hide a stored {stored} status"
             );
-            assert_eq!(registration_status_for_display(true, stored, false), stored);
+            assert_eq!(registration_status_for_display(true, true, stored, false), stored);
         }
     }
 
@@ -3178,11 +3184,44 @@ mod tests {
     fn a_running_verification_holds_the_badge_on_pending() {
         for stored in ["unregistered", "pending", "enrolled", "failed"] {
             assert_eq!(
-                registration_status_for_display(true, stored, true),
+                registration_status_for_display(true, true, stored, true),
                 "pending",
                 "an in-flight run must override a stored {stored} status"
             );
         }
+    }
+
+    #[test]
+    fn no_devices_always_show_pair_a_device() {
+        for online in [true, false] {
+            for verifying in [true, false] {
+                for stored in ["unregistered", "pending", "enrolled", "failed"] {
+                    assert_eq!(
+                        registration_status_for_display(false, online, stored, verifying),
+                        "unpaired",
+                        "no device + online={online} verifying={verifying} stored={stored} must show pair a device"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offline_beats_a_running_verification() {
+        assert_eq!(
+            registration_status_for_display(true, false, "enrolled", true),
+            "offline"
+        );
+    }
+
+    #[test]
+    fn a_stored_pending_verdict_survives_a_finished_run_when_no_device_was_ever_registered() {
+        // The gate only reports pending while a run is in flight; a finished
+        // run with no verification shows the stored verdict as-is.
+        assert_eq!(registration_status_for_display(true, true, "pending", false), "pending");
+        assert_eq!(registration_status_for_display(true, true, "enrolled", false), "enrolled");
+        assert_eq!(registration_status_for_display(true, true, "failed", false), "failed");
+        assert_eq!(registration_status_for_display(true, true, "unregistered", false), "unregistered");
     }
 
     #[test]
