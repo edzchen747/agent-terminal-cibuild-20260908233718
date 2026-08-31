@@ -217,4 +217,20 @@ mod tests {
         assert_eq!(clients.subscribers("moved-session"), vec!["window-a"]);
         assert!(clients.subscribers("old-session").is_empty());
     }
+
+    #[test]
+    fn assigning_an_unowned_project_displaces_no_other_window() {
+        // The quiet window path for phone-created sessions assigns a brand-new
+        // label to a project that had no window; this takeover must never
+        // evict a window that hosts a different project.
+        let mut clients = WindowClients::default();
+        clients.assign("window-a", "project-a");
+        clients.attach("window-a", "session-a");
+
+        let assignment = clients.assign("window-b", "project-b");
+        assert_eq!(assignment.displaced_window, None);
+        assert_eq!(clients.window_for_project("project-a"), Some("window-a"));
+        assert_eq!(clients.window_for_project("project-b"), Some("window-b"));
+        assert_eq!(clients.subscribers("session-a"), vec!["window-a"], "the old window keeps its terminal attachment");
+    }
 }

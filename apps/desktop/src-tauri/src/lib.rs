@@ -53,10 +53,9 @@ async fn create_project(state: State<'_, Arc<Core>>) -> Result<Option<Project>, 
     if !has_session {
         core.create_session(&project.id, None)
             .map_err(error_string)?;
-    } else {
-        core.ensure_project_window(&project.id)
-            .map_err(error_string)?;
     }
+    core.ensure_project_window(&project.id)
+        .map_err(error_string)?;
     Ok(Some(project))
 }
 
@@ -230,6 +229,16 @@ fn set_confirm_external_links(
 }
 
 #[tauri::command]
+fn set_follow_working_directory(
+    state: State<'_, Arc<Core>>,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .set_follow_working_directory(enabled)
+        .map_err(error_string)
+}
+
+#[tauri::command]
 async fn select_shell(
     state: State<'_, Arc<Core>>,
     session_id: Option<String>,
@@ -297,6 +306,7 @@ pub fn run() {
             set_default_shell,
             set_open_projects_in_new_windows,
             set_confirm_external_links,
+            set_follow_working_directory,
             select_shell,
         ])
         .build(tauri::generate_context!())

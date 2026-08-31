@@ -274,6 +274,7 @@ impl Core {
             ensure_home_project(&mut inner)?
         };
         self.create_session(&project.id, None)?;
+        self.ensure_project_window_with_focus(&project.id, true, None)?;
         Ok(())
     }
 
@@ -840,6 +841,7 @@ impl Core {
             current_project_id,
             open_projects_in_new_windows: inner.store.settings().open_projects_in_new_windows,
             confirm_external_links: inner.store.settings().confirm_external_links,
+            follow_working_directory: inner.store.settings().follow_working_directory,
             remote_registration: RemoteRegistration {
                 status: remote_status,
                 error: network.registration_error.clone(),
@@ -967,6 +969,59 @@ impl Core {
         self.ensure_project_window_with_focus(project_id, false, None)
     }
 
+    /// Ensures the project owns a window so its sessions have a place to
+    /// render, without taking focus and without reassigning any window that
+    /// currently hosts a different project. Used when a session is opened
+    /// outside of the desktop's explicit open-project flow (the phone's
+    /// `New terminal`, or the desktop's add-tab button): the tab must exist,
+    /// but it must not pull the desktop app to the front or tear the user
+    /// out of the project they are looking at.
+    fn ensure_project_window_quietly(self: &Arc<Self>, project_id: &str) -> Result<()> {
+        let (open_new_windows, existing) = {
+            let inner = self.inner.lock().expect("desktop state poisoned");
+            (
+                inner.store.settings().open_projects_in_new_windows,
+                inner
+                    .windows
+                    .window_for_project(project_id)
+                    .map(str::to_owned),
+            )
+        };
+        if !should_open_quiet_window(open_new_windows, existing.is_some()) {
+            // The project already owns a window (or the desktop is in
+            // single-window mode, where switching a window to the project is
+            // how the desktop changes its selected project): leave every
+            // window alone. Opening the project from the desktop focuses it.
+            return Ok(());
+        }
+        let project = self.project_by_id(project_id)?;
+        let label = format!("terminal-{}", Uuid::new_v4());
+        {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            inner.windows.assign(&label, &project.id);
+        }
+        let built =
+            WebviewWindowBuilder::new(&self.app, &label, WebviewUrl::App("index.html".into()))
+                .title(format!("{} — Agent Terminal", project.name))
+                .inner_size(1320.0, 820.0)
+                .min_inner_size(840.0, 560.0)
+                .visible(false)
+                .build();
+        let window = match built {
+            Ok(window) => window,
+            Err(error) => {
+                self.inner
+                    .lock()
+                    .expect("desktop state poisoned")
+                    .windows
+                    .remove_window(&label);
+                return Err(error.into());
+            }
+        };
+        window.show()?;
+        Ok(())
+    }
+
     fn ensure_project_window_with_focus(
         self: &Arc<Self>,
         project_id: &str,
@@ -1084,9 +1139,8 @@ impl Core {
             });
         if !has_running {
             self.create_session(project_id, None)?;
-        } else {
-            self.ensure_project_window_with_focus(project_id, true, preferred_window)?;
         }
+        self.ensure_project_window_with_focus(project_id, true, preferred_window)?;
         Ok(())
     }
 
@@ -1237,6 +1291,15 @@ impl Core {
         {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             inner.store.set_confirm_external_links(enabled)?;
+        }
+        self.broadcast();
+        Ok(())
+    }
+
+    pub fn set_follow_working_directory(&self, enabled: bool) -> Result<()> {
+        {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            inner.store.set_follow_working_directory(enabled)?;
         }
         self.broadcast();
         Ok(())
@@ -1399,7 +1462,7 @@ impl Core {
             }
         });
 
-        if let Err(error) = self.ensure_project_window(&project.id) {
+        if let Err(error) = self.ensure_project_window_quietly(&project.id) {
             self.close_session(&id);
             return Err(error);
         }
@@ -2343,104 +2406,35 @@ impl Core {
         let Ok(cwd) = canonical_directory(&cleaned) else {
             return;
         };
-        let (
-            project,
-            previous_project_id,
-            active_window,
-            displaced_window,
-            old_has_sessions,
-            open_projects_in_new_windows,
-        ) = {
+        let outcome = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
-            let Some(current) = inner
-                .sessions
-                .get(session_id)
-                .map(|session| session.metadata.clone())
-            else {
-                return;
-            };
-            let mut saved = inner
-                .store
-                .projects()
-                .iter()
-                .filter(|project| is_within_project(&cwd, Path::new(&project.path)))
-                .cloned()
-                .collect::<Vec<_>>();
-            saved.sort_by_key(|project| {
-                std::cmp::Reverse(Path::new(&project.path).components().count())
-            });
-            let project = saved
-                .into_iter()
-                .next()
-                .or_else(|| {
-                    inner
-                        .temporary_projects
-                        .values()
-                        .find(|project| {
-                            normalized_path(Path::new(&project.path)) == normalized_path(&cwd)
-                        })
-                        .cloned()
-                })
-                .unwrap_or_else(|| {
-                    let project = Project {
-                        id: format!("temporary-{}", Uuid::new_v4()),
-                        name: folder_name(&cwd),
-                        path: cwd.to_string_lossy().into_owned(),
-                        persistent: false,
-                        created_at: None,
-                    };
-                    inner
-                        .temporary_projects
-                        .insert(project.id.clone(), project.clone());
-                    inner.project_order.push(project.id.clone());
-                    project
-                });
-            if let Some(session) = inner.sessions.get_mut(session_id) {
-                session.metadata.cwd = cwd.to_string_lossy().into_owned();
-                session.metadata.project_id = project.id.clone();
-            }
-            let project_changed = project.id != current.project_id;
-            let active_window = project_changed
-                .then(|| {
-                    inner
-                        .windows
-                        .window_for_project(&current.project_id)
-                        .map(str::to_owned)
-                })
-                .flatten();
-            let displaced_window = active_window.as_ref().and_then(|label| {
-                inner.windows.retain_attachment(label, session_id);
-                inner.windows.assign(label, &project.id).displaced_window
-            });
-            let old_has_sessions = project_changed
-                && inner
-                    .sessions
-                    .values()
-                    .any(|session| session.metadata.project_id == current.project_id);
-            let open_projects_in_new_windows = inner.store.settings().open_projects_in_new_windows;
-            (
-                project,
-                current.project_id,
-                active_window,
-                displaced_window,
-                old_has_sessions,
-                open_projects_in_new_windows,
-            )
+            resolve_working_directory(&mut inner, session_id, &cwd)
         };
-        if project.id != previous_project_id {
-            if let Some(label) = displaced_window
+        let plan = match outcome {
+            CdOutcome::Missing => return,
+            // Follow-working-directory is off: the cwd was recorded and the
+            // session stays in its project, so only refresh the UI. Recording
+            // the cwd here also stops the change detector re-firing.
+            CdOutcome::Recorded => {
+                self.broadcast();
+                return;
+            }
+            CdOutcome::Reassigned(plan) => plan,
+        };
+        if plan.project_changed {
+            if let Some(label) = plan.displaced_window
                 && let Some(window) = self.app.get_webview_window(&label)
             {
                 let _ = window.destroy();
             }
 
-            if let Some(label) = active_window {
+            if let Some(label) = plan.active_window {
                 if let Some(window) = self.app.get_webview_window(&label) {
-                    let _ = window.set_title(&format!("{} — Agent Terminal", project.name));
-                    if old_has_sessions && open_projects_in_new_windows {
-                        let _ = self.ensure_project_window_in_background(&previous_project_id);
+                    let _ = window.set_title(&format!("{} — Agent Terminal", plan.project.name));
+                    if plan.old_has_sessions && plan.open_projects_in_new_windows {
+                        let _ = self.ensure_project_window_in_background(&plan.previous_project_id);
                     } else {
-                        self.cleanup_empty_temporary_project(&previous_project_id);
+                        self.cleanup_empty_temporary_project(&plan.previous_project_id);
                     }
                     let _ = window.unminimize();
                     let _ = window.show();
@@ -2448,11 +2442,11 @@ impl Core {
                     self.mark_window_focused(&label);
                 }
             } else {
-                let _ = self.ensure_project_window(&project.id);
-                if old_has_sessions {
-                    let _ = self.ensure_project_window_in_background(&previous_project_id);
+                let _ = self.ensure_project_window(&plan.project.id);
+                if plan.old_has_sessions {
+                    let _ = self.ensure_project_window_in_background(&plan.previous_project_id);
                 } else {
-                    self.cleanup_empty_temporary_project(&previous_project_id);
+                    self.cleanup_empty_temporary_project(&plan.previous_project_id);
                 }
             }
         }
@@ -2770,6 +2764,130 @@ fn newest_running_session_project_id<'a>(
         .map(|session| session.project_id.clone())
 }
 
+/// The result of applying a reported working directory to a session.
+#[derive(Debug)]
+enum CdOutcome {
+    /// No session matched the id; nothing changed and no broadcast is needed.
+    Missing,
+    /// Follow-working-directory is off: the new cwd was recorded, but the
+    /// session stays in its current project and no window is moved or opened.
+    Recorded,
+    /// Follow-working-directory is on: the session was reassigned to a project;
+    /// the window side-effects to run outside the lock are in the plan.
+    Reassigned(CdPlan),
+}
+
+/// Window decisions implied by a working-directory change, computed under the
+/// state lock and applied by the caller once it is free of the lock.
+#[derive(Debug, Clone)]
+struct CdPlan {
+    project: Project,
+    previous_project_id: String,
+    project_changed: bool,
+    active_window: Option<String>,
+    displaced_window: Option<String>,
+    old_has_sessions: bool,
+    open_projects_in_new_windows: bool,
+}
+
+/// Whether a session created outside of the desktop's explicit open-project
+/// flow (the phone's `New terminal`, or the desktop's add-tab button) needs a
+/// fresh background window: only when the project does not already own one
+/// and the desktop is in per-project-window mode. A project that already has
+/// a window is left alone (no focus, no hoisting), and in single-window mode
+/// nothing is created because switching a window to the project is exactly
+/// how the desktop changes its selected project.
+fn should_open_quiet_window(open_projects_in_new_windows: bool, project_has_window: bool) -> bool {
+    open_projects_in_new_windows && !project_has_window
+}
+
+/// Resolve which project a session's new working directory belongs to and
+/// update the session's stored cwd. With follow-working-directory on the
+/// session is moved to the matching project (creating a temporary one when
+/// none matches) and a window plan is returned; with it off the cwd is
+/// recorded but the session is left in its project.
+fn resolve_working_directory(inner: &mut Inner, session_id: &str, cwd: &Path) -> CdOutcome {
+    let Some(current) = inner
+        .sessions
+        .get(session_id)
+        .map(|session| session.metadata.clone())
+    else {
+        return CdOutcome::Missing;
+    };
+    let cwd_text = cwd.to_string_lossy().into_owned();
+    if let Some(session) = inner.sessions.get_mut(session_id) {
+        session.metadata.cwd = cwd_text.clone();
+    }
+    if !inner.store.settings().follow_working_directory {
+        return CdOutcome::Recorded;
+    }
+    let mut saved = inner
+        .store
+        .projects()
+        .iter()
+        .filter(|project| is_within_project(cwd, Path::new(&project.path)))
+        .cloned()
+        .collect::<Vec<_>>();
+    saved.sort_by_key(|project| {
+        std::cmp::Reverse(Path::new(&project.path).components().count())
+    });
+    let project = saved
+        .into_iter()
+        .next()
+        .or_else(|| {
+            inner
+                .temporary_projects
+                .values()
+                .find(|project| normalized_path(Path::new(&project.path)) == normalized_path(cwd))
+                .cloned()
+        })
+        .unwrap_or_else(|| {
+            let project = Project {
+                id: format!("temporary-{}", Uuid::new_v4()),
+                name: folder_name(cwd),
+                path: cwd_text.clone(),
+                persistent: false,
+                created_at: None,
+            };
+            inner
+                .temporary_projects
+                .insert(project.id.clone(), project.clone());
+            inner.project_order.push(project.id.clone());
+            project
+        });
+    if let Some(session) = inner.sessions.get_mut(session_id) {
+        session.metadata.project_id = project.id.clone();
+    }
+    let project_changed = project.id != current.project_id;
+    let active_window = project_changed
+        .then(|| {
+            inner
+                .windows
+                .window_for_project(&current.project_id)
+                .map(str::to_owned)
+        })
+        .flatten();
+    let displaced_window = active_window.as_ref().and_then(|label| {
+        inner.windows.retain_attachment(label, session_id);
+        inner.windows.assign(label, &project.id).displaced_window
+    });
+    let old_has_sessions = project_changed
+        && inner
+            .sessions
+            .values()
+            .any(|session| session.metadata.project_id == current.project_id);
+    let open_projects_in_new_windows = inner.store.settings().open_projects_in_new_windows;
+    CdOutcome::Reassigned(CdPlan {
+        project,
+        previous_project_id: current.project_id,
+        project_changed,
+        active_window,
+        displaced_window,
+        old_has_sessions,
+        open_projects_in_new_windows,
+    })
+}
+
 fn canonical_directory(value: impl AsRef<Path>) -> Result<PathBuf> {
     let path = value.as_ref();
     let resolved = path
@@ -2994,12 +3112,14 @@ fn registration_status_for_display(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectivityAction, ConnectivityTracker, EmbeddedNodeStatus, Inner, PRESENCE_WINDOW_MS,
-        PairingGrant, RetireOutcome, ensure_home_project, folder_name, is_cursor_position_report,
-        is_dropped_node_status, is_within_project, newest_running_session_project_id,
-        parse_terminal_titles, parse_working_directories, preferred_project, presence_alive,
-        project_is_usable, project_name_or_folder, record_cursor_position_requests,
-        registration_status_for_display, retire_empty_temporary_project, snapshot_from_inner,
+        CdOutcome, CdPlan, ConnectivityAction, ConnectivityTracker, EmbeddedNodeStatus, Inner,
+        ManagedSession, PRESENCE_WINDOW_MS, PairingGrant, RetireOutcome, ensure_home_project, folder_name,
+        is_cursor_position_report, is_dropped_node_status, is_within_project,
+        newest_running_session_project_id, parse_terminal_titles, parse_working_directories,
+        preferred_project, presence_alive, project_is_usable, project_name_or_folder,
+        record_cursor_position_requests, registration_status_for_display,
+        resolve_working_directory, retire_empty_temporary_project, should_open_quiet_window,
+        snapshot_from_inner,
         take_valid_pairing_grant, validate_project_name,
     };
     use crate::{
@@ -3007,6 +3127,7 @@ mod tests {
         store::DesktopStore,
         window_clients::WindowClients,
     };
+    use portable_pty::{ChildKiller, MasterPty, PtySize};
     use std::{
         collections::{HashMap, HashSet},
         fs,
@@ -3857,5 +3978,355 @@ mod tests {
             windows: WindowClients::default(),
             pairing_grants: HashMap::new(),
         }
+    }
+
+    // Inert pty handles so tests can build real sessions without spawning a
+    // terminal. Only the host-platform (Windows) surface is implemented. The
+    // concrete types satisfy the `Downcast` supertrait through downcast-rs's
+    // blanket `impl<T: Any> Downcast for T`, so no macro is required.
+    struct InertMaster;
+    impl MasterPty for InertMaster {
+        fn resize(&self, _size: PtySize) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+        fn get_size(&self) -> Result<PtySize, anyhow::Error> {
+            Ok(PtySize::default())
+        }
+        fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, anyhow::Error> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, anyhow::Error> {
+            Ok(Box::new(std::io::sink()))
+        }
+    }
+
+    struct InertKiller;
+    impl std::fmt::Debug for InertKiller {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("InertKiller")
+        }
+    }
+    impl ChildKiller for InertKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(InertKiller)
+        }
+    }
+
+    fn test_session(session_id: &str, project_id: &str, cwd: &str) -> ManagedSession {
+        ManagedSession {
+            metadata: TerminalSession {
+                id: session_id.into(),
+                project_id: project_id.into(),
+                title: "Test".into(),
+                cwd: cwd.into(),
+                shell_id: "powershell".into(),
+                status: "running".into(),
+                created_at: "now".into(),
+                exit_code: None,
+            },
+            master: Box::new(InertMaster),
+            writer: Box::new(std::io::sink()),
+            killer: Box::new(InertKiller),
+            buffer: String::new(),
+            control_tail: String::new(),
+            cursor_query_tail: String::new(),
+            pending_cursor_reports: 0,
+            has_run_command: false,
+            terminal_controller: None,
+        }
+    }
+
+    fn inner_with_settings(follow: bool, open_new_windows: bool) -> (Inner, PathBuf) {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
+        store
+            .set_follow_working_directory(follow)
+            .expect("set follow working directory");
+        store
+            .set_open_projects_in_new_windows(open_new_windows)
+            .expect("set open projects in new windows");
+        (test_inner(store, Vec::new()), state_path)
+    }
+
+    fn expect_reassigned(outcome: CdOutcome) -> CdPlan {
+        match outcome {
+            CdOutcome::Reassigned(plan) => plan,
+            other => panic!("expected a reassigned plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn follow_off_records_cwd_but_keeps_the_session_project() {
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        test_project(&mut inner, "b", r"C:\Work\B", true);
+        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner.windows.assign("window-a", "a");
+        inner.windows.attach("window-a", "s1");
+
+        let outcome = resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\B"));
+        assert!(
+            matches!(outcome, CdOutcome::Recorded),
+            "with follow off the cwd is recorded, not reassigned"
+        );
+        let session = &inner.sessions["s1"].metadata;
+        assert_eq!(session.cwd, r"C:\Work\B", "the new cwd is stored");
+        assert_eq!(
+            session.project_id, "a",
+            "the session stays in its project when follow is off"
+        );
+        assert!(
+            inner.temporary_projects.is_empty(),
+            "no temporary project is created while follow is off"
+        );
+        assert_eq!(
+            inner.windows.window_for_project("a"),
+            Some("window-a"),
+            "no window is moved while follow is off"
+        );
+        assert!(inner.windows.window_for_project("b").is_none());
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn follow_off_creates_no_temporary_project_for_an_unmatched_folder() {
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner.windows.assign("window-a", "a");
+
+        // A folder that matches no saved or temporary project.
+        let outcome =
+            resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Somewhere\Else"));
+        assert!(matches!(outcome, CdOutcome::Recorded));
+        assert_eq!(inner.sessions["s1"].metadata.project_id, "a");
+        assert!(
+            inner.temporary_projects.is_empty(),
+            "an unmatched folder must not spawn a temporary project while follow is off"
+        );
+        assert!(inner.project_order.is_empty());
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn follow_off_keeps_a_session_inside_a_temporary_project() {
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "temp-a", r"C:\Work\TempA", false);
+        inner.sessions.insert("s1".into(), test_session("s1", "temp-a", r"C:\Work\TempA"));
+        inner.windows.assign("window-t", "temp-a");
+        inner.windows.attach("window-t", "s1");
+
+        let outcome = resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\TempA\sub"));
+        assert!(matches!(outcome, CdOutcome::Recorded));
+        assert_eq!(inner.sessions["s1"].metadata.project_id, "temp-a");
+        assert_eq!(
+            inner.windows.window_for_project("temp-a"),
+            Some("window-t"),
+            "the temporary project's window is untouched while follow is off"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn resolve_missing_session_reports_missing_regardless_of_follow() {
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        assert!(matches!(
+            resolve_working_directory(&mut inner, "ghost", Path::new(r"C:\Work\A")),
+            CdOutcome::Missing
+        ));
+        inner.store
+            .set_follow_working_directory(true)
+            .expect("turn follow on");
+        assert!(matches!(
+            resolve_working_directory(&mut inner, "ghost", Path::new(r"C:\Work\A")),
+            CdOutcome::Missing
+        ));
+        assert!(inner.sessions.is_empty());
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn follow_on_reassigns_to_a_saved_project_that_contains_the_cwd() {
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        test_project(&mut inner, "b", r"C:\Work\B", true);
+        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner.windows.assign("window-a", "a");
+        inner.windows.attach("window-a", "s1");
+
+        let plan = expect_reassigned(resolve_working_directory(
+            &mut inner, "s1", Path::new(r"C:\Work\B\deep"),
+        ));
+        assert_eq!(inner.sessions["s1"].metadata.project_id, "b");
+        assert_eq!(plan.previous_project_id, "a");
+        assert!(plan.project_changed);
+        assert_eq!(plan.project.id, "b");
+        assert_eq!(plan.active_window.as_deref(), Some("window-a"));
+        assert_eq!(plan.displaced_window, None);
+        assert!(inner.temporary_projects.is_empty());
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn follow_on_prefers_the_deeper_nested_saved_project() {
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "outer", r"C:\Work", true);
+        test_project(&mut inner, "inner", r"C:\Work\Deep", true);
+        inner.sessions.insert("s1".into(), test_session("s1", "outer", r"C:\Work"));
+
+        let plan =
+            expect_reassigned(resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\Deep\x")));
+        assert_eq!(plan.project.id, "inner", "the more specific project wins");
+        assert_eq!(inner.sessions["s1"].metadata.project_id, "inner");
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn follow_on_reuses_an_existing_temporary_project() {
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        let temp = test_project(&mut inner, "temp-c", r"C:\Work\C", false);
+        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        let temp_count = inner.temporary_projects.len();
+
+        let plan =
+            expect_reassigned(resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\C")));
+        assert_eq!(plan.project.id, temp.id, "the existing temporary project is reused");
+        assert_eq!(inner.sessions["s1"].metadata.project_id, "temp-c");
+        assert_eq!(
+            inner.temporary_projects.len(),
+            temp_count,
+            "reusing a temporary project must not create a duplicate"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn follow_on_creates_a_temporary_project_when_nothing_matches() {
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        let order_len = inner.project_order.len();
+
+        let plan = expect_reassigned(resolve_working_directory(
+            &mut inner, "s1", Path::new(r"C:\Fresh\Folder"),
+        ));
+        assert!(!plan.project.persistent, "a freshly matched folder becomes a temporary project");
+        assert_eq!(plan.project.path, r"C:\Fresh\Folder");
+        assert!(inner.temporary_projects.contains_key(&plan.project.id));
+        assert_eq!(inner.sessions["s1"].metadata.project_id, plan.project.id);
+        assert_eq!(inner.project_order.len(), order_len + 1);
+        assert!(plan.project_changed);
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn follow_on_same_project_makes_no_window_changes() {
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner.windows.assign("window-a", "a");
+
+        let plan =
+            expect_reassigned(resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\A\sub")));
+        assert!(!plan.project_changed, "staying inside the same project is not a change");
+        assert_eq!(plan.active_window, None);
+        assert_eq!(plan.displaced_window, None);
+        assert_eq!(inner.sessions["s1"].metadata.cwd, r"C:\Work\A\sub");
+        assert_eq!(inner.sessions["s1"].metadata.project_id, "a");
+        assert_eq!(inner.windows.window_for_project("a"), Some("window-a"));
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn quiet_window_is_created_only_for_unowned_projects_in_multi_window_mode() {
+        // The contract behind a session opened by the phone or the add-tab
+        // button: a project that already owns a window is never touched, and
+        // single-window mode stays on the desktop's current project.
+        assert!(
+            should_open_quiet_window(true, false),
+            "multi-window mode with no window for the project opens a background one"
+        );
+        assert!(
+            !should_open_quiet_window(true, true),
+            "a project that already owns a window is not hoisted or refocused"
+        );
+        assert!(
+            !should_open_quiet_window(false, false),
+            "in single-window mode creating a window would switch the desktop's project"
+        );
+        assert!(
+            !should_open_quiet_window(false, true),
+            "single-window mode never touches an existing window either"
+        );
+    }
+
+    #[test]
+    fn follow_on_moves_the_active_window_and_reports_the_displaced_one() {
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        test_project(&mut inner, "b", r"C:\Work\B", true);
+        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner.windows.assign("window-a", "a");
+        inner.windows.assign("window-b", "b");
+        inner.windows.attach("window-a", "s1");
+
+        let plan =
+            expect_reassigned(resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\B")));
+        assert!(plan.project_changed);
+        assert_eq!(plan.active_window.as_deref(), Some("window-a"));
+        assert_eq!(
+            plan.displaced_window.as_deref(),
+            Some("window-b"),
+            "moving window-a to project b displaces project b's existing window"
+        );
+        assert_eq!(inner.windows.window_for_project("b"), Some("window-a"));
+        assert_eq!(inner.windows.window_for_project("a"), None);
+        assert_eq!(inner.sessions["s1"].metadata.project_id, "b");
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn follow_on_keeps_the_old_project_open_when_other_sessions_remain() {
+        let (mut inner, state_path) = inner_with_settings(true, true);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        test_project(&mut inner, "b", r"C:\Work\B", true);
+        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner.sessions.insert("s2".into(), test_session("s2", "a", r"C:\Work\A"));
+        inner.windows.assign("window-a", "a");
+
+        let plan =
+            expect_reassigned(resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\B")));
+        assert!(
+            plan.old_has_sessions,
+            "another session still lives in the old project"
+        );
+        assert!(plan.open_projects_in_new_windows);
+        assert_eq!(inner.sessions["s2"].metadata.project_id, "a", "the sibling session is untouched");
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn follow_on_reports_no_remaining_sessions_when_moving_the_last_one() {
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        test_project(&mut inner, "b", r"C:\Work\B", true);
+        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner.windows.assign("window-a", "a");
+
+        let plan =
+            expect_reassigned(resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\B")));
+        assert!(
+            !plan.old_has_sessions,
+            "the moved session was the last one in the old project"
+        );
+        fs::remove_file(state_path).expect("remove test state");
     }
 }

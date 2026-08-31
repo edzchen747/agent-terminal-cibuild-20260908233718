@@ -100,6 +100,7 @@ pub struct DesktopState {
     pub current_project_id: String,
     pub open_projects_in_new_windows: bool,
     pub confirm_external_links: bool,
+    pub follow_working_directory: bool,
     pub remote_registration: RemoteRegistration,
 }
 

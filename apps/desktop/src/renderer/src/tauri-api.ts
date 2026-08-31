@@ -55,6 +55,7 @@ const api: DesktopApi = {
   setDefaultShell: (shellId) => invoke("set_default_shell", { shellId }),
   setOpenProjectsInNewWindows: (enabled) => invoke("set_open_projects_in_new_windows", { enabled }),
   setConfirmExternalLinks: (enabled) => invoke("set_confirm_external_links", { enabled }),
+  setFollowWorkingDirectory: (enabled) => invoke("set_follow_working_directory", { enabled }),
   selectShell: (sessionId, shellId) => invoke("select_shell", { sessionId, shellId }),
   onPairingSucceeded: (callback) => {
     pairingListeners.add(callback);

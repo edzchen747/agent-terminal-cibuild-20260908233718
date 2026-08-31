@@ -24,6 +24,7 @@ import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shou
 import { effectiveDefaultShell } from "./defaultShell";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, SettingsIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
+import { backProjectId, resolveViewGeometry } from "./projectNavigation";
 
 type View = { type: "home" } | { type: "hosts" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
 const TERMINAL_FONT_WIDTH_KEY = "agent-terminal-font-width-percent";
@@ -111,8 +112,8 @@ export function App() {
   connectionRef.current = connection;
   const screenAwakeRef = useRef(true);
   const deviceSleepingRef = useRef(false);
-  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts, pairFromHome });
-  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts, pairFromHome };
+  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts, pairFromHome, snapshot });
+  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts, pairFromHome, snapshot };
   // The status and error message captured when the user leaves the hosts
   // page for the pairing screen, so pressing back restores the same screen
   // (the try-again screen with its original message when the hosts page was
@@ -193,11 +194,17 @@ export function App() {
         case "backFromPairing":
           backFromPairing();
           return;
-        case "navToProject":
+        case "navToProject": {
           // The action is only ever chosen for a terminal view; re-narrow here
-          // because the switch does not carry the policy's viewType guard.
-          if (navigation.view.type === "terminal") setView({ type: "project", projectId: navigation.view.projectId });
+          // because the switch does not carry the policy's viewType guard. The
+          // session may have been moved to another project by a cd in the
+          // shell, so back lands on the project it belongs to now.
+          const terminalView = navigation.view;
+          if (terminalView.type === "terminal") {
+            setView({ type: "project", projectId: backProjectId(navigation.snapshot, terminalView) });
+          }
           return;
+        }
         case "navToHome":
           setView({ type: "home" });
           return;
@@ -667,7 +674,11 @@ export function App() {
   }
 
   function navigateBack() {
-    if (view.type === "terminal") setView({ type: "project", projectId: view.projectId });
+    if (view.type === "terminal") {
+      // A cd in the shell can move the session to another project; land on
+      // the project it belongs to now instead of the one it was opened from.
+      setView({ type: "project", projectId: backProjectId(snapshot, view) });
+    }
     else if (view.type === "project") setView({ type: "home" });
     // The hosts page keeps the app status, so "home" lands on the home view
     // when connected and on the try-again screen when not.
@@ -761,11 +772,15 @@ export function App() {
   // The "hosts" case is unreachable here (the hosts branch returned above);
   // listing it keeps the union exhaustive for the type checker.
   const requestedProjectId = view.type === "home" || view.type === "hosts" ? selectedProjectId : view.projectId;
-  const activeProject = snapshot.projects.find((item) => item.id === requestedProjectId);
   const requestedSessionId = view.type === "terminal" ? view.sessionId : selectedSessionId;
-  const activeSession = snapshot.sessions.find((item) => item.id === requestedSessionId && (!activeProject || item.projectId === activeProject.id));
-  const pageCount = 1 + (activeProject ? 1 : 0) + (activeProject && activeSession ? 1 : 0);
-  const currentPage = Math.min(view.type === "terminal" ? 2 : view.type === "project" ? 1 : 0, pageCount - 1);
+  // A terminal view follows its session even when a cd in the shell moves it
+  // to another project: the phone stays attached, and the project shown (and
+  // navigated/backed into) is the one the session currently belongs to.
+  const { activeProject, activeSession, pageCount, currentPage } = resolveViewGeometry(snapshot, {
+    viewType: view.type,
+    requestedProjectId,
+    requestedSessionId
+  });
   const remoteStatus = registrationDisplayStatusFor(remoteRegistration.status, online);
   const remoteStatusLabel = REGISTRATION_STATUS_LABELS[remoteStatus];
 

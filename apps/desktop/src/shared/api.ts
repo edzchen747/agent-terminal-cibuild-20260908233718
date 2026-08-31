@@ -4,6 +4,7 @@ export interface DesktopState extends HostSnapshot {
   currentProjectId: string;
   openProjectsInNewWindows: boolean;
   confirmExternalLinks: boolean;
+  followWorkingDirectory: boolean;
   remoteRegistration: {
     status: "unregistered" | "pending" | "enrolled" | "failed" | "offline" | "unpaired";
     error?: string;
@@ -33,6 +34,7 @@ export interface DesktopApi {
   setDefaultShell(shellId: string): Promise<void>;
   setOpenProjectsInNewWindows(enabled: boolean): Promise<void>;
   setConfirmExternalLinks(enabled: boolean): Promise<void>;
+  setFollowWorkingDirectory(enabled: boolean): Promise<void>;
   selectShell(sessionId: string | null, shellId: string): Promise<TerminalSession | null>;
   onPairingSucceeded(callback: () => void): () => void;
   onState(callback: (state: DesktopState) => void): () => void;

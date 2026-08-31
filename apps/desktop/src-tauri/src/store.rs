@@ -42,6 +42,8 @@ pub struct Settings {
     pub open_projects_in_new_windows: bool,
     #[serde(default = "default_confirm_external_links")]
     pub confirm_external_links: bool,
+    #[serde(default = "default_follow_working_directory")]
+    pub follow_working_directory: bool,
 }
 
 fn default_open_projects_in_new_windows() -> bool {
@@ -49,6 +51,10 @@ fn default_open_projects_in_new_windows() -> bool {
 }
 
 fn default_confirm_external_links() -> bool {
+    true
+}
+
+fn default_follow_working_directory() -> bool {
     true
 }
 
@@ -296,6 +302,11 @@ impl DesktopStore {
         self.write()
     }
 
+    pub fn set_follow_working_directory(&mut self, enabled: bool) -> Result<()> {
+        self.state.settings.follow_working_directory = enabled;
+        self.write()
+    }
+
     fn write(&self) -> Result<()> {
         if let Some(parent) = self.file_path.parent() {
             fs::create_dir_all(parent)?;
@@ -328,6 +339,7 @@ fn default_state() -> StoredState {
             port: 47_831,
             open_projects_in_new_windows: true,
             confirm_external_links: true,
+            follow_working_directory: true,
         },
     }
 }
@@ -448,6 +460,64 @@ mod tests {
         assert!(reloaded.authenticate("phone-1", "durable-device-credential"));
         assert!(!reloaded.authenticate("phone-1", "wrong-credential"));
         fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn follow_working_directory_defaults_on_and_persists() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+
+        // A brand-new store enables the follow behavior by default.
+        let store = DesktopStore::load(state_path.clone()).expect("initial store");
+        assert!(store.settings().follow_working_directory);
+
+        // Disabling it is written to disk and survives a reload.
+        let mut store = store;
+        store
+            .set_follow_working_directory(false)
+            .expect("disable follow");
+        drop(store);
+        let reloaded = DesktopStore::load(state_path.clone()).expect("reloaded store");
+        assert!(!reloaded.settings().follow_working_directory);
+
+        // Legacy state files that predate the setting (no key present) must
+        // load with the default of `true` rather than failing to parse.
+        let legacy = serde_json::json!({
+            "host": { "id": "host-1", "name": "Workstation" },
+            "projects": [],
+            "devices": [],
+            "settings": { "defaultShellId": "powershell", "port": 47831 }
+        });
+        let legacy_path = test_root.join(format!("legacy-{}.json", Uuid::new_v4()));
+        fs::write(&legacy_path, serde_json::to_vec(&legacy).expect("serialize legacy")).expect("write legacy");
+        let legacy_store = DesktopStore::load(legacy_path.clone()).expect("load legacy state");
+        assert!(legacy_store.settings().follow_working_directory);
+
+        // A legacy file that already pinned the setting to `false` keeps it.
+        let explicit_off = serde_json::json!({
+            "host": { "id": "host-1", "name": "Workstation" },
+            "projects": [],
+            "devices": [],
+            "settings": { "defaultShellId": "powershell", "port": 47831, "followWorkingDirectory": false }
+        });
+        let explicit_path = test_root.join(format!("off-{}.json", Uuid::new_v4()));
+        fs::write(&explicit_path, serde_json::to_vec(&explicit_off).expect("serialize")).expect("write");
+        let explicit_store = DesktopStore::load(explicit_path.clone()).expect("load explicit-off state");
+        assert!(!explicit_store.settings().follow_working_directory);
+
+        // Re-enabling persists just like disabling does.
+        let mut store = DesktopStore::load(state_path.clone()).expect("reloaded store");
+        store.set_follow_working_directory(true).expect("re-enable follow");
+        drop(store);
+        let reenabled = DesktopStore::load(state_path.clone()).expect("final reload");
+        assert!(reenabled.settings().follow_working_directory);
+
+        fs::remove_file(state_path).expect("remove test state");
+        fs::remove_file(legacy_path).expect("remove legacy test state");
+        fs::remove_file(explicit_path).expect("remove explicit-off test state");
     }
 
     #[test]
