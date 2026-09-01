@@ -1006,7 +1006,7 @@ impl Core {
             WebviewWindowBuilder::new(&self.app, &label, WebviewUrl::App("index.html".into()))
                 .title(format!("{} — Agent Terminal", project.name))
                 .inner_size(1320.0, 820.0)
-                .min_inner_size(840.0, 560.0)
+                .min_inner_size(680.0, 560.0)
                 .visible(false)
                 .build();
         let window = match built {
@@ -1102,7 +1102,7 @@ impl Core {
             WebviewWindowBuilder::new(&self.app, &label, WebviewUrl::App("index.html".into()))
                 .title(format!("{} — Agent Terminal", project.name))
                 .inner_size(1320.0, 820.0)
-                .min_inner_size(840.0, 560.0)
+                .min_inner_size(680.0, 560.0)
                 .visible(focus)
                 .build();
         let window = match built {

@@ -3,6 +3,43 @@ export interface SidebarPreferences {
   autoCollapse: boolean;
 }
 
+/**
+ * Window width (CSS px) at or below which the project sidebar becomes an
+ * overlay drawer instead of taking flex space. Must stay in sync with the
+ * 900px media query in styles.css.
+ */
+export const NARROW_SIDEBAR_WIDTH = 900;
+
+/** Whether a given window width is in the narrow overlay-drawer layout. */
+export function isNarrowLayout(width: number): boolean {
+  return width <= NARROW_SIDEBAR_WIDTH;
+}
+
+/**
+ * The narrow layout implicitly enables auto-collapse so the terminal keeps
+ * the full width, regardless of the saved preference.
+ */
+export function effectiveAutoCollapse(setting: boolean, narrow: boolean): boolean {
+  return setting || narrow;
+}
+
+/**
+ * Entering the narrow layout implicitly enables auto-collapse, so an
+ * already-open sidebar collapses and the terminal gets the space back. Widen
+ * the window and the sidebar stays in whatever state it was in.
+ */
+export function sidebarOpenAfterNarrowLayout(open: boolean, narrow: boolean): boolean {
+  return narrow ? false : open;
+}
+
+/**
+ * Turning auto-collapse back off reopens the sidebar so the user can see
+ * that it is visible again. Turning it on leaves the sidebar as-is.
+ */
+export function sidebarOpenAfterAutoCollapseToggle(open: boolean, autoCollapse: boolean): boolean {
+  return autoCollapse ? open : true;
+}
+
 const STORAGE_KEY = "agent-terminal.desktop.sidebar.v1";
 const DEFAULT_PREFERENCES: SidebarPreferences = { autoCollapse: true };
 
@@ -32,9 +69,12 @@ export function saveSidebarPreferences(preferences: SidebarPreferences): void {
  * add-project controls, drag handles, and rename buttons) leave it open.
  * Clicks on the sidebar toggle itself are the user's explicit control of the
  * state, so the auto-collapse never fights them.
+ * The rename-project overlay is presented as part of the project sidebar
+ * flow, so clicks anywhere on it (its form or backdrop) never collapse the
+ * sidebar either.
  */
-export function shouldCollapseSidebar(open: boolean, autoCollapse: boolean, inside: boolean, isProject: boolean, isToggle = false): boolean {
-  if (isToggle) return false;
+export function shouldCollapseSidebar(open: boolean, autoCollapse: boolean, inside: boolean, isProject: boolean, isToggle = false, inProjectOverlay = false): boolean {
+  if (isToggle || inProjectOverlay) return false;
   if (!open || !autoCollapse) return false;
   return !inside || isProject;
 }

@@ -7,7 +7,7 @@ import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, Mor
 import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
 import type { SplitGroup, SplitLayout } from "./split-tabs";
 import { deviceListEntryModal, nextModalAfterPairing, nextModalOnEscape, pairModalEscapeTarget, type Modal } from "./modal-navigation";
-import { loadSidebarPreferences, saveSidebarPreferences, shouldCollapseSidebar } from "./sidebar";
+import { effectiveAutoCollapse, isNarrowLayout, loadSidebarPreferences, NARROW_SIDEBAR_WIDTH, saveSidebarPreferences, sidebarOpenAfterAutoCollapseToggle, sidebarOpenAfterNarrowLayout, shouldCollapseSidebar } from "./sidebar";
 import { TerminalPane } from "./TerminalPane";
 
 interface TabDragState {
@@ -65,6 +65,7 @@ export function App() {
   const [splitDropSide, setSplitDropSide] = useState<SplitDropSide>(null);
   const [resizingSplitId, setResizingSplitId] = useState<string | null>(null);
   const [autoCollapseSidebar, setAutoCollapseSidebar] = useState(() => loadSidebarPreferences().autoCollapse);
+  const [narrowLayout, setNarrowLayout] = useState(() => isNarrowLayout(window.innerWidth));
   const tabDragRef = useRef<TabDragState | null>(null);
   const tabElementsRef = useRef(new Map<string, HTMLButtonElement>());
   const pendingTabPositionsRef = useRef<Map<string, number> | null>(null);
@@ -104,18 +105,43 @@ export function App() {
     saveSidebarPreferences({ autoCollapse: autoCollapseSidebar });
   }, [autoCollapseSidebar]);
 
+  // Below the narrow threshold the project sidebar becomes an overlay drawer, so the
+  // auto-collapse behavior is implicitly enabled there regardless of the saved
+  // preference. This threshold must stay in sync with the CSS overlay breakpoint
+  // in styles.css (NARROW_SIDEBAR_WIDTH).
   useEffect(() => {
-    if (!sidebarOpen || !autoCollapseSidebar) return;
+    const query = window.matchMedia(`(max-width: ${NARROW_SIDEBAR_WIDTH}px)`);
+    const apply = () => setNarrowLayout(query.matches);
+    query.addEventListener("change", apply);
+    return () => query.removeEventListener("change", apply);
+  }, []);
+  const autoCollapseEffective = effectiveAutoCollapse(autoCollapseSidebar, narrowLayout);
+
+  // Entering the narrow layout implicitly enables auto-collapse; collapse an
+  // already-open sidebar so the terminal instantly gets the space back and the
+  // sidebar then behaves as the overlay drawer.
+  useEffect(() => {
+    setSidebarOpen((open) => sidebarOpenAfterNarrowLayout(open, narrowLayout));
+  }, [narrowLayout]);
+
+  useEffect(() => {
+    if (!sidebarOpen || !autoCollapseEffective) return;
     const handleClick = (event: MouseEvent) => {
       const target = event.target instanceof Element ? event.target : event.target instanceof Node ? event.target.parentElement : null;
       const inside = sidebarRef.current?.contains(target) ?? false;
       const isProject = Boolean(target && inside && target.closest(".project-item"));
       const isToggle = Boolean(target?.closest(".title-action"));
-      if (shouldCollapseSidebar(sidebarOpen, autoCollapseSidebar, inside, isProject, isToggle)) setSidebarOpen(false);
+      // The rename-project overlay belongs to the project sidebar flow, so
+      // clicks on it must not count as outside the sidebar. The state check
+      // covers normal clicks while the overlay is open; the DOM check covers
+      // the click that closes the overlay, when the state update may not have
+      // reached this listener yet (closest() still walks the detached form).
+      const inProjectOverlay = modal === "rename" || Boolean(target?.closest(".rename-modal"));
+      if (shouldCollapseSidebar(sidebarOpen, autoCollapseEffective, inside, isProject, isToggle, inProjectOverlay)) setSidebarOpen(false);
     };
     document.addEventListener("click", handleClick);
     return () => document.removeEventListener("click", handleClick);
-  }, [sidebarOpen, autoCollapseSidebar]);
+  }, [sidebarOpen, autoCollapseEffective, modal]);
 
   const currentProject = state?.projects.find((project) => project.id === state.currentProjectId);
   const unorderedProjectSessions = useMemo(
@@ -840,7 +866,7 @@ export function App() {
         <label className="settings-row settings-toggle"><span><strong>Move tabs to the matching project</strong><small>Turn off to keep a terminal tab in its current project even when the folder changes</small></span><input type="checkbox" checked={state.followWorkingDirectory} onChange={(event) => void window.agentTerminal.setFollowWorkingDirectory(event.target.checked)} /><i /></label>
         <label className="settings-row settings-toggle"><span><strong>Warn before opening external links</strong><small>Ask for confirmation before sending terminal links to your browser</small></span><input type="checkbox" checked={state.confirmExternalLinks} onChange={(event) => void window.agentTerminal.setConfirmExternalLinks(event.target.checked)} /><i /></label>
         <label className="settings-row settings-toggle"><span><strong>Drag tabs to split</strong><small>Drop a tab on the left or right edge of the terminal</small></span><input type="checkbox" checked={allowSplitEdgeDrop} onChange={(event) => setAllowSplitEdgeDrop(event.target.checked)} /><i /></label>
-        <label className="settings-row settings-toggle"><span><strong>Auto collapse project sidebar</strong><small>Collapse the project list when you click elsewhere or open a project</small></span><input type="checkbox" checked={autoCollapseSidebar} onChange={(event) => setAutoCollapseSidebar(event.target.checked)} /><i /></label>
+        <label className="settings-row settings-toggle"><span><strong>Auto collapse project sidebar</strong><small>Collapse the project list when you click elsewhere or open a project</small></span><input type="checkbox" checked={autoCollapseSidebar} onChange={(event) => { const next = event.target.checked; setAutoCollapseSidebar(next); setSidebarOpen((open) => sidebarOpenAfterAutoCollapseToggle(open, next)); }} /><i /></label>
       </section></div>}
 
       {modal === "devices" && <div className="modal-backdrop" onMouseDown={() => setModal(null)}><section className="modal devices-modal" onMouseDown={(event) => event.stopPropagation()}>

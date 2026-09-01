@@ -39,11 +39,11 @@ button { color: inherit; }
 .icon-button.small { width: 27px; height: 27px; }
 .icon-button.small svg { width: 15px; }
 .workspace { min-height: 0; display: flex; }
-.sidebar { width: 252px; flex: 0 0 252px; display: flex; flex-direction: column; background: #0d1016; border-right: 1px solid #20242e; transition: width .18s ease, flex-basis .18s ease, opacity .12s; overflow: hidden; }
+.sidebar { width: 252px; flex: 0 0 252px; display: flex; flex-direction: column; background: #0d1016; border-right: 1px solid #20242e; transition: width .18s ease, flex-basis .18s ease, opacity .12s ease, transform .18s ease; overflow: hidden; }
 .sidebar.is-collapsed { width: 0; flex-basis: 0; opacity: 0; }
 .sidebar-heading { min-width: 251px; height: 51px; padding: 0 12px 0 17px; display: flex; align-items: center; justify-content: space-between; color: #717989; font-size: 11px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; }
-.project-list { flex: 1; padding: 0 8px; overflow-y: auto; }
-.project-item { width: 100%; min-width: 235px; height: 58px; margin-bottom: 3px; padding: 0 7px 0 10px; display: grid; grid-template-columns: 32px 1fr 66px; align-items: center; position: relative; text-align: left; border: 1px solid transparent; border-radius: 9px; background: transparent; cursor: pointer; transition: transform .14s cubic-bezier(.2,.8,.2,1), background .12s ease; }
+.project-list { flex: 1; padding: 0 8px; overflow-y: auto; overflow-x: hidden; }
+.project-item { width: 100%; min-width: 0; height: 58px; margin-bottom: 3px; padding: 0 7px 0 10px; display: grid; grid-template-columns: 32px 1fr 66px; align-items: center; position: relative; text-align: left; border: 1px solid transparent; border-radius: 9px; background: transparent; cursor: pointer; transition: transform .14s cubic-bezier(.2,.8,.2,1), background .12s ease; }
 .project-item.is-dragging { z-index: 3; border-color: #3c6259; background: #1b2825; box-shadow: 0 9px 24px #0008; transition: none; }
 .project-item:hover { background: #141821; }
 .project-item.active { background: #19221f; border-color: #263a35; }
@@ -230,4 +230,5 @@ button { color: inherit; }
 .boot { gap: 10px; font-size: 12px; }
 .boot svg { color: #78d9c4; }
 @media (max-width: 1100px) { .remote-registration-inline > span { display: none; } }
-@media (max-width: 900px) { .host-online:not(.is-failed) { display: none; } .sidebar { width: 220px; flex-basis: 220px; } }
+/* Narrow layout: the sidebar becomes a drawer that overlays the terminal instead of taking 252px of flex space, so the terminal keeps the full width. Auto-collapse is implicitly enabled below this width (see App.tsx). Keep this 900px threshold in sync with the matchMedia query in App.tsx. */
+@media (max-width: 900px) { .host-online:not(.is-failed) { display: none; } .workspace { position: relative; } .sidebar { position: absolute; top: 0; left: 0; bottom: 0; z-index: 15; flex: none; width: 252px; box-shadow: 14px 0 34px #0009; } .sidebar.is-collapsed { width: 252px; opacity: 0; transform: translateX(-100%); pointer-events: none; } }
