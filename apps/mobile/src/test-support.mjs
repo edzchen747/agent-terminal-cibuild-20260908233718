@@ -27,7 +27,13 @@ globalThis.window = {
     setItem: (key, value) => storage.set(key, String(value)),
     removeItem: (key) => storage.delete(key),
     clear: () => storage.clear()
-  }
+  },
+  // The connection layer drives its socket timeouts through the platform
+  // timer globals; route them at the real ones so that path is testable.
+  setTimeout: (...args) => globalThis.setTimeout(...args),
+  clearTimeout: (...args) => globalThis.clearTimeout(...args),
+  setInterval: (...args) => globalThis.setInterval(...args),
+  clearInterval: (...args) => globalThis.clearInterval(...args)
 };
 
 registerHooks({
@@ -56,4 +62,13 @@ export function breakStorage() {
     throw new Error("storage unavailable");
   };
   return () => { window.localStorage.getItem = original; };
+}
+
+/** Simulates a storage outage on key removal; returns a function that restores it. */
+export function breakStorageRemove() {
+  const original = window.localStorage.removeItem;
+  window.localStorage.removeItem = () => {
+    throw new Error("storage unavailable");
+  };
+  return () => { window.localStorage.removeItem = original; };
 }

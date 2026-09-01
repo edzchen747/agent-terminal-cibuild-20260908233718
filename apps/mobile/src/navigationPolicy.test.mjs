@@ -11,7 +11,8 @@ const connected = (viewType) => ({
   hasCloseSessionSheet: false,
   showCreateProject: false,
   pairFromHosts: false,
-  pairFromHome: false
+  pairFromHome: false,
+  hostsEmpty: false
 });
 
 // ---- Back navigation on a connected desktop --------------------------------
@@ -30,6 +31,31 @@ test("back on the home view exits the app", () => {
 
 test("back on the hosts page returns to the home view", () => {
   assert.equal(backButtonAction(connected("hosts")), "navToHome");
+});
+
+test("back on a hosts page with no paired desktops opens the pairing screen", () => {
+  // With a loaded, empty list there is no useful back target: retrying with
+  // no saved desktops would just reload the app into pairing, and the home
+  // view is unreachable without a connection.
+  const state = connected("hosts");
+  state.hostsEmpty = true;
+  assert.equal(backButtonAction(state), "pairFromHosts");
+});
+
+test("back on an empty hosts page reached from the try-again screen opens the pairing screen", () => {
+  const state = connected("hosts");
+  state.status = "error";
+  state.hostsEmpty = true;
+  assert.equal(backButtonAction(state), "pairFromHosts");
+});
+
+test("hostsEmpty only affects the hosts view", () => {
+  const home = connected("home");
+  home.hostsEmpty = true;
+  assert.equal(backButtonAction(home), "exitApp");
+  const withHosts = connected("hosts");
+  withHosts.status = "error";
+  assert.equal(backButtonAction(withHosts), "navToHome");
 });
 
 // ---- Sheet precedence --------------------------------------------------------
@@ -235,7 +261,8 @@ test("every combination of status, view, and overlay satisfies the back-key spec
   //  2. on the pairing screen reached from the hosts page or the home
   //     bottom nav, with no sheet, back restores the originating page;
   //  3. the hosts page reached from the try-again screen (error status)
-  //     returns there;
+  //     returns there; with a loaded, empty list back opens the pairing
+  //     screen instead (in both the error and connected cases);
   //  4. every other non-connected state ignores back;
   //  5. connected: terminal -> project, project/hosts -> home, home -> exit.
   const spec = (state) => {
@@ -246,11 +273,12 @@ test("every combination of status, view, and overlay satisfies the back-key spec
     if (state.showCreateProject) return "closeCreateProject";
     if (state.status === "pairing" && (state.pairFromHosts || state.pairFromHome)) return "backFromPairing";
     if (state.status !== "connected") {
-      if (state.status === "error" && state.viewType === "hosts") return "navToHome";
+      if (state.status === "error" && state.viewType === "hosts") return state.hostsEmpty ? "pairFromHosts" : "navToHome";
       return "ignore";
     }
     if (state.viewType === "terminal") return "navToProject";
-    if (state.viewType === "project" || state.viewType === "hosts") return "navToHome";
+    if (state.viewType === "hosts") return state.hostsEmpty ? "pairFromHosts" : "navToHome";
+    if (state.viewType === "project") return "navToHome";
     return "exitApp";
   };
   const sheetOpen = (state) => state.showTerminalSettings || state.showSettings || state.hasRenameSheet || state.hasCloseSessionSheet || state.showCreateProject;
@@ -259,35 +287,47 @@ test("every combination of status, view, and overlay satisfies the back-key spec
       for (let mask = 0; mask < 32; mask += 1) {
         for (const pairFromHosts of [false, true]) {
           for (const pairFromHome of [false, true]) {
-            const state = {
-              status,
-              viewType,
-              showTerminalSettings: Boolean(mask & 1),
-              showSettings: Boolean(mask & 2),
-              hasRenameSheet: Boolean(mask & 4),
-              hasCloseSessionSheet: Boolean(mask & 8),
-              showCreateProject: Boolean(mask & 16),
-              pairFromHosts,
-              pairFromHome
-            };
-            assert.equal(backButtonAction(state), spec(state));
-            // exitApp is reachable only from the connected home view, no overlays.
-            if (backButtonAction(state) === "exitApp") {
-              assert.equal(status, "connected");
-              assert.equal(viewType, "home");
-              assert.equal(sheetOpen(state), false);
-            }
-            // backFromPairing is reachable only from the pairing screen
-            // reached from the hosts page or the home bottom nav, with no
-            // overlays, in any retained view.
-            if (backButtonAction(state) === "backFromPairing") {
-              assert.equal(status, "pairing");
-              assert.ok(pairFromHosts || pairFromHome);
-              assert.equal(sheetOpen(state), false);
-            }
-            // The flags must never leak into a connected or non-pairing state.
-            if ((pairFromHosts || pairFromHome) && (status !== "pairing" || sheetOpen(state))) {
-              assert.notEqual(backButtonAction(state), "backFromPairing");
+            for (const hostsEmpty of [false, true]) {
+              const state = {
+                status,
+                viewType,
+                showTerminalSettings: Boolean(mask & 1),
+                showSettings: Boolean(mask & 2),
+                hasRenameSheet: Boolean(mask & 4),
+                hasCloseSessionSheet: Boolean(mask & 8),
+                showCreateProject: Boolean(mask & 16),
+                pairFromHosts,
+                pairFromHome,
+                hostsEmpty
+              };
+              assert.equal(backButtonAction(state), spec(state), JSON.stringify(state));
+              // exitApp is reachable only from the connected home view, no overlays.
+              if (backButtonAction(state) === "exitApp") {
+                assert.equal(status, "connected");
+                assert.equal(viewType, "home");
+                assert.equal(sheetOpen(state), false);
+              }
+              // backFromPairing is reachable only from the pairing screen
+              // reached from the hosts page or the home bottom nav, with no
+              // overlays, in any retained view.
+              if (backButtonAction(state) === "backFromPairing") {
+                assert.equal(status, "pairing");
+                assert.ok(pairFromHosts || pairFromHome);
+                assert.equal(sheetOpen(state), false);
+              }
+              // pairFromHosts is reachable only on a hosts view with a
+              // loaded, empty list and no overlays, in the statuses where the
+              // hosts view is reachable (connected, or the try-again error).
+              if (backButtonAction(state) === "pairFromHosts") {
+                assert.equal(viewType, "hosts");
+                assert.equal(hostsEmpty, true);
+                assert.equal(sheetOpen(state), false);
+                assert.ok(status === "connected" || status === "error");
+              }
+              // The flags must never leak into a connected or non-pairing state.
+              if ((pairFromHosts || pairFromHome) && (status !== "pairing" || sheetOpen(state))) {
+                assert.notEqual(backButtonAction(state), "backFromPairing");
+              }
             }
           }
         }

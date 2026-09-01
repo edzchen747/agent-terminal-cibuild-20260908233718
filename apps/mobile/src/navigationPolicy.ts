@@ -23,6 +23,8 @@ export interface BackNavigationState {
   pairFromHosts: boolean;
   /** The user reached the pairing screen from the home view's bottom nav. */
   pairFromHome: boolean;
+  /** The hosts page finished loading and has no paired desktops. */
+  hostsEmpty: boolean;
 }
 
 export type BackAction =
@@ -32,6 +34,7 @@ export type BackAction =
   | "closeSessionSheet"
   | "closeCreateProject"
   | "backFromPairing"
+  | "pairFromHosts"
   | "navToProject"
   | "navToHome"
   | "exitApp"
@@ -55,12 +58,24 @@ export function backButtonAction(state: BackNavigationState): BackAction {
     // The hosts page is also reachable from the try-again screen; back leaves
     // it, the view resets, and the unchanged error status re-lands the user
     // on the try-again screen.
-    if (state.status === "error" && state.viewType === "hosts") return "navToHome";
+    if (state.status === "error" && state.viewType === "hosts") return hostsPageBackAction(state);
     return "ignore";
   }
   if (state.viewType === "terminal") return "navToProject";
-  if (state.viewType === "project" || state.viewType === "hosts") return "navToHome";
+  if (state.viewType === "hosts") return hostsPageBackAction(state);
+  if (state.viewType === "project") return "navToHome";
   return "exitApp";
+}
+
+/**
+ * Back on the hosts page: with a loaded, empty list there is no useful back
+ * target - the try-again screen's "Try again" would just reload the app into
+ * pairing with no saved desktop, and the home view is unreachable without a
+ * connection - so the pairing screen opens instead. With any desktops
+ * listed, back leaves the page for the home view / try-again screen.
+ */
+function hostsPageBackAction(state: BackNavigationState): BackAction {
+  return state.hostsEmpty ? "pairFromHosts" : "navToHome";
 }
 
 // ---- Back from the pairing screen: restoring the originating state --------

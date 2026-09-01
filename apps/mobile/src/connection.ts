@@ -160,6 +160,9 @@ export class HostConnection {
    * Removes a previously paired desktop and returns the remaining list. If
    * the removed entry was the launch default, the default is repointed to
    * the most recently connected survivor, or dropped when none remain.
+   * The promise resolves as soon as the list and default are persisted, so
+   * the hosts page can await it on the delete path; the node's unpairing
+   * cleanup runs on (best-effort) afterwards, off that critical path.
    */
   static async removeSavedHostRecord(id: string): Promise<SavedHostRecord[]> {
     const records = await this.savedHostRecords();
@@ -701,7 +704,7 @@ export class HostConnection {
         if (opened || settled) return;
         window.clearTimeout(timeout);
         settled = true;
-        reject(new Error("Could not reach the desktop host."));
+        reject(new Error("Could not reach the desktop host. Connect both devices to the same WiFi network with internet access."));
       };
       socket.onclose = () => {
         window.clearTimeout(timeout);

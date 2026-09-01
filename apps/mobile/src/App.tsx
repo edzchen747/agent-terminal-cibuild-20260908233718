@@ -112,8 +112,8 @@ export function App() {
   connectionRef.current = connection;
   const screenAwakeRef = useRef(true);
   const deviceSleepingRef = useRef(false);
-  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts, pairFromHome, snapshot });
-  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts, pairFromHome, snapshot };
+  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts, pairFromHome, snapshot, hostsEmpty: false });
+  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts, pairFromHome, snapshot, hostsEmpty: hostsLoaded && hostRecords.length === 0 };
   // The status and error message captured when the user leaves the hosts
   // page for the pairing screen, so pressing back restores the same screen
   // (the try-again screen with its original message when the hosts page was
@@ -128,6 +128,14 @@ export function App() {
   // Same hold for the bottom-nav path.
   const pairFromHomeRef = useRef(false);
   pairFromHomeRef.current = pairFromHome;
+  // Live status/error for enterPairFromHosts, which the Android back-key
+  // listener (registered once on mount) can reach with a stale closure:
+  // the pre-pair capture must see the status the hosts page is showing,
+  // not the first render's "loading".
+  const statusRef = useRef(status);
+  statusRef.current = status;
+  const errorRef = useRef(error);
+  errorRef.current = error;
   const projectDragRef = useRef<ProjectDragState | null>(null);
   const projectElementsRef = useRef(new Map<string, HTMLElement>());
   const swipeRef = useRef<SwipeState | null>(null);
@@ -174,7 +182,8 @@ export function App() {
         hasCloseSessionSheet: navigation.sessionToClose !== null,
         showCreateProject: navigation.showCreateProject,
         pairFromHosts: navigation.pairFromHosts,
-        pairFromHome: navigation.pairFromHome
+        pairFromHome: navigation.pairFromHome,
+        hostsEmpty: navigation.hostsEmpty
       })) {
         case "closeTerminalSettings":
           setShowTerminalSettings(false);
@@ -193,6 +202,12 @@ export function App() {
           return;
         case "backFromPairing":
           backFromPairing();
+          return;
+        case "pairFromHosts":
+          // The hosts page loaded with no paired desktops: open the pairing
+          // screen (its back button restores the hosts page via the
+          // pairFromHosts flag).
+          enterPairFromHosts();
           return;
         case "navToProject": {
           // The action is only ever chosen for a terminal view; re-narrow here
@@ -579,8 +594,11 @@ export function App() {
   // failed pairing), and no record changes happen on the way in: a pairing
   // only commits when it succeeds (HostConnection.pair).
   function enterPairFromHosts() {
-    prePairStatusRef.current = status === "error" ? "error" : "connected";
-    prePairErrorRef.current = error;
+    // status/error are read through refs: this function is reachable from
+    // the mount-time back-key listener, whose closure would otherwise hold
+    // the first render's status.
+    prePairStatusRef.current = statusRef.current === "error" ? "error" : "connected";
+    prePairErrorRef.current = errorRef.current;
     setError("");
     setPairFromHosts(true);
     setStatus("pairing");
@@ -681,8 +699,14 @@ export function App() {
     }
     else if (view.type === "project") setView({ type: "home" });
     // The hosts page keeps the app status, so "home" lands on the home view
-    // when connected and on the try-again screen when not.
-    else if (view.type === "hosts") setView({ type: "home" });
+    // when connected and on the try-again screen when not. With a loaded,
+    // empty list there is no useful back target - retrying with no saved
+    // desktops would just reload the app into pairing - so back opens the
+    // pairing screen instead; its own back button restores the hosts page.
+    else if (view.type === "hosts") {
+      if (hostsLoaded && hostRecords.length === 0) enterPairFromHosts();
+      else setView({ type: "home" });
+    }
   }
 
   function beginProjectDrag(event: ReactPointerEvent<HTMLElement>, projectId: string, index: number) {

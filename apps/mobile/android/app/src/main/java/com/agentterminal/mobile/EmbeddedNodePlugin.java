@@ -15,8 +15,10 @@ import android.util.Log;
 import java.io.File;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -25,8 +27,23 @@ import org.json.JSONObject;
 
 /**
  * Process-isolated bridge for the signed embedded node shipped in a release.
- * Development APKs can omit the optional executable; the web layer then uses
- * the embedded node is unavailable after retaining the same node identity.
+ * Development APKs can omit the optional executable; the web layer then
+ * reports the embedded node is unavailable while retaining the same node
+ * identity.
+ *
+ * Threading: Capacitor serializes every plugin method - including the
+ * Preferences calls the hosts page relies on for its delete path - on one
+ * shared plugin thread. The blocking lifecycle work here (spawning a node
+ * process, polling its status for up to 30 seconds, waiting up to two
+ * seconds for a process to exit) must therefore never run on that thread: a
+ * hosts-page registration check starts an engine per registered desktop,
+ * and while any of them is coming up a delete's Preferences round-trips
+ * queue behind it, leaving the deleted row on screen until the engines
+ * drain. start and stop instead hand their blocking work to a single
+ * dedicated lifecycle thread - which still serializes the engine's own
+ * start/stop - and return to the plugin thread immediately; the pending
+ * call is resolved from that thread, which the bridge marshals back to the
+ * WebView.
  */
 @CapacitorPlugin(name = "EmbeddedNode")
 public class EmbeddedNodePlugin extends Plugin {
@@ -34,19 +51,29 @@ public class EmbeddedNodePlugin extends Plugin {
     // One process-isolated tsnet node per paired desktop. Each process owns
     // its own state directory (and therefore node identity); the map lets
     // several hosts' nodes run side by side (e.g. hosts-page registration
-    // checks) without ever restarting the live host's node.
-    private final Map<File, Process> nodeProcesses = new HashMap<>();
+    // checks) without ever restarting the live host's node. Concurrent
+    // because the lifecycle executor, the watcher thread, and teardown all
+    // touch it without a shared lock.
+    private final Map<File, Process> nodeProcesses = new ConcurrentHashMap<>();
     private final ExecutorService processWatcher = Executors.newSingleThreadExecutor();
+    // All blocking lifecycle work runs on this one dedicated thread, so a
+    // start can never preempt another start or a stop while the shared
+    // Capacitor plugin thread stays free for the app's other plugin calls.
+    private final ExecutorService nodeLifecycle = Executors.newSingleThreadExecutor();
 
     @PluginMethod
-    public synchronized void start(PluginCall call) {
-        String controlUrl = call.getString("controlUrl");
-        String privateKey = call.getString("privateKey");
-        String nodeId = call.getString("nodeId");
-        String remoteEndpoint = call.getString("remoteEndpoint");
-        String authKey = call.getString("authKey");
-        String stateKey = call.getString("stateKey");
-        boolean hasAuthKey = authKey != null && !authKey.isEmpty();
+    public void start(PluginCall call) {
+        final String controlUrl = call.getString("controlUrl");
+        final String privateKey = call.getString("privateKey");
+        final String nodeId = call.getString("nodeId");
+        final String remoteEndpoint = call.getString("remoteEndpoint");
+        final String authKey = call.getString("authKey");
+        final String stateKey = call.getString("stateKey");
+        final boolean hasAuthKey = authKey != null && !authKey.isEmpty();
+        nodeLifecycle.execute(() -> doStart(call, controlUrl, privateKey, nodeId, remoteEndpoint, authKey, hasAuthKey, stateKey));
+    }
+
+    private void doStart(PluginCall call, String controlUrl, String privateKey, String nodeId, String remoteEndpoint, String authKey, boolean hasAuthKey, String stateKey) {
         File stateDir = stateDirFor(stateKey);
         Log.i(TAG, "start requested: control=" + (controlUrl == null ? "null" : controlUrl) + " remote=" + (remoteEndpoint == null ? "null" : remoteEndpoint) + " authKey=" + (hasAuthKey ? "present" : "EMPTY") + " nodeId=" + (nodeId == null ? "null" : nodeId) + " stateDir=" + stateDir.getName());
         File executable = bundledExecutable();
@@ -57,7 +84,7 @@ public class EmbeddedNodePlugin extends Plugin {
             return;
         }
         if (!executable.canExecute()) {
-            Log.e(TAG, "embedded node executable not executable at " + executable.getAbsolutePath());
+            Log.e(TAG, "embedded node engine not executable at " + executable.getAbsolutePath());
             call.reject("The embedded node engine is not executable in this build.");
             return;
         }
@@ -126,6 +153,9 @@ public class EmbeddedNodePlugin extends Plugin {
             nodeProcesses.put(stateDir, process);
             Log.i(TAG, "node process started " + process + " stateDir=" + stateDir.getName() + " remote=" + remoteHost + ":" + remotePort + " dns=" + dnsServers);
             watchProcess(process, stateDir);
+            // Polling for the node's status can take up to 30 seconds; it
+            // runs on the lifecycle thread, so the shared plugin thread is
+            // free to serve the app's other plugin calls while we wait.
             JSObject result = readStatus(stateDir, nodeId);
             if (rejectForStatus(call, result)) {
                 logStatus(result);
@@ -153,17 +183,19 @@ public class EmbeddedNodePlugin extends Plugin {
     }
 
     @PluginMethod
-    public synchronized void stop(PluginCall call) {
-        String stateKey = call.getString("stateKey");
-        if (stateKey == null || stateKey.isEmpty()) {
-            stopAllNodeProcesses();
-        } else {
-            // Only the host's own node is stopped, so background checks can
-            // tear down the node they started without touching the live
-            // connection's node.
-            stopNodeProcess(stateDirFor(stateKey));
-        }
-        call.resolve();
+    public void stop(PluginCall call) {
+        final String stateKey = call.getString("stateKey");
+        nodeLifecycle.execute(() -> {
+            if (stateKey == null || stateKey.isEmpty()) {
+                stopAllNodeProcesses();
+            } else {
+                // Only the host's own node is stopped, so background checks can
+                // tear down the node they started without touching the live
+                // connection's node.
+                stopNodeProcess(stateDirFor(stateKey));
+            }
+            call.resolve();
+        });
     }
 
     private void stopNodeProcess(File stateDir) {
@@ -172,7 +204,7 @@ public class EmbeddedNodePlugin extends Plugin {
     }
 
     private void stopAllNodeProcesses() {
-        for (File stateDir : new HashMap<>(nodeProcesses).keySet()) destroyNodeProcess(stateDir);
+        for (File stateDir : new ArrayList<>(nodeProcesses.keySet())) destroyNodeProcess(stateDir);
     }
 
     private void destroyNodeProcess(File stateDir) {
@@ -199,9 +231,10 @@ public class EmbeddedNodePlugin extends Plugin {
                 Thread.currentThread().interrupt();
                 return;
             }
-            synchronized (EmbeddedNodePlugin.this) {
-                if (nodeProcesses.get(stateDir) == process) nodeProcesses.remove(stateDir);
-            }
+            // Only clear the entry if this process is still the one tracked
+            // for the state directory; a replacement process started in the
+            // meantime keeps its own entry.
+            nodeProcesses.remove(stateDir, process);
             Log.i(TAG, "node process exited exit=" + process.exitValue());
         });
     }
@@ -217,10 +250,19 @@ public class EmbeddedNodePlugin extends Plugin {
     }
 
     @Override
-    protected synchronized void handleOnDestroy() {
+    protected void handleOnDestroy() {
         Log.i(TAG, "bridge destroyed; stopping node processes");
-        stopAllNodeProcesses();
+        // Stop without waiting: the bridge is going away, so teardown must
+        // not block on a process exit. Orphaned node processes are
+        // acceptable here; they stay in the relay until inactivity expiry,
+        // the same as an unpaired host's node.
+        List<Process> processes = new ArrayList<>(nodeProcesses.values());
+        nodeProcesses.clear();
+        for (Process process : processes) {
+            process.destroy();
+        }
         processWatcher.shutdownNow();
+        nodeLifecycle.shutdownNow();
         super.handleOnDestroy();
     }
 
@@ -232,8 +274,8 @@ public class EmbeddedNodePlugin extends Plugin {
      * One tsnet state directory per paired desktop. The state directory is
      * where tsnet persists the node key, so this is what makes every host
      * keep its own phone-side node (enrolled under that host's Headscale
-     * user) instead of sharing one identity that can only ever belong to a
-     * single pairing group. The legacy shared directory is kept as the
+     * user) instead of sharing one identity that can only ever belong to
+     * one pairing group. The legacy shared directory is kept as the
      * fallback so an old web layer still works.
      */
     private File stateDirFor(String stateKey) {
@@ -271,10 +313,10 @@ public class EmbeddedNodePlugin extends Plugin {
                     result.put("nodeId", json.optString("nodeId", nodeId));
                     result.put("tailnetAddress", json.optString("tailnetAddress", null));
                     String errorCode = json.optString("errorCode", "");
-                    String errorMessage = json.optString("errorMessage", "");
-                    String errorDetail = json.optString("errorDetail", "");
                     if (!errorCode.isEmpty()) result.put("errorCode", errorCode);
+                    String errorMessage = json.optString("errorMessage", "");
                     if (!errorMessage.isEmpty()) result.put("errorMessage", errorMessage);
+                    String errorDetail = json.optString("errorDetail", "");
                     if (!errorDetail.isEmpty()) result.put("errorDetail", errorDetail);
                     String proxyAddress = json.optString("proxyAddress", "");
                     if (!proxyAddress.isEmpty()) {

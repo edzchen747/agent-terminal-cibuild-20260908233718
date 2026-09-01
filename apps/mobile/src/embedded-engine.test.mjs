@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test, { beforeEach, afterEach } from "node:test";
+import { Capacitor } from "@capacitor/core";
 import { Preferences } from "@capacitor/preferences";
-import { resetStorage } from "./test-support.mjs";
+import { breakStorageRemove, resetStorage } from "./test-support.mjs";
 
 const { EmbeddedNodeEngine } = await import("./embedded-engine.ts");
 
@@ -112,6 +113,50 @@ test("forget drops only that host's identity", async () => {
 
 test("forget of the legacy key is a safe no-op", async () => {
   await assert.doesNotReject(() => EmbeddedNodeEngine.forget("legacy"));
+});
+
+// ---- forget with the native stop path ---------------------------------------
+//
+// Forcing the native platform probe on means the stop call goes through the
+// plugin proxy. In Node that proxy has no implementation, so the stop
+// rejects (UNIMPLEMENTED) - the failure the fire-and-forget catch in forget
+// must swallow without delaying or rejecting the unpair.
+function withNativePlatform(run) {
+  const real = Capacitor.isNativePlatform;
+  Capacitor.isNativePlatform = () => true;
+  return Promise.resolve().then(run).finally(() => { Capacitor.isNativePlatform = real; });
+}
+
+test("forget resolves and drops the identity even when the native stop fails", async () => {
+  await new EmbeddedNodeEngine("h1").start();
+  await new EmbeddedNodeEngine("h2").start();
+  await withNativePlatform(async () => {
+    await assert.doesNotReject(() => EmbeddedNodeEngine.forget("h1"));
+  });
+  assert.equal((await Preferences.get({ key: ENGINE_KEY("h1") })).value, null);
+  // The failed stop must not leak into the sibling host's state.
+  assert.ok((await Preferences.get({ key: ENGINE_KEY("h2") })).value);
+});
+
+test("forget of a host with no stored identity still fires the native stop", async () => {
+  // The unpair must not depend on local state: the stop is best effort but
+  // must still be attempted, and its failure must not reject the forget.
+  await withNativePlatform(async () => {
+    await assert.doesNotReject(() => EmbeddedNodeEngine.forget("ghost"));
+  });
+});
+
+test("forget rejects when the stored identity itself cannot be removed", async () => {
+  // Contrast with the stop failures above: the identity removal is the
+  // primary purpose of forget, so a storage failure propagates.
+  await new EmbeddedNodeEngine("h1").start();
+  const restore = breakStorageRemove();
+  try {
+    await assert.rejects(() => EmbeddedNodeEngine.forget("h1"), /storage unavailable/);
+  } finally {
+    restore();
+  }
+  assert.ok((await Preferences.get({ key: ENGINE_KEY("h1") })).value);
 });
 
 test("generated identities use an unpadded url-safe key", async () => {

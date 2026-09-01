@@ -107,11 +107,21 @@ export class EmbeddedNodeEngine {
    * its node process. The tsnet node it registered stays in the relay until
    * inactivity expiry, so no relay-side cleanup is needed; only the local
    * record goes away.
+   *
+   * The native stop is fire-and-forget: the plugin serializes start and
+   * stop on one dedicated lifecycle thread, and a start can occupy it for
+   * up to 30 seconds while a tsnet node comes up (the hosts-page
+   * background checks start engines for every registered desktop). An
+   * unpair must not queue behind that, or the hosts list removal the UI
+   * awaits on this call lingers on screen even though storage was already
+   * updated. (The lifecycle thread is separate from Capacitor's shared
+   * plugin thread, so engine start/stop can no longer stall the app's
+   * other plugin calls - the delete path's Preferences round-trips.)
    */
   static async forget(hostId: string): Promise<void> {
     await Preferences.remove({ key: `${ENGINE_STATE_KEY}-${hostId}` });
     if (!Capacitor.isNativePlatform()) return;
-    try { await NativeEmbeddedNode.stop({ stateKey: hostId }); } catch { /* best effort */ }
+    void NativeEmbeddedNode.stop({ stateKey: hostId }).catch(() => { /* best effort */ });
   }
 
   private async load(): Promise<EmbeddedNodeState> {

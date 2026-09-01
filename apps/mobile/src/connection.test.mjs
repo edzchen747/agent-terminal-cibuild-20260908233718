@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test, { beforeEach, afterEach } from "node:test";
 import { Preferences } from "@capacitor/preferences";
-import { breakStorage, resetStorage } from "./test-support.mjs";
+import { breakStorage, breakStorageRemove, resetStorage } from "./test-support.mjs";
 
 // The file uses a TypeScript parameter property (constructor(public
 // readonly host)), which the plain type-stripping mode rejects, so the
@@ -179,6 +179,118 @@ test("removeSavedHostRecord is a no-op for an unknown id", async () => {
   assert.equal(remaining.length, 1);
   assert.equal((await HostConnection.saved())?.id, "h1");
   assert.notEqual((await Preferences.get({ key: ENGINE_KEY("h1") })).value, null);
+});
+
+test("removing a record rejects when the node identity cannot be dropped", async () => {
+  // Edge of the delete path: the list write precedes the identity removal,
+  // so a partial storage failure leaves the record deleted in storage even
+  // though the call rejects.
+  await HostConnection.recordHost(host());
+  const restore = breakStorageRemove();
+  try {
+    await assert.rejects(() => HostConnection.removeSavedHostRecord("h1"), /storage unavailable/);
+  } finally {
+    restore();
+  }
+  assert.deepEqual(await HostConnection.savedHostRecords(), []);
+});
+
+// ---- open(): connection failure messages -----------------------------------
+
+// A stand-in for the platform WebSocket: it captures the socket open() creates
+// so a test can drive its error/close/timeout paths on demand instead of
+// reaching for the network.
+class FakeWebSocket {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSED = 3;
+  static instances = [];
+  url;
+  readyState = 0;
+  onopen = null;
+  onerror = null;
+  onclose = null;
+  onmessage = null;
+  constructor(url) {
+    this.url = url;
+    FakeWebSocket.instances.push(this);
+  }
+  close() {
+    this.readyState = 3;
+  }
+}
+
+function withFakeWebSocket(run) {
+  const real = globalThis.WebSocket;
+  globalThis.WebSocket = FakeWebSocket;
+  FakeWebSocket.instances = [];
+  return Promise.resolve().then(run).finally(() => { globalThis.WebSocket = real; });
+}
+
+// open is private; the message tests reach it directly instead of building a
+// full auth handshake.
+function openFailure(connection, url, timeoutMs) {
+  return connection["open"](url, timeoutMs).then(
+    () => { throw new Error("the fake socket never opens"); },
+    (error) => error
+  );
+}
+
+const UNREACHABLE_HOST_MESSAGE = "Could not reach the desktop host. Connect both devices to the same WiFi network with internet access.";
+
+test("a socket error rejects with the shared-network hint", async () => {
+  await withFakeWebSocket(async () => {
+    const connection = new HostConnection(host());
+    const pending = openFailure(connection, "ws://192.168.1.5:47831", 60_000);
+    FakeWebSocket.instances.at(-1).onerror?.();
+    const error = await pending;
+    assert.equal(error.message, UNREACHABLE_HOST_MESSAGE);
+    connection.close();
+  });
+});
+
+test("a stalled socket still rejects with the timeout message", async () => {
+  // The hint only belongs to the error path; the timeout message is untouched.
+  await withFakeWebSocket(async () => {
+    const connection = new HostConnection(host());
+    const error = await openFailure(connection, "ws://192.168.1.5:47831", 25);
+    assert.equal(error.message, "The desktop connection attempt timed out.");
+    assert.equal(FakeWebSocket.instances.at(-1).readyState, 3);
+    connection.close();
+  });
+});
+
+test("a socket that closes before opening rejects with the setup-close message", async () => {
+  await withFakeWebSocket(async () => {
+    const connection = new HostConnection(host());
+    const pending = openFailure(connection, "ws://192.168.1.5:47831", 60_000);
+    FakeWebSocket.instances.at(-1).onclose?.();
+    const error = await pending;
+    assert.equal(error.message, "The desktop connection closed during setup.");
+    connection.close();
+  });
+});
+
+test("connect rejects with the shared-network hint when the desktop cannot be reached", async () => {
+  // End-to-end through the public API: a remote-only host whose socket errors
+  // surfaces the hint in the rejection the app shows on the try-again screen.
+  const realOnLine = globalThis.navigator.onLine;
+  globalThis.navigator.onLine = true;
+  await withFakeWebSocket(async () => {
+    const connection = new HostConnection(host({ remoteEndpoint: "ws://h1.overlay.example:47831", remoteTransport: "direct" }));
+    connection.embeddedEngine = { start: async () => ({}), stop: async () => {} };
+    const pending = connection.connect().then(
+      () => { throw new Error("connect should have failed"); },
+      (error) => error
+    );
+    // The stubbed engine start resolves on a microtask, so the socket does
+    // not exist yet; drain the queue until the fake socket is constructed.
+    while (FakeWebSocket.instances.length === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+    FakeWebSocket.instances.at(-1).onerror?.();
+    const error = await pending;
+    assert.equal(error.message, UNREACHABLE_HOST_MESSAGE);
+    connection.close();
+  }).finally(() => { globalThis.navigator.onLine = realOnLine; });
 });
 
 // ---- verifySavedHostRegistration --------------------------------------------
