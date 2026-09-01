@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { applyTerminalModifiers, createRequestId, findHttpLinks, TERMINAL_ANSI_THEME } from "@agentterminal/protocol";
@@ -12,7 +12,8 @@ import { TERMINAL_FONT_SIZE, calibratedSquishFontSize, squishAdvanceRatio, squis
 import { TERMINAL_FONT_FAMILY, preloadTerminalFonts } from "./terminalFonts";
 import { activateTerminalCursor, deactivateTerminalCursor } from "./terminalCursor";
 import { guardUtilityKeySelection } from "./utilityKeySelection";
-import { createUtilityKeyPad, type KeyPadResult, type UtilityKey } from "./utilityKeys";
+import { createUtilityKeyPad, MODIFIER_HOLD_THRESHOLD_MS, type KeyPadResult, type UtilityKey } from "./utilityKeys";
+import { systemHoldThresholdMs } from "./systemMetrics";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { connection: HostConnection; session: TerminalSession; active: boolean; fontWidthScale: number; }
@@ -69,7 +70,18 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
   const resizeRef = useRef<(force?: boolean) => void>(() => undefined);
   const focusInputRef = useRef<() => void>(() => undefined);
   const keyPadRef = useRef<ReturnType<typeof createUtilityKeyPad> | null>(null);
-  if (keyPadRef.current === null) keyPadRef.current = createUtilityKeyPad();
+  // The utility-key hold boundary: the default until the Android system's
+  // own long-press timeout arrives; the pad consults it on every release,
+  // so an in-flight hold is unaffected when the value lands.
+  const holdThresholdRef = useRef(MODIFIER_HOLD_THRESHOLD_MS);
+  if (keyPadRef.current === null) keyPadRef.current = createUtilityKeyPad(undefined, () => holdThresholdRef.current);
+  useEffect(() => {
+    let cancelled = false;
+    void systemHoldThresholdMs().then((threshold) => {
+      if (!cancelled) holdThresholdRef.current = threshold;
+    });
+    return () => { cancelled = true; };
+  }, []);
   const [latchedKeyIds, setLatchedKeyIds] = useState<ReadonlySet<string>>(new Set());
   const [heldKeyIds, setHeldKeyIds] = useState<ReadonlySet<string>>(new Set());
 
@@ -699,6 +711,16 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     focusInputRef.current();
   }
 
+  function cancelAccessibilityKey(key: UtilityKey) {
+    if (!activeRef.current) return;
+    // The platform took the gesture away (the finger slid off the key and
+    // started scrolling or a system gesture): no pointerup will ever
+    // arrive for that pointer. The key must not outlive the finger, so a
+    // cancel ends with the same end-state as a release.
+    applyKeyPadResult(keyPadRef.current!.cancel(key.id));
+    focusInputRef.current();
+  }
+
   const squishFontSize = calibratedSquishFontSize(fontWidthScale, a11yAdvanceRatioRef.current);
   const squishLineHeight = squishLineHeightValue(fontWidthScale);
   const squishInverse = squishInverseValue(fontWidthScale);
@@ -720,7 +742,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
             pressAccessibilityKey(key);
           }}
           onPointerUp={() => releaseAccessibilityKey(key)}
-          onPointerCancel={() => releaseAccessibilityKey(key)}
+          onPointerCancel={() => cancelAccessibilityKey(key)}
           onClick={(event) => {
             // Pointer taps are handled above. Keep keyboard activation accessible:
             // a keyboard click has detail 0 and no pointer hold, so press and

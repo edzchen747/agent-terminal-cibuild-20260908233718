@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createUtilityKeyPad } from "./utilityKeys.ts";
+import { createUtilityKeyPad, MODIFIER_HOLD_THRESHOLD_MS } from "./utilityKeys.ts";
+
+// A clock the tests advance by hand, so tap (< threshold) and hold
+// (>= threshold) releases are deterministic instead of wall-clock dependent.
+function fakeClock() {
+  let time = 0;
+  return {
+    now: () => time,
+    advance(ms) { time += ms; }
+  };
+}
 
 const ctrl = { id: "ctrl", label: "Ctrl", modifier: "ctrl" };
 const alt = { id: "alt", label: "Alt", modifier: "alt" };
@@ -54,23 +64,39 @@ test("multiple latched modifiers combine and reset together", () => {
   assert.deepEqual(pad.press(up), { state: { held: ["up"], latched: [] }, data: "\x1b[1;7A" });
 });
 
-test("a held modifier fires with each keypress while held, and re-latches when released after a chord", () => {
-  const pad = createUtilityKeyPad();
+test("a held modifier fires with each keypress while held, and drops off when released after the hold", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
   pad.press(ctrl);
+  clock.advance(100);
   assert.deepEqual(pad.press(up), { state: { held: ["ctrl", "up"], latched: [] }, data: "\x1b[1;5A" });
   pad.release("up");
+  clock.advance(100);
   assert.deepEqual(pad.press(up), { state: { held: ["ctrl", "up"], latched: [] }, data: "\x1b[1;5A" });
   pad.release("up");
-  // Lifting a held modifier re-latches it, even though chords already
-  // fired while it was held; tap it again to toggle the latch off.
-  assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: ["ctrl"] }, data: null });
+  // Lifting a detected hold drops the modifier, not re-latches it, even
+  // though chords already fired while it was held; the next press is plain.
+  clock.advance(100);
+  assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: [] }, data: null });
+  assert.deepEqual(pad.press(up), { state: { held: ["up"], latched: [] }, data: "\x1b[A" });
 });
 
-test("a modifier held with no keypress latches on release, like a tap", () => {
-  const pad = createUtilityKeyPad();
+test("a modifier tapped with no keypress latches on release, like a tap", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
   pad.press(shift);
+  clock.advance(50);
   assert.deepEqual(pad.release("shift"), { state: { held: [], latched: ["shift"] }, data: null });
   assert.deepEqual(pad.press(right), { state: { held: ["right"], latched: [] }, data: "\x1b[1;2C" });
+});
+
+test("a modifier held past the threshold with no keypress drops off on release", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
+  pad.press(shift);
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  assert.deepEqual(pad.release("shift"), { state: { held: [], latched: [] }, data: null });
+  assert.deepEqual(pad.press(right), { state: { held: ["right"], latched: [] }, data: "\x1b[C" });
 });
 
 test("value keys fire immediately and never stack", () => {
@@ -94,16 +120,22 @@ test("a keypress resets every latched modifier", () => {
   assert.deepEqual(pad.press(tab), { state: { held: ["tab"], latched: [] }, data: "\t" });
 });
 
-test("a held modifier combines with latched modifiers on a keypress", () => {
-  const pad = createUtilityKeyPad();
+test("a held modifier combines with latched modifiers on a keypress, and the hold drops on release", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
   pad.press(ctrl);
+  clock.advance(50);
   pad.release("ctrl");
+  clock.advance(50);
   pad.press(alt);
+  clock.advance(50);
   assert.deepEqual(pad.press(left), { state: { held: ["alt", "left"], latched: [] }, data: "\x1b[1;7D" });
   pad.release("left");
-  // The latched ctrl was consumed by the chord; the held alt re-latches on
-  // release, so exactly alt stays armed.
-  assert.deepEqual(pad.release("alt"), { state: { held: [], latched: ["alt"] }, data: null });
+  // The latched ctrl was consumed by the chord; lifting the held alt drops
+  // it too, so nothing stays armed and the next press is plain.
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS - 50);
+  assert.deepEqual(pad.release("alt"), { state: { held: [], latched: [] }, data: null });
+  assert.deepEqual(pad.press(down), { state: { held: ["down"], latched: [] }, data: "\x1b[B" });
 });
 
 test("consuming typed input applies latched modifiers and clears them", () => {
@@ -113,11 +145,14 @@ test("consuming typed input applies latched modifiers and clears them", () => {
   assert.deepEqual(pad.consume("d"), { state: { held: [], latched: [] }, data: "\x04" });
 });
 
-test("consuming typed input applies a held modifier without clearing the hold, and the release re-latches", () => {
-  const pad = createUtilityKeyPad();
+test("consuming typed input applies a held modifier without clearing the hold, and the hold drops on release", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
   pad.press(ctrl);
+  clock.advance(50);
   assert.deepEqual(pad.consume("d"), { state: { held: ["ctrl"], latched: [] }, data: "\x04" });
-  assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: ["ctrl"] }, data: null });
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS - 50);
+  assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: [] }, data: null });
 });
 
 test("releasing a key that was never held is a no-op", () => {
@@ -149,15 +184,32 @@ test("releasing after a reset is a no-op even for keys that were held", () => {
 });
 
 test("holding a latched modifier and releasing it cancels the latch without re-latching", () => {
-  const pad = createUtilityKeyPad();
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
   pad.press(ctrl);
+  clock.advance(50);
   pad.release("ctrl");
   assert.deepEqual(pad.state(), { held: [], latched: ["ctrl"] });
   // Going down on the already-latched key records the latch; lifting must
   // toggle it off, not stack a second latch on top.
+  clock.advance(50);
   assert.deepEqual(pad.press(ctrl), { state: { held: ["ctrl"], latched: ["ctrl"] }, data: null });
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS - 100);
   assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: [] }, data: null });
   assert.deepEqual(pad.press(up), { state: { held: ["up"], latched: [] }, data: "\x1b[A" });
+});
+
+test("holding an already-latched modifier past the threshold and releasing it also cancels the latch", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
+  pad.press(ctrl);
+  clock.advance(50);
+  pad.release("ctrl");
+  assert.deepEqual(pad.state(), { held: [], latched: ["ctrl"] });
+  clock.advance(50);
+  pad.press(ctrl);
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: [] }, data: null });
 });
 
 test("tapping one of several latched modifiers toggles only that one off", () => {
@@ -173,32 +225,46 @@ test("tapping one of several latched modifiers toggles only that one off", () =>
   assert.deepEqual(pad.press(down), { state: { held: ["down"], latched: [] }, data: "\x1b[1;3B" });
 });
 
-test("two held modifiers re-latch in release order and the next chord carries both", () => {
-  const pad = createUtilityKeyPad();
+test("two held modifiers drop on release in turn and the next press is plain", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
   pad.press(ctrl);
+  clock.advance(50);
   pad.press(alt);
+  clock.advance(50);
   assert.deepEqual(pad.press(up), { state: { held: ["ctrl", "alt", "up"], latched: [] }, data: "\x1b[1;7A" });
   pad.release("up");
+  // Lifting each detected hold drops its modifier; nothing re-latches.
+  // alt went down 50ms before the hold window closed, so advance to t=350.
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS - 50);
   pad.release("alt");
+  clock.advance(50);
   pad.release("ctrl");
-  assert.deepEqual(pad.state(), { held: [], latched: ["alt", "ctrl"] });
-  assert.deepEqual(pad.press(right), { state: { held: ["right"], latched: [] }, data: "\x1b[1;7C" });
+  assert.deepEqual(pad.state(), { held: [], latched: [] });
+  assert.deepEqual(pad.press(right), { state: { held: ["right"], latched: [] }, data: "\x1b[C" });
   pad.release("right");
-  // Both chords consumed the state; the next press is plain.
+  // Both modifiers were dropped by the holds; the next press is plain.
   assert.deepEqual(pad.press(down), { state: { held: ["down"], latched: [] }, data: "\x1b[B" });
 });
 
-test("a held modifier interleaved with a latched one resets together on a keypress", () => {
-  const pad = createUtilityKeyPad();
+test("a held modifier interleaved with a latched one resets together on a keypress, and the hold drops on release", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
   pad.press(alt);
+  clock.advance(50);
   pad.release("alt");
+  clock.advance(50);
   pad.press(ctrl);
+  clock.advance(50);
   assert.deepEqual(pad.state(), { held: ["ctrl"], latched: ["alt"] });
   assert.deepEqual(pad.press(up), { state: { held: ["ctrl", "up"], latched: [] }, data: "\x1b[1;7A" });
   pad.release("up");
-  // The latched alt was consumed; lifting the held ctrl re-latches exactly ctrl.
-  assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: ["ctrl"] }, data: null });
-  assert.deepEqual(pad.press(down), { state: { held: ["down"], latched: [] }, data: "\x1b[1;5B" });
+  // The latched alt was consumed; lifting the held ctrl (down since t=100,
+  // lifted at t=450) drops it too, so nothing stays armed and the next
+  // press is plain.
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: [] }, data: null });
+  assert.deepEqual(pad.press(down), { state: { held: ["down"], latched: [] }, data: "\x1b[B" });
 });
 
 test("all three latched modifiers combine into one arrow chord", () => {
@@ -248,6 +314,36 @@ test("pressing a value key that is already held is a no-op", () => {
   assert.deepEqual(pad.release("pipe"), { state: { held: [], latched: [] }, data: null });
 });
 
+test("a dynamically updated threshold is consulted on each release", () => {
+  // Mirrors MobileTerminal: the pad starts on the default threshold and
+  // the Android system's long-press timeout may replace it mid-session.
+  const clock = fakeClock();
+  let threshold = MODIFIER_HOLD_THRESHOLD_MS;
+  const pad = createUtilityKeyPad(clock.now, () => threshold);
+  pad.press(ctrl);
+  clock.advance(200);
+  threshold = 500; // the system value arrives mid-hold
+  clock.advance(200);
+  pad.release("ctrl"); // down 400ms < the new 500ms threshold: a tap latches
+  assert.deepEqual(pad.state(), { held: [], latched: ["ctrl"] });
+  clock.advance(50);
+  pad.press(ctrl);
+  clock.advance(50);
+  pad.release("ctrl"); // quick tap on the armed key toggles the latch off
+  assert.deepEqual(pad.state(), { held: [], latched: [] });
+});
+
+test("release at exactly the updated threshold counts as a hold", () => {
+  const clock = fakeClock();
+  let threshold = MODIFIER_HOLD_THRESHOLD_MS;
+  const pad = createUtilityKeyPad(clock.now, () => threshold);
+  pad.press(ctrl);
+  threshold = 1000;
+  clock.advance(1000);
+  pad.release("ctrl"); // exactly 1000ms >= 1000ms: a detected hold drops
+  assert.deepEqual(pad.state(), { held: [], latched: [] });
+});
+
 test("state snapshots are independent of later mutation", () => {
   const pad = createUtilityKeyPad();
   pad.press(ctrl);
@@ -257,4 +353,166 @@ test("state snapshots are independent of later mutation", () => {
   pad.release("up");
   assert.deepEqual(snapshot, { held: [], latched: ["ctrl"] });
   assert.deepEqual(pad.state(), { held: [], latched: [] });
+});
+
+test("a cancelled hold drops the moment the pointer is cancelled", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
+  pad.press(ctrl);
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  // The finger slid off the key and the platform took the gesture away:
+  // no pointerup will ever arrive, but the key must not outlive the
+  // finger either, so the detected hold drops with the cancel.
+  assert.deepEqual(pad.cancel("ctrl"), { state: { held: [], latched: [] }, data: null });
+  // Nothing lingers: the next keypress is plain.
+  assert.deepEqual(pad.press(up), { state: { held: ["up"], latched: [] }, data: "\x1b[A" });
+  pad.release("up");
+});
+
+test("a key pressed after a cancelled hold behaves as a fresh press", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
+  pad.press(ctrl);
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  pad.cancel("ctrl"); // the hold drops, nothing is re-tracked
+  // A new press on the same key starts a plain hold; releasing it after
+  // the threshold drops it again.
+  pad.press(ctrl);
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: [] }, data: null });
+  assert.deepEqual(pad.press(up), { state: { held: ["up"], latched: [] }, data: "\x1b[A" });
+});
+
+test("a quick cancelled tap keeps the tap-toggle semantics", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
+  pad.press(ctrl);
+  clock.advance(50);
+  assert.deepEqual(pad.cancel("ctrl"), { state: { held: [], latched: ["ctrl"] }, data: null });
+});
+
+test("cancelling a value key just drops it, as a release does", () => {
+  const pad = createUtilityKeyPad();
+  assert.deepEqual(pad.press(pipe), { state: { held: ["pipe"], latched: [] }, data: "|" });
+  assert.deepEqual(pad.cancel("pipe"), { state: { held: [], latched: [] }, data: null });
+});
+
+test("cancelling a key that is not held is a no-op", () => {
+  const pad = createUtilityKeyPad();
+  assert.deepEqual(pad.cancel("ctrl"), { state: { held: [], latched: [] }, data: null });
+});
+
+test("a cancelled hold leaves no modifier on typed input", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
+  pad.press(ctrl);
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  pad.cancel("ctrl");
+  // The hold dropped with the cancel, so typing is plain text.
+  assert.deepEqual(pad.consume("d"), { state: { held: [], latched: [] }, data: "d" });
+});
+
+test("cancelling a hold leaves live holds untouched", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
+  pad.press(ctrl);
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  pad.cancel("ctrl");
+  pad.press(alt);
+  assert.deepEqual(pad.state(), { held: ["alt"], latched: [] });
+  // The live alt hold (down since t=300) drops normally on release.
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  assert.deepEqual(pad.release("alt"), { state: { held: [], latched: [] }, data: null });
+});
+
+test("a cancelled hold clears a latch from an earlier tap", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
+  pad.press(ctrl);
+  clock.advance(50);
+  pad.release("ctrl"); // tap latches ctrl on
+  assert.deepEqual(pad.state(), { held: [], latched: ["ctrl"] });
+  clock.advance(50);
+  pad.press(ctrl); // go down on the armed key again
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  pad.cancel("ctrl"); // the detected hold drops, and cancels the latch
+  assert.deepEqual(pad.state(), { held: [], latched: [] });
+  assert.deepEqual(pad.press(up), { state: { held: ["up"], latched: [] }, data: "\x1b[A" });
+});
+
+test("cancelling the key that completed a chord keeps the held modifier active", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
+  pad.press(ctrl);
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  assert.deepEqual(pad.press(up), { state: { held: ["ctrl", "up"], latched: [] }, data: "\x1b[1;5A" });
+  // The up-arrow pointer slid off: cancel it. The chord already fired,
+  // but the ctrl hold is still live and must survive up's cancel.
+  assert.deepEqual(pad.cancel("up"), { state: { held: ["ctrl"], latched: [] }, data: null });
+  // The still-held ctrl keeps applying to the next keypress...
+  assert.deepEqual(pad.press(left), { state: { held: ["ctrl", "left"], latched: [] }, data: "\x1b[1;5D" });
+  pad.release("left");
+  // ...and the hold drops when ctrl's own pointer lifts after the threshold.
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: [] }, data: null });
+  assert.deepEqual(pad.state(), { held: [], latched: [] });
+});
+
+test("cancelling one of two held modifiers keeps the other", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
+  pad.press(ctrl);
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  pad.press(alt);
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  // The ctrl pointer slid off; alt is still being held on its own pointer.
+  assert.deepEqual(pad.cancel("ctrl"), { state: { held: ["alt"], latched: [] }, data: null });
+  // Only alt arms the next chord; the cancelled ctrl is not latched.
+  assert.deepEqual(pad.press(up), { state: { held: ["alt", "up"], latched: [] }, data: "\x1b[1;3A" });
+  pad.release("up");
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  assert.deepEqual(pad.release("alt"), { state: { held: [], latched: [] }, data: null });
+});
+
+test("a quick cancelled tap of a value key sends nothing", () => {
+  const pad = createUtilityKeyPad();
+  // The value already fired on press; the cancel only drops the press.
+  assert.deepEqual(pad.press(pipe), { state: { held: ["pipe"], latched: [] }, data: "|" });
+  assert.deepEqual(pad.cancel("pipe"), { state: { held: [], latched: [] }, data: null });
+  assert.deepEqual(pad.state(), { held: [], latched: [] });
+});
+
+test("releasing a cancelled key is a no-op", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
+  pad.press(ctrl);
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  pad.cancel("ctrl"); // the hold already dropped with the cancel
+  // A late pointerup for the dead pointer (or any other stray release)
+  // must not disturb the state a second time.
+  assert.deepEqual(pad.release("ctrl"), { state: { held: [], latched: [] }, data: null });
+});
+
+test("a second cancel of the same key is a no-op", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
+  pad.press(ctrl);
+  clock.advance(MODIFIER_HOLD_THRESHOLD_MS);
+  pad.cancel("ctrl");
+  assert.deepEqual(pad.cancel("ctrl"), { state: { held: [], latched: [] }, data: null });
+});
+
+test("a cancelled quick tap on a latched modifier toggles the latch off", () => {
+  const clock = fakeClock();
+  const pad = createUtilityKeyPad(clock.now);
+  pad.press(ctrl);
+  clock.advance(50);
+  pad.release("ctrl"); // tap latches ctrl on
+  clock.advance(50);
+  pad.press(ctrl); // go down on the armed key again
+  clock.advance(50); // still under the threshold: this is a tap
+  // The pointer slid off before the lift: cancel ends with release
+  // semantics, and because the key was latched at press, the tap
+  // toggles the latch off.
+  assert.deepEqual(pad.cancel("ctrl"), { state: { held: [], latched: [] }, data: null });
 });

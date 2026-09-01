@@ -42,7 +42,12 @@ function Find-JdkHome {
     $candidates += (Get-ChildItem "$env:USERPROFILE\Playground" -Directory -Filter "jdk-*" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
     foreach ($candidate in $candidates) {
         if (-not (Test-Path (Join-Path $candidate "bin\java.exe"))) { continue }
+        # java -version writes to stderr; under -ErrorAction Stop the 2>&1
+        # capture would otherwise surface as a terminating NativeCommandError.
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
         $version = & (Join-Path $candidate "bin\java.exe") -version 2>&1 | Select-String -Pattern 'version "([0-9]+)' -AllMatches
+        $ErrorActionPreference = $previousPreference
         if ($version -and $version.Matches.Count -gt 0) {
             $major = [int]$version.Matches[0].Groups[1].Value
             # 21 is what the Android toolchain wants; 17/24 also run Gradle.

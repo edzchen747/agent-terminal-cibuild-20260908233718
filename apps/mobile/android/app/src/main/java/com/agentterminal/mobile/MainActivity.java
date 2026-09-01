@@ -21,6 +21,7 @@ public class MainActivity extends BridgeActivity {
     public void onCreate(Bundle savedInstanceState) {
         registerPlugin(EmbeddedNodePlugin.class);
         registerPlugin(ConnectionNotificationPlugin.class);
+        registerPlugin(SystemMetricsPlugin.class);
         super.onCreate(savedInstanceState);
         getBridge().getWebView().setLongClickable(true);
         rendererListener = new WebViewListener() {

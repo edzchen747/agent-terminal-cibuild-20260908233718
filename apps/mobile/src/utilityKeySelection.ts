@@ -2,7 +2,7 @@
  * The utility key labels must never become a text selection. A long-press
  * on a label opens the browser's select-all/copy menu, which takes input
  * focus away from the terminal IME field and can leave a latched modifier
- * or a held key stranded. Keep the labels inert at both the CSS layer (the
+ * or a held key stuck. Keep the labels inert at both the CSS layer (the
  * stylesheet applies user-select) and the DOM layer (this guard prevents a
  * selection start regardless of platform quirks).
  */
