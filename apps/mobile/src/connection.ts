@@ -230,6 +230,11 @@ export class HostConnection {
     if (payload.transport && payload.transport !== "direct" && !payload.localEndpoint) {
       throw new Error("Pairing must be completed while the phone and desktop are on the same LAN.");
     }
+    // The QR payload is the authorization grant, so the desktop joins the
+    // previously paired list right away - the row is visible on the hosts
+    // page before the LAN handshake and under no circumstances does it wait
+    // for the overlay registration to finish. If the desktop was already
+    // listed, its entry is left as-is (the commit below upserts it).
     const temporary = new HostConnection({
       id: payload.hostId,
       name: payload.hostName,
@@ -242,6 +247,9 @@ export class HostConnection {
       deviceId: device.id,
       deviceToken: ""
     });
+    const recordsBefore = await HostConnection.savedHostRecords();
+    const existedBefore = recordsBefore.some((record) => record.id === temporary.host.id);
+    if (!existedBefore) await HostConnection.recordHost(temporary.host);
     try {
       await temporary.open(localEndpoint, LAN_CONNECT_TIMEOUT_MS);
       const response = await temporary.request({ type: "pair", requestId: createRequestId(), token: payload.pairingToken, device });
@@ -253,13 +261,21 @@ export class HostConnection {
       // Trusted LAN pairing is the commit point. Overlay registration happens
       // independently so provisioning outages never block terminal streaming.
       await Preferences.set({ key: HOST_KEY, value: JSON.stringify(temporary.host) });
-      // The new desktop joins the previously paired list here, so it stays
-      // listed even if this pairing session is later dropped.
+      // Upsert the entry with the fresh connection fields and stamp it as
+      // connected so it sorts to the top of the hosts page immediately.
       await this.recordHost(temporary.host);
+      void this.markHostConnected(temporary.host.id);
       temporary.startHeartbeat();
       queueMicrotask(() => { void temporary.retryRemoteRegistration(); });
       return temporary;
     } catch (error) {
+      // An optimistic row must not outlive a failed pairing; drop it again
+      // unless the desktop was already paired before this attempt. The
+      // rollback is best-effort so a storage failure cannot mask the reason
+      // the pairing itself failed.
+      if (!existedBefore) {
+        try { await this.removeSavedHostRecord(temporary.host.id); } catch { /* stale row expires on next launch */ }
+      }
       temporary.close();
       throw error;
     }

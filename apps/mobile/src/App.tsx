@@ -16,13 +16,13 @@ import { HostConnection, type RemoteRegistrationState, type SavedHost, type Save
 import { ConnectionNotification } from "./connection-notification";
 import { notificationStateFor, type ConnectionNotificationState } from "./connectionPolicy";
 import { isRetryingSavedHost } from "./connectionFlow";
-import { hostRowRegistrationStatus, hostRowStatusLabel, lastConnectedLabel, REGISTRATION_STATUS_LABELS, registrationDisplayStatusFor, type HostCheckState, type RegistrationDisplayStatus, sortHostsByLastConnected } from "./hostSelection";
+import { hostRowRegistrationStatus, hostRowStatusLabel, hostsPageCheckPlan, lastConnectedLabel, REGISTRATION_STATUS_LABELS, registrationDisplayStatusFor, type HostCheckState, type RegistrationDisplayStatus, sortHostsByLastConnected } from "./hostSelection";
 import { readRegistrationVerdict, rememberRegistrationVerdict, type RegistrationVerdict } from "./registrationCache";
 import { backButtonAction, pairingReconnectStep, pairingRestoreDecision } from "./navigationPolicy";
 import { deviceIdentity } from "./device";
 import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_SLIDER_HORIZONTAL_BIAS } from "./gesture";
 import { effectiveDefaultShell } from "./defaultShell";
-import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, ScanIcon, SettingsIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
+import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, RefreshIcon, ScanIcon, SettingsIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
 import { backProjectId, resolveViewGeometry } from "./projectNavigation";
 
@@ -82,6 +82,9 @@ export function App() {
   // actually came back from the control plane.
   const [hostChecks, setHostChecks] = useState<Map<string, HostCheckState>>(() => new Map());
   const hostChecksStartedRef = useRef(false);
+  // A manual refresh re-verifies every registered host and rewrites the
+  // verdict cache; the header button spins while it runs.
+  const [hostsRefreshing, setHostsRefreshing] = useState(false);
   // The user reached the pairing screen from the hosts page; back restores
   // the pre-pair status captured in prePairStatusRef.
   const [pairFromHosts, setPairFromHosts] = useState(false);
@@ -446,34 +449,48 @@ export function App() {
     if (view.type !== "hosts" || hostChecksStartedRef.current) return;
     hostChecksStartedRef.current = true;
     let disposed = false;
-    void HostConnection.savedHostRecords().then(async (records) => {
-      if (disposed) return;
-      const liveHostId = connectionRef.current?.host.id;
-      const pending = records.filter((record) => record.remoteEnrolled === true && record.id !== liveHostId);
-      const cachedVerdicts = new Map<string, RegistrationVerdict>();
-      for (const record of pending) {
-        const verdict = await readRegistrationVerdict("hostPing", record.id);
-        if (verdict) cachedVerdicts.set(record.id, verdict);
-      }
-      for (const [hostId, verdict] of cachedVerdicts) {
-        setHostChecks((current) => new Map(current).set(hostId, verdict));
-      }
-      const uncached = pending.filter((record) => !cachedVerdicts.has(record.id));
-      for (const record of uncached) {
-        setHostChecks((current) => new Map(current).set(record.id, "checking"));
-      }
-      await Promise.all(uncached.map(async (record) => {
-        const verdict = await HostConnection.verifySavedHostRegistration(record);
-        if (disposed) return;
-        void rememberRegistrationVerdict("hostPing", record.id, verdict);
-        setHostChecks((current) => new Map(current).set(record.id, verdict));
-      }));
+    void runHostChecks(false, () => !disposed).finally(() => {
+      if (!disposed) hostChecksStartedRef.current = false;
     });
     return () => {
       disposed = true;
       hostChecksStartedRef.current = false;
     };
   }, [view.type]);
+
+  // Shared by the page-open effect and the header's refresh button. With
+  // `force` the one-minute verdict cache is bypassed, so every pending host
+  // is re-verified against the control plane and each fresh verdict replaces
+  // the cached one; a plain page open reuses live cache entries instead.
+  // `isActive` drops results once the caller's page is gone.
+  async function runHostChecks(force: boolean, isActive: () => boolean = () => true) {
+    const records = await HostConnection.savedHostRecords();
+    if (!isActive()) return;
+    const cached = new Map<string, RegistrationVerdict>();
+    if (!force) {
+      for (const record of records) {
+        const verdict = await readRegistrationVerdict("hostPing", record.id);
+        if (verdict) cached.set(record.id, verdict);
+      }
+    }
+    const plan = hostsPageCheckPlan({ records, liveHostId: connectionRef.current?.host.id, cached, force });
+    for (const [hostId, state] of plan.states) {
+      setHostChecks((current) => new Map(current).set(hostId, state));
+    }
+    await Promise.all(plan.toVerify.map(async (record) => {
+      const verdict = await HostConnection.verifySavedHostRegistration(record);
+      if (!isActive()) return;
+      void rememberRegistrationVerdict("hostPing", record.id, verdict);
+      setHostChecks((current) => new Map(current).set(record.id, verdict));
+    }));
+  }
+
+  // The hosts header's refresh button: force a fresh verification round for
+  // every registered non-connected host, refreshing the status cache too.
+  function refreshHosts() {
+    setHostsRefreshing(true);
+    void runHostChecks(true).finally(() => setHostsRefreshing(false));
+  }
 
   useEffect(() => {
     if (!connection) return;
@@ -788,7 +805,7 @@ export function App() {
     // Reached from home the live connection stays open and its row carries
     // the "connected" indicator; reached from the try-again screen the error
     // status is retained, so back returns there.
-    return <HostsPage records={hostRecords} loaded={hostsLoaded} connectedId={connection?.host.id ?? null} registration={remoteRegistration} online={online} checks={hostChecks} onBack={navigateBack} onSelect={(record) => selectHost(record)} onRemove={(record) => void removeHost(record)} onPairNew={enterPairFromHosts} />;
+    return <HostsPage records={hostRecords} loaded={hostsLoaded} connectedId={connection?.host.id ?? null} registration={remoteRegistration} online={online} checks={hostChecks} refreshing={hostsRefreshing} onBack={navigateBack} onSelect={(record) => selectHost(record)} onRemove={(record) => void removeHost(record)} onPairNew={enterPairFromHosts} onRefresh={() => void refreshHosts()} />;
   }
   if (status === "error") return <ErrorScreen message={error} hostName={hostName || undefined} onRetry={() => window.location.reload()} onConnectDifferent={openHosts} />;
   if (!connection || !snapshot) return null;
@@ -1247,10 +1264,10 @@ function Splash({ label, hostName, onCancel }: { label: string; hostName?: strin
   const status = label.endsWith("…") ? label : `${label}…`;
   return <div className="splash"><span className="logo large"><TerminalIcon /></span><strong>Agent Terminal</strong>{hostName && <span className="splash-host">Connecting to {hostName}</span>}<small>{status}</small><i className="loader" />{onCancel && <button className="text-button" onClick={onCancel}>Cancel</button>}</div>;
 }
-function HostsPage({ records, loaded, connectedId, registration, online, checks, onBack, onSelect, onRemove, onPairNew }: { records: SavedHostRecord[]; loaded: boolean; connectedId: string | null; registration: RemoteRegistrationState; online: boolean; checks: ReadonlyMap<string, HostCheckState>; onBack: () => void; onSelect: (record: SavedHostRecord) => void; onRemove: (record: SavedHostRecord) => void; onPairNew: () => void }) {
+function HostsPage({ records, loaded, connectedId, registration, online, checks, refreshing, onBack, onSelect, onRemove, onPairNew, onRefresh }: { records: SavedHostRecord[]; loaded: boolean; connectedId: string | null; registration: RemoteRegistrationState; online: boolean; checks: ReadonlyMap<string, HostCheckState>; refreshing: boolean; onBack: () => void; onSelect: (record: SavedHostRecord) => void; onRemove: (record: SavedHostRecord) => void; onPairNew: () => void; onRefresh: () => void }) {
   const ordered = sortHostsByLastConnected(records);
   return <div className="mobile-app hosts-page">
-    <MobileHeader title="Hosts" subtitle={loaded ? `${records.length} paired desktop${records.length === 1 ? "" : "s"}` : "Previously paired desktops"} onBack={onBack} />
+    <MobileHeader title="Hosts" subtitle={loaded ? `${records.length} paired desktop${records.length === 1 ? "" : "s"}` : "Previously paired desktops"} onBack={onBack} trailing={loaded ? <button className="round-button hosts-refresh" onClick={onRefresh} disabled={refreshing} aria-label="Refresh host statuses" title="Refresh host statuses">{refreshing ? <i className="loader" /> : <RefreshIcon />}</button> : undefined} />
     <section className="hosts-section">
       {!loaded ? <div className="hosts-loading"><i className="loader" />Loading paired desktops…</div>
       : !ordered.length ? <div className="hosts-empty">No paired desktops yet. Pair one below to connect your desktop.</div>

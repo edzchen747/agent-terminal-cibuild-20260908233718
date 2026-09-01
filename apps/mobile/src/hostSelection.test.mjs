@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { sortHostsByLastConnected, defaultHostAfterRemoval, lastConnectedLabel, hostRowRegistrationStatus, hostRowStatusLabel, registrationDisplayStatusFor, REGISTRATION_STATUS_LABELS } from "./hostSelection.ts";
+import { sortHostsByLastConnected, defaultHostAfterRemoval, lastConnectedLabel, hostRowRegistrationStatus, hostRowStatusLabel, hostsPageCheckPlan, registrationDisplayStatusFor, REGISTRATION_STATUS_LABELS } from "./hostSelection.ts";
 
 const day = 86_400_000;
 const NOW = 1_000_000_000_000;
@@ -169,4 +169,86 @@ test("host row labels: a checked row with a live check verdict that never finish
   assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "enrolled", check: "lanOnly" }), "unregistered");
   // A registered host with no check result yet stays checking, not failed.
   assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "failed", check: undefined }), "pending");
+});
+
+// ---- hostsPageCheckPlan: registration-check targeting ------------------------
+
+test("checks plan: the live desktop and never-registered hosts are skipped", () => {
+  const records = [
+    { id: "live", remoteEnrolled: true },
+    { id: "never", remoteEnrolled: undefined },
+    { id: "flagless", remoteEnrolled: false },
+    { id: "enrolled-a", remoteEnrolled: true },
+    { id: "enrolled-b", remoteEnrolled: true }
+  ];
+  const plan = hostsPageCheckPlan({ records, liveHostId: "live", cached: new Map(), force: false });
+  assert.deepEqual(plan.pending.map((record) => record.id), ["enrolled-a", "enrolled-b"]);
+  assert.deepEqual(plan.toVerify.map((record) => record.id), ["enrolled-a", "enrolled-b"]);
+  assert.deepEqual([...plan.states], [["enrolled-a", "checking"], ["enrolled-b", "checking"]]);
+});
+
+test("checks plan: a plain visit reuses cached verdicts instead of re-verifying", () => {
+  const records = [
+    { id: "a", remoteEnrolled: true },
+    { id: "b", remoteEnrolled: true },
+    { id: "c", remoteEnrolled: true }
+  ];
+  const cached = new Map([
+    ["a", "verified"],
+    ["b", "lanOnly"]
+  ]);
+  const plan = hostsPageCheckPlan({ records, liveHostId: null, cached, force: false });
+  assert.deepEqual(plan.toVerify.map((record) => record.id), ["c"]);
+  assert.deepEqual([...plan.states], [
+    ["a", "verified"],
+    ["b", "lanOnly"],
+    ["c", "checking"]
+  ]);
+});
+
+test("checks plan: a stale cache entry is never trusted on a plain visit", () => {
+  const records = [{ id: "old", remoteEnrolled: true }];
+  const plan = hostsPageCheckPlan({ records, liveHostId: undefined, cached: new Map(), force: false });
+  assert.deepEqual(plan.toVerify.map((record) => record.id), ["old"]);
+  assert.equal(plan.states.get("old"), "checking");
+  // A cached lanOnly verdict holds its host back from the round entirely.
+  assert.deepEqual(hostsPageCheckPlan({ records, liveHostId: undefined, cached: new Map([["old", "lanOnly"]]), force: false }).toVerify, []);
+});
+
+test("checks plan: a manual refresh forces verification for every registered host", () => {
+  const records = [
+    { id: "live", remoteEnrolled: true },
+    { id: "a", remoteEnrolled: true },
+    { id: "b", remoteEnrolled: true }
+  ];
+  const cached = new Map([
+    ["a", "verified"],
+    ["b", "lanOnly"]
+  ]);
+  const plan = hostsPageCheckPlan({ records, liveHostId: "live", cached, force: true });
+  assert.deepEqual(plan.pending.map((record) => record.id), ["a", "b"]);
+  assert.deepEqual(plan.toVerify.map((record) => record.id), ["a", "b"]);
+  assert.deepEqual([...plan.states], [["a", "checking"], ["b", "checking"]]);
+});
+
+test("checks plan: empty records and empty caches stay no-ops", () => {
+  const empty = hostsPageCheckPlan({ records: [], liveHostId: null, cached: new Map(), force: false });
+  assert.deepEqual(empty.pending, []);
+  assert.deepEqual(empty.toVerify, []);
+  assert.equal(empty.states.size, 0);
+  // A cache entry for a record that is not in the list does nothing.
+  const phantom = hostsPageCheckPlan({ records: [], liveHostId: null, cached: new Map([["ghost", "verified"]]), force: false });
+  assert.deepEqual(phantom.toVerify, []);
+  assert.equal(phantom.states.size, 0);
+});
+
+test("checks plan: never mutates the caller's cache or records", () => {
+  const records = [{ id: "a", remoteEnrolled: true }];
+  const cached = new Map([["a", "verified"]]);
+  const cacheSizeBefore = cached.size;
+  const recordsJson = JSON.stringify(records);
+  hostsPageCheckPlan({ records, liveHostId: null, cached, force: true });
+  assert.equal(cached.size, cacheSizeBefore);
+  assert.equal(cached.get("a"), "verified");
+  assert.equal(JSON.stringify(records), recordsJson);
 });

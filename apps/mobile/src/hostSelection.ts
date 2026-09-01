@@ -5,6 +5,8 @@
  * Capacitor storage layer.
  */
 
+import type { RegistrationVerdict } from "./registrationCache";
+
 /** The minimum shape of a persisted host entry these rules need. */
 export interface HostRef {
   id: string;
@@ -98,4 +100,33 @@ export function hostRowRegistrationStatus(input: {
   if (input.check === "verified") return "enrolled";
   if (input.check === "lanOnly" || input.remoteEnrolled !== true) return "unregistered";
   return "pending";
+}
+
+/**
+ * Plans one hosts-page registration-check round. The live desktop is
+ * skipped (it is verified by being connected) and hosts that were never
+ * registered (`remoteEnrolled` not set) stay LAN only without ever starting
+ * a node; every other registered host joins the round. With `force` (the
+ * header's manual refresh) the persisted verdict cache is ignored so each
+ * pending host is re-verified; a plain page visit reuses live cache
+ * entries, which keeps revisits from churning the native node engine.
+ */
+export function hostsPageCheckPlan<T extends { id: string; remoteEnrolled?: boolean }>(input: {
+  records: readonly T[];
+  liveHostId: string | null | undefined;
+  cached: ReadonlyMap<string, RegistrationVerdict>;
+  force: boolean;
+}): { pending: T[]; toVerify: T[]; states: Map<string, HostCheckState> } {
+  const pending = input.records.filter((record) => record.remoteEnrolled === true && record.id !== input.liveHostId);
+  const states = new Map<string, HostCheckState>();
+  const toVerify: T[] = [];
+  for (const record of pending) {
+    const verdict = input.force ? undefined : input.cached.get(record.id);
+    if (verdict) states.set(record.id, verdict);
+    else {
+      states.set(record.id, "checking");
+      toVerify.push(record);
+    }
+  }
+  return { pending, toVerify, states };
 }

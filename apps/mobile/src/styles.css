@@ -25,6 +25,9 @@ button { color: inherit; }
 .eyebrow { color: #72d2bf; font-size: 10px; line-height: 1; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
 .round-button { width: 40px; height: 40px; flex: none; border: 1px solid #252b35; border-radius: 12px; background: #12161d; color: #9ba3b1; display: grid; place-items: center; }
 .round-button:active { background: #20262f; transform: scale(.96); }
+.round-button:disabled { opacity: .55; cursor: default; }
+.round-button:disabled:active { background: #12161d; transform: none; }
+.round-button .loader { width: 14px; height: 14px; margin: 0; }
 .home-header { padding: 25px 21px 21px; display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 1px solid #1b2029; background: linear-gradient(180deg,#10141b,#0b0e13); }
 .home-header h1 { margin: 5px 0 7px; color: #f2f4f8; font-size: 27px; letter-spacing: -.04em; }
 .connection-label { display: flex; align-items: center; gap: 6px; color: #697383; font-size: 11px; }

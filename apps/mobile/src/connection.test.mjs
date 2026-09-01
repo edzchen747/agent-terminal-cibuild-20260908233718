@@ -211,9 +211,24 @@ class FakeWebSocket {
   onerror = null;
   onclose = null;
   onmessage = null;
+  lastSent = null;
   constructor(url) {
     this.url = url;
     FakeWebSocket.instances.push(this);
+  }
+  setOpen() {
+    this.readyState = 1;
+    this.onopen?.();
+  }
+  send(payload) {
+    this.lastSent = payload;
+  }
+  /** Delivers one server message, replying to the most recent client message. */
+  serve(message) {
+    this.onmessage?.({ data: JSON.stringify({ ...message, requestId: JSON.parse(this.lastSent).requestId }) });
+  }
+  deliverServerMessage(message) {
+    this.onmessage?.({ data: JSON.stringify(message) });
   }
   close() {
     this.readyState = 3;
@@ -359,6 +374,100 @@ test("pairing to a remote-only desktop without a LAN endpoint is rejected", asyn
     HostConnection.pair(payload, { id: "phone", name: "Phone", platform: "android" }),
     /must be completed while the phone and desktop are on the same LAN/i
   );
+  // The QR is consumed before any optimistic row: the guard rejects the
+  // pairing before the desktop is recorded, so the hosts list stays clean.
+  assert.deepEqual(await HostConnection.savedHostRecords(), []);
+});
+
+// ---- pair: optimistic host listing ------------------------------------------
+
+const FAKE_DEVICE = { id: "phone", name: "Phone", platform: "android" };
+const SNAPSHOT = { host: { id: "h1", name: "Desktop One" }, projects: [], sessions: [], devices: [], shells: [], defaultShellId: "" };
+
+const pairPayload = (overrides = {}) => ({
+  version: 1,
+  hostId: "h1",
+  hostName: "Desktop One",
+  endpoint: "ws://192.168.1.5:47831",
+  localEndpoint: "ws://192.168.1.5:47831",
+  pairingToken: "token",
+  expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  ...overrides
+});
+
+const pump = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+async function untilSocket() {
+  while (FakeWebSocket.instances.length === 0) await pump();
+  return FakeWebSocket.instances.at(-1);
+}
+
+test("pair lists the desktop before the handshake and drops the row when the socket errors", async () => {
+  await withFakeWebSocket(async () => {
+    const pending = HostConnection.pair(pairPayload(), FAKE_DEVICE).then(
+      () => { throw new Error("pairing should have failed"); },
+      (error) => error
+    );
+    // The QR grant is the commit point: the row is visible before the
+    // desktop answers, while the socket is still connecting.
+    const socket = await untilSocket();
+    const duringFlight = await HostConnection.savedHostRecords();
+    assert.deepEqual(duringFlight.map((record) => record.id), ["h1"]);
+    assert.equal(duringFlight[0].lastConnectedAt, undefined);
+    socket.onerror?.();
+    const error = await pending;
+    assert.equal(error.message, UNREACHABLE_HOST_MESSAGE);
+    // A failed pairing must not leave a phantom row behind.
+    assert.deepEqual(await HostConnection.savedHostRecords(), []);
+  });
+});
+
+test("a failed re-pairing keeps the desktop's existing row untouched", async () => {
+  await HostConnection.recordHost(host({ remoteEnrolled: true }));
+  await HostConnection.markHostConnected("h1");
+  const stampedAt = (await HostConnection.savedHostRecords())[0].lastConnectedAt;
+  assert.equal(typeof stampedAt, "number");
+  await withFakeWebSocket(async () => {
+    const pending = HostConnection.pair(pairPayload(), FAKE_DEVICE).then(
+      () => { throw new Error("pairing should have failed"); },
+      (error) => error
+    );
+    const socket = await untilSocket();
+    socket.onerror?.();
+    const error = await pending;
+    assert.equal(error.message, UNREACHABLE_HOST_MESSAGE);
+    const records = await HostConnection.savedHostRecords();
+    assert.equal(records.length, 1);
+    assert.equal(records[0].id, "h1");
+    assert.equal(records[0].remoteEnrolled, true);
+    assert.equal(records[0].lastConnectedAt, stampedAt);
+  });
+});
+
+test("a successful pairing commits the row, stamps it connected, and enrolls", async () => {
+  await withFakeWebSocket(async () => {
+    const pending = HostConnection.pair(pairPayload(), FAKE_DEVICE);
+    const socket = await untilSocket();
+    socket.setOpen();
+    await pump();
+    socket.serve({ type: "pair.accepted", deviceToken: "device-token", snapshot: SNAPSHOT });
+    const connection = await pending;
+    assert.equal(connection.host.deviceToken, "device-token");
+    // The background enrollment picks up from here; stub the native node so
+    // it resolves instead of reaching for a real engine.
+    connection.embeddedEngine = { start: async () => ({ engineStarted: true }), stop: async () => {} };
+    socket.serve({ type: "node.enrollment", authKey: "auth-key", expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    await pump();
+    await pump();
+    assert.equal(connection.remoteRegistrationState().status, "enrolled");
+    connection.close();
+    const records = await HostConnection.savedHostRecords();
+    assert.equal(records.length, 1);
+    assert.equal(records[0].id, "h1");
+    assert.equal(records[0].deviceToken, "device-token");
+    assert.equal(records[0].remoteEnrolled, true);
+    assert.equal(typeof records[0].lastConnectedAt, "number");
+  });
 });
 
 // ---- saveHost / forget round trip -------------------------------------------
