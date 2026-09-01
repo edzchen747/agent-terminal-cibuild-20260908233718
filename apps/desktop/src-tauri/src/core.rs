@@ -267,13 +267,15 @@ impl Core {
         core
     }
 
+    /// Boots on the first saved project in the user's order, falling back to
+    /// the home directory project when nothing is saved. No session is
+    /// created, so the window opens with zero terminal tabs.
     pub fn initialize(self: &Arc<Self>) -> Result<()> {
         let project = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             inner.store.ensure_network_identity()?;
-            ensure_home_project(&mut inner)?
+            startup_project(&mut inner)?
         };
-        self.create_session(&project.id, None)?;
         self.ensure_project_window_with_focus(&project.id, true, None)?;
         Ok(())
     }
@@ -2669,6 +2671,25 @@ fn ensure_home_project(inner: &mut Inner) -> Result<Project> {
     Ok(project)
 }
 
+/// The project a startup window opens on: the first saved project in the
+/// user's saved order, falling back to the home directory project when
+/// nothing is saved. Unsaved temporary projects never win, even while one
+/// still has live sessions or an open window, because a fresh start means
+/// none of those exist yet. No session is created, so a fresh app opens
+/// with zero terminal tabs.
+fn startup_project(inner: &mut Inner) -> Result<Project> {
+    if let Some(project) = public_projects(inner).into_iter().find(|project| {
+        inner
+            .store
+            .projects()
+            .iter()
+            .any(|saved| saved.id == project.id)
+    }) {
+        return Ok(project);
+    }
+    ensure_home_project(inner)
+}
+
 /// A saved project is always usable; a temporary project is only usable while
 /// it still has a session or an open window.
 fn project_is_usable(inner: &Inner, project_id: &str) -> bool {
@@ -3113,14 +3134,13 @@ fn registration_status_for_display(
 mod tests {
     use super::{
         CdOutcome, CdPlan, ConnectivityAction, ConnectivityTracker, EmbeddedNodeStatus, Inner,
-        ManagedSession, PRESENCE_WINDOW_MS, PairingGrant, RetireOutcome, ensure_home_project, folder_name,
-        is_cursor_position_report, is_dropped_node_status, is_within_project,
+        ManagedSession, PRESENCE_WINDOW_MS, PairingGrant, RetireOutcome, ensure_home_project,
+        folder_name, is_cursor_position_report, is_dropped_node_status, is_within_project,
         newest_running_session_project_id, parse_terminal_titles, parse_working_directories,
         preferred_project, presence_alive, project_is_usable, project_name_or_folder,
         record_cursor_position_requests, registration_status_for_display,
         resolve_working_directory, retire_empty_temporary_project, should_open_quiet_window,
-        snapshot_from_inner,
-        take_valid_pairing_grant, validate_project_name,
+        snapshot_from_inner, startup_project, take_valid_pairing_grant, validate_project_name,
     };
     use crate::{
         models::{AuthorizedDevice, Project, TerminalSession},
@@ -3755,6 +3775,138 @@ mod tests {
         );
         assert!(created.id.starts_with("temporary-"));
         assert!(inner.temporary_projects.contains_key(&created.id));
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn startup_project_picks_the_first_saved_project_in_the_user_order() {
+        let (store, state_path) = store_with_cleanup();
+        let mut inner = test_inner(store, Vec::new());
+        test_project(&mut inner, "saved-alpha", "C:\\Work\\Alpha", true);
+        test_project(&mut inner, "saved-beta", "C:\\Work\\Beta", true);
+        // The user reordered the sidebar so beta comes first; the startup
+        // must honor that order rather than the order the store persisted
+        // the records in.
+        inner.project_order = vec!["saved-beta".into(), "saved-alpha".into()];
+
+        let picked = startup_project(&mut inner).expect("startup project");
+        assert_eq!(picked.id, "saved-beta");
+        assert!(
+            inner.sessions.is_empty(),
+            "starting up must not open a terminal tab"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn startup_project_picks_the_saved_home_project_when_it_is_not_first() {
+        let (store, state_path) = store_with_cleanup();
+        let mut inner = test_inner(store, Vec::new());
+        test_project(&mut inner, "saved-alpha", "C:\\Work\\Alpha", true);
+        let home = home_path().to_string_lossy().into_owned();
+        test_project(&mut inner, "saved-home", &home, true);
+        // Alpha was moved ahead of the home project by the user.
+        inner.project_order = vec!["saved-alpha".into(), "saved-home".into()];
+
+        let picked = startup_project(&mut inner).expect("startup project");
+        assert_eq!(
+            picked.id, "saved-alpha",
+            "a saved project is chosen purely by user order, not by being the home directory"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn startup_project_falls_back_to_the_home_project_when_nothing_is_saved() {
+        let (store, state_path) = store_with_cleanup();
+        let mut inner = test_inner(store, Vec::new());
+        assert!(inner.store.projects().is_empty());
+
+        let picked = startup_project(&mut inner).expect("startup project");
+        assert!(
+            picked.id.starts_with("temporary-"),
+            "with no saved projects the home directory project is created"
+        );
+        assert!(!picked.persistent);
+        assert!(inner.temporary_projects.contains_key(&picked.id));
+        assert!(
+            inner.sessions.is_empty(),
+            "starting up must not open a terminal tab, not even for the fallback project"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn startup_project_reuses_an_existing_temporary_home_project_without_duplicating_it() {
+        let (store, state_path) = store_with_cleanup();
+        let mut inner = test_inner(store, Vec::new());
+        let existing = test_project(
+            &mut inner,
+            "temp-home",
+            home_path().to_string_lossy().to_lowercase().as_str(),
+            false,
+        );
+
+        let picked = startup_project(&mut inner).expect("startup project");
+        assert_eq!(picked.id, existing.id, "the existing temporary home project is reused");
+        assert_eq!(inner.temporary_projects.len(), 1, "no second home project appears");
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn startup_project_skips_unsaved_temporary_projects_even_when_they_have_live_sessions() {
+        let (store, state_path) = store_with_cleanup();
+        let mut inner = test_inner(store, Vec::new());
+        test_project(&mut inner, "saved-alpha", "C:\\Work\\Alpha", true);
+        // An unsaved project ordered first that still has a running session:
+        // it is eligible to appear in the sidebar, but a restart must not
+        // boot into an unsaved project.
+        let temporary = test_project(&mut inner, "temp-first", "C:\\Work\\First", false);
+        inner.sessions.insert(
+            "session-temp-first".into(),
+            test_session("session-temp-first", &temporary.id, "C:\\Work\\First"),
+        );
+        inner.project_order = vec![temporary.id, "saved-alpha".into()];
+
+        let picked = startup_project(&mut inner).expect("startup project");
+        assert_eq!(
+            picked.id, "saved-alpha",
+            "unsaved projects never win a startup, even ahead in the order"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn startup_project_never_boots_into_a_temporary_duplicate_of_a_saved_path() {
+        let (store, state_path) = store_with_cleanup();
+        let mut inner = test_inner(store, Vec::new());
+        let home = home_path().to_string_lossy().into_owned();
+        test_project(&mut inner, "saved-home", &home, true);
+        // A leftover temporary project that covers the same folder (in a
+        // different case) must not shadow the saved record.
+        let duplicate = test_project(
+            &mut inner,
+            "temp-home-duplicate",
+            home.to_lowercase().as_str(),
+            false,
+        );
+        inner.sessions.insert(
+            "session-temp-dup".into(),
+            test_session("session-temp-dup", &duplicate.id, &home),
+        );
+        inner.project_order = vec![duplicate.id, "saved-home".into()];
+
+        let picked = startup_project(&mut inner).expect("startup project");
+        assert_eq!(
+            picked.id, "saved-home",
+            "the saved record is used, never its unsaved path duplicate"
+        );
 
         fs::remove_file(state_path).expect("remove test state");
     }
