@@ -12,6 +12,8 @@ use std::{
     thread,
 };
 
+use std::fmt;
+
 use anyhow::{Context, Result, anyhow};
 use chrono::{Duration, Utc};
 use percent_encoding::percent_decode_str;
@@ -27,7 +29,8 @@ use crate::{
     models::{
         AuthorizedDevice, ClientMessage, DesktopState, DirectoryEntry, DirectoryListing, HostInfo,
         HostSnapshot, PROTOCOL_VERSION, PairingPayload, Project, RemoteRegistration, ServerMessage,
-        ShellProfile, TerminalDataEvent, TerminalSession,
+        SessionSegment, SessionSnapshot, ShellProfile, TerminalDataEvent, TerminalGridEvent,
+        TerminalSession,
     },
     network,
     path_utils::user_visible_path,
@@ -37,8 +40,28 @@ use crate::{
     window_clients::WindowClients,
 };
 
-const MAX_SCROLLBACK_BYTES: usize = 512_000;
+/// The PTY is spawned at this grid, then follows focus: whichever client
+/// actively uses the session (desktop window focused, or the phone) resizes
+/// the PTY to its own dimensions. Every change is journaled as a grid epoch
+/// (see `GridEpoch`), so a later replay reflows history exactly as live
+/// clients did.
+const SESSION_DEFAULT_COLS: u16 = 120;
+const SESSION_DEFAULT_ROWS: u16 = 30;
+/// Append-only raw PTY journal per session (the `session.buffer` replay
+/// source). Large enough for a full day of use; clients replay it over
+/// WebSocket on every attach, so the cap is the only history boundary.
+const MAX_TERMINAL_JOURNAL_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CONTROL_BYTES: usize = 8_192;
+
+/// A grid change in a session's PTY stream: `cols` x `rows` took effect at
+/// absolute stream offset `offset` (always a chunk-aligned boundary, because
+/// resize and append are serialized under the session lock).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GridEpoch {
+    offset: u64,
+    cols: u16,
+    rows: u16,
+}
 const MAX_PROJECT_NAME_CHARACTERS: usize = 100;
 /// Keep in sync with MOBILE_HEARTBEAT_INTERVAL_MS in packages/protocol/src/index.ts.
 const MOBILE_HEARTBEAT_INTERVAL_MS: i64 = 60_000;
@@ -50,6 +73,55 @@ const PRESENCE_WINDOW_MS: i64 = 2 * MOBILE_HEARTBEAT_INTERVAL_MS;
 const PRESENCE_REFRESH_INTERVAL_MS: u64 = (MOBILE_HEARTBEAT_INTERVAL_MS / 2) as u64;
 /// How often the connectivity monitor re-probes for internet access.
 const CONNECTIVITY_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+// ---------------------------------------------------------------------------
+// Terminal sync diagnostics (for debugging history parity between devices).
+// Enable by setting AGENT_TERMINAL_SYNC_DEBUG=1 before starting the host. The
+// log is written to %TEMP%/agent-terminal-sync.log and truncated at startup,
+// with one timestamped line per journal append, resize/broadcast, attach,
+// snapshot, and input point of interest.
+// ---------------------------------------------------------------------------
+
+static SYNC_DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn sync_debug_enabled() -> bool {
+    *SYNC_DEBUG_ENABLED.get_or_init(|| {
+        std::env::var("AGENT_TERMINAL_SYNC_DEBUG")
+            .is_ok_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "no" | "off"))
+    })
+}
+
+fn sync_log_path() -> PathBuf {
+    std::env::temp_dir().join("agent-terminal-sync.log")
+}
+
+fn sync_log_line(scope: &str, message: fmt::Arguments<'_>) {
+    let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let line = format!("{timestamp} [{scope}] {message}\n");
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(sync_log_path())
+        .and_then(|mut file| file.write_all(line.as_bytes()));
+}
+
+macro_rules! sync_log {
+    ($scope:expr, $($arg:tt)*) => {
+        if sync_debug_enabled() {
+            sync_log_line($scope, format_args!($($arg)*));
+        }
+    };
+}
+
+/// Webview-side terminal sync diagnostics (TerminalPane decisions), mirrored
+/// into the host log so a debug run captures both clients' merges in one file.
+/// Gated by AGENT_TERMINAL_SYNC_DEBUG like the rest of the sync log; with the
+/// env var unset the invoke returns immediately without touching the disk.
+pub fn sync_debug_from_webview(message: &str) {
+    if sync_debug_enabled() {
+        sync_log_line("webview", format_args!("{message}"));
+    }
+}
 
 fn presence_now_ms() -> i64 {
     Utc::now().timestamp_millis()
@@ -119,7 +191,19 @@ struct ManagedSession {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Current PTY grid (cols, rows): the focused client's dimensions.
+    grid: (u16, u16),
+    /// Grid history in stream order. Always starts with the spawn grid at
+    /// offset 0; the last entry is the current grid.
+    grid_epochs: Vec<GridEpoch>,
+    /// Raw append-only PTY output journal (the `session.buffer` replay
+    /// source). Every chunk is numbered by its absolute byte offset in the
+    /// session stream via `journal_len`; the front is trimmed only when the
+    /// cap is exceeded and never in the middle of an escape sequence.
     buffer: String,
+    /// Total bytes ever appended to `buffer` (a monotonic stream position
+    /// that survives front trimming, so offsets stay absolute for life).
+    journal_len: u64,
     control_tail: String,
     cursor_query_tail: String,
     pending_cursor_reports: usize,
@@ -235,6 +319,10 @@ impl ConnectivityTracker {
 
 impl Core {
     pub fn new(app: AppHandle, store: DesktopStore) -> Arc<Self> {
+        if sync_debug_enabled() {
+            let _ = fs::File::create(sync_log_path());
+            sync_log_line("boot", format_args!("sync debug log started for the host session"));
+        }
         let remote_port = store.settings().port;
         let project_order = store
             .projects()
@@ -1398,10 +1486,15 @@ impl Core {
             (project, shell)
         };
 
+        // The PTY starts at a default grid and follows focus afterwards:
+        // whichever client is actively using the session (desktop focused or
+        // the phone) resizes it to its own dimensions. History stays exact
+        // across these grid switches because every change is journaled as an
+        // epoch and every emulator reflows through the same resize sequence.
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
-            rows: 30,
-            cols: 120,
+            rows: SESSION_DEFAULT_ROWS,
+            cols: SESSION_DEFAULT_COLS,
             pixel_width: 0,
             pixel_height: 0,
         })?;
@@ -1431,7 +1524,14 @@ impl Core {
                     master: pair.master,
                     writer,
                     killer,
+                    grid: (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS),
+                    grid_epochs: vec![GridEpoch {
+                        offset: 0,
+                        cols: SESSION_DEFAULT_COLS,
+                        rows: SESSION_DEFAULT_ROWS,
+                    }],
                     buffer: String::new(),
+                    journal_len: 0,
                     control_tail: String::new(),
                     cursor_query_tail: String::new(),
                     pending_cursor_reports: 0,
@@ -1468,6 +1568,12 @@ impl Core {
             self.close_session(&id);
             return Err(error);
         }
+        sync_log!(
+            "session",
+            "created id={id} project={} shell={} grid={SESSION_DEFAULT_COLS}x{SESSION_DEFAULT_ROWS}",
+            project.id,
+            shell.id
+        );
         self.broadcast();
         Ok(metadata)
     }
@@ -1480,6 +1586,7 @@ impl Core {
             };
             inner.session_order.retain(|id| id != session_id);
             let _ = session.killer.kill();
+            sync_log!("session", "close id={session_id}");
             session.metadata.project_id
         };
         self.cleanup_empty_temporary_project(&project_id);
@@ -1525,35 +1632,107 @@ impl Core {
         controller: TerminalController,
         size: Option<(u16, u16)>,
     ) {
-        let mut inner = self.inner.lock().expect("desktop state poisoned");
-        let Some(session) = inner.sessions.get_mut(session_id) else {
-            return;
-        };
-        if session.metadata.status != "running" {
-            return;
-        }
-
-        // A CPR is valid only as a response to a live query emitted by the
-        // shell. Replayed PTY history and duplicate xterm responses otherwise
-        // arrive on the same input stream as typed keys; PSReadLine interprets
-        // those stale reports as an editing key and rings the bell.
-        if is_cursor_position_report(data) {
-            if session.pending_cursor_reports == 0 {
+        let grid_changed = {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let Some(session) = inner.sessions.get_mut(session_id) else {
+                return;
+            };
+            if session.metadata.status != "running" {
                 return;
             }
-            session.pending_cursor_reports -= 1;
-        } else {
-            session.terminal_controller = Some(controller.clone());
-            if let Some((cols, rows)) = size {
-                Self::resize_managed_session(session, cols, rows);
-            }
-        }
 
-        if data.contains('\r') || data.contains('\n') {
-            session.has_run_command = true;
+            // A CPR is valid only as a response to a live query emitted by the
+            // shell. Replayed PTY history and duplicate xterm responses otherwise
+            // arrive on the same input stream as typed keys; PSReadLine interprets
+            // those stale reports as an editing key and rings the bell.
+            if is_cursor_position_report(data) {
+                if session.pending_cursor_reports == 0 {
+                    return;
+                }
+                session.pending_cursor_reports -= 1;
+            } else {
+                session.terminal_controller = Some(controller.clone());
+                if let Some((cols, rows)) = size {
+                    apply_session_grid(session, cols, rows);
+                }
+            }
+            sync_log!(
+                "input",
+                "session={session_id} controller={controller:?} bytes={} grid_hint={:?}",
+                data.len(),
+                size
+            );
+
+            if data.contains('\r') || data.contains('\n') {
+                session.has_run_command = true;
+            }
+            let _ = session.writer.write_all(data.as_bytes());
+            let _ = session.writer.flush();
+
+            session
+                .grid_epochs
+                .last()
+                .filter(|epoch| epoch.offset == session.journal_len)
+                .copied()
+        };
+        if let Some(epoch) = grid_changed {
+            sync_log!(
+                "grid",
+                "change session={session_id} new={}x{} at_offset={}",
+                epoch.cols,
+                epoch.rows,
+                epoch.offset
+            );
+            self.broadcast_grid_change(session_id, epoch);
         }
-        let _ = session.writer.write_all(data.as_bytes());
-        let _ = session.writer.flush();
+    }
+
+    /// The focused client owns the PTY grid. Snapshots and live output never
+    /// re-wrap the stream: the grid change is recorded at its exact stream
+    /// offset, every emulator reflows through the same epoch sequence, and
+    /// history content stays identical on every device.
+    fn resize_session_from(
+        &self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+        controller: TerminalController,
+    ) {
+        let epoch = {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let Some(session) = inner.sessions.get_mut(session_id) else {
+                return;
+            };
+            if session.metadata.status != "running" {
+                return;
+            }
+            session.terminal_controller = Some(controller.clone());
+            apply_session_grid(session, cols, rows)
+        };
+        sync_log!(
+            "grid",
+            "request session={session_id} controller={controller:?} wanted={cols}x{rows} applied={}",
+            epoch.is_some()
+        );
+        if let Some(epoch) = epoch {
+            self.broadcast_grid_change(session_id, epoch);
+        }
+    }
+
+    pub fn resize_desktop_session(
+        &self,
+        window_label: &str,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+        _force: bool,
+    ) {
+        self.resize_session_from(
+            session_id,
+            cols,
+            rows,
+            TerminalController::Desktop(window_label.to_string()),
+        );
     }
 
     pub fn write_desktop_session(
@@ -1581,40 +1760,6 @@ impl Core {
         );
     }
 
-    fn resize_session_from(
-        &self,
-        session_id: &str,
-        cols: u16,
-        rows: u16,
-        controller: TerminalController,
-    ) {
-        let mut inner = self.inner.lock().expect("desktop state poisoned");
-        let Some(session) = inner.sessions.get_mut(session_id) else {
-            return;
-        };
-        if session.metadata.status != "running" {
-            return;
-        }
-        session.terminal_controller = Some(controller);
-        Self::resize_managed_session(session, cols, rows);
-    }
-
-    pub fn resize_desktop_session(
-        &self,
-        window_label: &str,
-        session_id: &str,
-        cols: u16,
-        rows: u16,
-        _force: bool,
-    ) {
-        self.resize_session_from(
-            session_id,
-            cols,
-            rows,
-            TerminalController::Desktop(window_label.to_string()),
-        );
-    }
-
     fn resize_remote_session(&self, client_id: &str, session_id: &str, cols: u16, rows: u16) {
         self.resize_session_from(
             session_id,
@@ -1634,22 +1779,13 @@ impl Core {
         }
     }
 
-    fn resize_managed_session(session: &ManagedSession, cols: u16, rows: u16) {
-        let cols = cols.clamp(2, 500);
-        let rows = rows.clamp(1, 200);
-        // A resize is already a PTY notification.  Do not pulse through a
-        // second row count for `force`: ConPTY can make a focused line editor
-        // beep or lose the key being entered when it sees the synthetic
-        // rows-1 -> rows transition.
-        let _ = session.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
-    }
-
-    pub fn attach_window_session(&self, label: &str, session_id: &str) -> Result<String> {
+    pub fn attach_window_session(
+        &self,
+        label: &str,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<SessionSnapshot> {
         let mut inner = self.inner.lock().expect("desktop state poisoned");
         let window_project_id = inner
             .windows
@@ -1658,23 +1794,41 @@ impl Core {
             .ok_or_else(|| {
                 anyhow!("Terminal window is no longer registered with the tray host.")
             })?;
-        let (session_project_id, buffer) = inner
-            .sessions
-            .get(session_id)
-            .map(|session| (session.metadata.project_id.clone(), session.buffer.clone()))
-            .ok_or_else(|| anyhow!("Terminal session not found."))?;
+        let (session_project_id, snapshot, epoch) = match inner.sessions.get_mut(session_id) {
+            // Apply the attaching window's grid BEFORE the snapshot is built:
+            // the snapshot must end at the PTY's current grid, otherwise the
+            // replay leaves the emulator on the stale grid (and the trailing
+            // grid notice races the replay, sometimes landing after it).
+            Some(session) => {
+                session.terminal_controller = Some(TerminalController::Desktop(label.to_string()));
+                let epoch = apply_session_grid(session, cols, rows);
+                (
+                    session.metadata.project_id.clone(),
+                    snapshot_of(session),
+                    epoch,
+                )
+            }
+            None => return Err(anyhow!("Terminal session not found.")),
+        };
         if session_project_id != window_project_id {
             return Err(anyhow!("Terminal session moved to another project window."));
-        }
-        if let Some(session) = inner.sessions.get_mut(session_id) {
-            session.terminal_controller = Some(TerminalController::Desktop(label.to_string()));
         }
         if !inner.windows.attach(label, session_id) {
             return Err(anyhow!(
                 "Terminal window is no longer registered with the tray host."
             ));
         }
-        Ok(buffer)
+        sync_log!(
+            "attach",
+            "desktop window={label} session={session_id} grid={cols}x{rows} segments={} end_offset={}",
+            snapshot.segments.len(),
+            snapshot.end_offset
+        );
+        drop(inner);
+        if let Some(epoch) = epoch {
+            self.broadcast_grid_change(session_id, epoch);
+        }
+        Ok(snapshot)
     }
 
     pub fn detach_window_session(&self, label: &str, session_id: &str) {
@@ -1696,14 +1850,86 @@ impl Core {
         }
     }
 
-    fn session_buffer(&self, session_id: &str) -> String {
-        self.inner
+    fn session_snapshot(&self, session_id: &str) -> SessionSnapshot {
+        let snapshot = self
+            .inner
             .lock()
             .expect("desktop state poisoned")
             .sessions
             .get(session_id)
-            .map(|session| session.buffer.clone())
-            .unwrap_or_default()
+            .map(snapshot_of)
+            .unwrap_or(SessionSnapshot {
+                segments: Vec::new(),
+                end_offset: 0,
+            });
+        sync_log!(
+            "snapshot",
+            "session={session_id} segments={} bytes={} end_offset={}",
+            snapshot.segments.len(),
+            snapshot
+                .segments
+                .iter()
+                .map(|segment| segment.data.len())
+                .sum::<usize>(),
+            snapshot.end_offset
+        );
+        snapshot
+    }
+
+    /// Tell every attached device (and every desktop window) that the PTY
+    /// grid changed at this stream offset, so all emulators reflow in step.
+    /// The resizing client receives the notice too; applying its own grid is
+    /// a no-op reflow, and this keeps the event order deterministic.
+    fn broadcast_grid_change(&self, session_id: &str, epoch: GridEpoch) {
+        let targets = self
+            .clients
+            .lock()
+            .expect("remote clients poisoned")
+            .iter()
+            .filter(|(_, client)| {
+                client.device_id.is_some() && client.attached_sessions.contains(session_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for client_id in &targets {
+            self.send_to_client(
+                client_id,
+                ServerMessage::SessionGrid {
+                    session_id: session_id.to_string(),
+                    cols: epoch.cols,
+                    rows: epoch.rows,
+                    offset: epoch.offset,
+                },
+            );
+        }
+        let event = TerminalGridEvent {
+            session_id: session_id.to_string(),
+            cols: epoch.cols,
+            rows: epoch.rows,
+            offset: epoch.offset,
+        };
+        let windows = self
+            .inner
+            .lock()
+            .expect("desktop state poisoned")
+            .windows
+            .subscribers(session_id);
+        let windows_count = windows.len();
+        sync_log!(
+            "grid",
+            "broadcast session={session_id} new={}x{} at_offset={} clients={} windows={windows_count}",
+            epoch.cols,
+            epoch.rows,
+            epoch.offset,
+            targets.len()
+        );
+        for label in windows {
+            let _ = self.app.emit_to(
+                EventTarget::webview_window(label),
+                "desktop-grid",
+                event.clone(),
+            );
+        }
     }
 
     pub fn set_default_shell(&self, shell_id: &str) -> Result<()> {
@@ -2205,11 +2431,14 @@ impl Core {
                 cols,
                 rows,
             } => {
+                // Attaching focuses this client: the PTY takes its grid.
                 self.resize_remote_session(client_id, &session_id, cols, rows);
+                let snapshot = self.session_snapshot(&session_id);
                 Some(ServerMessage::SessionBuffer {
                     request_id,
                     session_id: session_id.clone(),
-                    data: self.session_buffer(&session_id),
+                    segments: snapshot.segments,
+                    end_offset: snapshot.end_offset,
                 })
             }
             ClientMessage::SessionDetach {
@@ -2231,6 +2460,14 @@ impl Core {
             } => {
                 let _ = force;
                 self.resize_remote_session(client_id, &session_id, cols, rows);
+                None
+            }
+            ClientMessage::DebugDiagnostics { message } => {
+                // Phone-side terminal sync diagnostics ([ATSync] lines from
+                // MobileTerminal), mirrored into the host log so a debug run
+                // captures both sides of the sync in one file. Only logged
+                // when AGENT_TERMINAL_SYNC_DEBUG is enabled.
+                sync_log!("diagnostics", "client={client_id} {message}");
                 None
             }
             ClientMessage::Pair { .. }
@@ -2283,7 +2520,7 @@ impl Core {
         }
     }
 
-    fn send_terminal_output(&self, session_id: &str, data: &str) {
+    fn send_terminal_output(&self, session_id: &str, data: &str, offset: u64) {
         let targets = self
             .clients
             .lock()
@@ -2294,12 +2531,19 @@ impl Core {
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
-        for client_id in targets {
+        let targets_count = targets.len();
+        sync_log!(
+            "output",
+            "session={session_id} offset={offset} len={} targets={targets_count}",
+            data.len()
+        );
+        for client_id in &targets {
             self.send_to_client(
-                &client_id,
+                client_id,
                 ServerMessage::SessionOutput {
                     session_id: session_id.to_string(),
                     data: data.to_string(),
+                    offset,
                 },
             );
         }
@@ -2324,13 +2568,35 @@ impl Core {
     }
 
     fn on_terminal_data(self: &Arc<Self>, session_id: &str, data: String) {
-        let (reported_cwd, title_changed, window_clients) = {
+        let (reported_cwd, title_changed, window_clients, offset) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
             };
+            // Append to the journal and number the chunk with its absolute
+            // stream offset. The offset is monotonic for the lifetime of the
+            // session: front trimming moves `offset` forward in `buffer`, but
+            // `journal_len` keeps counting from stream position zero, so a
+            // replay snapshot and a live chunk can be compared exactly.
+            let offset = session.journal_len;
             session.buffer.push_str(&data);
-            truncate_front(&mut session.buffer, MAX_SCROLLBACK_BYTES);
+            let before_trim = session.buffer.len();
+            session.journal_len = offset.saturating_add(data.len() as u64);
+            truncate_journal_front(&mut session.buffer, MAX_TERMINAL_JOURNAL_BYTES);
+            if session.buffer.len() != before_trim {
+                sync_log!(
+                    "journal",
+                    "trim session={session_id} trimmed={} remaining={}",
+                    before_trim - session.buffer.len(),
+                    session.buffer.len()
+                );
+            }
+            sync_log!(
+                "journal",
+                "append session={session_id} offset={offset} len={} journal_len={}",
+                data.len(),
+                session.journal_len
+            );
             session.control_tail.push_str(&data);
             truncate_front(&mut session.control_tail, MAX_CONTROL_BYTES);
             session.pending_cursor_reports =
@@ -2360,11 +2626,13 @@ impl Core {
                 reported,
                 title_changed,
                 inner.windows.subscribers(session_id),
+                offset,
             )
         };
         let event = TerminalDataEvent {
             session_id: session_id.to_string(),
             data: data.clone(),
+            offset,
         };
         for label in window_clients {
             let _ = self.app.emit_to(
@@ -2373,7 +2641,7 @@ impl Core {
                 event.clone(),
             );
         }
-        self.send_terminal_output(session_id, &data);
+        self.send_terminal_output(session_id, &data, offset);
         if let Some(cwd) = reported_cwd {
             self.handle_session_working_directory(session_id, &cwd);
         } else if title_changed {
@@ -2964,6 +3232,140 @@ fn truncate_front(value: &mut String, maximum: usize) {
     value.drain(..start);
 }
 
+/// Trim the front of the raw PTY journal so a replayed snapshot never starts in
+/// the middle of an ANSI escape sequence. Clients replay the journal into a
+/// blank xterm emulator, so the first byte they see must be at a sequence
+/// boundary (`ESC` or plain printable output); cutting in the middle of a CSI
+/// or OSC sequence would leave the emulator in a corrupted drawing state.
+fn truncate_journal_front(value: &mut String, maximum: usize) {
+    if value.len() <= maximum {
+        return;
+    }
+    let mut start = value.len() - maximum;
+    if let Some(relative) = value.get(start..).and_then(|tail| tail.find('\x1b')) {
+        start += relative;
+    }
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value.drain(..start);
+}
+
+/// Resize the PTY to the requesting client's grid and record the epoch, or
+/// nothing if the grid did not actually change. `apply_session_grid` runs
+/// under the session lock, so the recorded epoch offset is always aligned to
+/// a journal chunk boundary.
+fn apply_session_grid(session: &mut ManagedSession, cols: u16, rows: u16) -> Option<GridEpoch> {
+    let cols = cols.clamp(2, 500);
+    let rows = rows.clamp(1, 200);
+    if (cols, rows) == session.grid {
+        return None;
+    }
+    // A resize is already a PTY notification. Do not pulse through a second
+    // row count: ConPTY can make a focused line editor beep or lose the key
+    // being entered when it sees the synthetic rows-1 -> rows transition.
+    let _ = session.master.resize(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+    session.grid = (cols, rows);
+    let epoch = GridEpoch {
+        offset: session.journal_len,
+        cols,
+        rows,
+    };
+    session.grid_epochs.push(epoch);
+    Some(epoch)
+}
+
+fn snapshot_of(session: &ManagedSession) -> SessionSnapshot {
+    let base = session.journal_len.saturating_sub(session.buffer.len() as u64);
+    SessionSnapshot {
+        segments: split_journal_by_epochs(&session.buffer, &session.grid_epochs, base),
+        end_offset: session.journal_len,
+    }
+}
+
+/// Split the (possibly front-trimmed) journal into per-grid segments. Every
+/// epoch's stream offset maps to a byte position in the string because the
+/// journal is only ever trimmed as a prefix and appends always land on
+/// character boundaries. Zero-length segments are kept for back-to-back grid
+/// swaps (no output between two resizes), so a replay reflows through every
+/// intermediate grid exactly the way live clients did.
+fn split_journal_by_epochs(
+    journal: &str,
+    epochs: &[GridEpoch],
+    base_offset: u64,
+) -> Vec<SessionSegment> {
+    if journal.is_empty() {
+        return Vec::new();
+    }
+    let mut segments = Vec::new();
+    let mut cursor_byte = 0_usize;
+    let mut current = GridEpoch {
+        offset: base_offset,
+        cols: SESSION_DEFAULT_COLS,
+        rows: SESSION_DEFAULT_ROWS,
+    };
+    for epoch in epochs {
+        if epoch.offset < base_offset {
+            current = *epoch;
+            continue;
+        }
+        let mut relative = (epoch.offset - base_offset) as usize;
+        if relative > journal.len() {
+            break;
+        }
+        while relative < journal.len() && !journal.is_char_boundary(relative) {
+            relative += 1;
+        }
+        let start = cursor_byte.min(relative);
+        let mut cursor = start;
+        while cursor < relative && !journal.is_char_boundary(cursor) {
+            cursor += 1;
+        }
+        if relative > cursor {
+            segments.push(SessionSegment {
+                cols: current.cols,
+                rows: current.rows,
+                data: journal[cursor..relative].to_string(),
+            });
+        } else if (current.cols, current.rows) != (epoch.cols, epoch.rows) {
+            // A back-to-back grid swap with no output in between: keep the
+            // zero-length segment so replay reflows through the intermediate
+            // grid exactly as the live clients did.
+            segments.push(SessionSegment {
+                cols: current.cols,
+                rows: current.rows,
+                data: String::new(),
+            });
+        }
+        cursor_byte = relative;
+        current = *epoch;
+    }
+    if cursor_byte < journal.len() {
+        segments.push(SessionSegment {
+            cols: current.cols,
+            rows: current.rows,
+            data: journal[cursor_byte..].to_string(),
+        });
+    }
+    // Pin the final (current) grid even when it produced no bytes yet, so a
+    // replay always ends at the same grid the live clients are on.
+    if !segments.last().is_some_and(|segment: &SessionSegment| {
+        (segment.cols, segment.rows) == (current.cols, current.rows)
+    }) {
+        segments.push(SessionSegment {
+            cols: current.cols,
+            rows: current.rows,
+            data: String::new(),
+        });
+    }
+    segments
+}
+
 fn parse_working_directories(value: &str) -> Vec<String> {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     let regex = PATTERN.get_or_init(|| {
@@ -3137,10 +3539,12 @@ mod tests {
         ManagedSession, PRESENCE_WINDOW_MS, PairingGrant, RetireOutcome, ensure_home_project,
         folder_name, is_cursor_position_report, is_dropped_node_status, is_within_project,
         newest_running_session_project_id, parse_terminal_titles, parse_working_directories,
-        preferred_project, presence_alive, project_is_usable, project_name_or_folder,
-        record_cursor_position_requests, registration_status_for_display,
+        apply_session_grid, preferred_project, presence_alive, project_is_usable,
+        project_name_or_folder, record_cursor_position_requests, registration_status_for_display,
         resolve_working_directory, retire_empty_temporary_project, should_open_quiet_window,
-        snapshot_from_inner, startup_project, take_valid_pairing_grant, validate_project_name,
+        snapshot_from_inner, split_journal_by_epochs, startup_project, take_valid_pairing_grant,
+        truncate_journal_front, validate_project_name, GridEpoch, SESSION_DEFAULT_COLS,
+        SESSION_DEFAULT_ROWS,
     };
     use crate::{
         models::{AuthorizedDevice, Project, TerminalSession},
@@ -3154,6 +3558,203 @@ mod tests {
         path::{Path, PathBuf},
     };
     use uuid::Uuid;
+
+    #[test]
+    fn journal_truncation_starts_the_tail_at_an_escape_boundary() {
+        let mut journal = String::new();
+        journal.push_str("C:\\repo> ls\r\n");
+        for index in 0..100 {
+            journal.push_str(&format!("file-{index:03}.txt\r\n"));
+        }
+        journal.push_str("C:\\repo> echo \x1b[31mred\x1b[0m\r\n");
+        journal.push_str("\x1b]9;9;C:\\repo\\docs\x07journal tail\r\n");
+
+        let expected_tail =
+            String::from("\x1b[31mred\x1b[0m\r\n\x1b]9;9;C:\\repo\\docs\x07journal tail\r\n");
+
+        truncate_journal_front(&mut journal, 64);
+        assert_eq!(journal, expected_tail);
+    }
+
+    #[test]
+    fn journal_truncation_mid_sequence_skips_to_the_next_escape() {
+        // The natural cut point lands inside "\x1b[1;5C", and a second escape
+        // ("\x1b[32m") follows it. The trimmed journal must start at that next
+        // ESC so a replayed snapshot never begins inside a sequence.
+        let mut journal = String::from("seed \x1b[1;5C");
+        journal.push_str(&"x".repeat(20));
+        journal.push_str("\x1b[32m");
+        journal.push_str(&"y".repeat(60));
+
+        truncate_journal_front(&mut journal, 90);
+        assert_eq!(journal, format!("\x1b[32m{}", "y".repeat(60)));
+    }
+
+    #[test]
+    fn journal_truncation_handles_tiny_caps_without_panicking() {
+        let mut journal = String::from("\x1b[1A text goes here");
+        truncate_journal_front(&mut journal, 4);
+        assert!(journal.len() > 0);
+        truncate_journal_front(&mut journal, 0);
+        assert!(journal.is_empty());
+        truncate_journal_front(&mut journal, usize::MAX);
+        assert!(journal.is_empty());
+    }
+
+    #[test]
+    fn journal_splits_into_per_grid_segments_without_losing_bytes() {
+        let stream = "PS C:\\repo> dir\r\nfile-one.txt\r\nfile-two.txt\r\nPS C:\\repo> git status\r\n";
+        // Offsets: 18 lands inside "file-one.txt" (a mid-line grid switch is
+        // fine - reflow takes over the already-printed row), 45 is exactly
+        // the start of the next prompt line.
+        let epochs = vec![
+            GridEpoch { offset: 0, cols: 120, rows: 30 },
+            GridEpoch { offset: 18, cols: 45, rows: 35 },
+            GridEpoch { offset: 45, cols: 100, rows: 40 },
+        ];
+        let segments = split_journal_by_epochs(stream, &epochs, 0);
+        let joined: String = segments.iter().map(|segment| segment.data.as_str()).collect();
+        assert_eq!(joined, stream, "no byte may be lost or duplicated across grid slices");
+        assert_eq!(segments[0].cols, 120);
+        assert_eq!(segments[1].cols, 45);
+        assert_eq!(segments[1].data, "ile-one.txt\r\nfile-two.txt\r\n");
+        assert_eq!(segments[2].cols, 100);
+        assert_eq!(segments[2].data, "PS C:\\repo> git status\r\n");
+    }
+
+    #[test]
+    fn journal_split_keeps_zero_length_segments_for_back_to_back_swaps() {
+        // Two grid swaps with no output between them must still appear as
+        // resize steps so a replay reflows through the intermediate grid and
+        // always ends on the current grid.
+        let stream = "abc";
+        let epochs = vec![
+            GridEpoch { offset: 0, cols: 120, rows: 30 },
+            GridEpoch { offset: 3, cols: 45, rows: 35 },
+            GridEpoch { offset: 3, cols: 100, rows: 40 },
+        ];
+        let segments = split_journal_by_epochs(stream, &epochs, 0);
+        assert_eq!(segments.len(), 3);
+        assert_eq!((segments[0].cols, segments[0].rows), (120, 30));
+        assert_eq!(segments[0].data, "abc");
+        assert_eq!((segments[1].cols, segments[1].rows), (45, 35));
+        assert_eq!(segments[1].data, "");
+        assert_eq!((segments[2].cols, segments[2].rows), (100, 40));
+        assert_eq!(segments[2].data, "");
+        let joined: String = segments.iter().map(|segment| segment.data.as_str()).collect();
+        assert_eq!(joined, "abc");
+    }
+
+    #[test]
+    fn journal_split_after_front_trimming_starts_at_the_trimmed_base() {
+        let journal = &"A".repeat(500)[200..];
+        let epochs = vec![
+            GridEpoch { offset: 0, cols: 120, rows: 30 },
+            GridEpoch { offset: 480, cols: 60, rows: 40 },
+        ];
+        let base = 200_u64;
+        let segments = split_journal_by_epochs(journal, &epochs, base);
+        assert_eq!(segments[0].cols, 120, "the last epoch at or before the base still applies");
+        let joined: String = segments.iter().map(|segment| segment.data.as_str()).collect();
+        assert_eq!(joined, journal);
+    }
+
+    #[test]
+    fn journal_split_survives_multibyte_characters_at_epoch_boundaries() {
+        let stream = "PS> 日本語ファイル.txt\r\n日本語列もそのまま\r\n";
+        let epochs = vec![
+            GridEpoch { offset: 0, cols: 120, rows: 30 },
+            GridEpoch { offset: (stream.len() - "日本語列もそのまま\r\n".len()) as u64, cols: 80, rows: 24 },
+        ];
+        let segments = split_journal_by_epochs(stream, &epochs, 0);
+        let joined: String = segments.iter().map(|segment| segment.data.as_str()).collect();
+        assert_eq!(joined, stream);
+        assert_eq!(segments[1].cols, 80);
+    }
+
+    #[test]
+    fn journal_split_starts_at_an_epoch_that_sits_exactly_on_the_trimmed_base() {
+        // base_offset == an epoch offset: that epoch's grid must own the
+        // whole trimmed journal, with no bytes ascribed to the stale grid.
+        let journal = "PS> dir\r\nfile.txt\r\n";
+        let epochs = vec![
+            GridEpoch { offset: 0, cols: 120, rows: 30 },
+            GridEpoch { offset: 200, cols: 45, rows: 35 },
+        ];
+        let segments = split_journal_by_epochs(journal, &epochs, 200);
+        let joined: String = segments.iter().map(|segment| segment.data.as_str()).collect();
+        assert_eq!(joined, journal);
+        assert_eq!(segments.last().unwrap().cols, 45);
+    }
+
+    #[test]
+    fn journal_split_ignores_epochs_beyond_the_trimmed_journal() {
+        // The journal was front-trimmed so far that an archive epoch now sits
+        // past the end of the retained bytes; slicing must not panic or emit
+        // unreachable segments, and the retained grid stays the latest one.
+        let journal = "tail-content\r\n";
+        let epochs = vec![
+            GridEpoch { offset: 0, cols: 120, rows: 30 },
+            GridEpoch { offset: 10, cols: 72, rows: 26 },
+            GridEpoch { offset: 5000, cols: 113, rows: 39 },
+        ];
+        let segments = split_journal_by_epochs(journal, &epochs, 200);
+        let joined: String = segments.iter().map(|segment| segment.data.as_str()).collect();
+        assert_eq!(joined, journal);
+        assert_eq!(segments.last().unwrap().cols, 72);
+    }
+
+    #[test]
+    fn journal_split_of_an_empty_journal_yields_no_segments() {
+        let epochs = vec![GridEpoch { offset: 0, cols: 120, rows: 30 }];
+        assert!(split_journal_by_epochs("", &epochs, 0).is_empty());
+    }
+
+    #[test]
+    fn journal_split_pins_the_current_grid_when_the_trimmed_journal_has_no_epoch_yet() {
+        // base sits before the first (zero-byte) epoch that already changed
+        // the grid: the split must still end on the epoch's grid, never on
+        // the spawn default.
+        let journal = "abc";
+        let epochs = vec![
+            GridEpoch { offset: 0, cols: 120, rows: 30 },
+            GridEpoch { offset: 3, cols: 45, rows: 35 },
+        ];
+        let segments = split_journal_by_epochs(journal, &epochs, 0);
+        assert_eq!(segments.last().unwrap().cols, 45);
+        assert_eq!(
+            segments[0].cols,
+            120,
+            "the bytes before the epoch still carry the previous grid"
+        );
+    }
+
+    #[test]
+    fn applying_the_same_grid_is_a_no_op_and_changing_it_records_an_epoch() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let first = apply_session_grid(&mut session, 113, 39);
+        assert_eq!(first, Some(GridEpoch { offset: 0, cols: 113, rows: 39 }));
+        assert_eq!(session.grid, (113, 39));
+        assert_eq!(session.grid_epochs.len(), 2);
+
+        let noop = apply_session_grid(&mut session, 113, 39);
+        assert_eq!(noop, None);
+        assert_eq!(session.grid_epochs.len(), 2, "a no-op must not add an epoch");
+
+        let second = apply_session_grid(&mut session, 72, 26);
+        assert_eq!(second, Some(GridEpoch { offset: 0, cols: 72, rows: 26 }));
+        assert_eq!(session.grid, (72, 26));
+        assert_eq!(session.grid_epochs.len(), 3);
+    }
+
+    #[test]
+    fn applying_a_grid_uses_the_current_journal_position_for_the_epoch() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        session.buffer.push_str("existing history");
+        session.journal_len = 19;
+        let epoch = apply_session_grid(&mut session, 100, 34);
+        assert_eq!(epoch, Some(GridEpoch { offset: 19, cols: 100, rows: 34 }));
+    }
 
     #[test]
     fn presence_alive_covers_the_heartbeat_window_boundaries() {
@@ -4182,7 +4783,14 @@ mod tests {
             master: Box::new(InertMaster),
             writer: Box::new(std::io::sink()),
             killer: Box::new(InertKiller),
+            grid: (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS),
+            grid_epochs: vec![GridEpoch {
+                offset: 0,
+                cols: SESSION_DEFAULT_COLS,
+                rows: SESSION_DEFAULT_ROWS,
+            }],
             buffer: String::new(),
+            journal_len: 0,
             control_tail: String::new(),
             cursor_query_tail: String::new(),
             pending_cursor_reports: 0,

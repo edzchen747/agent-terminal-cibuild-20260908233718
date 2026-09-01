@@ -310,6 +310,76 @@ test("connect rejects with the shared-network hint when the desktop cannot be re
   }).finally(() => { globalThis.navigator.onLine = realOnLine; });
 });
 
+// ---- session event routing -------------------------------------------------
+
+test("session.output and session.grid arrive as typed events with raw payloads", async () => {
+  await withFakeWebSocket(async () => {
+    const connection = new HostConnection(host());
+    const outputs = [];
+    const grids = [];
+    connection.on("output", (event) => outputs.push(event));
+    connection.on("grid", (event) => grids.push(event));
+    const opening = connection["open"]("ws://192.168.1.5:47831", 2_000);
+    FakeWebSocket.instances.at(-1).setOpen();
+    await opening;
+
+    FakeWebSocket.instances.at(-1).deliverServerMessage({
+      type: "session.output",
+      sessionId: "s1",
+      data: "hello\r\n",
+      offset: 337
+    });
+    FakeWebSocket.instances.at(-1).deliverServerMessage({
+      type: "session.grid",
+      sessionId: "s1",
+      cols: 72,
+      rows: 26,
+      offset: 636
+    });
+    FakeWebSocket.instances.at(-1).deliverServerMessage({
+      type: "session.output",
+      sessionId: "s1",
+      data: "world\r\n",
+      offset: 343
+    });
+    FakeWebSocket.instances.at(-1).deliverServerMessage({
+      type: "snapshot",
+      requestId: "r1",
+      snapshot: { host: { id: "h1", name: "Desktop One", version: "0.3.5" }, projects: [], sessions: [], devices: [], shells: [], defaultShellId: "" }
+    });
+
+    assert.deepEqual(outputs, [
+      { sessionId: "s1", data: "hello\r\n", offset: 337 },
+      { sessionId: "s1", data: "world\r\n", offset: 343 }
+    ]);
+    assert.deepEqual(grids, [{ sessionId: "s1", cols: 72, rows: 26, offset: 636 }]);
+    connection.close();
+  });
+});
+
+test("session stream messages from other sessions do not cross into the terminal", async () => {
+  await withFakeWebSocket(async () => {
+    const connection = new HostConnection(host());
+    const outputs = [];
+    connection.on("output", (event) => outputs.push(event));
+    const opening = connection["open"]("ws://192.168.1.5:47831", 2_000);
+    FakeWebSocket.instances.at(-1).setOpen();
+    await opening;
+    FakeWebSocket.instances.at(-1).deliverServerMessage({
+      type: "session.output",
+      sessionId: "other",
+      data: "noise",
+      offset: 0
+    });
+
+    // Routing is per-session in the terminal component; the transport must
+    // not swallow or alter session ids - the terminal filters on them.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(outputs, [{ sessionId: "other", data: "noise", offset: 0 }]);
+    connection.close();
+  });
+});
+
 // ---- verifySavedHostRegistration --------------------------------------------
 
 test("a never-registered desktop returns lanOnly and never starts a node", async () => {

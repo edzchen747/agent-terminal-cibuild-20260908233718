@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { applyTerminalModifiers, createRequestId, findHttpLinks, TERMINAL_ANSI_THEME } from "@agentterminal/protocol";
+import { applyTerminalModifiers, createRequestId, findHttpLinks, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCROLLBACK_LINES } from "@agentterminal/protocol";
 import type { TerminalModifier, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
 import { classifyGestureAxis, type GestureAxis } from "./gesture";
@@ -59,6 +59,18 @@ const ACCESSIBILITY_KEY_ROWS: UtilityKey[][] = [
 ];
 
 export function MobileTerminal({ connection, session, active, fontWidthScale }: Props) {
+  // Terminal sync diagnostics: [ATSync] lines go to the WebView console
+  // (logcat tag: Capacitor/Console) and are mirrored to the host through the
+  // live connection, where they land in the host's sync log file - so a
+  // debug session correlates the phone-side merges even if logcat is lost.
+  const syncDebug = (message: string) => {
+    console.log("[ATSync]", message);
+    try {
+      connection.send({ type: "debug.diagnostics", message });
+    } catch {
+      // Bounds: the connection is down; the console copy still exists.
+    }
+  };
   const hostRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -94,9 +106,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
 
   const sendKeyData = (data: string) => {
     if (!data || !activeRef.current) return;
-    // Mirror the desktop write path, which reasserts its size with every
-    // key. Force it: a plain resize sends nothing when the local fit is
-    // unchanged, leaving the host at another client's PTY size.
+    // The mobile terminal owns the PTY grid while it is the focused client,
+    // so reassert its dimensions with the key (see also sendInput).
     focusInputRef.current();
     resizeRef.current(true);
     connection.send({ type: "session.input", sessionId: session.id, data });
@@ -133,13 +144,17 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         activateTerminalCursor(terminal.textarea);
       };
       focusInputRef.current = focusInput;
+      // The PTY grid follows focus: while the phone is the focused client,
+      // this emulator's fitted dimensions ARE the host PTY grid. When the
+      // desktop takes control, the host announces the new grid (session.grid)
+      // and this emulator reflows its history in place, so nothing is lost.
       const terminal = new Terminal({
       cursorBlink: true,
       cursorStyle: "bar",
       fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: TERMINAL_FONT_SIZE,
       lineHeight: 1,
-      scrollback: 5000,
+      scrollback: TERMINAL_SCROLLBACK_LINES,
       screenReaderMode: true,
       smoothScrollDuration: 75,
       theme: {
@@ -169,7 +184,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       }
     });
     if (activeRef.current) focusInput();
-    fit.fit();
+    try { fit.fit(); } catch { /* not laid out yet */ }
 
     // The accessibility layer's rows must paint and anchor at the same advance
     // the squished canvas cells have. Rather than trusting the font metrics to
@@ -205,6 +220,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     };
     calibrateAccessibilityMetrics();
 
+    // Fit-based resize: only the focused (active) terminal page asserts its
+    // dimensions - that is what switches the host PTY grid to the mobile
+    // layout. An unfocused page follows the grid the host announces instead.
     let resizeFrame: number | undefined;
     let forceResizePending = false;
     let lastSize = { cols: 0, rows: 0 };
@@ -224,6 +242,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
           calibrateAccessibilityMetrics();
           if (shouldSendResize(true, terminal.cols, terminal.rows, lastSize)) {
             lastSize = { cols: terminal.cols, rows: terminal.rows };
+            syncDebug(`resize session=${session.id} cols=${terminal.cols} rows=${terminal.rows} force=true`);
             connection.send({ type: "session.resize", sessionId: session.id, cols: terminal.cols, rows: terminal.rows, force: true });
           }
         } catch {
@@ -246,6 +265,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
           calibrateAccessibilityMetrics();
           if (shouldSendResize(shouldForce, terminal.cols, terminal.rows, lastSize)) {
             lastSize = { cols: terminal.cols, rows: terminal.rows };
+            syncDebug(`resize session=${session.id} cols=${terminal.cols} rows=${terminal.rows} force=${shouldForce}`);
             connection.send({ type: "session.resize", sessionId: session.id, cols: terminal.cols, rows: terminal.rows, force: shouldForce });
           }
         } catch {
@@ -289,11 +309,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     let lastNativeBeforeInput: { data: string; at: number } | undefined;
     const sendInput = (data: string) => {
       if (!data || !activeRef.current) return;
-      // The desktop write path attaches its cols/rows to every key, so the
-      // host reasserts that client's size on every input. Remote input
-      // carries no size, so force a session.resize on each key; a plain
-      // resize would send nothing while our local fit is unchanged and the
-      // host would keep another client's (or a lost) PTY size.
+      // Typing means the phone is the focused client: reassert the mobile
+      // dimensions so the host PTY grid switches to the mobile layout before
+      // the input lands. A plain resize would send nothing while the local
+      // fit is unchanged, and the grid should be ours while we type.
       resize(true);
       const result = keyPadRef.current!.consume(data);
       syncKeyPad();
@@ -373,8 +392,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         return;
       }
       if (activeRef.current) {
-        // Force, like every other input path, so the host reasserts this
-        // client's size even when the local fit has not changed.
         resize(true);
         connection.send({ type: "session.input", sessionId: session.id, data });
       }
@@ -419,11 +436,63 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     inputElement.addEventListener("beforeinput", handleNativeBeforeInput, true);
     inputElement.addEventListener("input", handleNativeInput);
     inputElement.addEventListener("compositionend", handleCompositionEnd);
-    const pendingOutput: string[] = [];
+    // Every chunk carries its absolute offset in the host PTY stream. The
+    // emulator tracks the stream position it has applied up to (`appliedUpTo`)
+    // so chunks that are already inside a replayed journal snapshot are
+    // dropped instead of double-printed: this is what makes attach racing /
+    // reconnect catch-up lossless without deduplication heuristics.
+    // Every chunk carries its absolute offset in the host PTY stream; grid
+    // changes carry the offset where they took effect. The emulator tracks
+    // the stream position it has applied up to (`appliedUpTo`) so chunks and
+    // grid epochs already inside a replayed snapshot are dropped instead of
+    // double-applied: this is what makes attach racing / reconnect catch-up
+    // lossless across focus-driven grid switches.
+    const pendingOutput: Array<
+      | { kind: "data"; data: string; offset: number }
+      | { kind: "grid"; cols: number; rows: number; offset: number }
+    > = [];
+    let replayingSessionBuffer = false;
+    let appliedUpTo = 0;
+    const applyItem = (item: { kind: "data"; data: string; offset: number } | { kind: "grid"; cols: number; rows: number; offset: number }) => {
+      if (item.kind === "grid") {
+        // A grid change is never "covered" by anything but an equal grid
+        // state: offsets only dedupe DATA chunks. Live clients must follow
+        // every grid epoch even when stream offsets have advanced past it.
+        if (item.cols !== terminal.cols || item.rows !== terminal.rows) {
+          terminal.resize(item.cols, item.rows);
+          syncDebug(`grid session=${session.id} cols=${item.cols} rows=${item.rows} off=${item.offset} reflow`);
+        } else {
+          syncDebug(`grid session=${session.id} cols=${item.cols} rows=${item.rows} off=${item.offset} same-grid skip`);
+        }
+        return;
+      }
+      if (item.offset < appliedUpTo) {
+        syncDebug(`out session=${session.id} off=${item.offset} len=${streamByteLength(item.data)} skipped(already covered upTo=${appliedUpTo})`);
+        return;
+      }
+      appliedUpTo = Math.max(appliedUpTo, item.offset + streamByteLength(item.data));
+      syncDebug(`out session=${session.id} off=${item.offset} len=${streamByteLength(item.data)} upTo=${appliedUpTo}`);
+      terminal.write(item.data);
+    };
     const output = connection.on("output", (event) => {
       if (event.sessionId !== session.id) return;
-      if (initialized) terminal.write(event.data);
-      else pendingOutput.push(event.data);
+      if (replayingSessionBuffer || !initialized) {
+        pendingOutput.push({ kind: "data", data: event.data, offset: event.offset });
+        return;
+      }
+      applyItem({ kind: "data", data: event.data, offset: event.offset });
+    });
+    const gridChange = connection.on("grid", (event) => {
+      if (event.sessionId !== session.id) return;
+      if (replayingSessionBuffer || !initialized) {
+        pendingOutput.push({ kind: "grid", cols: event.cols, rows: event.rows, offset: event.offset });
+        return;
+      }
+      applyItem({ kind: "grid", cols: event.cols, rows: event.rows, offset: event.offset });
+    });
+    const connected = connection.on("connected", () => {
+      syncDebug(`connected session=${session.id} -> re-attach`);
+      startAttachment();
     });
 
     const screen = hostElement.querySelector<HTMLElement>(".xterm-screen");
@@ -608,34 +677,103 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const finishAttachment = () => {
       if (disposed) return;
       initialized = true;
-      resize();
       if (activeRef.current) focusInput();
     };
     const replayPendingOutput = (index = 0) => {
       if (disposed) return;
-      const data = pendingOutput[index];
-      if (data === undefined) {
+      const item = pendingOutput[index];
+      if (item === undefined) {
         pendingOutput.length = 0;
         finishAttachment();
         return;
       }
-      terminal.write(data, () => replayPendingOutput(index + 1));
-    };
-    const attachment = connection.request({ type: "session.attach", requestId: createRequestId(), sessionId: session.id, cols: terminal.cols, rows: terminal.rows }).then((message) => {
-      if (disposed) return;
-      if (message.type === "session.buffer") {
-        terminal.write(message.data, () => {
-          replayPendingOutput();
-        });
-      } else {
-        replayPendingOutput();
+      if (item.kind === "grid") {
+        // Grid notices are applied whenever the grid differs from the
+        // emulator's current one; snapshot epochs already contained in the
+        // replayed segments result in a same-grid no-op, stale ones cannot
+        // corrupt anything because the call is idempotent per grid state.
+        if (item.cols !== terminal.cols || item.rows !== terminal.rows) {
+          terminal.resize(item.cols, item.rows);
+          syncDebug(`pend grid session=${session.id} cols=${item.cols} rows=${item.rows} off=${item.offset} reflow`);
+        }
+        replayPendingOutput(index + 1);
+        return;
       }
-    }).catch((cause) => {
-      if (!disposed) terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
-    });
+      if (item.offset < appliedUpTo) {
+        // Already covered by the journal snapshot; drop it.
+        syncDebug(`pend session=${session.id} off=${item.offset} skipped(covered upTo=${appliedUpTo})`);
+        replayPendingOutput(index + 1);
+        return;
+      }
+      appliedUpTo = Math.max(appliedUpTo, item.offset + streamByteLength(item.data));
+      syncDebug(`pend session=${session.id} off=${item.offset} len=${streamByteLength(item.data)} upTo=${appliedUpTo}`);
+      terminal.write(item.data, () => replayPendingOutput(index + 1));
+    };
+    let attachmentPromise: Promise<unknown> | undefined;
+    const startAttachment = () => {
+      // Runs on mount and again on every reconnect: the host journal is the
+      // source of truth, so the emulator resets and replays the full stream
+      // segmented by grid epochs. Live output and grid changes received
+      // during that window are queued and merged exactly after the snapshot
+      // ends (offsets make the merge precise across grid switches).
+      if (disposed || attachmentPromise !== undefined) return;
+      initialized = false;
+      replayingSessionBuffer = false;
+      pendingOutput.length = 0;
+      appliedUpTo = 0;
+      syncDebug(`attach send session=${session.id} cols=${terminal.cols} rows=${terminal.rows}`);
+      attachmentPromise = connection.request({
+        type: "session.attach",
+        requestId: createRequestId(),
+        sessionId: session.id,
+        cols: terminal.cols,
+        rows: terminal.rows
+      }).then((message) => {
+        attachmentPromise = undefined;
+        if (disposed) return;
+        if (message.type !== "session.buffer") {
+          syncDebug(`attach session=${session.id} replied ${message.type}`);
+          pendingOutput.length = 0;
+          finishAttachment();
+          return;
+        }
+        terminal.reset();
+        replayingSessionBuffer = true;
+        const segments = message.segments;
+        syncDebug(`buffer session=${session.id} end=${message.endOffset} segs=${segments.map((s) => `${s.cols}x${s.rows}+${s.data.length}`).join(" ")}`);
+        const writeNext = (index = 0) => {
+          if (disposed) return;
+          const segment = segments[index];
+          if (segment === undefined) {
+            replayingSessionBuffer = false;
+            appliedUpTo = Math.max(appliedUpTo, message.endOffset);
+            syncDebug(`replay done session=${session.id} upTo=${appliedUpTo} pending=${pendingOutput.length}`);
+            replayPendingOutput();
+            return;
+          }
+          if (segment.cols !== terminal.cols || segment.rows !== terminal.rows) {
+            terminal.resize(segment.cols, segment.rows);
+          }
+          terminal.write(segment.data, () => writeNext(index + 1));
+        };
+        writeNext();
+      }).catch((cause) => {
+        attachmentPromise = undefined;
+        syncDebug(`attach session=${session.id} failed: ${String(cause)}`);
+        if (!disposed) terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
+      });
+    };
+    startAttachment();
+    const statsTimer = window.setInterval(() => {
+      if (disposed || !terminalRef.current) return;
+      const buffer = terminal.buffer.active;
+      syncDebug(`stats session=${session.id} grid=${terminal.cols}x${terminal.rows} bufferLines=${buffer.length} baseY=${buffer.baseY} viewport=${buffer.viewportY}`);
+    }, 5_000);
       cleanup = () => {
       disposed = true;
-      void attachment.finally(() => connection.send({ type: "session.detach", requestId: createRequestId(), sessionId: session.id }));
+      void (attachmentPromise ?? Promise.resolve())
+        .finally(() => connection.send({ type: "session.detach", requestId: createRequestId(), sessionId: session.id }))
+        .catch(() => undefined);
       observer.disconnect();
       if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
       window.removeEventListener("pointerdown", handlePointerActivity, true);
@@ -650,7 +788,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       hostElement.removeEventListener("touchend", handleTouchEnd);
       hostElement.removeEventListener("touchcancel", handleTouchCancel);
       clearLongPressTimer();
-      input.dispose(); output(); httpLinkProvider.dispose(); terminal.dispose(); terminalRef.current = null;
+      if (statsTimer !== undefined) window.clearInterval(statsTimer);
+      connected(); gridChange(); input.dispose(); output(); httpLinkProvider.dispose(); terminal.dispose(); terminalRef.current = null;
       resizeRef.current = () => undefined;
       focusInputRef.current = () => undefined;
       };

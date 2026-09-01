@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, applyTerminalModifiers, decodeClientMessage, encodeMessage, encodePairingPayload, findHttpLinks, parsePairingPayload, parseTerminalWorkingDirectories, TERMINAL_ANSI_THEME } from "./index.js";
-import type { ClientMessage } from "./index.js";
+import { LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, type ClientMessage } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -155,10 +154,40 @@ test("shell working-directory reports parse from Windows Terminal OSC sequences"
   );
 });
 
+test("session.buffer chunks history into grid segments and session.grid targets reflows", () => {
+  const buffer = {
+    type: "session.buffer",
+    requestId: "r1",
+    sessionId: "s1",
+    segments: [
+      { cols: 120, rows: 30, data: "PS C:\\> ls\r\n" },
+      { cols: 45, rows: 35, data: "file.txt\r\n" }
+    ],
+    endOffset: 1024
+  };
+  const decoded = decodeServerMessage(JSON.stringify(buffer));
+  assert.equal(decoded.type, "session.buffer");
+  if (decoded.type !== "session.buffer") assert.fail("expected session.buffer");
+  assert.equal(decoded.segments[1]?.cols, 45);
+  assert.equal(decoded.segments[1]?.rows, 35);
+  assert.equal(decoded.endOffset, 1024);
+
+  const grid = decodeServerMessage(JSON.stringify({ type: "session.grid", sessionId: "s1", cols: 100, rows: 34, offset: 512 }));
+  assert.equal(grid.type, "session.grid");
+  assert.ok(TERMINAL_SCROLLBACK_LINES >= 50_000);
+});
+
 test("the mobile heartbeat interval is the desktop presence window source", () => {
   // The desktop Rust core counts as connected any device heard from within
   // 2x this value, so these two sides must share one constant.
   assert.equal(MOBILE_HEARTBEAT_INTERVAL_MS, 60_000);
+});
+
+test("debug.diagnostics round-trips as a fire-and-forget client message", () => {
+  const message: ClientMessage = { type: "debug.diagnostics", message: "[ATSync] out off=337 len=299 upTo=636" };
+  const encoded = encodeMessage(message);
+  assert.equal(encoded, '{"type":"debug.diagnostics","message":"[ATSync] out off=337 len=299 upTo=636"}');
+  assert.deepEqual(decodeClientMessage(encoded), message);
 });
 
 test("auth messages carry an optional display name through the wire contract", () => {
@@ -173,6 +202,24 @@ test("auth messages carry an optional display name through the wire contract", (
   assert.equal(decoded.type, "auth");
   if (decoded.type !== "auth") assert.fail("expected an auth message");
   assert.equal(decoded.name, "Pixel 9");
+});
+
+test("stream byte lengths match the host journal's byte accounting", () => {
+  assert.equal(streamByteLength("abc"), 3);
+  assert.equal(streamByteLength("C:\\repo>"), 8);
+  assert.equal(streamByteLength("\x1b[31m"), 5);
+  assert.equal(streamByteLength("日本"), 6);
+  assert.equal(streamByteLength("Ω"), 2);
+  assert.equal(streamByteLength(""), 0);
+});
+
+test("stream byte lengths count surrogate pairs as four bytes each", () => {
+  // PTY output can contain astral characters (emoji, exotic filename
+  // glyphs); the host journal counts UTF-8 bytes and the clients must agree.
+  assert.equal(streamByteLength("😀"), 4);
+  assert.equal(streamByteLength("😀a"), 5);
+  assert.equal(streamByteLength("a😀日本"), 1 + 4 + 6);
+  assert.equal(streamByteLength("\x1b[31m😀\x1b[0m"), 5 + 4 + 4);
 });
 
 // Windows Terminal ships "Campbell" as its default scheme (microsoft/terminal

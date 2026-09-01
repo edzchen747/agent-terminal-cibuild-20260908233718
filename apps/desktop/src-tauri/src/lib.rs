@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use arboard::Clipboard;
 use core::Core;
-use models::{DesktopState, PairingPayload, Project, TerminalSession};
+use models::{DesktopState, PairingPayload, Project, SessionSnapshot, TerminalSession};
 use store::DesktopStore;
 use tauri::{
     Manager, State, WebviewWindow,
@@ -167,9 +167,11 @@ fn attach_session(
     window: WebviewWindow,
     state: State<'_, Arc<Core>>,
     session_id: String,
-) -> Result<String, String> {
+    cols: u16,
+    rows: u16,
+) -> Result<SessionSnapshot, String> {
     state
-        .attach_window_session(window.label(), &session_id)
+        .attach_window_session(window.label(), &session_id, cols, rows)
         .map_err(error_string)
 }
 
@@ -183,6 +185,11 @@ fn copy_text(text: String) -> Result<(), String> {
     Clipboard::new()
         .and_then(|mut clipboard| clipboard.set_text(text))
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn log_debug(message: String) {
+    core::sync_debug_from_webview(&message);
 }
 
 #[tauri::command]
@@ -300,6 +307,7 @@ pub fn run() {
             attach_session,
             detach_session,
             copy_text,
+            log_debug,
             start_pairing,
             retry_remote_registration,
             revoke_device,

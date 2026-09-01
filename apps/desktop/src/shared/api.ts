@@ -1,4 +1,4 @@
-import type { HostSnapshot, PairingPayload, Project, TerminalSession } from "@agentterminal/protocol";
+import type { HostSnapshot, PairingPayload, Project, SessionSegment, TerminalSession } from "@agentterminal/protocol";
 
 export interface DesktopState extends HostSnapshot {
   currentProjectId: string;
@@ -9,6 +9,15 @@ export interface DesktopState extends HostSnapshot {
     status: "unregistered" | "pending" | "enrolled" | "failed" | "offline" | "unpaired";
     error?: string;
   };
+}
+
+/** Per-grid PTY journal snapshot returned by `attachSession`: history split at
+ * every grid epoch so the emulator can reflow through the exact sequence the
+ * live clients applied. */
+export interface SessionSnapshot {
+  segments: SessionSegment[];
+  /** Absolute stream byte offset just past the journal; live chunks below it are already contained in the replay. */
+  endOffset: number;
 }
 
 export interface DesktopApi {
@@ -24,9 +33,10 @@ export interface DesktopApi {
   reorderSessions(projectId: string, sessionIds: string[]): Promise<void>;
   write(sessionId: string, data: string, cols?: number, rows?: number): void;
   resize(sessionId: string, cols: number, rows: number, force?: boolean): void;
-  attachSession(sessionId: string): Promise<string>;
+  attachSession(sessionId: string, cols: number, rows: number): Promise<SessionSnapshot>;
   detachSession(sessionId: string): void;
   copyText(text: string): Promise<void>;
+  logDebug(message: string): void;
   openExternalUrl(url: string): Promise<void>;
   startPairing(): Promise<PairingPayload>;
   retryRemoteRegistration(): Promise<void>;
@@ -38,5 +48,6 @@ export interface DesktopApi {
   selectShell(sessionId: string | null, shellId: string): Promise<TerminalSession | null>;
   onPairingSucceeded(callback: () => void): () => void;
   onState(callback: (state: DesktopState) => void): () => void;
-  onData(callback: (sessionId: string, data: string) => void): () => void;
+  onData(callback: (sessionId: string, data: string, offset: number) => void): () => void;
+  onGrid(callback: (sessionId: string, cols: number, rows: number, offset: number) => void): () => void;
 }

@@ -1,18 +1,30 @@
 import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { applyTerminalModifiers, findHttpLinks, TERMINAL_ANSI_THEME, type TerminalModifier } from "@agentterminal/protocol";
+import { applyTerminalModifiers, findHttpLinks, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCROLLBACK_LINES, type TerminalModifier } from "@agentterminal/protocol";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { sessionId: string; visible: boolean; active: boolean; confirmExternalLinks: boolean; }
 
 const isCursorPositionReport = (data: string) => /^\x1b\[\??\d+;\d+R$/.test(data);
 
+type PendingItem =
+  | { kind: "data"; data: string; offset: number }
+  | { kind: "grid"; cols: number; rows: number; offset: number };
+
+// Terminal sync diagnostics: mirrored to the host's sync log file (and the
+// WebView2 console) so desktop decisions are captured in the same run as the
+// journal and remote merges.
+const dbg = (message: string) => {
+  console.log("[ATSync]", message);
+  window.agentTerminal.logDebug(`[ATSync] ${message}`);
+};
+
 export function TerminalPane({ sessionId, visible, active, confirmExternalLinks }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const activeRef = useRef(active);
-  const resizeRef = useRef<() => void>(() => undefined);
+  const resizeRef = useRef<(force?: boolean) => void>(() => undefined);
   const confirmExternalLinksRef = useRef(confirmExternalLinks);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const [linkOpening, setLinkOpening] = useState(false);
@@ -85,7 +97,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
       fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, monospace',
       fontSize: 14,
       lineHeight: 1,
-      scrollback: 10_000,
+      scrollback: TERMINAL_SCROLLBACK_LINES,
       linkHandler: {
         activate: (_event, uri) => activateLink(uri)
       },
@@ -146,8 +158,17 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
       copyToastTimer = window.setTimeout(() => copyToast.classList.remove("is-visible"), 900);
     };
 
+    // The PTY grid follows focus: a focused desktop window reasserts its own
+    // dimensions (fit + resize), while an unfocused pane just follows the
+    // grid announced by the host (target.grid), reflowing its history in
+    // place. This is what keeps history intact as focus flips devices.
     const resize = (force = false) => {
-      try { fit.fit(); window.agentTerminal.resize(sessionId, terminal.cols, terminal.rows, force); } catch { /* hidden pane */ }
+      if (!activeRef.current) return;
+      try {
+        fit.fit();
+        dbg(`resize session=${sessionId} cols=${terminal.cols} rows=${terminal.rows} force=${force}`);
+        window.agentTerminal.resize(sessionId, terminal.cols, terminal.rows, force);
+      } catch { /* hidden pane */ }
     };
     resizeRef.current = resize;
 
@@ -203,6 +224,8 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
     const observer = new ResizeObserver(() => resize());
     observer.observe(hostRef.current);
     const handlePointerActivity = () => {
+      // Only a focused window drives the PTY grid; taps elsewhere (e.g. an
+      // inactive split pane) must not steal focus.
       if (activeRef.current) resize(true);
     };
     window.addEventListener("pointerdown", handlePointerActivity, true);
@@ -211,6 +234,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
         // A newly created pane is attached before it becomes the active tab.
         // Forward terminal-generated CPR replies even while hidden; the tray
         // validates them against the shell's outstanding queries.
+        try { fit.fit(); } catch { /* hidden pane */ }
         window.agentTerminal.write(sessionId, data, terminal.cols, terminal.rows);
         return;
       }
@@ -218,56 +242,132 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
       try { fit.fit(); } catch { /* hidden pane */ }
       window.agentTerminal.write(sessionId, data, terminal.cols, terminal.rows);
     });
+
     let initialized = false;
     let replayingSessionBuffer = false;
     let disposed = false;
-    const pendingData: string[] = [];
-    const offData = window.agentTerminal.onData((id, data) => {
+    // Absolute stream position up to which this emulator's buffer is known to
+    // be applied: any chunk (or grid epoch) at or below this offset is already
+    // contained in the replayed segments.
+    let appliedUpTo = 0;
+    const pending: PendingItem[] = [];
+    const applyItem = (item: PendingItem) => {
+      if (item.kind === "grid") {
+        // A grid change is never "covered" by anything but an equal grid
+        // state: offsets only dedupe DATA chunks. Live clients must follow
+        // every grid epoch even when stream offsets have advanced past it.
+        if (item.cols !== terminal.cols || item.rows !== terminal.rows) {
+          terminal.resize(item.cols, item.rows);
+          dbg(`grid session=${sessionId} cols=${item.cols} rows=${item.rows} off=${item.offset} reflow`);
+        } else {
+          dbg(`grid session=${sessionId} cols=${item.cols} rows=${item.rows} off=${item.offset} same-grid`);
+        }
+        return;
+      }
+      if (item.offset < appliedUpTo) {
+        dbg(`out session=${sessionId} off=${item.offset} len=${streamByteLength(item.data)} skipped(covered upTo=${appliedUpTo})`);
+        return;
+      }
+      appliedUpTo = Math.max(appliedUpTo, item.offset + streamByteLength(item.data));
+      dbg(`out session=${sessionId} off=${item.offset} len=${streamByteLength(item.data)} upTo=${appliedUpTo}`);
+      terminal.write(item.data);
+    };
+    const offData = window.agentTerminal.onData((id, data, offset) => {
       if (id !== sessionId) return;
-      if (replayingSessionBuffer && isCursorPositionReport(data)) return;
-      if (initialized) terminal.write(data);
-      else pendingData.push(data);
+      if (replayingSessionBuffer || !initialized) {
+        pending.push({ kind: "data", data, offset });
+        return;
+      }
+      applyItem({ kind: "data", data, offset });
+    });
+    const offGrid = window.agentTerminal.onGrid((id, cols, rows, offset) => {
+      if (id !== sessionId) return;
+      if (replayingSessionBuffer || !initialized) {
+        pending.push({ kind: "grid", cols, rows, offset });
+        return;
+      }
+      applyItem({ kind: "grid", cols, rows, offset });
     });
     const finishAttachment = () => {
       if (disposed) return;
       initialized = true;
-      resize();
       if (activeRef.current) terminal.focus();
     };
-    const replayPendingData = (index = 0) => {
+    const replayPending = (index = 0) => {
       if (disposed) return;
-      const data = pendingData[index];
-      if (data === undefined) {
-        pendingData.length = 0;
+      const item = pending[index];
+      if (item === undefined) {
+        pending.length = 0;
         finishAttachment();
         return;
       }
-      terminal.write(data, () => replayPendingData(index + 1));
+      if (item.kind === "grid") {
+        // Grid notices are applied unless the replayed snapshot already
+        // covered them; dropping them would leave the emulator on the grid
+        // before the snapshot's last segment.
+        if (item.offset >= appliedUpTo && (item.cols !== terminal.cols || item.rows !== terminal.rows)) {
+          terminal.resize(item.cols, item.rows);
+          dbg(`grid(snap) session=${sessionId} cols=${item.cols} rows=${item.rows} off=${item.offset} reflow`);
+        }
+        replayPending(index + 1);
+        return;
+      }
+      if (item.offset < appliedUpTo) {
+        dbg(`pend session=${sessionId} off=${item.offset} skipped(covered upTo=${appliedUpTo})`);
+        replayPending(index + 1);
+        return;
+      }
+      appliedUpTo = Math.max(appliedUpTo, item.offset + streamByteLength(item.data));
+      dbg(`pend session=${sessionId} off=${item.offset} len=${streamByteLength(item.data)} upTo=${appliedUpTo}`);
+      terminal.write(item.data, () => replayPending(index + 1));
     };
-    const attachment = window.agentTerminal.attachSession(sessionId).then((buffer) => {
+    const attachment = (async () => {
+      try { fit.fit(); } catch { /* hidden pane */ }
+      dbg(`attach send session=${sessionId} cols=${terminal.cols} rows=${terminal.rows}`);
+      const snapshot = await window.agentTerminal.attachSession(sessionId, terminal.cols, terminal.rows);
       if (disposed) {
         window.agentTerminal.detachSession(sessionId);
         return;
       }
-      if (buffer) {
-        replayingSessionBuffer = true;
-        terminal.write(buffer, () => {
+      dbg(`buffer session=${sessionId} end=${snapshot.endOffset} segs=${snapshot.segments.map((s) => `${s.cols}x${s.rows}+${s.data.length}`).join(" ")}`);
+      replayingSessionBuffer = true;
+      const segments = snapshot.segments;
+      const writeNext = (index = 0) => {
+        if (disposed) return;
+        const segment = segments[index];
+        if (segment === undefined) {
           replayingSessionBuffer = false;
-          replayPendingData();
-        });
-      } else {
-        replayPendingData();
+          appliedUpTo = Math.max(appliedUpTo, snapshot.endOffset);
+          dbg(`replay done session=${sessionId} upTo=${appliedUpTo} pending=${pending.length}`);
+          replayPending();
+          return;
+        }
+        if (segment.cols !== terminal.cols || segment.rows !== terminal.rows) {
+          terminal.resize(segment.cols, segment.rows);
+        }
+        terminal.write(segment.data, () => writeNext(index + 1));
+      };
+      writeNext();
+    })().catch((cause) => {
+      if (!disposed) {
+        dbg(`attach session=${sessionId} failed: ${String(cause)}`);
+        terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
       }
-    }).catch((cause) => {
-      if (!disposed) terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
     });
+    const statsTimer = window.setInterval(() => {
+      if (disposed || !terminalRef.current) return;
+      const buffer = terminal.buffer.active;
+      dbg(`stats session=${sessionId} grid=${terminal.cols}x${terminal.rows} bufferLines=${buffer.length} baseY=${buffer.baseY} viewport=${buffer.viewportY}`);
+    }, 5_000);
     return () => {
       disposed = true;
       observer.disconnect();
       window.removeEventListener("pointerdown", handlePointerActivity, true);
       dataSubscription.dispose();
       offData();
+      offGrid();
       void attachment.then(() => window.agentTerminal.detachSession(sessionId));
+      if (statsTimer !== undefined) window.clearInterval(statsTimer);
       if (copyToastTimer) window.clearTimeout(copyToastTimer);
       httpLinkProvider.dispose();
       terminal.dispose();

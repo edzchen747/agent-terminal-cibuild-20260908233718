@@ -139,6 +139,40 @@ pub struct PairingPayload {
 pub struct TerminalDataEvent {
     pub session_id: String,
     pub data: String,
+    /// Absolute byte offset of `data` in the session's PTY stream.
+    pub offset: u64,
+}
+
+/// The focus-dependent grid of a session changed at stream offset `offset`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalGridEvent {
+    pub session_id: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub offset: u64,
+}
+
+/// One contiguous slice of the session's PTY stream recorded under a single
+/// terminal grid. Emulators resize to `cols` x `rows` before writing `data`,
+/// so their history reflows exactly the way live clients reflowed it.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSegment {
+    pub cols: u16,
+    pub rows: u16,
+    pub data: String,
+}
+
+/// A point-in-time snapshot of one session's PTY stream: the append-only
+/// journal split into per-grid segments plus the absolute stream position it
+/// ends at, so clients can replay history with the exact resize sequence the
+/// live clients applied and drop live chunks the journal already contains.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSnapshot {
+    pub segments: Vec<SessionSegment>,
+    pub end_offset: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -229,6 +263,8 @@ pub enum ClientMessage {
         rows: u16,
         force: Option<bool>,
     },
+    #[serde(rename = "debug.diagnostics")]
+    DebugDiagnostics { message: String },
     #[serde(rename = "shell.default")]
     ShellDefault {
         request_id: String,
@@ -254,7 +290,9 @@ impl ClientMessage {
             | Self::SessionAttach { request_id, .. }
             | Self::SessionDetach { request_id, .. }
             | Self::ShellDefault { request_id, .. } => Some(request_id),
-            Self::SessionInput { .. } | Self::SessionResize { .. } => None,
+            Self::SessionInput { .. } | Self::SessionResize { .. } | Self::DebugDiagnostics { .. } => {
+                None
+            }
         }
     }
 }
@@ -291,12 +329,24 @@ pub enum ServerMessage {
         listing: DirectoryListing,
     },
     #[serde(rename = "session.output")]
-    SessionOutput { session_id: String, data: String },
+    SessionOutput {
+        session_id: String,
+        data: String,
+        offset: u64,
+    },
     #[serde(rename = "session.buffer")]
     SessionBuffer {
         request_id: String,
         session_id: String,
-        data: String,
+        segments: Vec<SessionSegment>,
+        end_offset: u64,
+    },
+    #[serde(rename = "session.grid")]
+    SessionGrid {
+        session_id: String,
+        cols: u16,
+        rows: u16,
+        offset: u64,
     },
     #[serde(rename = "ok")]
     Ok { request_id: String },
@@ -311,7 +361,7 @@ pub enum ServerMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientMessage, ServerMessage};
+    use super::{ClientMessage, ServerMessage, SessionSegment};
 
     #[test]
     fn protocol_field_names_match_the_mobile_contract() {
@@ -339,6 +389,52 @@ mod tests {
         .expect("server message");
         assert_eq!(json["type"], "ok");
         assert_eq!(json["requestId"], "r1");
+    }
+
+    #[test]
+    fn session_stream_messages_carry_absolute_byte_offsets_and_grid_segments() {
+        let output = serde_json::to_value(ServerMessage::SessionOutput {
+            session_id: "s1".into(),
+            data: "\x1b[31mred\x1b[0m".into(),
+            offset: 1024,
+        })
+        .expect("session.output");
+        assert_eq!(output["type"], "session.output");
+        assert_eq!(output["offset"], 1024);
+
+        let buffer = serde_json::to_value(ServerMessage::SessionBuffer {
+            request_id: "r1".into(),
+            session_id: "s2".into(),
+            segments: vec![
+                SessionSegment {
+                    cols: 120,
+                    rows: 40,
+                    data: "PS C:\\> ls\r\n".into(),
+                },
+                SessionSegment {
+                    cols: 45,
+                    rows: 35,
+                    data: "file.txt\r\n".into(),
+                },
+            ],
+            end_offset: 777,
+        })
+        .expect("session.buffer");
+        assert_eq!(buffer["type"], "session.buffer");
+        assert_eq!(buffer["endOffset"], 777);
+        assert_eq!(buffer["segments"][1]["cols"], 45);
+
+        let grid = serde_json::to_value(ServerMessage::SessionGrid {
+            session_id: "s1".into(),
+            cols: 100,
+            rows: 34,
+            offset: 512,
+        })
+        .expect("session.grid");
+        assert_eq!(grid["type"], "session.grid");
+        assert_eq!(grid["cols"], 100);
+        assert_eq!(grid["rows"], 34);
+        assert_eq!(grid["offset"], 512);
     }
 
     #[test]

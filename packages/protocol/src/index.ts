@@ -15,6 +15,18 @@ export const MAX_PROJECT_NAME_LENGTH = 100 as const;
  */
 export const MOBILE_HEARTBEAT_INTERVAL_MS = 60_000 as const;
 
+/**
+ * The PTY follows focus: whichever client is actively using the session owns
+ * the terminal grid (desktop window size while the desktop is focused, mobile
+ * dimensions while the phone is), and every emulator reflows to the announced
+ * grid. History survives the transitions because the host journals each grid
+ * change at its exact stream offset (`session.buffer.segments` + live
+ * `session.grid` messages), so a replay reproduces the same resize sequence
+ * the live clients applied.
+ */
+/** xterm scrollback on every client; the host journal cap is the same idea in bytes. */
+export const TERMINAL_SCROLLBACK_LINES = 50_000 as const;
+
 export type Platform = "android" | "ios" | "web";
 export type TerminalModifier = "ctrl" | "alt" | "shift";
 
@@ -255,7 +267,19 @@ export type ClientMessage =
   | { type: "session.detach"; requestId: string; sessionId: string }
   | { type: "session.input"; sessionId: string; data: string }
   | { type: "session.resize"; sessionId: string; cols: number; rows: number; force?: boolean }
+  | { type: "debug.diagnostics"; message: string }
   | { type: "shell.default"; requestId: string; shellId: string };
+
+/**
+ * One contiguous slice of a session's PTY stream recorded under a single
+ * terminal grid. The client resizes its emulator to `cols` x `rows` before
+ * writing `data`, which reflows its history exactly the way live clients did.
+ */
+export interface SessionSegment {
+  cols: number;
+  rows: number;
+  data: string;
+}
 
 export type ServerMessage =
   | { type: "pair.accepted"; requestId: string; deviceToken: string; snapshot: HostSnapshot }
@@ -263,8 +287,9 @@ export type ServerMessage =
   | { type: "node.enrollment"; requestId: string; authKey: string; expiresAt: string }
   | { type: "snapshot"; requestId?: string; snapshot: HostSnapshot }
   | { type: "directory.listing"; requestId: string; listing: DirectoryListing }
-  | { type: "session.output"; sessionId: string; data: string }
-  | { type: "session.buffer"; requestId: string; sessionId: string; data: string }
+  | { type: "session.output"; sessionId: string; data: string; offset: number }
+  | { type: "session.buffer"; requestId: string; sessionId: string; segments: SessionSegment[]; endOffset: number }
+  | { type: "session.grid"; sessionId: string; cols: number; rows: number; offset: number }
   | { type: "ok"; requestId: string }
   | { type: "error"; requestId?: string; code: string; message: string };
 
@@ -351,4 +376,16 @@ export function parsePairingPayload(raw: string): PairingPayload {
 
 export function createRequestId(): string {
   return globalThis.crypto.randomUUID();
+}
+
+const STREAM_BYTE_ENCODER = new TextEncoder();
+
+/**
+ * Length of a terminal stream chunk in bytes. The host journal numbers every
+ * output chunk with the absolute byte offset of its first byte in the session
+ * stream, so clients need the same byte accounting to know whether a piece of
+ * live output is already contained in a replayed journal snapshot.
+ */
+export function streamByteLength(value: string): number {
+  return STREAM_BYTE_ENCODER.encode(value).byteLength;
 }

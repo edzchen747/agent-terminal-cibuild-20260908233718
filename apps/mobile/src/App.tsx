@@ -1176,7 +1176,7 @@ function ProjectCard({ project, sessions, dragging, reordering, transform, eleme
 }
 
 function TerminalSettingsSheet({ value, onChange, onClose }: { value: number; onChange: (value: number) => void; onClose: () => void }) {
-  return <div className="sheet-backdrop" onClick={onClose}><section className="bottom-sheet terminal-settings-sheet" data-no-swipe onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Terminal display</span><h2>Fit more text</h2><p>Squish characters horizontally while keeping their height readable. The terminal refits to show more columns.</p><FontWidthControl value={value} onChange={onChange} /><button className="mobile-primary full" onClick={onClose}>Done</button></section></div>;
+  return <div className="sheet-backdrop" onClick={onClose}><section className="bottom-sheet terminal-settings-sheet" data-no-swipe onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Terminal display</span><h2>Fit more text</h2><p>Squish characters horizontally while keeping their height readable. The locked 40-column grid never reflows, so both devices keep identical line wraps.</p><FontWidthControl value={value} onChange={onChange} /><button className="mobile-primary full" onClick={onClose}>Done</button></section></div>;
 }
 
 function FontWidthControl({ value, onChange }: { value: number; onChange: (value: number) => void }) {
