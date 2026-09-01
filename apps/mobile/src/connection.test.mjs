@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test, { beforeEach, afterEach } from "node:test";
+import { Capacitor } from "@capacitor/core";
 import { Preferences } from "@capacitor/preferences";
 import { breakStorage, breakStorageRemove, resetStorage } from "./test-support.mjs";
 
@@ -10,6 +11,7 @@ import { breakStorage, breakStorageRemove, resetStorage } from "./test-support.m
 // window.localStorage shim and the extensionless-.ts resolve hook the
 // modules below need.
 const { HostConnection } = await import("./connection.ts");
+const { EmbeddedNodeEngine } = await import("./embedded-engine.ts");
 
 const HOST_KEY = "agent-terminal-host";
 const HOSTS_KEY = "agent-terminal-hosts";
@@ -330,8 +332,101 @@ test("verification never mutates the persisted enrollment flag on the web platfo
   assert.equal((await HostConnection.savedHostRecords())[0]?.remoteEnrolled, true);
 });
 
+test("a native engine failure with an unknown code stays lanOnly and keeps the enrollment flag", async () => {
+  // Force the native platform probe: the engine start goes through the
+  // plugin proxy, which rejects in Node (UNIMPLEMENTED) with a code that is
+  // not remote_host_unavailable. Only the engine's own peer-dial failure may
+  // mark a host offline; an unknown failure must leave it at LAN only.
+  const realIsNative = Capacitor.isNativePlatform;
+  Capacitor.isNativePlatform = () => true;
+  try {
+    await HostConnection.recordHost(host({ remoteEnrolled: true }));
+    const verdict = await HostConnection.verifySavedHostRegistration(host({ remoteEnrolled: true }));
+    assert.equal(verdict, "lanOnly");
+    assert.equal((await HostConnection.savedHostRecords())[0]?.remoteEnrolled, true);
+  } finally {
+    Capacitor.isNativePlatform = realIsNative;
+  }
+});
+
 test("an undefined enrollment flag counts as never registered", async () => {
   assert.equal(await HostConnection.verifySavedHostRegistration(host({ remoteEnrolled: undefined })), "lanOnly");
+});
+
+// ---- verifySavedHostRegistration: native engine failures ---------------------
+//
+// The real plugin proxy cannot run in Node, so each failure code is injected
+// by patching the engine's prototype. The native platform probe is forced on
+// so verification takes the native branch; the patched stop records that the
+// engine is torn down even when the start rejected.
+
+function withNativeEngineRejecting(code, run) {
+  const realIsNative = Capacitor.isNativePlatform;
+  const originalStart = EmbeddedNodeEngine.prototype.start;
+  const originalStop = EmbeddedNodeEngine.prototype.stop;
+  let stopped = 0;
+  Capacitor.isNativePlatform = () => true;
+  EmbeddedNodeEngine.prototype.start = async () => {
+    throw Object.assign(new Error("engine rejected"), { code });
+  };
+  EmbeddedNodeEngine.prototype.stop = async () => { stopped += 1; };
+  return Promise.resolve()
+    .then(run)
+    .finally(() => {
+      Capacitor.isNativePlatform = realIsNative;
+      EmbeddedNodeEngine.prototype.start = originalStart;
+      EmbeddedNodeEngine.prototype.stop = originalStop;
+    })
+    .then(() => stopped);
+}
+
+test("a dropped phone node during verification marks the host unregistered everywhere", async () => {
+  // Only the phone-side node is gone (revoked or expired) and the desktop is
+  // on LAN: the row falls back to LAN only and both the launch default and
+  // the hosts list lose the enrollment flag, so the next remote connection
+  // re-registers instead of trusting the stale flag.
+  await HostConnection.saveHost(host({ remoteEnrolled: true }));
+  await HostConnection.recordHost(host({ remoteEnrolled: true }));
+  await withNativeEngineRejecting("preauth_missing", async () => {
+    const verdict = await HostConnection.verifySavedHostRegistration(host({ remoteEnrolled: true }));
+    assert.equal(verdict, "lanOnly");
+  });
+  assert.equal((await HostConnection.saved())?.remoteEnrolled, false);
+  assert.equal((await HostConnection.savedHostRecords())[0]?.remoteEnrolled, false);
+});
+
+test("a dialed-but-refused desktop reports offline and keeps the enrollment flag", async () => {
+  // Both nodes are registered; the desktop is simply down. The flag must
+  // survive an offline verdict - the registration is still valid and the
+  // next launch check should trust it again.
+  await HostConnection.saveHost(host({ remoteEnrolled: true }));
+  await HostConnection.recordHost(host({ remoteEnrolled: true }));
+  await withNativeEngineRejecting("remote_host_unavailable", async () => {
+    const verdict = await HostConnection.verifySavedHostRegistration(host({ remoteEnrolled: true }));
+    assert.equal(verdict, "offline");
+  });
+  assert.equal((await HostConnection.saved())?.remoteEnrolled, true);
+  assert.equal((await HostConnection.savedHostRecords())[0]?.remoteEnrolled, true);
+});
+
+test("a desktop node missing from the netmap stays lanOnly and keeps the enrollment flag", async () => {
+  // The peer is gone from the netmap (unregistered/reaped): LAN only, and no
+  // flag mutation - the phone's own node did not prove its state either way.
+  await HostConnection.recordHost(host({ remoteEnrolled: true }));
+  await withNativeEngineRejecting("tsnet_host_not_found", async () => {
+    const verdict = await HostConnection.verifySavedHostRegistration(host({ remoteEnrolled: true }));
+    assert.equal(verdict, "lanOnly");
+  });
+  assert.equal((await HostConnection.savedHostRecords())[0]?.remoteEnrolled, true);
+});
+
+test("the engine process is torn down even when its start rejected", async () => {
+  let verdict;
+  const stoppedCalls = await withNativeEngineRejecting("remote_host_unavailable", async () => {
+    verdict = await HostConnection.verifySavedHostRegistration(host({ remoteEnrolled: true }));
+  });
+  assert.equal(verdict, "offline");
+  assert.equal(stoppedCalls, 1);
 });
 
 // ---- saved: launch default protection ---------------------------------------

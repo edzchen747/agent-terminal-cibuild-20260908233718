@@ -123,6 +123,10 @@ test("host row registration: a failed check falls back to LAN only even when pre
   assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "enrolled", check: "lanOnly" }), "unregistered");
 });
 
+test("host row registration: a check that found the registered desktop down shows offline", () => {
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "enrolled", check: "offline" }), "offline");
+});
+
 test("host row registration: the connected desktop uses its live registration state", () => {
   assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: true, liveStatus: "pending", check: undefined }), "pending");
   assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: true, liveStatus: "failed", check: undefined }), "failed");
@@ -169,6 +173,10 @@ test("host row labels: a checked row with a live check verdict that never finish
   assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "enrolled", check: "lanOnly" }), "unregistered");
   // A registered host with no check result yet stays checking, not failed.
   assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "failed", check: undefined }), "pending");
+  // An offline verdict is equally authoritative over a cleared flag.
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: false, isCurrent: false, liveStatus: "failed", check: "offline" }), "offline");
+  // The live desktop's badge never takes the background check, offline or not.
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: true, liveStatus: "enrolled", check: "offline" }), "enrolled");
 });
 
 // ---- hostsPageCheckPlan: registration-check targeting ------------------------
@@ -213,6 +221,8 @@ test("checks plan: a stale cache entry is never trusted on a plain visit", () =>
   assert.equal(plan.states.get("old"), "checking");
   // A cached lanOnly verdict holds its host back from the round entirely.
   assert.deepEqual(hostsPageCheckPlan({ records, liveHostId: undefined, cached: new Map([["old", "lanOnly"]]), force: false }).toVerify, []);
+  // A cached offline verdict holds its host back just the same.
+  assert.deepEqual(hostsPageCheckPlan({ records, liveHostId: undefined, cached: new Map([["old", "offline"]]), force: false }).toVerify, []);
 });
 
 test("checks plan: a manual refresh forces verification for every registered host", () => {

@@ -5,8 +5,8 @@ import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOU
 import { deviceName } from "./device";
 import { canAttemptConnection, heartbeatActive, heartbeatCatchUpNeeded, heartbeatIntervalMs, nextReconnectDelay, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS } from "./connectionPolicy";
 import { EmbeddedNodeEngine, type EmbeddedNodeState } from "./embedded-engine";
-import { enrollmentFailureMessage, isDroppedNodeEnrollmentError } from "./nodeEnrollment";
-import { forgetRegistrationVerdict, readRegistrationVerdict, rememberRegistrationVerdict } from "./registrationCache";
+import { enrollmentFailureMessage, isDroppedNodeEnrollmentError, savedHostRegistrationVerdict } from "./nodeEnrollment";
+import { forgetRegistrationVerdict, readRegistrationVerdict, rememberRegistrationVerdict, type RegistrationVerdict } from "./registrationCache";
 import { registrationCheckPlan, type RegistrationCheckPlan } from "./registrationFlow";
 import { defaultHostAfterRemoval } from "./hostSelection";
 
@@ -186,9 +186,13 @@ export class HostConnection {
    * against the control plane. The persisted `remoteEnrolled` flag is never
    * trusted: the node may have been revoked or expired since it was written,
    * so the hosts page only shows "Ready" for a host whose node actually
-   * comes back. A host that was never registered never starts a node.
+   * comes back. A host that was never registered never starts a node. The
+   * verdict follows the node's own failure code: the desktop's node resolved
+   * but refused the dial means both sides are registered and the desktop is
+   * down ("offline"); anything else means registration could not be proven
+   * ("lanOnly").
    */
-  static async verifySavedHostRegistration(record: SavedHostRecord): Promise<"verified" | "lanOnly"> {
+  static async verifySavedHostRegistration(record: SavedHostRecord): Promise<RegistrationVerdict> {
     if (record.remoteEnrolled !== true) return "lanOnly";
     if (!Capacitor.isNativePlatform()) return "verified";
     const engine = new EmbeddedNodeEngine(record.id);
@@ -200,8 +204,11 @@ export class HostConnection {
       );
       if (state.engineStarted) return "verified";
     } catch (error) {
-      if (isDroppedNodeEnrollmentError(error)) await this.markSavedHostUnregistered(record);
-      return "lanOnly";
+      if (isDroppedNodeEnrollmentError(error)) {
+        await this.markSavedHostUnregistered(record);
+        return "lanOnly";
+      }
+      return savedHostRegistrationVerdict(error);
     } finally {
       await engine.stop();
     }

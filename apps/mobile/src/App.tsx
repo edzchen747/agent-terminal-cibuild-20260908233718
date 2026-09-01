@@ -440,11 +440,14 @@ export function App() {
   // against the control plane. The persisted enrollment flag is not trusted
   // (a node can be revoked or expire), so a row shows Ready only after its
   // check came back; hosts that were never registered stay LAN only without
-  // ever starting a node. The live desktop is already verified by being
-  // connected, so it is skipped. The native engine runs one node per host,
-  // so all checks run side by side instead of one after another, and each
-  // verdict is cached per host for a minute so revisiting the page does not
-  // re-ping hosts that were just checked.
+  // ever starting a node. The node's own failure code is preserved: the
+  // desktop's node resolved but refused the dial means it is registered and
+  // simply down (Offline), anything else leaves the row at LAN only. The
+  // live desktop is already verified by being connected, so it is skipped.
+  // The native engine runs one node per host, so all checks run side by side
+  // instead of one after another, and each verdict is cached per host for a
+  // minute so revisiting the page does not re-ping hosts that were just
+  // checked.
   useEffect(() => {
     if (view.type !== "hosts" || hostChecksStartedRef.current) return;
     hostChecksStartedRef.current = true;

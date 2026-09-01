@@ -34,6 +34,15 @@ test("cached verdict: a `lanOnly` verdict is cached like any other", () => {
   assert.equal(cachedVerdict(entries, "host-a", NOW, 3_600_000), "lanOnly");
 });
 
+test("cached verdict: an `offline` verdict is cached and replaced like any other", () => {
+  // The offline verdict shares the same entry shape and expiration as the
+  // other verdicts: a fresh one is returned and a later verdict overwrites.
+  const entries = { "host-a": { at: NOW - 30_000, verdict: "offline" } };
+  assert.equal(cachedVerdict(entries, "host-a", NOW, 60_000), "offline");
+  assert.deepEqual(rememberVerdict(entries, "host-a", "verified", NOW)["host-a"], { at: NOW, verdict: "verified" });
+  assert.deepEqual(rememberVerdict(entries, "host-b", "offline", NOW)["host-b"], { at: NOW, verdict: "offline" });
+});
+
 test("cached verdict: an expired entry is treated as absent", () => {
   const entries = { "host-a": { at: NOW - 60_000, verdict: "verified" } };
   assert.equal(cachedVerdict(entries, "host-a", NOW, 60_000), null);

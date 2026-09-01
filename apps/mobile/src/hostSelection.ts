@@ -52,7 +52,7 @@ export function lastConnectedLabel(timestamp: number | undefined, now: number = 
 export type RegistrationDisplayStatus = "unregistered" | "pending" | "enrolled" | "failed" | "offline";
 
 /** Where a hosts-page row stands in its background registration check. */
-export type HostCheckState = "checking" | "verified" | "lanOnly";
+export type HostCheckState = "checking" | "verified" | "lanOnly" | "offline";
 
 /** Shorthand labels shown on the phone, mirroring the full desktop labels. */
 export const REGISTRATION_STATUS_LABELS: Record<RegistrationDisplayStatus, string> = {
@@ -88,7 +88,9 @@ export function hostRowStatusLabel(status: RegistrationDisplayStatus, isCurrent:
  * The registration badge shown for a hosts-page row. The connected desktop's
  * badge follows its live connection state; every other row is only trusted
  * after its own check ran: a never-registered host shows LAN only right away,
- * a registered one stays "checking" until the verification comes back.
+ * a registered one stays "checking" until the verification comes back. The
+ * check can also conclude the desktop's node is registered but down
+ * ("offline"), which beats the stale registration flag below.
  */
 export function hostRowRegistrationStatus(input: {
   remoteEnrolled?: boolean;
@@ -98,6 +100,7 @@ export function hostRowRegistrationStatus(input: {
 }): RegistrationDisplayStatus {
   if (input.isCurrent) return input.liveStatus;
   if (input.check === "verified") return "enrolled";
+  if (input.check === "offline") return "offline";
   if (input.check === "lanOnly" || input.remoteEnrolled !== true) return "unregistered";
   return "pending";
 }

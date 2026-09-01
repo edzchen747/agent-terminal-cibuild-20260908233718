@@ -22,6 +22,19 @@ export function isDroppedNodeEnrollmentError(value: unknown): boolean {
 }
 
 /**
+ * The hosts-page verdict for a failed saved-host verification. The embedded
+ * node distinguishes its failure causes by code (see the Go engine): a peer
+ * that resolved but refused the dial means the desktop's node is registered
+ * and simply down, so the host is "offline"; every other failure means
+ * registration could not be proven (the desktop node is gone from the
+ * netmap, the phone node was dropped, the control plane was unreachable),
+ * so the host stays LAN only.
+ */
+export function savedHostRegistrationVerdict(value: unknown): "lanOnly" | "offline" {
+  return asEmbeddedNodeFailure(value).code === "remote_host_unavailable" ? "offline" : "lanOnly";
+}
+
+/**
  * The message the registration banner shows for a failed enrollment. The
  * desktop's own text is surfaced when it is actionable; denial from a
  * desktop session that predates the trusted-pairing rule is rewritten by
