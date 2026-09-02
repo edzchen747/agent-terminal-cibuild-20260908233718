@@ -31,6 +31,23 @@ export type Platform = "android" | "ios" | "web";
 export type TerminalModifier = "ctrl" | "alt" | "shift";
 
 /**
+ * How a running foreground program wants to own the terminal grid. The host
+ * classifies the PTY stream into one of these modes and tells every client:
+ *
+ * - canonical: the PTY stays at its snapshot size; each client reflows the
+ *   journal at its own size and never resizes the PTY for this program.
+ * - inline: the program paints a bounded region in place. The PTY follows
+ *   the focused client (resize knob: resize), and its output intentionally
+ *   stays in the scrollback, so clients reflow history normally.
+ * - fullscreen: the program owns the whole grid. The PTY follows the
+ *   focused client; output is history-isolated (a synthetic alt-screen
+ *   pair is journaled when the program does not use one itself) so TUI
+ *   frames never bleed into the shell history.
+ */
+export type TuiMode = "canonical" | "inline" | "fullscreen";
+export const TERMINAL_TUI_MODES: readonly TuiMode[] = ["canonical", "inline", "fullscreen"];
+
+/**
  * The 16 ANSI colors the desktop terminal renders with. These are the
  * "Campbell" scheme that Windows Terminal ships as its default, so the
  * desktop terminal colors shell output the same way the native Windows
@@ -212,8 +229,14 @@ export interface TerminalSession {
   status: "running" | "exited";
   createdAt: string;
   exitCode?: number;
-  /** True while the shell is drawing an alternate screen buffer (TUI): treat the data block as a strict cell grid. */
-  altBuffer?: boolean;
+  /**
+   * The host's TUI classification of the running foreground program
+   * (default canonical). Canonical keeps the PTY frozen at its snapshot
+   * grid and lets each client reflow the journal to its own size; inline
+   * and fullscreen make the PTY follow the focused client, with
+   * fullscreen additionally isolating TUI frames from the scrollback.
+   */
+  tuiMode?: TuiMode;
 }
 
 export interface ShellProfile {
@@ -292,7 +315,7 @@ export type ServerMessage =
   | { type: "session.output"; sessionId: string; data: string; offset: number }
   | { type: "session.buffer"; requestId: string; sessionId: string; segments: SessionSegment[]; endOffset: number }
   | { type: "session.grid"; sessionId: string; cols: number; rows: number; offset: number }
-  | { type: "session.alt"; sessionId: string; active: boolean; offset: number }
+  | { type: "session.mode"; sessionId: string; mode: TuiMode; offset: number }
   | { type: "ok"; requestId: string }
   | { type: "error"; requestId?: string; code: string; message: string };
 

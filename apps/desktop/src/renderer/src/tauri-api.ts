@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import type { TuiMode } from "@agentterminal/protocol";
 import type { DesktopApi, DesktopState } from "../../shared/api";
 
 interface TerminalDataEvent {
@@ -17,16 +18,16 @@ interface TerminalGridEvent {
   offset: number;
 }
 
-interface TerminalAltBufferEvent {
+interface TerminalTuiModeEvent {
   sessionId: string;
-  active: boolean;
+  mode: TuiMode;
   offset: number;
 }
 
 const stateListeners = new Set<(state: DesktopState) => void>();
 const dataListeners = new Set<(sessionId: string, data: string, offset: number) => void>();
 const gridListeners = new Set<(sessionId: string, cols: number, rows: number, offset: number) => void>();
-const altListeners = new Set<(sessionId: string, active: boolean, offset: number) => void>();
+const modeListeners = new Set<(sessionId: string, mode: TuiMode, offset: number) => void>();
 const pairingListeners = new Set<() => void>();
 const currentWindowTarget = getCurrentWebviewWindow().label;
 
@@ -42,8 +43,8 @@ const gridBridgeReady = listen<TerminalGridEvent>("desktop-grid", ({ payload }) 
   for (const listener of gridListeners) listener(payload.sessionId, payload.cols, payload.rows, payload.offset);
 }, { target: currentWindowTarget });
 
-const altBridgeReady = listen<TerminalAltBufferEvent>("desktop-alt", ({ payload }) => {
-  for (const listener of altListeners) listener(payload.sessionId, payload.active, payload.offset);
+const modeBridgeReady = listen<TerminalTuiModeEvent>("desktop-mode", ({ payload }) => {
+  for (const listener of modeListeners) listener(payload.sessionId, payload.mode, payload.offset);
 }, { target: currentWindowTarget });
 
 const pairingBridgeReady = listen<string>("pairing-succeeded", () => {
@@ -98,9 +99,9 @@ const api: DesktopApi = {
     gridListeners.add(callback);
     return () => gridListeners.delete(callback);
   },
-  onAlt: (callback) => {
-    altListeners.add(callback);
-    return () => altListeners.delete(callback);
+  onTuiMode: (callback) => {
+    modeListeners.add(callback);
+    return () => modeListeners.delete(callback);
   }
 };
 

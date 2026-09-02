@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { applyTerminalModifiers, createRequestId, findHttpLinks, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCROLLBACK_LINES } from "@agentterminal/protocol";
+import { applyTerminalModifiers, createRequestId, findHttpLinks, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCROLLBACK_LINES, type TuiMode } from "@agentterminal/protocol";
 import type { TerminalModifier, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
 import { classifyGestureAxis, type GestureAxis } from "./gesture";
@@ -490,15 +490,16 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       }
       applyItem({ kind: "grid", cols: event.cols, rows: event.rows, offset: event.offset });
     });
-    // Alternate-screen state from the host: while a TUI owns the alternate
-    // buffer, this data block is a strict cell grid - reflow heuristics are
-    // bypassed for it (xterm keeps the alternate buffer isolated from the
-    // primary scrollback) and the TUI repaints natively on SIGWINCH.
-    let altBufferActive = false;
-    const altChange = connection.on("alt", (event) => {
+    // TUI mode from the host: while the classifier reports inline or
+    // fullscreen, this data block is a strict cell grid - reflow
+    // heuristics are bypassed for it (the host journals a synthetic
+    // alt-screen pair for fullscreen so xterm keeps the TUI isolated from
+    // the primary scrollback) and the TUI repaints natively on SIGWINCH.
+    let tuiMode: TuiMode = "canonical";
+    const modeChange = connection.on("mode", (event) => {
       if (event.sessionId !== session.id) return;
-      altBufferActive = event.active;
-      syncDebug(`alt session=${session.id} active=${event.active} off=${event.offset}`);
+      tuiMode = event.mode;
+      syncDebug(`mode session=${session.id} mode=${event.mode} off=${event.offset}`);
     });
     const connected = connection.on("connected", () => {
       syncDebug(`connected session=${session.id} -> re-attach`);
@@ -800,7 +801,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       hostElement.removeEventListener("touchcancel", handleTouchCancel);
       clearLongPressTimer();
       if (statsTimer !== undefined) window.clearInterval(statsTimer);
-      connected(); gridChange(); altChange(); input.dispose(); output(); httpLinkProvider.dispose(); terminal.dispose(); terminalRef.current = null;
+      connected(); gridChange(); modeChange(); input.dispose(); output(); httpLinkProvider.dispose(); terminal.dispose(); terminalRef.current = null;
       resizeRef.current = () => undefined;
       focusInputRef.current = () => undefined;
       };

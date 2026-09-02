@@ -10,6 +10,7 @@ use std::{
         atomic::{AtomicBool, AtomicU16, Ordering},
     },
     thread,
+    time::Instant,
 };
 
 use std::fmt;
@@ -29,15 +30,15 @@ use crate::{
     models::{
         AuthorizedDevice, ClientMessage, DesktopState, DirectoryEntry, DirectoryListing, HostInfo,
         HostSnapshot, PROTOCOL_VERSION, PairingPayload, Project, RemoteRegistration, ServerMessage,
-        SessionSegment, SessionSnapshot, ShellProfile, TerminalAltBufferEvent, TerminalDataEvent,
-        TerminalGridEvent,
-        TerminalSession,
+        SessionSegment, SessionSnapshot, ShellProfile, TerminalDataEvent, TerminalGridEvent,
+        TerminalSession, TerminalTuiModeEvent, TuiMode,
     },
     network,
     path_utils::user_visible_path,
     provisioning,
     shells::{command_for, detect_shells},
     store::{DesktopStore, NetworkState, random_token},
+    tui::TuiClassifier,
     window_clients::WindowClients,
 };
 
@@ -162,58 +163,6 @@ fn is_cursor_position_report(data: &str) -> bool {
     index > second_start && bytes.get(index) == Some(&b'R') && index + 1 == bytes.len()
 }
 
-/// Detect alternate-screen-buffer entry/exit sequences in the raw PTY stream
-/// and flip `active` accordingly. Handles `\x1b[?1049h/l`, `\x1b[?47h/l` (the
-/// standard vt100/vt220-family alternates) plus their non-private-space
-/// variants. The 8-byte tail window keeps split sequences across chunk
-/// boundaries. Returns true when the state changed.
-fn scan_alt_buffer_transitions(tail: &mut String, data: &str, active: &mut bool) -> bool {
-    let combined = format!("{tail}{data}");
-    // Exit-first (a shell may leave an alt screen and immediately enter
-    // another full-screen app in the same chunk; the final state wins).
-    // Alternate-screen sequences (classic TUIs like vim/htop) ...
-    let enter = [
-        "\x1b[?1049h", "\x1b[?47h", "\x1b[?1047h",
-        "\x1b[1049h", "\x1b[47h", "\x1b[1047h",
-        // ... plus the "full-screen renderer owns the terminal" cues emitted
-        // by raw primary-buffer TUIs (ink/clack/custom harnesses): hiding
-        // the cursor and enabling synchronized output. A normal shell never
-        // hides its cursor or turns on sync mode.
-        "\x1b[?25l", "\x1b[?2026h",
-    ];
-    let leave = [
-        "\x1b[?1049l", "\x1b[?47l", "\x1b[?1047l",
-        "\x1b[1049l", "\x1b[47l", "\x1b[1047l",
-        "\x1b[?25h", "\x1b[?2026l",
-    ];
-    // One transition per call, exit-first: a chunk that carries a previously
-    // consumed sequence in its bridge tail must not flip the flag a second
-    // time against the SAME bytes.
-    let changed = if *active && leave.iter().any(|pattern| combined.contains(pattern)) {
-        *active = false;
-        true
-    } else if !*active && enter.iter().any(|pattern| combined.contains(pattern)) {
-        *active = true;
-        if sync_debug_enabled() {
-            sync_log_line("alt", format_args!("detected a TUI enter sequence in the session stream"));
-        }
-        true
-    } else {
-        false
-    };
-    // Bridge only the newest bytes so an already-consumed sequence in a
-    // previous chunk's tail never re-matches.
-    *tail = data
-        .chars()
-        .rev()
-        .take(8)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    changed
-}
-
 fn record_cursor_position_requests(tail: &mut String, data: &str) -> usize {
     const STANDARD: &[u8] = b"\x1b[6n";
     const DEC_PRIVATE: &[u8] = b"\x1b[?6n";
@@ -263,14 +212,16 @@ struct ManagedSession {
     /// Total bytes ever appended to `buffer` (a monotonic stream position
     /// that survives front trimming, so offsets stay absolute for life).
     journal_len: u64,
-    /// Whether the shell is currently in an alternate screen buffer (a TUI
-    /// like vim / htop / lazygit is drawing absolute-positioned cells).
-    /// While true, clients bypass text reflow for that data block: the TUI
-    /// owns the exact grid and repaints natively on SIGWINCH. Only when the
-    /// alternate screen is ACTIVE may the PTY be resized (focus-driven);
-    /// otherwise the session grid is fixed and clients render as viewports.
-    is_alt_buffer: bool,
-    alt_tail: String,
+    /// Per-session TUI mode classifier: watches the raw stream for evidence
+    /// of who owns the grid (canonical / inline / fullscreen). See
+    /// `crate::tui`. Confined to this session's reader thread.
+    tui: TuiClassifier,
+    /// True while the host's SYNTHETIC alt-screen enter (\x1b[?1049h) is
+    /// still open: fullscreen TUIs that draw into the primary buffer are
+    /// journaled inside a host-injected alt pair so their frames stay
+    /// isolated from client scrollback. Cleared once the matching alt exit
+    /// (synthetic or program-sent) has been journaled.
+    synthetic_alt: bool,
     /// The viewport dimensions the focused client most recently announced
     /// (recorded even while the PTY is frozen). Applied to the PTY on the
     /// next alternate-screen entry so a freshly launched TUI opens at the
@@ -1586,7 +1537,7 @@ impl Core {
             status: "running".into(),
             created_at: Utc::now().to_rfc3339(),
             exit_code: None,
-            alt_buffer: false,
+            tui_mode: TuiMode::Canonical,
         };
         {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
@@ -1605,8 +1556,8 @@ impl Core {
                     }],
             buffer: String::new(),
             journal_len: 0,
-            is_alt_buffer: false,
-            alt_tail: String::new(),
+            tui: TuiClassifier::new(SESSION_DEFAULT_ROWS),
+            synthetic_alt: false,
             requested_viewport: None,
             control_tail: String::new(),
             cursor_query_tail: String::new(),
@@ -1951,11 +1902,12 @@ impl Core {
         snapshot
     }
 
-    /// Tell every attached device (and every desktop window) that the shell
-    /// entered/left the alternate screen buffer at this stream offset. While
-    /// an alternate buffer is active, clients treat the data block as a
-    /// strict cell grid (TUI boxes must never be reflowed away).
-    fn broadcast_alt_change(&self, session_id: &str, active: bool, offset: u64) {
+    /// Tell every attached device (and every desktop window) that the host
+    /// reclassified the session's TUI mode at this stream offset. Inline and
+    /// fullscreen clients own the PTY grid (strict cell grid, no reflow
+    /// heuristics); canonical clients render the journal as their own
+    /// viewport.
+    fn broadcast_tui_mode(&self, session_id: &str, mode: TuiMode, offset: u64) {
         let targets = self
             .clients
             .lock()
@@ -1969,16 +1921,16 @@ impl Core {
         for client_id in &targets {
             self.send_to_client(
                 client_id,
-                ServerMessage::SessionAltBuffer {
+                ServerMessage::SessionMode {
                     session_id: session_id.to_string(),
-                    active,
+                    mode,
                     offset,
                 },
             );
         }
-        let event = TerminalAltBufferEvent {
+        let event = TerminalTuiModeEvent {
             session_id: session_id.to_string(),
-            active,
+            mode,
             offset,
         };
         let windows = self
@@ -1987,10 +1939,15 @@ impl Core {
             .expect("desktop state poisoned")
             .windows
             .subscribers(session_id);
+        sync_log!(
+            "mode",
+            "broadcast session={session_id} mode={mode:?} at_offset={offset} clients={}",
+            targets.len()
+        );
         for label in windows {
             let _ = self.app.emit_to(
                 EventTarget::webview_window(label),
-                "desktop-alt",
+                "desktop-mode",
                 event.clone(),
             );
         }
@@ -2688,7 +2645,15 @@ impl Core {
     }
 
     fn on_terminal_data(self: &Arc<Self>, session_id: &str, data: String) {
-        let (reported_cwd, title_changed, window_clients, offset, alt_change, alt_entry_grid) = {
+        let (
+            reported_cwd,
+            title_changed,
+            window_clients,
+            offset,
+            payload,
+            mode_change,
+            tui_entry_grid,
+        ) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
@@ -2699,9 +2664,37 @@ impl Core {
             // `journal_len` keeps counting from stream position zero, so a
             // replay snapshot and a live chunk can be compared exactly.
             let offset = session.journal_len;
-            session.buffer.push_str(&data);
+            // TUI mode classification: the per-session stream-signal
+            // classifier decides when the foreground program takes (or
+            // releases) grid ownership. The chunk is journaled together
+            // with any host-injected synthetic alt-screen bytes so replay
+            // and live clients see the exact same stream.
+            let tui_transition = session.tui.feed(&data, Instant::now(), session.grid.1);
+            // History isolation: a fullscreen TUI that never enters the
+            // alternate screen of its own (a raw primary-buffer harness)
+            // is wrapped in a host-injected alt pair so its frames stay
+            // out of client scrollback. The enter is injected BEFORE the
+            // first TUI bytes of this chunk; the exit before the first
+            // post-TUI bytes of theirs.
+            let mut injected = String::new();
+            if let Some(transition) = tui_transition {
+                if transition.to != TuiMode::Canonical && !transition.via_alt_enter {
+                    injected.push_str("\x1b[?1049h");
+                    session.synthetic_alt = true;
+                } else if transition.to == TuiMode::Canonical
+                    && session.synthetic_alt
+                    && !transition.program_alt_exit
+                {
+                    injected.push_str("\x1b[?1049l");
+                    session.synthetic_alt = false;
+                }
+            }
+            let mut payload = String::with_capacity(injected.len() + data.len());
+            payload.push_str(&injected);
+            payload.push_str(&data);
+            session.buffer.push_str(&payload);
             let before_trim = session.buffer.len();
-            session.journal_len = offset.saturating_add(data.len() as u64);
+            session.journal_len = offset.saturating_add(payload.len() as u64);
             truncate_journal_front(&mut session.buffer, MAX_TERMINAL_JOURNAL_BYTES);
             if session.buffer.len() != before_trim {
                 sync_log!(
@@ -2714,7 +2707,7 @@ impl Core {
             sync_log!(
                 "journal",
                 "append session={session_id} offset={offset} len={} journal_len={}",
-                data.len(),
+                payload.len(),
                 session.journal_len
             );
             if sync_debug_enabled() {
@@ -2722,12 +2715,12 @@ impl Core {
                     .create(true)
                     .append(true)
                     .open(journal_dump_path(session_id))
-                    .and_then(|mut file| file.write_all(data.as_bytes()));
+                    .and_then(|mut file| file.write_all(payload.as_bytes()));
                 // A full-screen clear is the universal TUI repaint op; probe
                 // the bytes so an unrecognized alternate-screen protocol can
                 // be identified (and matched) from a single run.
-                if data.contains("\x1b[2J") {
-                    let preview: String = data
+                if payload.contains("\x1b[2J") {
+                    let preview: String = payload
                         .as_bytes()
                         .iter()
                         .take(200)
@@ -2745,21 +2738,23 @@ impl Core {
                         &mut session.cursor_query_tail,
                         &data,
                     ));
-            // Alternate-screen detection: a TUI entering/leaving the
-            // alternate buffer changes how clients may treat this data
-            // block (strict grid, no reflow heuristics). The transition is
-            // recorded with its stream offset and broadcast immediately.
-            let alt_transitioned =
-                scan_alt_buffer_transitions(&mut session.alt_tail, &data, &mut session.is_alt_buffer);
-            if alt_transitioned {
-                session.metadata.alt_buffer = session.is_alt_buffer;
+            // TUI mode transition (canonical / inline / fullscreen): a
+            // program taking or releasing grid ownership changes how
+            // clients may treat the data block (strict grid, no reflow
+            // heuristics). The transition is recorded on the session with
+            // its stream offset and broadcast immediately.
+            let mode_change = if let Some(transition) = tui_transition {
+                session.metadata.tui_mode = transition.to;
                 sync_log!(
-                    "alt",
-                    "session={session_id} active={} at_offset={}",
-                    session.is_alt_buffer,
-                    offset
+                    "mode",
+                    "session={session_id} mode={:?} reason={} at_offset={offset}",
+                    transition.to,
+                    transition.reason
                 );
-            }
+                Some((transition.to, offset))
+            } else {
+                None
+            };
             let reported = parse_working_directories(&session.control_tail)
                 .into_iter()
                 .last()
@@ -2776,12 +2771,10 @@ impl Core {
                 session.metadata.title = title;
                 true
             });
-            let alt_now = (session.is_alt_buffer, session.journal_len);
-            let alt_change = alt_transitioned.then_some(alt_now);
-            // On TUI entry, open it at the focused client's recorded
-            // viewport so the TUI starts at the right dimensions (SIGWINCH
-            // triggers its native repaint).
-            let alt_entry_grid = if alt_transitioned && session.is_alt_buffer {
+            // On TUI entry (inline or fullscreen), open the program at the
+            // focused client's recorded viewport so it starts at the right
+            // dimensions (SIGWINCH triggers its native repaint).
+            let tui_entry_grid = if tui_transition.is_some_and(|t| t.to != TuiMode::Canonical) {
                 session
                     .requested_viewport
                     .and_then(|(cols, rows)| apply_session_grid(session, cols, rows))
@@ -2793,13 +2786,14 @@ impl Core {
                 title_changed,
                 inner.windows.subscribers(session_id),
                 offset,
-                alt_change,
-                alt_entry_grid,
+                payload,
+                mode_change,
+                tui_entry_grid,
             )
         };
         let event = TerminalDataEvent {
             session_id: session_id.to_string(),
-            data: data.clone(),
+            data: payload.clone(),
             offset,
         };
         for label in window_clients {
@@ -2809,11 +2803,11 @@ impl Core {
                 event.clone(),
             );
         }
-        self.send_terminal_output(session_id, &data, offset);
-        if let Some((active, transition_offset)) = alt_change {
-            self.broadcast_alt_change(session_id, active, transition_offset);
+        self.send_terminal_output(session_id, &payload, offset);
+        if let Some((mode, transition_offset)) = mode_change {
+            self.broadcast_tui_mode(session_id, mode, transition_offset);
         }
-        if let Some(epoch) = alt_entry_grid {
+        if let Some(epoch) = tui_entry_grid {
             self.broadcast_grid_change(session_id, epoch);
         }
         if let Some(cwd) = reported_cwd {
@@ -3425,14 +3419,15 @@ fn truncate_journal_front(value: &mut String, maximum: usize) {
     value.drain(..start);
 }
 
-/// Dual-path grid policy. The session grid may ONLY change while an
-/// alternate screen (TUI) is active (focus-driven ownership): the TUI gets a
-/// SIGWINCH and repaints natively. Outside a TUI the session grid is fixed,
-/// so client sizes are recorded as the next TUI's viewport but never applied
-/// to the PTY - clients render the frozen session as independent viewports.
+/// Dual-path grid policy. The session grid may ONLY change while a TUI owns
+/// the screen (inline or fullscreen - focus-driven ownership): the program
+/// gets a SIGWINCH and repaints natively. In canonical mode the session grid
+/// is fixed, so client sizes are recorded as the next TUI's viewport but
+/// never applied to the PTY - clients render the frozen session as
+/// independent viewports.
 fn apply_grid_if_tui(session: &mut ManagedSession, cols: u16, rows: u16) -> Option<GridEpoch> {
     session.requested_viewport = Some((cols, rows));
-    if session.is_alt_buffer {
+    if session.tui.mode() != TuiMode::Canonical {
         apply_session_grid(session, cols, rows)
     } else {
         None
@@ -3730,13 +3725,14 @@ mod tests {
         apply_grid_if_tui, apply_session_grid, preferred_project, presence_alive,
         project_is_usable, project_name_or_folder, record_cursor_position_requests,
         registration_status_for_display, resolve_working_directory, retire_empty_temporary_project,
-        scan_alt_buffer_transitions, should_open_quiet_window, snapshot_from_inner,
+        should_open_quiet_window, snapshot_from_inner,
         split_journal_by_epochs, startup_project, take_valid_pairing_grant, truncate_journal_front,
         validate_project_name, GridEpoch, SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS,
     };
     use crate::{
-        models::{AuthorizedDevice, Project, TerminalSession},
+        models::{AuthorizedDevice, Project, TerminalSession, TuiMode},
         store::DesktopStore,
+        tui::TuiClassifier,
         window_clients::WindowClients,
     };
     use portable_pty::{ChildKiller, MasterPty, PtySize};
@@ -3744,6 +3740,7 @@ mod tests {
         collections::{HashMap, HashSet},
         fs,
         path::{Path, PathBuf},
+        time::{Duration, Instant},
     };
     use uuid::Uuid;
 
@@ -3944,86 +3941,87 @@ mod tests {
         assert_eq!(epoch, Some(GridEpoch { offset: 19, cols: 100, rows: 34 }));
     }
 
-    #[test]
-    fn alt_buffer_scanner_detects_enter_and_exit_sequences() {
-        let mut tail = String::new();
-        let mut active = false;
-        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?1049h", &mut active));
-        assert!(active, "1049h enters the alternate screen");
-        assert!(!scan_alt_buffer_transitions(&mut tail, "top - 0.3 up\r\n", &mut active));
-        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?1049l", &mut active));
-        assert!(!active, "1049l leaves the alternate screen");
-        assert!(!scan_alt_buffer_transitions(&mut tail, "\x1b[31mtext\x1b[0m", &mut active));
-        assert!(!active);
+    /// Feed one chunk to the session's TUI classifier, advancing the test
+    /// clock, and mirror the host's metadata sync (what `on_terminal_data`
+    /// does with a reported transition).
+    fn feed_session(
+        session: &mut ManagedSession,
+        clock: &mut Instant,
+        step_ms: u64,
+        chunk: &str,
+    ) -> Option<crate::tui::TuiTransition> {
+        *clock += Duration::from_millis(step_ms);
+        let transition = session.tui.feed(chunk, *clock, session.grid.1);
+        if let Some(t) = transition {
+            session.metadata.tui_mode = t.to;
+        }
+        transition
     }
 
     #[test]
-    fn alt_buffer_scanner_handles_vt52_variants_and_split_sequences() {
-        let mut tail = String::new();
-        let mut active = false;
-        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?47h", &mut active));
-        assert!(active);
-        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[47l", &mut active));
-        assert!(!active);
-
-        // The sequence is split across two chunks; the tail window must keep
-        // the prefix so the second chunk completes the detection.
-        let mut tail = String::new();
-        let mut active = false;
-        assert!(!scan_alt_buffer_transitions(&mut tail, "\x1b[?10", &mut active));
-        assert!(scan_alt_buffer_transitions(&mut tail, "49h", &mut active));
-        assert!(active);
-        assert!(!scan_alt_buffer_transitions(&mut tail, "\x1b[?10", &mut active));
-        assert!(scan_alt_buffer_transitions(&mut tail, "49l", &mut active));
-        assert!(!active);
+    fn tui_classifier_moves_a_session_between_modes() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let mut clock = Instant::now();
+        // A split alt-enter sequence bridges chunk boundaries and commits
+        // to fullscreen immediately.
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?104").is_none());
+        let enter = feed_session(&mut session, &mut clock, 5, "9h").expect("alt enter");
+        assert_eq!(enter.to, TuiMode::Fullscreen);
+        assert!(enter.via_alt_enter, "the program's own alt enter is reported");
+        assert_eq!(session.metadata.tui_mode, TuiMode::Fullscreen);
+        // TUI frames do not re-trigger a transition.
+        assert!(feed_session(&mut session, &mut clock, 10, "top - 0.3 up\r\n").is_none());
+        // The program's own alt exit is observed, but the mode only
+        // releases once the cursor is visible and the stream goes quiet.
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049l").is_none());
+        assert_eq!(session.metadata.tui_mode, TuiMode::Fullscreen);
+        let exit = feed_session(&mut session, &mut clock, 350, "\r\n").expect("quiet alt exit");
+        assert_eq!(exit.to, TuiMode::Canonical);
+        assert!(exit.program_alt_exit);
+        assert_eq!(session.metadata.tui_mode, TuiMode::Canonical);
     }
 
     #[test]
-    fn alt_buffer_scanner_treats_cursor_hide_and_sync_output_as_tui_entry() {
-        let mut tail = String::new();
-        let mut active = false;
-        // A primary-buffer full-screen renderer hides the cursor to begin.
-        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?25l", &mut active));
-        assert!(active, "cursor-hide must mark a full-screen UI as active");
-        assert!(!scan_alt_buffer_transitions(&mut tail, "\x1b[38;2;102;102;102m\x1b[K", &mut active));
-        assert!(active, "repaint content keeps the TUI active");
-        // The harness restores the cursor when it exits.
-        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?25h", &mut active));
-        assert!(!active, "cursor-show must end the full-screen UI");
-
-        // Synchronized-output mode is also a TUI cue.
-        let mut tail = String::new();
-        let mut active = false;
-        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?2026h", &mut active));
-        assert!(active);
-        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?2026l", &mut active));
-        assert!(!active);
+    fn tui_classifier_keeps_shell_activity_in_canonical() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let mut clock = Instant::now();
+        // An orphan alt exit (no entry), the shell's `clear` (ED2 +
+        // home), and bracketed-paste state must never leave canonical
+        // mode - and still must not after the confirmation window.
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049l").is_none());
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[2J\x1b[H").is_none());
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?2004h").is_none());
+        assert!(feed_session(&mut session, &mut clock, 10, "\r\n").is_none());
+        assert!(feed_session(&mut session, &mut clock, 60, "").is_none());
+        assert_eq!(session.tui.mode(), TuiMode::Canonical);
+        assert_eq!(session.metadata.tui_mode, TuiMode::Canonical);
     }
 
     #[test]
-    fn alt_buffer_scanner_handles_the_1047_variant_and_exit_wins_a_mixed_chunk() {
-        let mut tail = String::new();
-        let mut active = false;
-        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?1047h", &mut active));
-        assert!(active, "1047h is an alternate-screen enter");
-        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?1047l", &mut active));
-        assert!(!active, "1047l is an alternate-screen exit");
-
-        // A chunk that carries an old enter in its bridge tail plus a fresh
-        // exit must end EXITED (one transition per chunk, exit-first): a real
-        // TUI exiting emits only the exit here.
-        let mut tail = String::new();
-        let mut active = true;
-        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?1049l", &mut active));
-        assert!(!active, "the exit wins even when a stale enter sequence is in the bridge tail");
-        assert!(!scan_alt_buffer_transitions(&mut tail, "shell text", &mut active));
-        assert!(!active);
+    fn tui_classifier_treats_a_repaint_harness_as_inline() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let mut clock = Instant::now();
+        // A primary-buffer bottom-region harness (fzf-style) repaints a
+        // bounded region: the session goes inline - output stays in the
+        // scrollback - instead of fullscreen.
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?25l").is_none());
+        assert!(feed_session(&mut session, &mut clock, 5, "\x1b[3A\x1b[2Kline a\r\n").is_none());
+        assert!(feed_session(&mut session, &mut clock, 5, "\x1b[3A\x1b[2Kline b\r\n").is_none());
+        assert!(feed_session(&mut session, &mut clock, 5, "\x1b[3A\x1b[2Kline c\r\n").is_none());
+        let inline = feed_session(&mut session, &mut clock, 60, "").expect("inline commit");
+        assert_eq!(inline.to, TuiMode::Inline);
+        assert!(!inline.via_alt_enter);
+        // The program's own alt enter upgrades the period to fullscreen.
+        let upgrade = feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").expect("upgrade");
+        assert_eq!(upgrade.to, TuiMode::Fullscreen);
+        assert!(upgrade.via_alt_enter);
     }
 
     #[test]
     fn grid_policy_records_but_does_not_reapply_an_unaltered_viewport() {
         let mut session = test_session("s1", "p1", "C:\\repo");
-        session.is_alt_buffer = true;
+        let mut clock = Instant::now();
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
         let first = apply_grid_if_tui(&mut session, 113, 39);
         assert_eq!(first, Some(GridEpoch { offset: 0, cols: 113, rows: 39 }));
         // Re-asserting the SAME viewport while the TUI still owns the screen
@@ -4031,46 +4029,38 @@ mod tests {
         let second = apply_grid_if_tui(&mut session, 113, 39);
         assert_eq!(second, None);
         assert_eq!(session.grid_epochs.len(), 2);
-        session.is_alt_buffer = false;
-        // Outside a TUI the same size is recorded (for the next TUI) but not
-        // applied.
+        // Leaving the TUI: the grid freezes; the next client viewport is
+        // recorded only, never applied to the PTY.
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049l").is_none());
+        assert!(feed_session(&mut session, &mut clock, 350, "\r\n").is_some());
         let third = apply_grid_if_tui(&mut session, 113, 39);
         assert_eq!(third, None);
         assert_eq!(session.requested_viewport, Some((113, 39)));
     }
 
     #[test]
-    fn alt_buffer_scanner_ignores_exit_without_entry_and_orphan_sequences() {
-        let mut tail = String::new();
-        let mut active = false;
-        assert!(!scan_alt_buffer_transitions(&mut tail, "\x1b[?1049l", &mut active));
-        assert!(!active, "a stray exit must not flip the flag");
-        assert!(!scan_alt_buffer_transitions(&mut tail, "\x1b[2J\x1b[H", &mut active));
-        assert!(!scan_alt_buffer_transitions(&mut tail, "\x1b[?2004h", &mut active));
-        assert!(!active, "bracketed-paste state must never be confused with TUI state");
-    }
-
-    #[test]
     fn grid_policy_only_resizes_while_a_tui_is_active() {
         let mut session = test_session("s1", "p1", "C:\\repo");
-        // Non-TUI: client sizes are recorded for the next TUI, never applied.
+        let mut clock = Instant::now();
+        // Canonical: client sizes are recorded for the next TUI, never applied.
         assert!(apply_grid_if_tui(&mut session, 72, 26).is_none());
         assert_eq!(
             session.grid,
             (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS),
-            "the session grid must stay frozen outside a TUI"
+            "the session grid must stay frozen in canonical mode"
         );
         assert_eq!(session.requested_viewport, Some((72, 26)));
 
         // TUI active: focus-driven ownership applies the announced viewport.
-        session.is_alt_buffer = true;
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
         let epoch = apply_grid_if_tui(&mut session, 113, 39);
         assert_eq!(epoch, Some(GridEpoch { offset: 0, cols: 113, rows: 39 }));
         assert_eq!(session.grid, (113, 39));
 
         // TUI exit: the grid freezes at the last TUI size, and the next
         // client viewport is only recorded again.
-        session.is_alt_buffer = false;
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049l").is_none());
+        assert!(feed_session(&mut session, &mut clock, 350, "\r\n").is_some());
         assert!(apply_grid_if_tui(&mut session, 90, 30).is_none());
         assert_eq!(session.grid, (113, 39), "grid freezes after TUI exit");
         assert_eq!(session.requested_viewport, Some((90, 30)));
@@ -5037,7 +5027,7 @@ mod tests {
             status: status.into(),
             created_at: created_at.into(),
             exit_code: None,
-                alt_buffer: false,
+                tui_mode: TuiMode::Canonical,
         }
     }
 
@@ -5100,7 +5090,7 @@ mod tests {
                 status: "running".into(),
                 created_at: "now".into(),
                 exit_code: None,
-                alt_buffer: false,
+                tui_mode: TuiMode::Canonical,
             },
             master: Box::new(InertMaster),
             writer: Box::new(std::io::sink()),
@@ -5113,8 +5103,8 @@ mod tests {
             }],
             buffer: String::new(),
             journal_len: 0,
-            is_alt_buffer: false,
-            alt_tail: String::new(),
+            tui: TuiClassifier::new(SESSION_DEFAULT_ROWS),
+            synthetic_alt: false,
             requested_viewport: None,
             control_tail: String::new(),
             cursor_query_tail: String::new(),

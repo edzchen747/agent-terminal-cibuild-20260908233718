@@ -1,6 +1,6 @@
 import { Preferences } from "@capacitor/preferences";
 import { Capacitor } from "@capacitor/core";
-import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage } from "@agentterminal/protocol";
+import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage, TuiMode } from "@agentterminal/protocol";
 import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN } from "@agentterminal/protocol";
 import { deviceName } from "./device";
 import { canAttemptConnection, heartbeatActive, heartbeatCatchUpNeeded, heartbeatIntervalMs, nextReconnectDelay, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS } from "./connectionPolicy";
@@ -45,7 +45,7 @@ type EventMap = {
   snapshot: HostSnapshot;
   output: { sessionId: string; data: string; offset: number };
   grid: { sessionId: string; cols: number; rows: number; offset: number };
-  alt: { sessionId: string; active: boolean; offset: number };
+  mode: { sessionId: string; mode: TuiMode; offset: number };
   disconnected: undefined;
   connected: HostSnapshot;
   heartbeat: HostSnapshot;
@@ -873,7 +873,7 @@ export class HostConnection {
     try { message = decodeServerMessage(raw); } catch { return; }
     if (message.type === "session.output") { this.emit("output", { sessionId: message.sessionId, data: message.data, offset: message.offset }); return; }
     if (message.type === "session.grid") { this.emit("grid", { sessionId: message.sessionId, cols: message.cols, rows: message.rows, offset: message.offset }); return; }
-    if (message.type === "session.alt") { this.emit("alt", { sessionId: message.sessionId, active: message.active, offset: message.offset }); return; }
+    if (message.type === "session.mode") { this.emit("mode", { sessionId: message.sessionId, mode: message.mode, offset: message.offset }); return; }
     if (message.type === "snapshot") { this.snapshot = message.snapshot; this.emit("snapshot", message.snapshot); }
     if ((message.type === "auth.accepted" || message.type === "pair.accepted") && message.snapshot) this.snapshot = message.snapshot;
     const requestId = "requestId" in message ? message.requestId : undefined;

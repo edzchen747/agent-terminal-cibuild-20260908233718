@@ -2,6 +2,21 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 
+/// How the host classifies the running foreground program's relationship to
+/// the terminal grid (see the `TuiMode` doc in `packages/protocol`):
+/// canonical keeps the PTY frozen at its snapshot size while clients reflow
+/// the journal at their own sizes; inline and fullscreen make the PTY
+/// follow the focused client, with fullscreen additionally isolating TUI
+/// frames from the scrollback with a synthetic alt-screen pair.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TuiMode {
+    #[default]
+    Canonical,
+    Inline,
+    Fullscreen,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceIdentity {
@@ -62,10 +77,11 @@ pub struct TerminalSession {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<u32>,
-    /// True while the shell is drawing an alternate screen buffer (TUI):
-    /// clients must treat this data block as a strict cell grid.
+    /// The host's TUI classification of the running foreground program:
+    /// clients in canonical mode render the journal at their own grid, while
+    /// inline/fullscreen follow the host grid announcements.
     #[serde(default)]
-    pub alt_buffer: bool,
+    pub tui_mode: TuiMode,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -157,14 +173,13 @@ pub struct TerminalGridEvent {
     pub offset: u64,
 }
 
-/// The shell entered/left the alternate screen buffer at stream offset
-/// `offset`; clients treat the active data block as a strict cell grid and
-/// bypass reflow heuristics for it.
+/// The host reclassified the session's foreground program at stream offset
+/// `offset`; `mode` tells clients how to own (or not own) the PTY grid.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TerminalAltBufferEvent {
+pub struct TerminalTuiModeEvent {
     pub session_id: String,
-    pub active: bool,
+    pub mode: TuiMode,
     pub offset: u64,
 }
 
@@ -363,10 +378,10 @@ pub enum ServerMessage {
         rows: u16,
         offset: u64,
     },
-    #[serde(rename = "session.alt")]
-    SessionAltBuffer {
+    #[serde(rename = "session.mode")]
+    SessionMode {
         session_id: String,
-        active: bool,
+        mode: TuiMode,
         offset: u64,
     },
     #[serde(rename = "ok")]
@@ -382,7 +397,7 @@ pub enum ServerMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientMessage, ServerMessage, SessionSegment, TerminalAltBufferEvent, TerminalSession};
+    use super::{ClientMessage, ServerMessage, SessionSegment, TerminalTuiModeEvent, TerminalSession, TuiMode};
 
     #[test]
     fn protocol_field_names_match_the_mobile_contract() {
@@ -457,19 +472,19 @@ mod tests {
         assert_eq!(grid["rows"], 34);
         assert_eq!(grid["offset"], 512);
 
-        let alt = serde_json::to_value(ServerMessage::SessionAltBuffer {
+        let mode = serde_json::to_value(ServerMessage::SessionMode {
             session_id: "s1".into(),
-            active: true,
+            mode: TuiMode::Fullscreen,
             offset: 200,
         })
-        .expect("session.alt");
-        assert_eq!(alt["type"], "session.alt");
-        assert_eq!(alt["active"], true);
-        assert_eq!(alt["offset"], 200);
+        .expect("session.mode");
+        assert_eq!(mode["type"], "session.mode");
+        assert_eq!(mode["mode"], "fullscreen");
+        assert_eq!(mode["offset"], 200);
     }
 
     #[test]
-    fn session_alt_buffer_flag_and_event_are_camel_cased_on_the_wire() {
+    fn session_tui_mode_flag_and_event_are_camel_cased_on_the_wire() {
         let session = TerminalSession {
             id: "s1".into(),
             project_id: "p1".into(),
@@ -479,19 +494,19 @@ mod tests {
             status: "running".into(),
             created_at: "now".into(),
             exit_code: None,
-            alt_buffer: true,
+            tui_mode: TuiMode::Inline,
         };
         let json = serde_json::to_value(&session).expect("TerminalSession");
-        assert_eq!(json["altBuffer"], true, "the TUI flag must be camelCased");
+        assert_eq!(json["tuiMode"], "inline", "the TUI mode must be camelCased");
         assert_eq!(json["title"], "pwsh");
 
-        let event = TerminalAltBufferEvent {
+        let event = TerminalTuiModeEvent {
             session_id: "s1".into(),
-            active: false,
+            mode: TuiMode::Canonical,
             offset: 42,
         };
-        let event_json = serde_json::to_value(event).expect("TerminalAltBufferEvent");
-        assert_eq!(event_json["active"], false);
+        let event_json = serde_json::to_value(event).expect("TerminalTuiModeEvent");
+        assert_eq!(event_json["mode"], "canonical");
         assert_eq!(event_json["offset"], 42);
         assert_eq!(event_json["sessionId"], "s1");
     }

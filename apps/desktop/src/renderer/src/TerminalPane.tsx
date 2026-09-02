@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { applyTerminalModifiers, findHttpLinks, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCROLLBACK_LINES, type TerminalModifier } from "@agentterminal/protocol";
+import { applyTerminalModifiers, findHttpLinks, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCROLLBACK_LINES, type TerminalModifier, type TuiMode } from "@agentterminal/protocol";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { sessionId: string; visible: boolean; active: boolean; confirmExternalLinks: boolean; }
@@ -157,17 +157,17 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
     };
 
     // ---------------------------------------------------------------------
-    // Dual-path rendering (distinguished by the host's alternate-screen
-    // state):
-    //  - NON-TUI (viewport mode): the session grid is frozen; this pane
+    // Dual-path rendering (distinguished by the host's TUI mode, which
+    // the stream-signal classifier reports):
+    //  - CANONICAL (viewport mode): the session grid is frozen; this pane
     //    renders the journal at its OWN size by re-parsing it at a single
     //    grid (reset + full replay, coalesced). Idempotent and lossless,
     //    no reflow, no host resize - resizing a million times is a re-render.
-    //  - TUI (focus mode): the focused window's size IS the PTY grid; the
-    //    pane calls fit() and pushes the dimensions to the host (SIGWINCH),
-    //    and the TUI repaints natively across the new grid.
+    //  - INLINE / FULLSCREEN (focus mode): the focused window's size IS the
+    //    PTY grid; the pane calls fit() and pushes the dimensions to the
+    //    host (SIGWINCH), and the TUI repaints natively across the new grid.
     // ---------------------------------------------------------------------
-    let altBufferActive = false;
+    let tuiMode: TuiMode = "canonical";
     let sessionGrid = { cols: 0, rows: 0 };
     let viewportGrid = { cols: 0, rows: 0 };
     let refreshing = false;
@@ -243,7 +243,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
 
     const resize = (force = false) => {
       if (!activeRef.current) return;
-      if (altBufferActive) {
+      if (tuiMode !== "canonical") {
         // TUI focus mode: push our dimensions so the TUI repaints (SIGWINCH).
         announceViewport();
         return;
@@ -260,7 +260,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
 
     const sendKeyboardInput = (data: string) => {
       if (!data) return;
-      if (altBufferActive) {
+      if (tuiMode !== "canonical") {
         try { fit.fit(); } catch { /* hidden pane */ }
         window.agentTerminal.write(sessionId, data, terminal.cols, terminal.rows);
         return;
@@ -320,7 +320,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
       if (activeRef.current) resize(true);
     };
     window.addEventListener("pointerdown", handlePointerActivity, true);
-    const inputDims = () => altBufferActive
+    const inputDims = () => tuiMode !== "canonical"
       ? { cols: terminal.cols, rows: terminal.rows }
       : (proposeGrid() ?? { cols: terminal.cols, rows: terminal.rows });
     const dataSubscription = terminal.onData((data) => {
@@ -328,13 +328,13 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
         // A newly created pane is attached before it becomes the active tab.
         // Forward terminal-generated CPR replies even while hidden; the tray
         // validates them against the shell's outstanding queries.
-        if (altBufferActive) { try { fit.fit(); } catch { /* hidden pane */ } }
+        if (tuiMode !== "canonical") { try { fit.fit(); } catch { /* hidden pane */ } }
         const dims = inputDims();
         window.agentTerminal.write(sessionId, data, dims.cols, dims.rows);
         return;
       }
       if (!activeRef.current) return;
-      if (altBufferActive) { try { fit.fit(); } catch { /* hidden pane */ } }
+      if (tuiMode !== "canonical") { try { fit.fit(); } catch { /* hidden pane */ } }
       const dims = inputDims();
       window.agentTerminal.write(sessionId, data, dims.cols, dims.rows);
     });
@@ -364,25 +364,26 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
     const offGrid = window.agentTerminal.onGrid((id, cols, rows) => {
       if (id !== sessionId) return;
       sessionGrid = { cols, rows };
-      if (altBufferActive) {
+      if (tuiMode !== "canonical") {
         applyGridInPlace(cols, rows);
         dbg(`grid(tui) session=${sessionId} cols=${cols} rows=${rows}`);
       } else {
         dbg(`grid session=${sessionId} cols=${cols} rows=${rows} recorded`);
       }
     });
-    // Alternate-screen state flips the render path. On entry, the focused
-    // pane announces its size so the TUI opens at the right dimensions; on
-    // exit, the pane returns to viewport rendering, re-parsing the journal
-    // at its own grid (which also heals any primary history after the TUI).
-    const offAlt = window.agentTerminal.onAlt((id, active, offset) => {
+    // TUI mode flips the render path. On entry to inline/fullscreen, the
+    // focused pane announces its size so the TUI opens at the right
+    // dimensions; on exit to canonical, the pane returns to viewport
+    // rendering, re-parsing the journal at its own grid (which also heals
+    // any primary history after the TUI).
+    const offMode = window.agentTerminal.onTuiMode((id, mode, offset) => {
       if (id !== sessionId) return;
-      altBufferActive = active;
-      dbg(`alt session=${sessionId} active=${active} off=${offset}`);
-      if (active) {
-        if (activeRef.current) announceViewport();
-      } else {
+      tuiMode = mode;
+      dbg(`mode session=${sessionId} mode=${mode} off=${offset}`);
+      if (mode === "canonical") {
         scheduleRefresh();
+      } else if (activeRef.current) {
+        announceViewport();
       }
     });
     const finishAttachment = () => {
@@ -420,7 +421,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
       dataSubscription.dispose();
       offData();
       offGrid();
-      offAlt();
+      offMode();
       void refreshLoopPromise.then(() => window.agentTerminal.detachSession(sessionId));
       if (statsTimer !== undefined) window.clearInterval(statsTimer);
       if (copyToastTimer) window.clearTimeout(copyToastTimer);
