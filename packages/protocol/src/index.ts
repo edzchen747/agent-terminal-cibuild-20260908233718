@@ -212,6 +212,8 @@ export interface TerminalSession {
   status: "running" | "exited";
   createdAt: string;
   exitCode?: number;
+  /** True while the shell is drawing an alternate screen buffer (TUI): treat the data block as a strict cell grid. */
+  altBuffer?: boolean;
 }
 
 export interface ShellProfile {
@@ -290,6 +292,7 @@ export type ServerMessage =
   | { type: "session.output"; sessionId: string; data: string; offset: number }
   | { type: "session.buffer"; requestId: string; sessionId: string; segments: SessionSegment[]; endOffset: number }
   | { type: "session.grid"; sessionId: string; cols: number; rows: number; offset: number }
+  | { type: "session.alt"; sessionId: string; active: boolean; offset: number }
   | { type: "ok"; requestId: string }
   | { type: "error"; requestId?: string; code: string; message: string };
 

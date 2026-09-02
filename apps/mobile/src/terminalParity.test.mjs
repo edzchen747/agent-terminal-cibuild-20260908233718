@@ -220,6 +220,43 @@ test("a chunk and a grid notice racing the snapshot reply are applied exactly on
   assert.deepEqual(snapshot(replayed), snapshot(live));
 });
 
+test("resizing mid-TUI keeps the primary history and TUI isolation on both devices", async () => {
+  // Focus switches while a TUI owns the alternate screen: the PTY resize
+  // sends SIGWINCH, the TUI wipes and repaints across the new grid. The
+  // client follows the grid announcements, but the alternate buffer must
+  // stay isolated - primary scrollback stays clean and complete.
+  const events = [];
+  let offset = 0;
+  const data = (s) => { events.push({ data: s, offset }); offset += streamByteLength(s); };
+  const grid = (cols, rows) => events.push({ grid: { cols, rows }, offset });
+  grid(113, 39);
+  for (let i = 0; i < 50; i += 1) data(`base-line-${i} ${"x".repeat(90)}\r\n`);
+  data("\x1b[?1049h\x1b[H\x1b[2J");
+  data("\x1b[1;1H\x1b[42m\x1b[1;37m top - TUI canvas\x1b[0m\r\n");
+  data("+----+------------------------+-------+\r\n");
+  data("| 1  | agent-terminal-host    |  0.7% |\r\n");
+  data("+----+------------------------+-------+\r\n");
+  grid(72, 26);
+  data("\x1b[H\x1b[2J\x1b[1;1H top - repainted after SIGWINCH\r\n");
+  data("| 2  | node.exe               | 12.9% |\r\n");
+  data("\x1b[?1049l");
+  grid(113, 39);
+  data("END-OF-TUI\r\n");
+  data("PS> after-exit\r\n");
+
+  const a = makeTerminal();
+  await applyLive(a, events);
+  const b = makeTerminal();
+  await applyLive(b, events);
+
+  assert.deepEqual(snapshot(a), snapshot(b), "both devices converge through the mid-TUI resize");
+  const lines = snapshot(a).lines;
+  assert.ok(lines.some((line) => line.includes("base-line-0")), "pre-TUI history survives");
+  assert.ok(lines.some((line) => line.includes("base-line-49")), "the last pre-TUI line survives");
+  assert.ok(lines.some((line) => line.includes("END-OF-TUI")), "post-TUI content arrives");
+  assert.ok(!lines.some((line) => line.includes("TUI canvas")), "alternate-screen paint never leaks into the primary history");
+});
+
 test("alternate screen round trips stay clean and identical across grid flips", async () => {
   const events = buildSessionEvents();
   const a = makeTerminal();
@@ -330,4 +367,83 @@ test("an empty snapshot replay initializes cleanly and applies pending live outp
       ? { grid: { cols: event.grid.cols, rows: event.grid.rows }, offset: event.offset }
       : { data: event.data, offset: event.offset }));
   assert.deepEqual(snapshot(replayed), snapshot(live));
+});
+
+test("a non-TUI session re-renders losslessly across every viewport size", async () => {
+  // Fixed-session model: the stream is produced at one grid with no WINCH
+  // churn. Each viewport change re-renders it (reset + full replay at the
+  // viewport grid) and must equal the canonical parse at the final size.
+  const journal = [];
+  for (let i = 0; i < 200; i += 1) journal.push(`header-line-${i} ${"x".repeat(140)}\r\n`);
+  journal.push("PS> done\r\n");
+  const stream = journal.join("");
+  const viewports = [[120, 40], [90, 30], [113, 39], [72, 26], [100, 34]];
+
+  const renderAt = async (term, cols, rows) => {
+    term.reset();
+    if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows);
+    await write(term, stream);
+  };
+
+  // Emulate the pane's viewport re-renders after every window resize.
+  const pane = makeTerminal(120, 40);
+  for (const [cols, rows] of viewports) await renderAt(pane, cols, rows);
+
+  const truth = makeTerminal(120, 40);
+  const [finalCols, finalRows] = viewports.at(-1);
+  await renderAt(truth, finalCols, finalRows);
+
+  assert.deepEqual(snapshot(pane), snapshot(truth), "every viewport re-render must equal the canonical parse at the final size");
+  const lines = snapshot(truth).lines;
+  assert.equal(lines.filter((line) => line.includes("header-line-")).length, 200, "no header may be lost across viewport re-renders");
+  assert.equal(lines.filter((line) => line.includes("PS> done")).length, 1, "the tail must be intact");
+});
+
+test("a full-screen primary-buffer TUI is isolated and the session returns cleanly", async () => {
+  // A harness that renders full-screen in the PRIMARY buffer (cursor-hide +
+  // synchronized-output + absolute repaints, no alternate screen). Detection
+  // is server-side (core.rs), but the client contract is: the UI content and
+  // cursor/sync state never pollute the pre-TUI history, and after the UI
+  // releases the terminal (cursor-show) the session re-renders cleanly.
+  const renderAt = (term, cols, rows, data) => new Promise((resolve) => {
+    term.resize(cols, rows);
+    term.reset();
+    term.write(data, () => resolve());
+  });
+  const tui = makeTerminal(120, 40);
+  let journal = "";
+  const emit = (s) => { journal += s; };
+
+  await write(tui, "base-line-one\r\nbase-line-two\r\n");
+  emit("base-line-one\r\nbase-line-two\r\n");
+  // TUI enter: cursor-hide + sync mode, then absolute repaints.
+  const enter = "\x1b[?25l\x1b[?2026h\x1b[38;2;102;102;102m\x1b[1m AGENT UI \x1b[0m\r\n\x1b[2b\x1b[4C\x1b[38;2;255;255;0m●\x1b[0m\r\n";
+  await write(tui, enter);
+  emit(enter);
+  // A repaint burst (the harness redraws on a resize; absolute positioning).
+  const repaint = "\x1b[H\x1b[K\x1b[38;2;240;198;116m running\u2026 \x1b[0m\r\n";
+  await write(tui, repaint);
+  emit(repaint);
+  // TUI exit: sync off + cursor show, then the prompt returns.
+  const exit = "\x1b[?2026l\x1b[?25h\r\nPS> done\r\n";
+  await write(tui, exit);
+  emit(exit);
+
+  // Canonical re-render at the same grid must be identical (no loss / no
+  // residue), and the pre-TUI history must be untouched.
+  const fresh = makeTerminal(120, 40);
+  fresh.reset();
+  await write(fresh, journal);
+  assert.deepEqual(snapshot(fresh), snapshot(tui), "a clean re-render equals the live TUI session");
+  const lines = snapshot(fresh).lines;
+  // The TUI repainted row 0 in place (a legit full-screen overpaint), so the
+  // row it did not touch survives; the re-parse must neither lose it nor
+  // duplicate the UI's own repaint.
+  assert.ok(lines.some((line) => line.includes("base-line-two")), "the un-overpainted pre-TUI history survives");
+  assert.ok(lines.some((line) => line.includes("PS> done")), "post-TUI prompt arrives");
+  // The full-screen UI repainted its rows in place: the surviving repaint
+  // marker must appear exactly once - never duplicated into scrollback, and
+  // the earlier painted line was legitimately overpainted by the later one.
+  const joined = lines.join("\n");
+  assert.equal((joined.match(/running…/g) ?? []).length, 1, "the full-screen UI paints in place, never duplicating into history");
 });

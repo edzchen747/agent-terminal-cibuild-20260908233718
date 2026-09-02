@@ -17,9 +17,16 @@ interface TerminalGridEvent {
   offset: number;
 }
 
+interface TerminalAltBufferEvent {
+  sessionId: string;
+  active: boolean;
+  offset: number;
+}
+
 const stateListeners = new Set<(state: DesktopState) => void>();
 const dataListeners = new Set<(sessionId: string, data: string, offset: number) => void>();
 const gridListeners = new Set<(sessionId: string, cols: number, rows: number, offset: number) => void>();
+const altListeners = new Set<(sessionId: string, active: boolean, offset: number) => void>();
 const pairingListeners = new Set<() => void>();
 const currentWindowTarget = getCurrentWebviewWindow().label;
 
@@ -33,6 +40,10 @@ const dataBridgeReady = listen<TerminalDataEvent>("desktop-data", ({ payload }) 
 
 const gridBridgeReady = listen<TerminalGridEvent>("desktop-grid", ({ payload }) => {
   for (const listener of gridListeners) listener(payload.sessionId, payload.cols, payload.rows, payload.offset);
+}, { target: currentWindowTarget });
+
+const altBridgeReady = listen<TerminalAltBufferEvent>("desktop-alt", ({ payload }) => {
+  for (const listener of altListeners) listener(payload.sessionId, payload.active, payload.offset);
 }, { target: currentWindowTarget });
 
 const pairingBridgeReady = listen<string>("pairing-succeeded", () => {
@@ -86,6 +97,10 @@ const api: DesktopApi = {
   onGrid: (callback) => {
     gridListeners.add(callback);
     return () => gridListeners.delete(callback);
+  },
+  onAlt: (callback) => {
+    altListeners.add(callback);
+    return () => altListeners.delete(callback);
   }
 };
 

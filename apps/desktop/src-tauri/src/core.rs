@@ -29,7 +29,8 @@ use crate::{
     models::{
         AuthorizedDevice, ClientMessage, DesktopState, DirectoryEntry, DirectoryListing, HostInfo,
         HostSnapshot, PROTOCOL_VERSION, PairingPayload, Project, RemoteRegistration, ServerMessage,
-        SessionSegment, SessionSnapshot, ShellProfile, TerminalDataEvent, TerminalGridEvent,
+        SessionSegment, SessionSnapshot, ShellProfile, TerminalAltBufferEvent, TerminalDataEvent,
+        TerminalGridEvent,
         TerminalSession,
     },
     network,
@@ -95,6 +96,12 @@ fn sync_log_path() -> PathBuf {
     std::env::temp_dir().join("agent-terminal-sync.log")
 }
 
+/// Raw byte dump of one session's PTY stream (gated by AGENT_TERMINAL_SYNC_DEBUG),
+/// written per append so a failing TUI resize can be replayed byte-for-byte.
+fn journal_dump_path(session_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("agent-terminal-journal-{session_id}.log"))
+}
+
 fn sync_log_line(scope: &str, message: fmt::Arguments<'_>) {
     let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
     let line = format!("{timestamp} [{scope}] {message}\n");
@@ -155,6 +162,58 @@ fn is_cursor_position_report(data: &str) -> bool {
     index > second_start && bytes.get(index) == Some(&b'R') && index + 1 == bytes.len()
 }
 
+/// Detect alternate-screen-buffer entry/exit sequences in the raw PTY stream
+/// and flip `active` accordingly. Handles `\x1b[?1049h/l`, `\x1b[?47h/l` (the
+/// standard vt100/vt220-family alternates) plus their non-private-space
+/// variants. The 8-byte tail window keeps split sequences across chunk
+/// boundaries. Returns true when the state changed.
+fn scan_alt_buffer_transitions(tail: &mut String, data: &str, active: &mut bool) -> bool {
+    let combined = format!("{tail}{data}");
+    // Exit-first (a shell may leave an alt screen and immediately enter
+    // another full-screen app in the same chunk; the final state wins).
+    // Alternate-screen sequences (classic TUIs like vim/htop) ...
+    let enter = [
+        "\x1b[?1049h", "\x1b[?47h", "\x1b[?1047h",
+        "\x1b[1049h", "\x1b[47h", "\x1b[1047h",
+        // ... plus the "full-screen renderer owns the terminal" cues emitted
+        // by raw primary-buffer TUIs (ink/clack/custom harnesses): hiding
+        // the cursor and enabling synchronized output. A normal shell never
+        // hides its cursor or turns on sync mode.
+        "\x1b[?25l", "\x1b[?2026h",
+    ];
+    let leave = [
+        "\x1b[?1049l", "\x1b[?47l", "\x1b[?1047l",
+        "\x1b[1049l", "\x1b[47l", "\x1b[1047l",
+        "\x1b[?25h", "\x1b[?2026l",
+    ];
+    // One transition per call, exit-first: a chunk that carries a previously
+    // consumed sequence in its bridge tail must not flip the flag a second
+    // time against the SAME bytes.
+    let changed = if *active && leave.iter().any(|pattern| combined.contains(pattern)) {
+        *active = false;
+        true
+    } else if !*active && enter.iter().any(|pattern| combined.contains(pattern)) {
+        *active = true;
+        if sync_debug_enabled() {
+            sync_log_line("alt", format_args!("detected a TUI enter sequence in the session stream"));
+        }
+        true
+    } else {
+        false
+    };
+    // Bridge only the newest bytes so an already-consumed sequence in a
+    // previous chunk's tail never re-matches.
+    *tail = data
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    changed
+}
+
 fn record_cursor_position_requests(tail: &mut String, data: &str) -> usize {
     const STANDARD: &[u8] = b"\x1b[6n";
     const DEC_PRIVATE: &[u8] = b"\x1b[?6n";
@@ -204,6 +263,19 @@ struct ManagedSession {
     /// Total bytes ever appended to `buffer` (a monotonic stream position
     /// that survives front trimming, so offsets stay absolute for life).
     journal_len: u64,
+    /// Whether the shell is currently in an alternate screen buffer (a TUI
+    /// like vim / htop / lazygit is drawing absolute-positioned cells).
+    /// While true, clients bypass text reflow for that data block: the TUI
+    /// owns the exact grid and repaints natively on SIGWINCH. Only when the
+    /// alternate screen is ACTIVE may the PTY be resized (focus-driven);
+    /// otherwise the session grid is fixed and clients render as viewports.
+    is_alt_buffer: bool,
+    alt_tail: String,
+    /// The viewport dimensions the focused client most recently announced
+    /// (recorded even while the PTY is frozen). Applied to the PTY on the
+    /// next alternate-screen entry so a freshly launched TUI opens at the
+    /// focused client's size.
+    requested_viewport: Option<(u16, u16)>,
     control_tail: String,
     cursor_query_tail: String,
     pending_cursor_reports: usize,
@@ -1514,6 +1586,7 @@ impl Core {
             status: "running".into(),
             created_at: Utc::now().to_rfc3339(),
             exit_code: None,
+            alt_buffer: false,
         };
         {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
@@ -1530,12 +1603,15 @@ impl Core {
                         cols: SESSION_DEFAULT_COLS,
                         rows: SESSION_DEFAULT_ROWS,
                     }],
-                    buffer: String::new(),
-                    journal_len: 0,
-                    control_tail: String::new(),
-                    cursor_query_tail: String::new(),
-                    pending_cursor_reports: 0,
-                    has_run_command: false,
+            buffer: String::new(),
+            journal_len: 0,
+            is_alt_buffer: false,
+            alt_tail: String::new(),
+            requested_viewport: None,
+            control_tail: String::new(),
+            cursor_query_tail: String::new(),
+            pending_cursor_reports: 0,
+            has_run_command: false,
                     terminal_controller: None,
                 },
             );
@@ -1653,7 +1729,7 @@ impl Core {
             } else {
                 session.terminal_controller = Some(controller.clone());
                 if let Some((cols, rows)) = size {
-                    apply_session_grid(session, cols, rows);
+                    apply_grid_if_tui(session, cols, rows);
                 }
             }
             sync_log!(
@@ -1707,11 +1783,11 @@ impl Core {
                 return;
             }
             session.terminal_controller = Some(controller.clone());
-            apply_session_grid(session, cols, rows)
+            apply_grid_if_tui(session, cols, rows)
         };
         sync_log!(
             "grid",
-            "request session={session_id} controller={controller:?} wanted={cols}x{rows} applied={}",
+            "request session={session_id} controller={controller:?} wanted={cols}x{rows} applied={} (tui-held)",
             epoch.is_some()
         );
         if let Some(epoch) = epoch {
@@ -1795,13 +1871,12 @@ impl Core {
                 anyhow!("Terminal window is no longer registered with the tray host.")
             })?;
         let (session_project_id, snapshot, epoch) = match inner.sessions.get_mut(session_id) {
-            // Apply the attaching window's grid BEFORE the snapshot is built:
-            // the snapshot must end at the PTY's current grid, otherwise the
-            // replay leaves the emulator on the stale grid (and the trailing
-            // grid notice races the replay, sometimes landing after it).
+            // Record the attaching window's viewport. The session grid only
+            // moves while a TUI owns the alternate screen (focus-driven);
+            // otherwise the grid stays fixed and clients render viewports.
             Some(session) => {
                 session.terminal_controller = Some(TerminalController::Desktop(label.to_string()));
-                let epoch = apply_session_grid(session, cols, rows);
+                let epoch = apply_grid_if_tui(session, cols, rows);
                 (
                     session.metadata.project_id.clone(),
                     snapshot_of(session),
@@ -1874,6 +1949,51 @@ impl Core {
             snapshot.end_offset
         );
         snapshot
+    }
+
+    /// Tell every attached device (and every desktop window) that the shell
+    /// entered/left the alternate screen buffer at this stream offset. While
+    /// an alternate buffer is active, clients treat the data block as a
+    /// strict cell grid (TUI boxes must never be reflowed away).
+    fn broadcast_alt_change(&self, session_id: &str, active: bool, offset: u64) {
+        let targets = self
+            .clients
+            .lock()
+            .expect("remote clients poisoned")
+            .iter()
+            .filter(|(_, client)| {
+                client.device_id.is_some() && client.attached_sessions.contains(session_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for client_id in &targets {
+            self.send_to_client(
+                client_id,
+                ServerMessage::SessionAltBuffer {
+                    session_id: session_id.to_string(),
+                    active,
+                    offset,
+                },
+            );
+        }
+        let event = TerminalAltBufferEvent {
+            session_id: session_id.to_string(),
+            active,
+            offset,
+        };
+        let windows = self
+            .inner
+            .lock()
+            .expect("desktop state poisoned")
+            .windows
+            .subscribers(session_id);
+        for label in windows {
+            let _ = self.app.emit_to(
+                EventTarget::webview_window(label),
+                "desktop-alt",
+                event.clone(),
+            );
+        }
     }
 
     /// Tell every attached device (and every desktop window) that the PTY
@@ -2568,7 +2688,7 @@ impl Core {
     }
 
     fn on_terminal_data(self: &Arc<Self>, session_id: &str, data: String) {
-        let (reported_cwd, title_changed, window_clients, offset) = {
+        let (reported_cwd, title_changed, window_clients, offset, alt_change, alt_entry_grid) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
@@ -2597,6 +2717,25 @@ impl Core {
                 data.len(),
                 session.journal_len
             );
+            if sync_debug_enabled() {
+                let _ = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(journal_dump_path(session_id))
+                    .and_then(|mut file| file.write_all(data.as_bytes()));
+                // A full-screen clear is the universal TUI repaint op; probe
+                // the bytes so an unrecognized alternate-screen protocol can
+                // be identified (and matched) from a single run.
+                if data.contains("\x1b[2J") {
+                    let preview: String = data
+                        .as_bytes()
+                        .iter()
+                        .take(200)
+                        .map(|byte| format!("{byte:02x} "))
+                        .collect();
+                    sync_log_line("alt", format_args!("repaint chunk (hex) = {preview}"));
+                }
+            }
             session.control_tail.push_str(&data);
             truncate_front(&mut session.control_tail, MAX_CONTROL_BYTES);
             session.pending_cursor_reports =
@@ -2606,6 +2745,21 @@ impl Core {
                         &mut session.cursor_query_tail,
                         &data,
                     ));
+            // Alternate-screen detection: a TUI entering/leaving the
+            // alternate buffer changes how clients may treat this data
+            // block (strict grid, no reflow heuristics). The transition is
+            // recorded with its stream offset and broadcast immediately.
+            let alt_transitioned =
+                scan_alt_buffer_transitions(&mut session.alt_tail, &data, &mut session.is_alt_buffer);
+            if alt_transitioned {
+                session.metadata.alt_buffer = session.is_alt_buffer;
+                sync_log!(
+                    "alt",
+                    "session={session_id} active={} at_offset={}",
+                    session.is_alt_buffer,
+                    offset
+                );
+            }
             let reported = parse_working_directories(&session.control_tail)
                 .into_iter()
                 .last()
@@ -2622,11 +2776,25 @@ impl Core {
                 session.metadata.title = title;
                 true
             });
+            let alt_now = (session.is_alt_buffer, session.journal_len);
+            let alt_change = alt_transitioned.then_some(alt_now);
+            // On TUI entry, open it at the focused client's recorded
+            // viewport so the TUI starts at the right dimensions (SIGWINCH
+            // triggers its native repaint).
+            let alt_entry_grid = if alt_transitioned && session.is_alt_buffer {
+                session
+                    .requested_viewport
+                    .and_then(|(cols, rows)| apply_session_grid(session, cols, rows))
+            } else {
+                None
+            };
             (
                 reported,
                 title_changed,
                 inner.windows.subscribers(session_id),
                 offset,
+                alt_change,
+                alt_entry_grid,
             )
         };
         let event = TerminalDataEvent {
@@ -2642,6 +2810,12 @@ impl Core {
             );
         }
         self.send_terminal_output(session_id, &data, offset);
+        if let Some((active, transition_offset)) = alt_change {
+            self.broadcast_alt_change(session_id, active, transition_offset);
+        }
+        if let Some(epoch) = alt_entry_grid {
+            self.broadcast_grid_change(session_id, epoch);
+        }
         if let Some(cwd) = reported_cwd {
             self.handle_session_working_directory(session_id, &cwd);
         } else if title_changed {
@@ -3251,6 +3425,20 @@ fn truncate_journal_front(value: &mut String, maximum: usize) {
     value.drain(..start);
 }
 
+/// Dual-path grid policy. The session grid may ONLY change while an
+/// alternate screen (TUI) is active (focus-driven ownership): the TUI gets a
+/// SIGWINCH and repaints natively. Outside a TUI the session grid is fixed,
+/// so client sizes are recorded as the next TUI's viewport but never applied
+/// to the PTY - clients render the frozen session as independent viewports.
+fn apply_grid_if_tui(session: &mut ManagedSession, cols: u16, rows: u16) -> Option<GridEpoch> {
+    session.requested_viewport = Some((cols, rows));
+    if session.is_alt_buffer {
+        apply_session_grid(session, cols, rows)
+    } else {
+        None
+    }
+}
+
 /// Resize the PTY to the requesting client's grid and record the epoch, or
 /// nothing if the grid did not actually change. `apply_session_grid` runs
 /// under the session lock, so the recorded epoch offset is always aligned to
@@ -3539,12 +3727,12 @@ mod tests {
         ManagedSession, PRESENCE_WINDOW_MS, PairingGrant, RetireOutcome, ensure_home_project,
         folder_name, is_cursor_position_report, is_dropped_node_status, is_within_project,
         newest_running_session_project_id, parse_terminal_titles, parse_working_directories,
-        apply_session_grid, preferred_project, presence_alive, project_is_usable,
-        project_name_or_folder, record_cursor_position_requests, registration_status_for_display,
-        resolve_working_directory, retire_empty_temporary_project, should_open_quiet_window,
-        snapshot_from_inner, split_journal_by_epochs, startup_project, take_valid_pairing_grant,
-        truncate_journal_front, validate_project_name, GridEpoch, SESSION_DEFAULT_COLS,
-        SESSION_DEFAULT_ROWS,
+        apply_grid_if_tui, apply_session_grid, preferred_project, presence_alive,
+        project_is_usable, project_name_or_folder, record_cursor_position_requests,
+        registration_status_for_display, resolve_working_directory, retire_empty_temporary_project,
+        scan_alt_buffer_transitions, should_open_quiet_window, snapshot_from_inner,
+        split_journal_by_epochs, startup_project, take_valid_pairing_grant, truncate_journal_front,
+        validate_project_name, GridEpoch, SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS,
     };
     use crate::{
         models::{AuthorizedDevice, Project, TerminalSession},
@@ -3754,6 +3942,138 @@ mod tests {
         session.journal_len = 19;
         let epoch = apply_session_grid(&mut session, 100, 34);
         assert_eq!(epoch, Some(GridEpoch { offset: 19, cols: 100, rows: 34 }));
+    }
+
+    #[test]
+    fn alt_buffer_scanner_detects_enter_and_exit_sequences() {
+        let mut tail = String::new();
+        let mut active = false;
+        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?1049h", &mut active));
+        assert!(active, "1049h enters the alternate screen");
+        assert!(!scan_alt_buffer_transitions(&mut tail, "top - 0.3 up\r\n", &mut active));
+        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?1049l", &mut active));
+        assert!(!active, "1049l leaves the alternate screen");
+        assert!(!scan_alt_buffer_transitions(&mut tail, "\x1b[31mtext\x1b[0m", &mut active));
+        assert!(!active);
+    }
+
+    #[test]
+    fn alt_buffer_scanner_handles_vt52_variants_and_split_sequences() {
+        let mut tail = String::new();
+        let mut active = false;
+        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?47h", &mut active));
+        assert!(active);
+        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[47l", &mut active));
+        assert!(!active);
+
+        // The sequence is split across two chunks; the tail window must keep
+        // the prefix so the second chunk completes the detection.
+        let mut tail = String::new();
+        let mut active = false;
+        assert!(!scan_alt_buffer_transitions(&mut tail, "\x1b[?10", &mut active));
+        assert!(scan_alt_buffer_transitions(&mut tail, "49h", &mut active));
+        assert!(active);
+        assert!(!scan_alt_buffer_transitions(&mut tail, "\x1b[?10", &mut active));
+        assert!(scan_alt_buffer_transitions(&mut tail, "49l", &mut active));
+        assert!(!active);
+    }
+
+    #[test]
+    fn alt_buffer_scanner_treats_cursor_hide_and_sync_output_as_tui_entry() {
+        let mut tail = String::new();
+        let mut active = false;
+        // A primary-buffer full-screen renderer hides the cursor to begin.
+        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?25l", &mut active));
+        assert!(active, "cursor-hide must mark a full-screen UI as active");
+        assert!(!scan_alt_buffer_transitions(&mut tail, "\x1b[38;2;102;102;102m\x1b[K", &mut active));
+        assert!(active, "repaint content keeps the TUI active");
+        // The harness restores the cursor when it exits.
+        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?25h", &mut active));
+        assert!(!active, "cursor-show must end the full-screen UI");
+
+        // Synchronized-output mode is also a TUI cue.
+        let mut tail = String::new();
+        let mut active = false;
+        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?2026h", &mut active));
+        assert!(active);
+        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?2026l", &mut active));
+        assert!(!active);
+    }
+
+    #[test]
+    fn alt_buffer_scanner_handles_the_1047_variant_and_exit_wins_a_mixed_chunk() {
+        let mut tail = String::new();
+        let mut active = false;
+        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?1047h", &mut active));
+        assert!(active, "1047h is an alternate-screen enter");
+        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?1047l", &mut active));
+        assert!(!active, "1047l is an alternate-screen exit");
+
+        // A chunk that carries an old enter in its bridge tail plus a fresh
+        // exit must end EXITED (one transition per chunk, exit-first): a real
+        // TUI exiting emits only the exit here.
+        let mut tail = String::new();
+        let mut active = true;
+        assert!(scan_alt_buffer_transitions(&mut tail, "\x1b[?1049l", &mut active));
+        assert!(!active, "the exit wins even when a stale enter sequence is in the bridge tail");
+        assert!(!scan_alt_buffer_transitions(&mut tail, "shell text", &mut active));
+        assert!(!active);
+    }
+
+    #[test]
+    fn grid_policy_records_but_does_not_reapply_an_unaltered_viewport() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        session.is_alt_buffer = true;
+        let first = apply_grid_if_tui(&mut session, 113, 39);
+        assert_eq!(first, Some(GridEpoch { offset: 0, cols: 113, rows: 39 }));
+        // Re-asserting the SAME viewport while the TUI still owns the screen
+        // yields no epoch (no spurious SIGWINCH).
+        let second = apply_grid_if_tui(&mut session, 113, 39);
+        assert_eq!(second, None);
+        assert_eq!(session.grid_epochs.len(), 2);
+        session.is_alt_buffer = false;
+        // Outside a TUI the same size is recorded (for the next TUI) but not
+        // applied.
+        let third = apply_grid_if_tui(&mut session, 113, 39);
+        assert_eq!(third, None);
+        assert_eq!(session.requested_viewport, Some((113, 39)));
+    }
+
+    #[test]
+    fn alt_buffer_scanner_ignores_exit_without_entry_and_orphan_sequences() {
+        let mut tail = String::new();
+        let mut active = false;
+        assert!(!scan_alt_buffer_transitions(&mut tail, "\x1b[?1049l", &mut active));
+        assert!(!active, "a stray exit must not flip the flag");
+        assert!(!scan_alt_buffer_transitions(&mut tail, "\x1b[2J\x1b[H", &mut active));
+        assert!(!scan_alt_buffer_transitions(&mut tail, "\x1b[?2004h", &mut active));
+        assert!(!active, "bracketed-paste state must never be confused with TUI state");
+    }
+
+    #[test]
+    fn grid_policy_only_resizes_while_a_tui_is_active() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        // Non-TUI: client sizes are recorded for the next TUI, never applied.
+        assert!(apply_grid_if_tui(&mut session, 72, 26).is_none());
+        assert_eq!(
+            session.grid,
+            (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS),
+            "the session grid must stay frozen outside a TUI"
+        );
+        assert_eq!(session.requested_viewport, Some((72, 26)));
+
+        // TUI active: focus-driven ownership applies the announced viewport.
+        session.is_alt_buffer = true;
+        let epoch = apply_grid_if_tui(&mut session, 113, 39);
+        assert_eq!(epoch, Some(GridEpoch { offset: 0, cols: 113, rows: 39 }));
+        assert_eq!(session.grid, (113, 39));
+
+        // TUI exit: the grid freezes at the last TUI size, and the next
+        // client viewport is only recorded again.
+        session.is_alt_buffer = false;
+        assert!(apply_grid_if_tui(&mut session, 90, 30).is_none());
+        assert_eq!(session.grid, (113, 39), "grid freezes after TUI exit");
+        assert_eq!(session.requested_viewport, Some((90, 30)));
     }
 
     #[test]
@@ -4717,6 +5037,7 @@ mod tests {
             status: status.into(),
             created_at: created_at.into(),
             exit_code: None,
+                alt_buffer: false,
         }
     }
 
@@ -4779,6 +5100,7 @@ mod tests {
                 status: "running".into(),
                 created_at: "now".into(),
                 exit_code: None,
+                alt_buffer: false,
             },
             master: Box::new(InertMaster),
             writer: Box::new(std::io::sink()),
@@ -4791,6 +5113,9 @@ mod tests {
             }],
             buffer: String::new(),
             journal_len: 0,
+            is_alt_buffer: false,
+            alt_tail: String::new(),
+            requested_viewport: None,
             control_tail: String::new(),
             cursor_query_tail: String::new(),
             pending_cursor_reports: 0,

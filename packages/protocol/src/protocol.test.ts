@@ -190,6 +190,23 @@ test("debug.diagnostics round-trips as a fire-and-forget client message", () => 
   assert.deepEqual(decodeClientMessage(encoded), message);
 });
 
+test("session.alt round-trips and session.altBuffer defaults to undefined on old builds", () => {
+  const alt = decodeServerMessage(JSON.stringify({ type: "session.alt", sessionId: "s1", active: true, offset: 2048 }));
+  assert.equal(alt.type, "session.alt");
+  if (alt.type !== "session.alt") assert.fail("expected session.alt");
+  assert.equal(alt.active, true);
+  assert.equal(alt.offset, 2048);
+});
+
+test("TerminalSession.altBuffer is optional so old snapshots parse cleanly", () => {
+  const decoded = decodeServerMessage(JSON.stringify({
+    type: "snapshot",
+    snapshot: { host: { id: "h1", name: "Desktop One", version: "0.3.5" }, projects: [], sessions: [{ id: "s1", projectId: "p1", title: "pwsh", cwd: "C:\\repo", shellId: "powershell", status: "running", createdAt: "now" }], devices: [], shells: [], defaultShellId: "" }
+  }));
+  if (decoded.type !== "snapshot") assert.fail("expected snapshot");
+  assert.equal(decoded.snapshot.sessions[0]?.altBuffer, undefined, "a legacy session without the flag must stay undefined");
+});
+
 test("auth messages carry an optional display name through the wire contract", () => {
   const wire = encodeMessage({
     type: "auth",

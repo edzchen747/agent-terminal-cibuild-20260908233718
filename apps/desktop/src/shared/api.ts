@@ -50,4 +50,5 @@ export interface DesktopApi {
   onState(callback: (state: DesktopState) => void): () => void;
   onData(callback: (sessionId: string, data: string, offset: number) => void): () => void;
   onGrid(callback: (sessionId: string, cols: number, rows: number, offset: number) => void): () => void;
+  onAlt(callback: (sessionId: string, active: boolean, offset: number) => void): () => void;
 }

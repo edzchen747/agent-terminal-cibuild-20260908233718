@@ -8,9 +8,7 @@ interface Props { sessionId: string; visible: boolean; active: boolean; confirmE
 
 const isCursorPositionReport = (data: string) => /^\x1b\[\??\d+;\d+R$/.test(data);
 
-type PendingItem =
-  | { kind: "data"; data: string; offset: number }
-  | { kind: "grid"; cols: number; rows: number; offset: number };
+interface PendingItem { data: string; offset: number; }
 
 // Terminal sync diagnostics: mirrored to the host's sync log file (and the
 // WebView2 console) so desktop decisions are captured in the same run as the
@@ -158,24 +156,117 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
       copyToastTimer = window.setTimeout(() => copyToast.classList.remove("is-visible"), 900);
     };
 
-    // The PTY grid follows focus: a focused desktop window reasserts its own
-    // dimensions (fit + resize), while an unfocused pane just follows the
-    // grid announced by the host (target.grid), reflowing its history in
-    // place. This is what keeps history intact as focus flips devices.
-    const resize = (force = false) => {
-      if (!activeRef.current) return;
+    // ---------------------------------------------------------------------
+    // Dual-path rendering (distinguished by the host's alternate-screen
+    // state):
+    //  - NON-TUI (viewport mode): the session grid is frozen; this pane
+    //    renders the journal at its OWN size by re-parsing it at a single
+    //    grid (reset + full replay, coalesced). Idempotent and lossless,
+    //    no reflow, no host resize - resizing a million times is a re-render.
+    //  - TUI (focus mode): the focused window's size IS the PTY grid; the
+    //    pane calls fit() and pushes the dimensions to the host (SIGWINCH),
+    //    and the TUI repaints natively across the new grid.
+    // ---------------------------------------------------------------------
+    let altBufferActive = false;
+    let sessionGrid = { cols: 0, rows: 0 };
+    let viewportGrid = { cols: 0, rows: 0 };
+    let refreshing = false;
+    let refreshQueued = false;
+    let refreshLoopPromise = Promise.resolve();
+    const proposeGrid = () => {
+      try {
+        const dims = fit.proposeDimensions();
+        if (dims && dims.cols > 0 && dims.rows > 0) return { cols: dims.cols, rows: dims.rows };
+      } catch { /* hidden pane */ }
+      return null;
+    };
+    const scheduleRefresh = () => {
+      refreshQueued = true;
+      if (!refreshing) void refreshLoop();
+    };
+    const refreshLoop = () => {
+      if (refreshing) return refreshLoopPromise;
+      refreshing = true;
+      refreshLoopPromise = (async () => {
+        try {
+          while (refreshQueued) {
+            refreshQueued = false;
+            await refreshOnce();
+          }
+        } finally {
+          refreshing = false;
+        }
+      })();
+      return refreshLoopPromise;
+    };
+    const refreshOnce = async () => {
+      if (disposed) return;
+      const dims = proposeGrid();
+      if (dims) viewportGrid = dims;
+      if (!(viewportGrid.cols > 0)) return;
+      const requestGrid = sessionGrid.cols > 0 ? sessionGrid : viewportGrid;
+      dbg(`reparse send session=${sessionId} viewport=${viewportGrid.cols}x${viewportGrid.rows} sessionGrid=${requestGrid.cols}x${requestGrid.rows}`);
+      const snapshot = await window.agentTerminal.attachSession(sessionId, requestGrid.cols, requestGrid.rows);
+      if (disposed) {
+        window.agentTerminal.detachSession(sessionId);
+        return;
+      }
+      const lastSegment = snapshot.segments.at(-1);
+      if (lastSegment) sessionGrid = { cols: lastSegment.cols, rows: lastSegment.rows };
+      initialized = false;
+      replayingSessionBuffer = true;
+      pending.length = 0;
+      appliedUpTo = Math.max(appliedUpTo, snapshot.endOffset);
+      terminal.reset();
+      if (viewportGrid.cols !== terminal.cols || viewportGrid.rows !== terminal.rows) {
+        terminal.resize(viewportGrid.cols, viewportGrid.rows);
+      }
+      const flat = snapshot.segments.map((segment) => segment.data).join("");
+      dbg(`reparse session=${sessionId} viewport=${viewportGrid.cols}x${viewportGrid.rows} sessionGrid=${sessionGrid.cols}x${sessionGrid.rows} bytes=${flat.length} end=${snapshot.endOffset} pending=${pending.length}`);
+      await new Promise<void>((resolve) => terminal.write(flat, () => resolve()));
+      replayingSessionBuffer = false;
+      replayPending();
+    };
+    // TUI path: assert our dimensions to the host (SIGWINCH on the PTY).
+    const announceViewport = () => {
       try {
         fit.fit();
-        dbg(`resize session=${sessionId} cols=${terminal.cols} rows=${terminal.rows} force=${force}`);
-        window.agentTerminal.resize(sessionId, terminal.cols, terminal.rows, force);
+        dbg(`resize(tui) session=${sessionId} cols=${terminal.cols} rows=${terminal.rows}`);
+        window.agentTerminal.resize(sessionId, terminal.cols, terminal.rows, true);
       } catch { /* hidden pane */ }
+    };
+    const applyGridInPlace = (cols: number, rows: number) => {
+      if (cols !== terminal.cols || rows !== terminal.rows) {
+        terminal.resize(cols, rows);
+      }
+    };
+
+    const resize = (force = false) => {
+      if (!activeRef.current) return;
+      if (altBufferActive) {
+        // TUI focus mode: push our dimensions so the TUI repaints (SIGWINCH).
+        announceViewport();
+        return;
+      }
+      const dims = proposeGrid();
+      if (!dims) return;
+      if (dims.cols !== viewportGrid.cols || dims.rows !== viewportGrid.rows) {
+        viewportGrid = dims;
+        scheduleRefresh();
+      }
+      dbg(`viewport session=${sessionId} cols=${dims.cols} rows=${dims.rows} force=${force}`);
     };
     resizeRef.current = resize;
 
     const sendKeyboardInput = (data: string) => {
       if (!data) return;
-      try { fit.fit(); } catch { /* hidden pane */ }
-      window.agentTerminal.write(sessionId, data, terminal.cols, terminal.rows);
+      if (altBufferActive) {
+        try { fit.fit(); } catch { /* hidden pane */ }
+        window.agentTerminal.write(sessionId, data, terminal.cols, terminal.rows);
+        return;
+      }
+      const dims = proposeGrid() ?? { cols: terminal.cols, rows: terminal.rows };
+      window.agentTerminal.write(sessionId, data, dims.cols, dims.rows);
     };
     const keyInput = (event: KeyboardEvent): string | undefined => {
       if (!event.ctrlKey || event.metaKey) return undefined;
@@ -229,18 +320,23 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
       if (activeRef.current) resize(true);
     };
     window.addEventListener("pointerdown", handlePointerActivity, true);
+    const inputDims = () => altBufferActive
+      ? { cols: terminal.cols, rows: terminal.rows }
+      : (proposeGrid() ?? { cols: terminal.cols, rows: terminal.rows });
     const dataSubscription = terminal.onData((data) => {
       if (isCursorPositionReport(data)) {
         // A newly created pane is attached before it becomes the active tab.
         // Forward terminal-generated CPR replies even while hidden; the tray
         // validates them against the shell's outstanding queries.
-        try { fit.fit(); } catch { /* hidden pane */ }
-        window.agentTerminal.write(sessionId, data, terminal.cols, terminal.rows);
+        if (altBufferActive) { try { fit.fit(); } catch { /* hidden pane */ } }
+        const dims = inputDims();
+        window.agentTerminal.write(sessionId, data, dims.cols, dims.rows);
         return;
       }
       if (!activeRef.current) return;
-      try { fit.fit(); } catch { /* hidden pane */ }
-      window.agentTerminal.write(sessionId, data, terminal.cols, terminal.rows);
+      if (altBufferActive) { try { fit.fit(); } catch { /* hidden pane */ } }
+      const dims = inputDims();
+      window.agentTerminal.write(sessionId, data, dims.cols, dims.rows);
     });
 
     let initialized = false;
@@ -251,42 +347,43 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
     // contained in the replayed segments.
     let appliedUpTo = 0;
     const pending: PendingItem[] = [];
-    const applyItem = (item: PendingItem) => {
-      if (item.kind === "grid") {
-        // A grid change is never "covered" by anything but an equal grid
-        // state: offsets only dedupe DATA chunks. Live clients must follow
-        // every grid epoch even when stream offsets have advanced past it.
-        if (item.cols !== terminal.cols || item.rows !== terminal.rows) {
-          terminal.resize(item.cols, item.rows);
-          dbg(`grid session=${sessionId} cols=${item.cols} rows=${item.rows} off=${item.offset} reflow`);
-        } else {
-          dbg(`grid session=${sessionId} cols=${item.cols} rows=${item.rows} off=${item.offset} same-grid`);
-        }
-        return;
-      }
-      if (item.offset < appliedUpTo) {
-        dbg(`out session=${sessionId} off=${item.offset} len=${streamByteLength(item.data)} skipped(covered upTo=${appliedUpTo})`);
-        return;
-      }
-      appliedUpTo = Math.max(appliedUpTo, item.offset + streamByteLength(item.data));
-      dbg(`out session=${sessionId} off=${item.offset} len=${streamByteLength(item.data)} upTo=${appliedUpTo}`);
-      terminal.write(item.data);
-    };
     const offData = window.agentTerminal.onData((id, data, offset) => {
       if (id !== sessionId) return;
       if (replayingSessionBuffer || !initialized) {
-        pending.push({ kind: "data", data, offset });
+        pending.push({ data, offset });
         return;
       }
-      applyItem({ kind: "data", data, offset });
+      if (offset < appliedUpTo) {
+        dbg(`out session=${sessionId} off=${offset} len=${streamByteLength(data)} skipped(covered upTo=${appliedUpTo})`);
+        return;
+      }
+      appliedUpTo = Math.max(appliedUpTo, offset + streamByteLength(data));
+      dbg(`out session=${sessionId} off=${offset} len=${streamByteLength(data)} upTo=${appliedUpTo}`);
+      terminal.write(data);
     });
-    const offGrid = window.agentTerminal.onGrid((id, cols, rows, offset) => {
+    const offGrid = window.agentTerminal.onGrid((id, cols, rows) => {
       if (id !== sessionId) return;
-      if (replayingSessionBuffer || !initialized) {
-        pending.push({ kind: "grid", cols, rows, offset });
-        return;
+      sessionGrid = { cols, rows };
+      if (altBufferActive) {
+        applyGridInPlace(cols, rows);
+        dbg(`grid(tui) session=${sessionId} cols=${cols} rows=${rows}`);
+      } else {
+        dbg(`grid session=${sessionId} cols=${cols} rows=${rows} recorded`);
       }
-      applyItem({ kind: "grid", cols, rows, offset });
+    });
+    // Alternate-screen state flips the render path. On entry, the focused
+    // pane announces its size so the TUI opens at the right dimensions; on
+    // exit, the pane returns to viewport rendering, re-parsing the journal
+    // at its own grid (which also heals any primary history after the TUI).
+    const offAlt = window.agentTerminal.onAlt((id, active, offset) => {
+      if (id !== sessionId) return;
+      altBufferActive = active;
+      dbg(`alt session=${sessionId} active=${active} off=${offset}`);
+      if (active) {
+        if (activeRef.current) announceViewport();
+      } else {
+        scheduleRefresh();
+      }
     });
     const finishAttachment = () => {
       if (disposed) return;
@@ -301,17 +398,6 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
         finishAttachment();
         return;
       }
-      if (item.kind === "grid") {
-        // Grid notices are applied unless the replayed snapshot already
-        // covered them; dropping them would leave the emulator on the grid
-        // before the snapshot's last segment.
-        if (item.offset >= appliedUpTo && (item.cols !== terminal.cols || item.rows !== terminal.rows)) {
-          terminal.resize(item.cols, item.rows);
-          dbg(`grid(snap) session=${sessionId} cols=${item.cols} rows=${item.rows} off=${item.offset} reflow`);
-        }
-        replayPending(index + 1);
-        return;
-      }
       if (item.offset < appliedUpTo) {
         dbg(`pend session=${sessionId} off=${item.offset} skipped(covered upTo=${appliedUpTo})`);
         replayPending(index + 1);
@@ -321,39 +407,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
       dbg(`pend session=${sessionId} off=${item.offset} len=${streamByteLength(item.data)} upTo=${appliedUpTo}`);
       terminal.write(item.data, () => replayPending(index + 1));
     };
-    const attachment = (async () => {
-      try { fit.fit(); } catch { /* hidden pane */ }
-      dbg(`attach send session=${sessionId} cols=${terminal.cols} rows=${terminal.rows}`);
-      const snapshot = await window.agentTerminal.attachSession(sessionId, terminal.cols, terminal.rows);
-      if (disposed) {
-        window.agentTerminal.detachSession(sessionId);
-        return;
-      }
-      dbg(`buffer session=${sessionId} end=${snapshot.endOffset} segs=${snapshot.segments.map((s) => `${s.cols}x${s.rows}+${s.data.length}`).join(" ")}`);
-      replayingSessionBuffer = true;
-      const segments = snapshot.segments;
-      const writeNext = (index = 0) => {
-        if (disposed) return;
-        const segment = segments[index];
-        if (segment === undefined) {
-          replayingSessionBuffer = false;
-          appliedUpTo = Math.max(appliedUpTo, snapshot.endOffset);
-          dbg(`replay done session=${sessionId} upTo=${appliedUpTo} pending=${pending.length}`);
-          replayPending();
-          return;
-        }
-        if (segment.cols !== terminal.cols || segment.rows !== terminal.rows) {
-          terminal.resize(segment.cols, segment.rows);
-        }
-        terminal.write(segment.data, () => writeNext(index + 1));
-      };
-      writeNext();
-    })().catch((cause) => {
-      if (!disposed) {
-        dbg(`attach session=${sessionId} failed: ${String(cause)}`);
-        terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
-      }
-    });
+    void refreshLoop();
     const statsTimer = window.setInterval(() => {
       if (disposed || !terminalRef.current) return;
       const buffer = terminal.buffer.active;
@@ -366,7 +420,8 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
       dataSubscription.dispose();
       offData();
       offGrid();
-      void attachment.then(() => window.agentTerminal.detachSession(sessionId));
+      offAlt();
+      void refreshLoopPromise.then(() => window.agentTerminal.detachSession(sessionId));
       if (statsTimer !== undefined) window.clearInterval(statsTimer);
       if (copyToastTimer) window.clearTimeout(copyToastTimer);
       httpLinkProvider.dispose();

@@ -62,6 +62,10 @@ pub struct TerminalSession {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<u32>,
+    /// True while the shell is drawing an alternate screen buffer (TUI):
+    /// clients must treat this data block as a strict cell grid.
+    #[serde(default)]
+    pub alt_buffer: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -150,6 +154,17 @@ pub struct TerminalGridEvent {
     pub session_id: String,
     pub cols: u16,
     pub rows: u16,
+    pub offset: u64,
+}
+
+/// The shell entered/left the alternate screen buffer at stream offset
+/// `offset`; clients treat the active data block as a strict cell grid and
+/// bypass reflow heuristics for it.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalAltBufferEvent {
+    pub session_id: String,
+    pub active: bool,
     pub offset: u64,
 }
 
@@ -348,6 +363,12 @@ pub enum ServerMessage {
         rows: u16,
         offset: u64,
     },
+    #[serde(rename = "session.alt")]
+    SessionAltBuffer {
+        session_id: String,
+        active: bool,
+        offset: u64,
+    },
     #[serde(rename = "ok")]
     Ok { request_id: String },
     #[serde(rename = "error")]
@@ -361,7 +382,7 @@ pub enum ServerMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientMessage, ServerMessage, SessionSegment};
+    use super::{ClientMessage, ServerMessage, SessionSegment, TerminalAltBufferEvent, TerminalSession};
 
     #[test]
     fn protocol_field_names_match_the_mobile_contract() {
@@ -435,6 +456,44 @@ mod tests {
         assert_eq!(grid["cols"], 100);
         assert_eq!(grid["rows"], 34);
         assert_eq!(grid["offset"], 512);
+
+        let alt = serde_json::to_value(ServerMessage::SessionAltBuffer {
+            session_id: "s1".into(),
+            active: true,
+            offset: 200,
+        })
+        .expect("session.alt");
+        assert_eq!(alt["type"], "session.alt");
+        assert_eq!(alt["active"], true);
+        assert_eq!(alt["offset"], 200);
+    }
+
+    #[test]
+    fn session_alt_buffer_flag_and_event_are_camel_cased_on_the_wire() {
+        let session = TerminalSession {
+            id: "s1".into(),
+            project_id: "p1".into(),
+            title: "pwsh".into(),
+            cwd: "C:\\repo".into(),
+            shell_id: "powershell".into(),
+            status: "running".into(),
+            created_at: "now".into(),
+            exit_code: None,
+            alt_buffer: true,
+        };
+        let json = serde_json::to_value(&session).expect("TerminalSession");
+        assert_eq!(json["altBuffer"], true, "the TUI flag must be camelCased");
+        assert_eq!(json["title"], "pwsh");
+
+        let event = TerminalAltBufferEvent {
+            session_id: "s1".into(),
+            active: false,
+            offset: 42,
+        };
+        let event_json = serde_json::to_value(event).expect("TerminalAltBufferEvent");
+        assert_eq!(event_json["active"], false);
+        assert_eq!(event_json["offset"], 42);
+        assert_eq!(event_json["sessionId"], "s1");
     }
 
     #[test]

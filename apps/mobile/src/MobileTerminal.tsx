@@ -490,6 +490,16 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       }
       applyItem({ kind: "grid", cols: event.cols, rows: event.rows, offset: event.offset });
     });
+    // Alternate-screen state from the host: while a TUI owns the alternate
+    // buffer, this data block is a strict cell grid - reflow heuristics are
+    // bypassed for it (xterm keeps the alternate buffer isolated from the
+    // primary scrollback) and the TUI repaints natively on SIGWINCH.
+    let altBufferActive = false;
+    const altChange = connection.on("alt", (event) => {
+      if (event.sessionId !== session.id) return;
+      altBufferActive = event.active;
+      syncDebug(`alt session=${session.id} active=${event.active} off=${event.offset}`);
+    });
     const connected = connection.on("connected", () => {
       syncDebug(`connected session=${session.id} -> re-attach`);
       startAttachment();
@@ -751,9 +761,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
             replayPendingOutput();
             return;
           }
-          if (segment.cols !== terminal.cols || segment.rows !== terminal.rows) {
-            terminal.resize(segment.cols, segment.rows);
-          }
+          // Outside a TUI the session grid is frozen and the emulator parses
+          // the whole stream at its OWN fitted grid (viewport mode): segment
+          // grids are metadata only. During a TUI the live grid notices
+          // re-anchor the emulator to the session grid.
           terminal.write(segment.data, () => writeNext(index + 1));
         };
         writeNext();
@@ -789,7 +800,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       hostElement.removeEventListener("touchcancel", handleTouchCancel);
       clearLongPressTimer();
       if (statsTimer !== undefined) window.clearInterval(statsTimer);
-      connected(); gridChange(); input.dispose(); output(); httpLinkProvider.dispose(); terminal.dispose(); terminalRef.current = null;
+      connected(); gridChange(); altChange(); input.dispose(); output(); httpLinkProvider.dispose(); terminal.dispose(); terminalRef.current = null;
       resizeRef.current = () => undefined;
       focusInputRef.current = () => undefined;
       };

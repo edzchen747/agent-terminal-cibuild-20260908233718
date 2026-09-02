@@ -317,8 +317,10 @@ test("session.output and session.grid arrive as typed events with raw payloads",
     const connection = new HostConnection(host());
     const outputs = [];
     const grids = [];
+    const alts = [];
     connection.on("output", (event) => outputs.push(event));
     connection.on("grid", (event) => grids.push(event));
+    connection.on("alt", (event) => alts.push(event));
     const opening = connection["open"]("ws://192.168.1.5:47831", 2_000);
     FakeWebSocket.instances.at(-1).setOpen();
     await opening;
@@ -343,6 +345,18 @@ test("session.output and session.grid arrive as typed events with raw payloads",
       offset: 343
     });
     FakeWebSocket.instances.at(-1).deliverServerMessage({
+      type: "session.alt",
+      sessionId: "s1",
+      active: true,
+      offset: 900
+    });
+    FakeWebSocket.instances.at(-1).deliverServerMessage({
+      type: "session.alt",
+      sessionId: "s1",
+      active: false,
+      offset: 910
+    });
+    FakeWebSocket.instances.at(-1).deliverServerMessage({
       type: "snapshot",
       requestId: "r1",
       snapshot: { host: { id: "h1", name: "Desktop One", version: "0.3.5" }, projects: [], sessions: [], devices: [], shells: [], defaultShellId: "" }
@@ -353,6 +367,10 @@ test("session.output and session.grid arrive as typed events with raw payloads",
       { sessionId: "s1", data: "world\r\n", offset: 343 }
     ]);
     assert.deepEqual(grids, [{ sessionId: "s1", cols: 72, rows: 26, offset: 636 }]);
+    assert.deepEqual(alts, [
+      { sessionId: "s1", active: true, offset: 900 },
+      { sessionId: "s1", active: false, offset: 910 }
+    ]);
     connection.close();
   });
 });

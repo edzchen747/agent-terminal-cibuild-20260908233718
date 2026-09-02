@@ -45,6 +45,7 @@ type EventMap = {
   snapshot: HostSnapshot;
   output: { sessionId: string; data: string; offset: number };
   grid: { sessionId: string; cols: number; rows: number; offset: number };
+  alt: { sessionId: string; active: boolean; offset: number };
   disconnected: undefined;
   connected: HostSnapshot;
   heartbeat: HostSnapshot;
@@ -872,6 +873,7 @@ export class HostConnection {
     try { message = decodeServerMessage(raw); } catch { return; }
     if (message.type === "session.output") { this.emit("output", { sessionId: message.sessionId, data: message.data, offset: message.offset }); return; }
     if (message.type === "session.grid") { this.emit("grid", { sessionId: message.sessionId, cols: message.cols, rows: message.rows, offset: message.offset }); return; }
+    if (message.type === "session.alt") { this.emit("alt", { sessionId: message.sessionId, active: message.active, offset: message.offset }); return; }
     if (message.type === "snapshot") { this.snapshot = message.snapshot; this.emit("snapshot", message.snapshot); }
     if ((message.type === "auth.accepted" || message.type === "pair.accepted") && message.snapshot) this.snapshot = message.snapshot;
     const requestId = "requestId" in message ? message.requestId : undefined;
