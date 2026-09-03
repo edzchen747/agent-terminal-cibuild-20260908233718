@@ -222,6 +222,12 @@ struct ManagedSession {
     /// isolated from client scrollback. Cleared once the matching alt exit
     /// (synthetic or program-sent) has been journaled.
     synthetic_alt: bool,
+    /// A shell alt-screen entry (PSReadLine's Clear-Host) deferred its
+    /// grid change: the classifier is Fullscreen and alt-anchored but
+    /// the program has painted no TUI frame yet, so the PTY must not
+    /// receive a SIGWINCH mid-shell-state. Cleared when paint evidence
+    /// fires the deferred resize, or when the mode exits to canonical.
+    deferred_tui_resize: bool,
     /// The viewport dimensions the focused client most recently announced
     /// (recorded even while the PTY is frozen). Applied to the PTY on the
     /// next alternate-screen entry so a freshly launched TUI opens at the
@@ -232,12 +238,60 @@ struct ManagedSession {
     pending_cursor_reports: usize,
     has_run_command: bool,
     terminal_controller: Option<TerminalController>,
+    /// The client that last produced user input, with its monotonic
+    /// sequence number. Once ANY client has typed, that client "owns"
+    /// the PTY grid: resize asserts and re-attaches from the OTHER
+    /// client are ignored, so a passive observer can never yank the
+    /// shared grid away from the active device mid-command. Before the
+    /// first input, last-writer-wins (a fresh attach may take the
+    /// grid).
+    last_input: Option<(TerminalController, u64)>,
+    /// Monotonic per-session counter ordering `last_input` (not
+    /// wall-clock).
+    input_seq: u64,
+}
+
+impl ManagedSession {
+    /// Grid-ownership precedence. Until any client has typed, any
+    /// attach/resize may take the grid (last-writer-wins - a fresh
+    /// viewer is the focused client). Once input has happened, the
+    /// last input owner keeps the grid: passive clients' auto-asserts
+    /// (a pane re-attaching after a grid epoch, a pane's automatic
+    /// assert on a TUI mode flip) must not yank the shared PTY away
+    /// from the active device mid-command.
+    fn can_apply_grid_from(&self, client: &TerminalController) -> bool {
+        match &self.last_input {
+            None => true,
+            Some((input_owner, _)) => input_owner == client,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TerminalController {
     Desktop(String),
     Remote(String),
+}
+
+/// Render an input write for the sync log: printable ASCII verbatim,
+/// control characters as `\u{NN}` (or `\r`/`\n`/`\t`), truncated to
+/// `max_chars` for readability.
+fn log_escape(data: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (i, ch) in data.char_indices() {
+        if i >= max_chars {
+            out.push('…');
+            break;
+        }
+        match ch {
+            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+        }
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -1558,12 +1612,15 @@ impl Core {
             journal_len: 0,
             tui: TuiClassifier::new(SESSION_DEFAULT_ROWS),
             synthetic_alt: false,
+            deferred_tui_resize: false,
             requested_viewport: None,
             control_tail: String::new(),
             cursor_query_tail: String::new(),
             pending_cursor_reports: 0,
             has_run_command: false,
                     terminal_controller: None,
+                    last_input: None,
+                    input_seq: 0,
                 },
             );
             inner.session_order.push(id.clone());
@@ -1679,15 +1736,18 @@ impl Core {
                 session.pending_cursor_reports -= 1;
             } else {
                 session.terminal_controller = Some(controller.clone());
+                session.input_seq += 1;
+                session.last_input = Some((controller.clone(), session.input_seq));
                 if let Some((cols, rows)) = size {
                     apply_grid_if_tui(session, cols, rows);
                 }
             }
             sync_log!(
                 "input",
-                "session={session_id} controller={controller:?} bytes={} grid_hint={:?}",
+                "session={session_id} controller={controller:?} bytes={} grid_hint={:?} data={}",
                 data.len(),
-                size
+                size,
+                log_escape(data, 48),
             );
 
             if data.contains('\r') || data.contains('\n') {
@@ -1725,7 +1785,7 @@ impl Core {
         rows: u16,
         controller: TerminalController,
     ) {
-        let epoch = {
+        let (epoch, held, gated) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
@@ -1733,13 +1793,27 @@ impl Core {
             if session.metadata.status != "running" {
                 return;
             }
-            session.terminal_controller = Some(controller.clone());
-            apply_grid_if_tui(session, cols, rows)
+            // Grid-ownership precedence: once another client has typed,
+            // this client's assert must not steal the grid - it may be
+            // a passive observer's automatic assert (mode-flip
+            // re-announce, re-attach). The owner's own asserts always
+            // apply.
+            let gated = !session.can_apply_grid_from(&controller);
+            let epoch = if gated {
+                None
+            } else {
+                session.terminal_controller = Some(controller.clone());
+                apply_grid_if_tui(session, cols, rows)
+            };
+            let held = gated || session.tui.grid_change_suppressed();
+            (epoch, held, gated)
         };
         sync_log!(
             "grid",
-            "request session={session_id} controller={controller:?} wanted={cols}x{rows} applied={} (tui-held)",
-            epoch.is_some()
+            "request session={session_id} controller={controller:?} wanted={cols}x{rows} gated={} applied={} (held={})",
+            gated,
+            epoch.is_some(),
+            held
         );
         if let Some(epoch) = epoch {
             self.broadcast_grid_change(session_id, epoch);
@@ -1801,8 +1875,19 @@ impl Core {
         let Some(session) = inner.sessions.get_mut(session_id) else {
             return;
         };
-        if session.terminal_controller == Some(TerminalController::Remote(client_id.to_string())) {
+        let leaving = TerminalController::Remote(client_id.to_string());
+        if session.terminal_controller == Some(leaving.clone()) {
             session.terminal_controller = None;
+            // A departing device releases its input claim: until
+            // someone types again, the grid returns to
+            // last-writer-wins.
+            if session
+                .last_input
+                .as_ref()
+                .is_some_and(|(owner, _)| owner == &leaving)
+            {
+                session.last_input = None;
+            }
         }
     }
 
@@ -1821,17 +1906,28 @@ impl Core {
             .ok_or_else(|| {
                 anyhow!("Terminal window is no longer registered with the tray host.")
             })?;
-        let (session_project_id, snapshot, epoch) = match inner.sessions.get_mut(session_id) {
-            // Record the attaching window's viewport. The session grid only
-            // moves while a TUI owns the alternate screen (focus-driven);
-            // otherwise the grid stays fixed and clients render viewports.
+        let (session_project_id, snapshot, epoch, gated) =
+            match inner.sessions.get_mut(session_id) {
+            // Record the attaching window's viewport: the focused client
+            // owns the PTY grid, so the session resizes to it in any mode
+            // (the shell redraws its prompt for the new size). Two holds:
+            // a shell alt-screen cycle in progress, and another client's
+            // more recent input (grid-ownership precedence - a passive
+            // observer re-attaching must not steal the grid).
             Some(session) => {
-                session.terminal_controller = Some(TerminalController::Desktop(label.to_string()));
-                let epoch = apply_grid_if_tui(session, cols, rows);
+                let controller = TerminalController::Desktop(label.to_string());
+                let gated = !session.can_apply_grid_from(&controller);
+                let epoch = if gated {
+                    None
+                } else {
+                    session.terminal_controller = Some(controller.clone());
+                    apply_grid_if_tui(session, cols, rows)
+                };
                 (
                     session.metadata.project_id.clone(),
                     snapshot_of(session),
                     epoch,
+                    gated,
                 )
             }
             None => return Err(anyhow!("Terminal session not found.")),
@@ -1846,7 +1942,9 @@ impl Core {
         }
         sync_log!(
             "attach",
-            "desktop window={label} session={session_id} grid={cols}x{rows} segments={} end_offset={}",
+            "desktop window={label} session={session_id} grid={cols}x{rows} gated={} resized={} segments={} end_offset={}",
+            gated,
+            epoch.is_some(),
             snapshot.segments.len(),
             snapshot.end_offset
         );
@@ -1864,14 +1962,22 @@ impl Core {
             .windows
             .detach(label, session_id);
         let mut inner = self.inner.lock().expect("desktop state poisoned");
+        let leaving = TerminalController::Desktop(label.to_string());
         if inner
             .sessions
             .get(session_id)
             .and_then(|session| session.terminal_controller.as_ref())
-            == Some(&TerminalController::Desktop(label.to_string()))
+            == Some(&leaving)
         {
             if let Some(session) = inner.sessions.get_mut(session_id) {
                 session.terminal_controller = None;
+                if session
+                    .last_input
+                    .as_ref()
+                    .is_some_and(|(owner, _)| owner == &leaving)
+                {
+                    session.last_input = None;
+                }
             }
         }
     }
@@ -2145,9 +2251,17 @@ impl Core {
             .remove(id)
             .and_then(|client| client.device_id);
         let mut inner = self.inner.lock().expect("desktop state poisoned");
+        let leaving = TerminalController::Remote(id.to_string());
         for session in inner.sessions.values_mut() {
-            if session.terminal_controller == Some(TerminalController::Remote(id.to_string())) {
+            if session.terminal_controller == Some(leaving.clone()) {
                 session.terminal_controller = None;
+                if session
+                    .last_input
+                    .as_ref()
+                    .is_some_and(|(owner, _)| owner == &leaving)
+                {
+                    session.last_input = None;
+                }
             }
         }
         drop(inner);
@@ -2773,14 +2887,44 @@ impl Core {
             });
             // On TUI entry (inline or fullscreen), open the program at the
             // focused client's recorded viewport so it starts at the right
-            // dimensions (SIGWINCH triggers its native repaint).
-            let tui_entry_grid = if tui_transition.is_some_and(|t| t.to != TuiMode::Canonical) {
-                session
-                    .requested_viewport
-                    .and_then(|(cols, rows)| apply_session_grid(session, cols, rows))
+            // dimensions (SIGWINCH triggers its native repaint). A shell
+            // alt-screen cycle (PSReadLine's Clear-Host) enters the alt
+            // screen but paints no TUI frames: defer ITS grid change until
+            // paint evidence arrives, so the SIGWINCH never lands mid-
+            // shell-state and desyncs PSReadLine's prompt-row tracking.
+            let mut tui_entry_grid = if tui_transition.is_some_and(|t| t.to != TuiMode::Canonical) {
+                if tui_transition.is_some_and(|t| t.via_alt_enter) && session.tui.grid_change_suppressed() {
+                    session.deferred_tui_resize = true;
+                    None
+                } else {
+                    session
+                        .requested_viewport
+                        .and_then(|(cols, rows)| apply_session_grid(session, cols, rows))
+                }
             } else {
                 None
             };
+            // Exiting to canonical clears a pending deferral BEFORE the
+            // fire check below: in canonical mode the suppression
+            // predicate is false, so without this ordering a bare shell
+            // alt cycle would fire its deferred resize on the exit
+            // chunk - the very transient mid-shell-state SIGWINCH this
+            // deferral exists to prevent.
+            if tui_transition.is_some_and(|t| t.to == TuiMode::Canonical) {
+                session.deferred_tui_resize = false;
+            }
+            // The deferred alt-enter resize fires the moment paint
+            // evidence (DECSTBM or a hidden-cursor write past row 1
+            // while the program's alt screen is open) releases the
+            // suppression. A bare shell alt cycle never produces
+            // evidence, so its grid - and the shell's row tracking -
+            // stay intact.
+            if session.deferred_tui_resize && !session.tui.grid_change_suppressed() {
+                session.deferred_tui_resize = false;
+                tui_entry_grid = session
+                    .requested_viewport
+                    .and_then(|(cols, rows)| apply_session_grid(session, cols, rows));
+            }
             (
                 reported,
                 title_changed,
@@ -3419,19 +3563,24 @@ fn truncate_journal_front(value: &mut String, maximum: usize) {
     value.drain(..start);
 }
 
-/// Dual-path grid policy. The session grid may ONLY change while a TUI owns
-/// the screen (inline or fullscreen - focus-driven ownership): the program
-/// gets a SIGWINCH and repaints natively. In canonical mode the session grid
-/// is fixed, so client sizes are recorded as the next TUI's viewport but
-/// never applied to the PTY - clients render the frozen session as
-/// independent viewports.
+/// Grid policy: the focused client owns the PTY grid in EVERY mode. The
+/// PTY resizes to the client's viewport and every attached emulator
+/// reflows through the recorded epoch, so the shell's absolute cursor
+/// addressing (PSReadLine's CUP-based prompt redraws, bottom-row
+/// scrolling) is always expressed in the focused client's own row space.
+/// A frozen grid would desync that: CUP rows land N lines off whenever a
+/// client has more rows than the PTY, and the prompt visibly "jumps up"
+/// into previous output on the first redraw. While a shell alt-screen
+/// cycle is in progress (`grid_change_suppressed`), the grid is held:
+/// the size is recorded but applied only once the program paints a TUI
+/// frame (or never, for a bare shell cycle) - a SIGWINCH mid-shell-state
+/// desyncs PSReadLine's prompt-row tracking.
 fn apply_grid_if_tui(session: &mut ManagedSession, cols: u16, rows: u16) -> Option<GridEpoch> {
     session.requested_viewport = Some((cols, rows));
-    if session.tui.mode() != TuiMode::Canonical {
-        apply_session_grid(session, cols, rows)
-    } else {
-        None
+    if session.tui.grid_change_suppressed() {
+        return None;
     }
+    apply_session_grid(session, cols, rows)
 }
 
 /// Resize the PTY to the requesting client's grid and record the epoch, or
@@ -3722,8 +3871,9 @@ mod tests {
         ManagedSession, PRESENCE_WINDOW_MS, PairingGrant, RetireOutcome, ensure_home_project,
         folder_name, is_cursor_position_report, is_dropped_node_status, is_within_project,
         newest_running_session_project_id, parse_terminal_titles, parse_working_directories,
-        apply_grid_if_tui, apply_session_grid, preferred_project, presence_alive,
+        apply_grid_if_tui, apply_session_grid, log_escape, preferred_project, presence_alive,
         project_is_usable, project_name_or_folder, record_cursor_position_requests,
+        TerminalController,
         registration_status_for_display, resolve_working_directory, retire_empty_temporary_project,
         should_open_quiet_window, snapshot_from_inner,
         split_journal_by_epochs, startup_project, take_valid_pairing_grant, truncate_journal_front,
@@ -4018,52 +4168,201 @@ mod tests {
     }
 
     #[test]
-    fn grid_policy_records_but_does_not_reapply_an_unaltered_viewport() {
+    fn grid_policy_resizes_the_pty_to_the_client_viewport_in_canonical_mode() {
+        // The focused client owns the PTY grid in every mode: a canonical
+        // (shell) session resizes on the client's viewport announcement,
+        // so PSReadLine's absolute CUP addressing stays in the client's
+        // row space. Re-asserting the SAME viewport emits no epoch (no
+        // spurious SIGWINCH).
         let mut session = test_session("s1", "p1", "C:\\repo");
-        let mut clock = Instant::now();
-        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
         let first = apply_grid_if_tui(&mut session, 113, 39);
-        assert_eq!(first, Some(GridEpoch { offset: 0, cols: 113, rows: 39 }));
-        // Re-asserting the SAME viewport while the TUI still owns the screen
-        // yields no epoch (no spurious SIGWINCH).
-        let second = apply_grid_if_tui(&mut session, 113, 39);
-        assert_eq!(second, None);
-        assert_eq!(session.grid_epochs.len(), 2);
-        // Leaving the TUI: the grid freezes; the next client viewport is
-        // recorded only, never applied to the PTY.
-        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049l").is_none());
-        assert!(feed_session(&mut session, &mut clock, 350, "\r\n").is_some());
-        let third = apply_grid_if_tui(&mut session, 113, 39);
-        assert_eq!(third, None);
+        assert_eq!(
+            first,
+            Some(GridEpoch { offset: 0, cols: 113, rows: 39 }),
+            "a canonical-mode viewport announcement resizes the PTY"
+        );
+        assert_eq!(session.grid, (113, 39));
         assert_eq!(session.requested_viewport, Some((113, 39)));
+        let repeat = apply_grid_if_tui(&mut session, 113, 39);
+        assert_eq!(repeat, None, "an unaltered viewport must not re-resize");
+        assert_eq!(session.grid_epochs.len(), 2);
+        // A changed viewport resizes again, in canonical mode.
+        let second = apply_grid_if_tui(&mut session, 72, 26);
+        assert_eq!(second, Some(GridEpoch { offset: 0, cols: 72, rows: 26 }));
+        assert_eq!(session.grid, (72, 26));
     }
 
     #[test]
-    fn grid_policy_only_resizes_while_a_tui_is_active() {
+    fn grid_policy_holds_the_grid_through_a_bare_alt_cycle() {
         let mut session = test_session("s1", "p1", "C:\\repo");
         let mut clock = Instant::now();
-        // Canonical: client sizes are recorded for the next TUI, never applied.
-        assert!(apply_grid_if_tui(&mut session, 72, 26).is_none());
-        assert_eq!(
-            session.grid,
-            (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS),
-            "the session grid must stay frozen in canonical mode"
-        );
-        assert_eq!(session.requested_viewport, Some((72, 26)));
-
-        // TUI active: focus-driven ownership applies the announced viewport.
-        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
-        let epoch = apply_grid_if_tui(&mut session, 113, 39);
-        assert_eq!(epoch, Some(GridEpoch { offset: 0, cols: 113, rows: 39 }));
+        // Canonical: the client's viewport applies immediately.
+        assert!(apply_grid_if_tui(&mut session, 113, 39).is_some());
         assert_eq!(session.grid, (113, 39));
-
-        // TUI exit: the grid freezes at the last TUI size, and the next
-        // client viewport is only recorded again.
+        // A bare alt-enter (the shell's Clear-Host) must not let a new
+        // viewport announcement land a SIGWINCH mid-shell-state.
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
+        let held = apply_grid_if_tui(&mut session, 90, 30);
+        assert_eq!(held, None, "the grid is held through the bare alt cycle");
+        assert_eq!(session.requested_viewport, Some((90, 30)));
+        assert_eq!(session.grid, (113, 39));
+        // A real TUI frame (DECSTBM) releases the hold: the recorded
+        // viewport applies.
+        assert!(feed_session(&mut session, &mut clock, 5, "\x1b[1;39r").is_none());
+        let epoch = apply_grid_if_tui(&mut session, 90, 30);
+        assert_eq!(epoch, Some(GridEpoch { offset: 0, cols: 90, rows: 30 }));
+        assert_eq!(session.grid, (90, 30));
+        // Exit to canonical: the next client viewport applies again -
+        // the grid is NOT frozen after a TUI period.
         assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049l").is_none());
         assert!(feed_session(&mut session, &mut clock, 350, "\r\n").is_some());
-        assert!(apply_grid_if_tui(&mut session, 90, 30).is_none());
-        assert_eq!(session.grid, (113, 39), "grid freezes after TUI exit");
-        assert_eq!(session.requested_viewport, Some((90, 30)));
+        let resumed = apply_grid_if_tui(&mut session, 113, 39);
+        assert_eq!(resumed, Some(GridEpoch { offset: 0, cols: 113, rows: 39 }));
+        assert_eq!(session.grid, (113, 39));
+    }
+
+    /// Mirror the `on_terminal_data` TUI-entry grid decision for one
+    /// chunk: entering while suppressed defers the recorded viewport;
+    /// a canonical exit clears a pending deferral first (nothing is
+    /// restored and nothing fires on the exit chunk); a still-active
+    /// deferral fires the moment paint evidence releases the
+    /// suppression.
+    fn on_chunk_tui_grid(
+        session: &mut ManagedSession,
+        tui_transition: Option<crate::tui::TuiTransition>,
+    ) -> Option<GridEpoch> {
+        let mut epoch = if tui_transition.is_some_and(|t| t.to != TuiMode::Canonical) {
+            if session.tui.grid_change_suppressed() {
+                session.deferred_tui_resize = true;
+                None
+            } else {
+                session
+                    .requested_viewport
+                    .and_then(|(cols, rows)| apply_session_grid(session, cols, rows))
+            }
+        } else {
+            None
+        };
+        if tui_transition.is_some_and(|t| t.to == TuiMode::Canonical) {
+            session.deferred_tui_resize = false;
+        }
+        if session.deferred_tui_resize && !session.tui.grid_change_suppressed() {
+            session.deferred_tui_resize = false;
+            epoch = session
+                .requested_viewport
+                .and_then(|(cols, rows)| apply_session_grid(session, cols, rows));
+        }
+        epoch
+    }
+
+    #[test]
+    fn deferred_alt_resize_fires_on_real_tui_paint() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let mut clock = Instant::now();
+        // The focused client's viewport is recorded while the shell is
+        // canonical (forced fit on every keystroke).
+        session.requested_viewport = Some((113, 39));
+        session.buffer.push_str(&"a".repeat(100));
+        session.journal_len = 100;
+        // Bare alt-enter (a real TUI like vim): the entry chunk defers
+        // the resize instead of landing a SIGWINCH on an unpainted
+        // program.
+        let entry = feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").expect("alt-enter");
+        assert!(entry.via_alt_enter);
+        assert_eq!(on_chunk_tui_grid(&mut session, Some(entry)), None);
+        assert!(session.deferred_tui_resize);
+        assert_eq!(session.grid, (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS));
+        assert_eq!(session.grid_epochs.len(), 1);
+        // The program's first painted frame (DECSTBM + hidden multi-row
+        // CUP) releases the suppression: the recorded viewport fires as
+        // a journal epoch at the current offset.
+        let frame = feed_session(&mut session, &mut clock, 5, "\x1b[?25l\x1b[1;39r\x1b[5;10H");
+        assert_eq!(on_chunk_tui_grid(&mut session, frame), Some(GridEpoch { offset: 100, cols: 113, rows: 39 }));
+        assert!(!session.deferred_tui_resize);
+        assert_eq!(session.grid, (113, 39));
+        assert_eq!(session.grid_epochs.len(), 2);
+        // Exit: the TUI re-shows its cursor, leaves the alt screen, and
+        // goes quiet: the grid freezes at the TUI size, nothing is
+        // restored.
+        assert!(
+            feed_session(&mut session, &mut clock, 10, "\x1b[?25h\x1b[?1049l").is_none()
+        );
+        let exit = feed_session(&mut session, &mut clock, 350, "\r\n").expect("quiet exit");
+        assert_eq!(on_chunk_tui_grid(&mut session, Some(exit)), None);
+        assert_eq!(session.grid, (113, 39));
+        assert_eq!(session.grid_epochs.len(), 2);
+    }
+
+    #[test]
+    fn bare_shell_alt_cycle_never_fires_the_deferred_resize() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let mut clock = Instant::now();
+        session.requested_viewport = Some((79, 26));
+        // PSReadLine's Clear-Host: alt-enter, hidden row-1 prompt
+        // redraws, alt-exit, main-screen backspace redraws (hidden CUP
+        // past row 1 on the MAIN screen - not paint evidence), quiet
+        // exit. No DECSTBM ever appears while the program's alt screen
+        // is open, so the grid must never move.
+        let entry = feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").expect("alt-enter");
+        assert_eq!(on_chunk_tui_grid(&mut session, Some(entry)), None);
+        assert!(session.deferred_tui_resize);
+        let alt_content =
+            feed_session(&mut session, &mut clock, 5, "\x1b[?25l\x1b[HPS C:\\> \x1b[?25h");
+        assert_eq!(on_chunk_tui_grid(&mut session, alt_content), None);
+        assert!(session.deferred_tui_resize, "still held mid-alt-cycle");
+        let alt_out = feed_session(&mut session, &mut clock, 10, "\x1b[?1049l");
+        assert_eq!(on_chunk_tui_grid(&mut session, alt_out), None);
+        assert!(session.deferred_tui_resize, "pending until the period exits");
+        let redraw = feed_session(
+            &mut session,
+            &mut clock,
+            5,
+            "\x1b[?25l\x1b[6;11HPS C:\\> \x1b[?25h",
+        );
+        assert_eq!(on_chunk_tui_grid(&mut session, redraw), None);
+        let exit = feed_session(&mut session, &mut clock, 350, "\r\n").expect("quiet exit");
+        assert_eq!(on_chunk_tui_grid(&mut session, Some(exit)), None);
+        assert!(!session.deferred_tui_resize, "deferral cleared on canonical exit");
+        assert_eq!(session.grid, (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS));
+        assert_eq!(session.grid_epochs.len(), 1, "no epoch was ever emitted");
+        // After the cycle the shell is idle at the prompt: a client
+        // resize applies normally again (no desync risk at the prompt).
+        let resumed = apply_grid_if_tui(&mut session, 79, 26);
+        assert_eq!(resumed, Some(GridEpoch { offset: 0, cols: 79, rows: 26 }));
+        assert_eq!(session.grid, (79, 26));
+    }
+
+    #[test]
+    fn grid_precedence_gates_passive_clients_after_input() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let mobile = TerminalController::Remote("phone".into());
+        let desktop = TerminalController::Desktop("window".into());
+        // Before any input, either client may take the grid
+        // (last-writer-wins: a fresh attach/resize claims it).
+        assert!(session.can_apply_grid_from(&mobile));
+        assert!(session.can_apply_grid_from(&desktop));
+        // A keystroke claims the grid for ITS device: the passive
+        // desktop observer's auto-asserts (mode-flip re-announce,
+        // re-attach) must not yank the PTY away from the mobile
+        // user's command.
+        session.input_seq += 1;
+        session.last_input = Some((mobile.clone(), session.input_seq));
+        session.terminal_controller = Some(mobile.clone());
+        assert!(session.can_apply_grid_from(&mobile));
+        assert!(!session.can_apply_grid_from(&desktop));
+        // The claim follows the last input owner.
+        session.input_seq += 1;
+        session.last_input = Some((desktop.clone(), session.input_seq));
+        session.terminal_controller = Some(desktop.clone());
+        assert!(session.can_apply_grid_from(&desktop));
+        assert!(!session.can_apply_grid_from(&mobile));
+    }
+
+    #[test]
+    fn log_escape_renders_input_bytes_for_the_sync_log() {
+        assert_eq!(log_escape("ls\r", 48), "ls\\r");
+        assert_eq!(log_escape("\x1b[?1049h", 48), "\\u{1b}[?1049h");
+        assert_eq!(log_escape("abcdefgh", 5), "abcde\u{2026}");
     }
 
     #[test]
@@ -5105,12 +5404,15 @@ mod tests {
             journal_len: 0,
             tui: TuiClassifier::new(SESSION_DEFAULT_ROWS),
             synthetic_alt: false,
+            deferred_tui_resize: false,
             requested_viewport: None,
             control_tail: String::new(),
             cursor_query_tail: String::new(),
             pending_cursor_reports: 0,
             has_run_command: false,
             terminal_controller: None,
+            last_input: None,
+            input_seq: 0,
         }
     }
 

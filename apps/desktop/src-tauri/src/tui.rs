@@ -38,7 +38,13 @@
 //! writes in general) additionally require a TUI marker in the window -
 //! a cursor hide or CUP/VPR addressing to a non-home row: shell command
 //! output after `clear` (e.g. `clear; ls`) is ED2 + home + sequential
-//! newline-terminated scrolling, which carries none of those.
+//! newline-terminated scrolling, which carries none of those. The
+//! distinct-row rule counts only rows first written while the cursor is
+//! hidden: TUI frames are drawn flicker-free, while shell listings
+//! scroll with the cursor visible. Focus-event reporting (`CSI ?1004 h`)
+//! is not evidence either - PSReadLine (plain PowerShell) enables it at
+//! startup, and the focus events it produces (`\x1b[I`/`\x1b[O`) are
+//! not TUI behavior.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -115,6 +121,13 @@ pub struct TuiClassifier {
     hidden_since: Option<Instant>,
     /// Approximate cursor row (1-based, clamped to the grid).
     cursor_row: u16,
+    /// The current row was entered by an absolute CUP rather than by
+    /// scrolling (newline) or relative motion. TUI frames are drawn
+    /// with absolute addressing; shell output scrolls. The
+    /// distinct-row and cup-rewind rules only count rows entered
+    /// this way, so a PSReadLine clear (38 CRLFs down, then home)
+    /// or a scrolled `ls` listing cannot arm them.
+    cup_entered_row: bool,
     /// The most recent chunk whose *visible* tail (escapes stripped)
     /// ended with a newline: line editing, not a TUI repaint.
     last_newline_chunk_at: Option<Instant>,
@@ -125,6 +138,12 @@ pub struct TuiClassifier {
     alt_anchored: bool,
     /// An alt-exit sequence was seen since the TUI period started.
     saw_alt_exit: bool,
+    /// The program's own alt screen is currently open: it entered via
+    /// its own `?1049h` and has not yet sent the matching `?1049l`.
+    /// TUI paint evidence is only counted while this is set, so the
+    /// shell's post-alt main-screen redraws cannot be mistaken for TUI
+    /// frames.
+    alt_open: bool,
     /// DECSTBM was set during this period; with any drawing it is a
     /// definitive fullscreen signal.
     stbm: bool,
@@ -154,8 +173,8 @@ pub struct TuiClassifier {
     /// Distinct rows that received text under absolute addressing, for
     /// the whole foreground period.
     extent_rows: Vec<bool>,
-    /// (row, time) of rows that first received text, for the windowed
-    /// distinct-row count.
+    /// (row, time) of rows that first received text while the cursor
+    /// was hidden, for the windowed distinct-row count.
     row_stamps: VecDeque<(u16, Instant)>,
     /// A strong signal awaiting the confirmation window; the reason is
     /// the rule that queued it, carried to the committing transition.
@@ -176,10 +195,12 @@ impl TuiClassifier {
             cursor_hidden: false,
             hidden_since: None,
             cursor_row: 1,
+            cup_entered_row: false,
             last_newline_chunk_at: None,
             last_chunk_at: None,
             alt_anchored: false,
             saw_alt_exit: false,
+            alt_open: false,
             stbm: false,
             last_ed: None,
             ed_home_watch: None,
@@ -199,6 +220,33 @@ impl TuiClassifier {
 
     pub fn mode(&self) -> TuiMode {
         self.mode
+    }
+
+    /// Whether the program has painted TUI frames while its own alt
+    /// screen is open: DECSTBM, or an absolute-addressed write past
+    /// row 1 under a hidden cursor. The evidence is scoped to the alt
+    /// screen (`alt_open`): after the program's `?1049l` it is back on
+    /// the main screen, where PSReadLine's own prompt and listing
+    /// redraws CUP across many rows (hidden or visible) and must not
+    /// count as TUI frames. Shell alt-screen cycles (PSReadLine's
+    /// Clear-Host) paint only the prompt on row 1 of the alt screen -
+    /// no DECSTBM, no hidden writes past row 1 - so they never
+    /// produce evidence.
+    pub fn has_paint_evidence(&self) -> bool {
+        self.alt_open && (self.stbm || self.row_stamps.iter().any(|(row, _)| *row > 1))
+    }
+
+    /// While a shell alt-screen cycle is in progress the grid must not
+    /// move: the program entered the alt screen itself (the shell's
+    /// Clear-Host) but has not painted a TUI frame, and a SIGWINCH
+    /// mid-shell-state desyncs PSReadLine's prompt-row tracking. A
+    /// bare alt cycle never produces paint evidence, so its grid stays
+    /// put; a real alt-screen TUI releases the suppression on its
+    /// first painted frame.
+    pub fn grid_change_suppressed(&self) -> bool {
+        self.mode == TuiMode::Fullscreen
+            && self.alt_anchored
+            && !self.has_paint_evidence()
     }
 
     /// A platform prober (termios on the PTY master) can publish raw
@@ -325,6 +373,7 @@ impl TuiClassifier {
         self.pending = None;
         self.saw_alt_exit = false;
         self.alt_anchored = false;
+        self.alt_open = false;
         self.stbm = false;
         self.last_ed = None;
         self.ed_home_watch = None;
@@ -471,10 +520,12 @@ impl TuiClassifier {
         match signal {
             AltEnter => {
                 self.saw_alt_exit = false;
+                self.alt_open = true;
                 self.commit_definitive(now, rows, true, "alt-enter")
             }
             AltExit => {
                 self.saw_alt_exit = true;
+                self.alt_open = false;
                 None
             }
             CursorHidden => {
@@ -525,6 +576,7 @@ impl TuiClassifier {
                     self.repaint_armed = Some(now);
                 }
                 self.cursor_row = self.cursor_row.saturating_sub(n).max(1);
+                self.cup_entered_row = false;
                 None
             }
             ClearLineOrEraseDown => {
@@ -546,13 +598,19 @@ impl TuiClassifier {
                 // Full-screen addressing: a jump from the bottom of the
                 // grid (the bottom two rows) back to the top - the
                 // frame rewind of a full-screen repaint. A mid-grid
-                // jump is not evidence.
-                let from_bottom = self.cursor_row >= rows.saturating_sub(1);
+                // jump is not evidence. The bottom must have been
+                // *addressed* by a CUP, not reached by scrolling: a
+                // PSReadLine startup clear scrolls the cursor to the
+                // bottom with CRLFs and homes again, which is not a
+                // frame rewind.
+                let from_bottom =
+                    self.cursor_row >= rows.saturating_sub(1) && self.cup_entered_row;
                 let ed2_recent = self.last_ed.is_some_and(|ed| {
                     now.duration_since(ed) <= Duration::from_millis(FULLSCREEN_WINDOW_MS)
                 });
                 let target = row.clamp(1, rows.max(1));
                 self.cursor_row = target;
+                self.cup_entered_row = true;
                 // Addressing a non-home row is a TUI marker: shell
                 // cooked output positions the cursor only via home
                 // (after ED2) and scrolling.
@@ -648,6 +706,8 @@ impl TuiClassifier {
     fn on_plain_byte(&mut self, byte: u8, now: Instant, rows: u16) {
         if byte == b'\n' {
             self.cursor_row = (self.cursor_row + 1).min(rows.max(1));
+            // The new row was reached by scrolling, not addressing.
+            self.cup_entered_row = false;
             return;
         }
         if byte.is_ascii_control() {
@@ -658,7 +718,15 @@ impl TuiClassifier {
         let row = self.cursor_row as usize;
         if row < self.extent_rows.len() && !self.extent_rows[row] {
             self.extent_rows[row] = true;
-            self.row_stamps.push_back((self.cursor_row, now));
+            // TUI frames are drawn flicker-free: cursor hidden, rows
+            // entered by absolute CUP. Shell listings scroll with the
+            // cursor visible, and even when PSReadLine hides the
+            // cursor to redraw the prompt it reaches the listing rows
+            // by scrolling, stamping at most a handful of rows - far
+            // below the threshold. A plain `ls` must not commit.
+            if self.cursor_hidden && self.cup_entered_row {
+                self.row_stamps.push_back((self.cursor_row, now));
+            }
         }
         // A full-screen clear followed by multi-row drawing is the
         // classic TUI repaint - but only with a TUI marker (cursor
@@ -688,7 +756,9 @@ impl TuiClassifier {
         // Distinct-row writes inside the window: full-screen
         // addressing. As with the post-ED rule, the writes must be
         // accompanied by a TUI marker: a long `ls` listing scrolls
-        // across half the grid with none.
+        // across half the grid without CUP addressing - the scrolled
+        // rows stamp nothing, and its few CUP-targeted redraw rows
+        // stay far below the threshold.
         self.row_stamps
             .retain(|(_, at)| now.duration_since(*at) <= Duration::from_millis(FULLSCREEN_WINDOW_MS));
         let distinct = self
@@ -786,7 +856,11 @@ impl TuiClassifier {
                     1049 | 1047 | 1048 => AltEnter,
                     25 => CursorVisible,
                     2026 => SyncOutput,
-                    1000 | 1002 | 1003 | 1005 | 1006 | 1015 | 1004 => MouseOrFocus,
+                    1000 | 1002 | 1003 | 1005 | 1006 | 1015 => MouseOrFocus,
+                    // Focus-event reporting: PSReadLine (plain pwsh)
+                    // enables it at startup; the \x1b[I/\x1b[O focus
+                    // events it produces are not TUI evidence.
+                    1004 => NoSignal,
                     2004 => Weak,
                     1 => AppCursorKeys,
                     _ => NoSignal,
@@ -1037,10 +1111,108 @@ mod tests {
 
     #[test]
     fn mouse_tracking_commits_fullscreen_immediately() {
-        let out = feed(Instant::now(), 30, &["\x1b[?1003h\x1b[?1006h", "x"]);
-        assert_eq!(out.len(), 1);
+        for seq in [
+            "\x1b[?1000h",
+            "\x1b[?1002h",
+            "\x1b[?1003h\x1b[?1006h",
+            "\x1b[?1005h",
+            "\x1b[?1015h",
+        ] {
+            let out = feed(Instant::now(), 30, &[seq, "x"]);
+            assert_eq!(out.len(), 1, "{seq}");
+            assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
+            assert!(!out[0].via_alt_enter);
+        }
+    }
+
+    #[test]
+    fn pwsh_startup_burst_stays_canonical() {
+        // Plain PowerShell: PSReadLine answers the CPR, enables
+        // DECSCUSR + focus reporting, resets SGR, sets the title.
+        // None of that is a TUI - the old rule committed Fullscreen
+        // on the ?1004, which flapped back to Canonical on the
+        // stream-quiet exit and wiped the prompt on reparse.
+        let out = feed(
+            Instant::now(),
+            39,
+            &[
+                "\x1b[?9001h\x1b[?1004h\x1b[m\x1b]0;C:\\Program Files\\PowerShell\\7\\pwsh.exe\x07\x1b[?25h\r\n\x1b]9;9;C:\\Users\\x\x1b\\PS C:\\Users> ",
+                "\x1b[I",
+                "\x1b[O",
+            ],
+        );
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn pwsh_prompt_redraw_plus_listing_stays_canonical() {
+        // First `ls` in plain pwsh: PSReadLine redraws the prompt
+        // (cursor hidden, CUP to the prompt row, erase + text), shows
+        // the cursor, then streams the listing with the cursor
+        // visible across half the grid. The listing stamps no rows
+        // (visible), so the distinct-row rule cannot commit even
+        // though a marker (non-home CUP) is recent.
+        let mut steps: Vec<(u64, String)> = vec![
+            (
+                10,
+                "\x1b[?25l\x1b[35;1H\x1b[16X\x1b[44mPS C:\\Users> \x1b[?25h".into(),
+            ),
+        ];
+        for row in 1..=34 {
+            steps.push((5, format!("-rw- 1 file{row}\r\n")));
+        }
+        steps.push((60, String::new()));
+        let out = feed_timed_owned(39, &steps);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn hidden_multi_row_frame_still_commits_fullscreen() {
+        // The distinct-row rule still fires for real repaints: cursor
+        // hidden, absolute CUP addressing across half the grid.
+        let mut steps: Vec<(u64, String)> = vec![(10, "\x1b[?25l".into())];
+        for row in 1..=20u16 {
+            steps.push((5, format!("\x1b[{row};1Hrow {row}\r\n")));
+        }
+        steps.push((60, String::new()));
+        let out = feed_timed_owned(30, &steps);
+        assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
-        assert!(!out[0].via_alt_enter);
+    }
+
+    #[test]
+    fn pwsh_startup_clear_with_home_stays_canonical() {
+        // PSReadLine startup: hide the cursor, clear all rows with
+        // EL + CRLF (the cursor scrolls to the bottom row), then
+        // home and show the cursor. The home from the bottom looks
+        // like a frame rewind, but the bottom was reached by
+        // scrolling, not a CUP, so cup-rewind must not fire.
+        let mut chunk = String::from("\x1b[?25l");
+        for _ in 0..38 {
+            chunk.push_str("\x1b[K\r\n");
+        }
+        chunk.push_str("\x1b[K\x1b[H\x1b[?25hPS C:\\Users> ");
+        let out = feed(Instant::now(), 39, &[&chunk, "\x1b[I"]);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn pwsh_hidden_redraw_plus_scrolled_listing_stays_canonical() {
+        // First `ls` in plain pwsh: PSReadLine hides the cursor, CUPs
+        // to the prompt/output region and rewrites it, then streams
+        // the listing with the cursor visible, scrolled across the
+        // whole grid. Only the few CUP-targeted rows stamp; the
+        // scrolled listing rows do not - far below the distinct-row
+        // threshold.
+        let mut steps: Vec<(u64, String)> = vec![
+            (10, "\x1b[?25l\x1b[5;1H\x1b[16XDirectory: C:\\Users\x1b[?25h".into()),
+        ];
+        for i in 1..=38u16 {
+            steps.push((2, format!("-rw- 1 file{i}\r\n")));
+        }
+        steps.push((60, String::new()));
+        let out = feed_timed_owned(39, &steps);
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]
@@ -1375,5 +1547,110 @@ mod tests {
         at += Duration::from_millis(5);
         // Definitive signals are not vetoed.
         assert!(clf.feed("\x1b[?2026h", at, 30).is_some());
+    }
+
+    /// Feed one step on a live classifier, advancing the clock by `gap`.
+    /// A free function (not a closure) so each call's borrows of `clf`
+    /// and `at` are scoped to the call and do not overlap later asserts.
+    fn step(
+        clf: &mut TuiClassifier,
+        at: &mut Instant,
+        rows: u16,
+        chunk: &str,
+        gap: u64,
+    ) -> Option<TuiTransition> {
+        *at += Duration::from_millis(gap);
+        clf.feed(chunk, *at, rows)
+    }
+
+    #[test]
+    fn bare_alt_cycle_suppresses_grid_changes_until_exit() {
+        // PSReadLine's Clear-Host: alt-enter, a HIDDEN prompt redraw on
+        // row 1 only, alt-exit, then main-screen backspace redraws
+        // (row 1, hidden cursor) while the pending-exit quiet window is
+        // open. No DECSTBM, no hidden writes past row 1 - the shell
+        // never paints a TUI frame, so the grid must stay held the
+        // whole time.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        let entry =
+            step(&mut clf, &mut at, 30, "\x1b[?1049h\x1b[?25l\x1b[HPS C:\\> ", 10)
+                .expect("alt-enter commits");
+        assert!(entry.via_alt_enter);
+        // Row-1 hidden writes produce no paint evidence; the grid is
+        // suppressed from the moment of entry.
+        step(&mut clf, &mut at, 30, "\x1b[K\r\n\x1b[K\r\n\x1b[1;32H\x1b[?25h", 10);
+        assert!(!clf.has_paint_evidence());
+        assert!(clf.grid_change_suppressed());
+        // Alt-exit, then the main-screen prompt redraw: PSReadLine CUPs
+        // to a non-home row (here row 4) under a hidden cursor. That is
+        // shell activity on the MAIN screen after the program left the
+        // alt screen - it must NOT count as TUI paint evidence, so the
+        // grid stays held.
+        step(&mut clf, &mut at, 30, "\x1b[?1049l\x1b[?25l\x1b[4;31Hl\x1b[?25h", 10);
+        assert!(!clf.has_paint_evidence(), "post-alt main-screen CUP is not TUI paint");
+        assert!(clf.grid_change_suppressed());
+        // Quiet + visible cursor exits to canonical; the suppression
+        // disappears with the TUI period.
+        step(&mut clf, &mut at, 30, "\r", 350);
+        assert_eq!(clf.mode(), TuiMode::Canonical);
+        assert!(!clf.grid_change_suppressed());
+    }
+
+    #[test]
+    fn alt_tui_stbm_releases_grid_suppression() {
+        let mut clf = TuiClassifier::new(26);
+        let mut at = Instant::now();
+        let entry = step(&mut clf, &mut at, 26, "\x1b[?1049h\x1b[?25l", 10)
+            .expect("alt-enter commits");
+        assert!(entry.via_alt_enter);
+        assert!(clf.grid_change_suppressed());
+        // DECSTBM: definitive paint evidence on the first frame.
+        step(&mut clf, &mut at, 26, "\x1b[1;26r\x1b[3;1Hframe", 10);
+        assert!(clf.has_paint_evidence());
+        assert!(!clf.grid_change_suppressed());
+    }
+
+    #[test]
+    fn hidden_multirow_paint_releases_grid_suppression() {
+        let mut clf = TuiClassifier::new(26);
+        let mut at = Instant::now();
+        let _entry = step(&mut clf, &mut at, 26, "\x1b[?1049h\x1b[?25l", 10)
+            .expect("alt-enter commits");
+        // Hidden-cursor absolute writes past row 1: paint evidence
+        // without DECSTBM.
+        step(&mut clf, &mut at, 26, "\x1b[5;10Hx\x1b[7;10Hy", 10);
+        assert!(clf.has_paint_evidence());
+        assert!(!clf.grid_change_suppressed());
+    }
+
+    #[test]
+    fn synthetic_entry_never_suppresses_grid_changes() {
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        // A non-alt definitive entry does not anchor to alt, so the
+        // entry-time grid change applies immediately (host-injected
+        // alt pair already guarantees the evidence).
+        let entry = step(&mut clf, &mut at, 30, "\x1b[?2026h", 10).expect("sync-output entry");
+        assert!(!entry.via_alt_enter);
+        assert!(!clf.grid_change_suppressed());
+    }
+
+    #[test]
+    fn deferred_exit_cancels_pending_suppression_state() {
+        // A bare alt cycle that exits quietly leaves no trace: a later
+        // real TUI entry behaves exactly as before the fix.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        let _ = step(&mut clf, &mut at, 30, "\x1b[?1049h\x1b[?25l\x1b[H> ", 10).unwrap();
+        step(&mut clf, &mut at, 30, "\x1b[?1049l\x1b[?25h", 10);
+        step(&mut clf, &mut at, 30, "\r", 350);
+        assert_eq!(clf.mode(), TuiMode::Canonical);
+        let entry = step(&mut clf, &mut at, 30, "\x1b[?1049h\x1b[?25l", 10)
+            .expect("second alt-enter");
+        assert!(entry.via_alt_enter);
+        assert!(clf.grid_change_suppressed());
+        step(&mut clf, &mut at, 30, "\x1b[1;30r\x1b[2;1Ht", 10);
+        assert!(!clf.grid_change_suppressed());
     }
 }
