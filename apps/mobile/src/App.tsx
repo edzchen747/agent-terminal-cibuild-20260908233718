@@ -24,6 +24,7 @@ import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shou
 import { effectiveDefaultShell } from "./defaultShell";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, RefreshIcon, ScanIcon, SettingsIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
+import { FONT_WIDTH_MAX, FONT_WIDTH_MIN, FONT_WIDTH_STEP, normalizeFontWidthPercent } from "./fontWidth";
 import { applyTheme, loadThemePreference, resolveTheme, saveThemePreference, SYSTEM_DARK_QUERY, THEME_LABELS, THEME_PREFERENCES, type ResolvedTheme, type ThemePreference } from "./theme";
 import { syncSystemBars } from "./systemBars";
 import { backProjectId, resolveViewGeometry } from "./projectNavigation";
@@ -105,7 +106,7 @@ export function App() {
   const [sessionToClose, setSessionToClose] = useState<TerminalSession | null>(null);
   const [showTerminalSettings, setShowTerminalSettings] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [fontWidthPercent, setFontWidthPercent] = useState(100);
+  const [fontWidthPercent, setFontWidthPercent] = useState(FONT_WIDTH_MAX);
   const [themePreference, setThemePreference] = useState<ThemePreference>(loadThemePreference);
   const [systemPrefersDark, setSystemPrefersDark] = useState(() => window.matchMedia(SYSTEM_DARK_QUERY).matches);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
@@ -157,7 +158,9 @@ export function App() {
     void Preferences.get({ key: TERMINAL_FONT_WIDTH_KEY }).then(({ value }) => {
       if (value === null) return;
       const parsed = Number(value);
-      if (Number.isFinite(parsed)) setFontWidthPercent(Math.max(65, Math.min(100, parsed)));
+      // Snap to the slider's step grid so a value saved at the old
+      // 1%-granularity does not park the thumb between steps.
+      if (Number.isFinite(parsed)) setFontWidthPercent(normalizeFontWidthPercent(parsed));
     });
   }, []);
 
@@ -1228,7 +1231,7 @@ function TerminalSettingsSheet({ snapshot, connection, value, onChange, themePre
 /** The slider and its live preview, in one box. */
 function FontWidthControl({ value, onChange }: { value: number; onChange: (value: number) => void }) {
   return <div className="font-width-control">
-    <label><span><strong>Terminal character width</strong><output>{value}%</output></span><input type="range" min="65" max="100" step="1" value={value} onChange={(event) => onChange(Number(event.target.value))} /></label>
+    <label><span><strong>Terminal character width</strong><output>{value}%</output></span><input type="range" min={FONT_WIDTH_MIN} max={FONT_WIDTH_MAX} step={FONT_WIDTH_STEP} value={value} onChange={(event) => onChange(Number(event.target.value))} /></label>
     <div className="font-width-preview"><span className="font-width-preview-text" style={{ transform: `scaleX(${value / 100})` }}>MyProject&gt; npm run dev</span></div>
   </div>;
 }
