@@ -440,6 +440,8 @@ button { color: inherit; }
 .host-registration.is-failed i { background: var(--danger); box-shadow: 0 0 6px var(--danger-glow); }
 .host-registration.is-offline { border-color: var(--border-strong); background: var(--surface-raised); color: var(--text-faint); }
 .host-registration.is-offline i { background: var(--idle); box-shadow: none; }
+.host-registration.is-error { border-color: var(--danger-border); background: var(--danger-surface); color: var(--danger-ink); }
+.host-registration.is-error i { background: var(--danger); box-shadow: 0 0 6px var(--danger-glow); }
 .host-registration.is-pending i { width: 8px; height: 8px; border: 1.5px solid var(--warn-track); border-top-color: var(--warn); background: none; box-shadow: none; animation: spin .8s linear infinite; }
 .host-main > svg { width: 15px; color: var(--text-faint); }
 .host-remove { width: 34px; height: 34px; padding: 0; display: grid; place-items: center; border: 1px solid var(--danger-border); border-radius: 9px; background: var(--danger-surface); color: var(--danger-ink); cursor: pointer; }

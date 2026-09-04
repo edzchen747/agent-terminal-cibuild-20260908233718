@@ -49,10 +49,10 @@ export function lastConnectedLabel(timestamp: number | undefined, now: number = 
 }
 
 /** Registration states shared with the desktop badge. */
-export type RegistrationDisplayStatus = "unregistered" | "pending" | "enrolled" | "failed" | "offline";
+export type RegistrationDisplayStatus = "unregistered" | "pending" | "enrolled" | "failed" | "offline" | "error";
 
 /** Where a hosts-page row stands in its background registration check. */
-export type HostCheckState = "checking" | "verified" | "lanOnly" | "offline";
+export type HostCheckState = "checking" | "verified" | "lanOnly" | "offline" | "error";
 
 /** Shorthand labels shown on the phone, mirroring the full desktop labels. */
 export const REGISTRATION_STATUS_LABELS: Record<RegistrationDisplayStatus, string> = {
@@ -60,7 +60,8 @@ export const REGISTRATION_STATUS_LABELS: Record<RegistrationDisplayStatus, strin
   pending: "Registering",
   enrolled: "Ready",
   failed: "Failed",
-  offline: "Offline"
+  offline: "Offline",
+  error: "Error"
 };
 
 /**
@@ -101,6 +102,7 @@ export function hostRowRegistrationStatus(input: {
   if (input.isCurrent) return input.liveStatus;
   if (input.check === "verified") return "enrolled";
   if (input.check === "offline") return "offline";
+  if (input.check === "error") return "error";
   if (input.check === "lanOnly" || input.remoteEnrolled !== true) return "unregistered";
   return "pending";
 }

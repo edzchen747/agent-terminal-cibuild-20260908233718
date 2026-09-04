@@ -10,7 +10,7 @@ import { breakStorage, breakStorageRemove, resetStorage } from "./test-support.m
 // test-support.mjs is imported statically first: it installs the
 // window.localStorage shim and the extensionless-.ts resolve hook the
 // modules below need.
-const { HostConnection } = await import("./connection.ts");
+const { HostConnection, HOST_CHECK_TIMEOUT_MS } = await import("./connection.ts");
 const { EmbeddedNodeEngine } = await import("./embedded-engine.ts");
 
 const HOST_KEY = "agent-terminal-host";
@@ -515,6 +515,160 @@ test("the engine process is torn down even when its start rejected", async () =>
   });
   assert.equal(verdict, "offline");
   assert.equal(stoppedCalls, 1);
+});
+
+// ---- verifySavedHostRegistration: two-step tsnet + device ping ---------------
+//
+// The check is now two steps: (1) the tsnet engine must start and report an
+// address, then (2) a single WebSocket open to the device endpoint confirms it
+// is actually online. The device ping has no timer of its own; the whole check
+// is bounded by one shared deadline. These tests drive a resolving engine so
+// the ping path is reached, and a fake WebSocket so the ping is observable.
+
+function withNativeEngineResolving(startResult, run) {
+  const realIsNative = Capacitor.isNativePlatform;
+  const originalStart = EmbeddedNodeEngine.prototype.start;
+  const originalStop = EmbeddedNodeEngine.prototype.stop;
+  let stopped = 0;
+  Capacitor.isNativePlatform = () => true;
+  EmbeddedNodeEngine.prototype.start = async () => startResult;
+  EmbeddedNodeEngine.prototype.stop = async () => { stopped += 1; };
+  return Promise.resolve()
+    .then(run)
+    .finally(() => {
+      Capacitor.isNativePlatform = realIsNative;
+      EmbeddedNodeEngine.prototype.start = originalStart;
+      EmbeddedNodeEngine.prototype.stop = originalStop;
+    })
+    .then(() => stopped);
+}
+
+// The ping's socket is created one tick after the (instant) engine start;
+// flush a macrotask so the FakeWebSocket instance exists before driving it.
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+test("a responding tsnet plus a live device ping verifies the host", async () => {
+  const stopped = await withNativeEngineResolving({ engineStarted: true, proxyEndpoint: "ws://127.0.0.1:39478" }, async () => {
+    await withFakeWebSocket(async () => {
+      const promise = HostConnection.verifySavedHostRegistration(host({ remoteEnrolled: true }));
+      await tick();
+      FakeWebSocket.instances.at(-1).setOpen(); // device answers the ping
+      assert.equal(await promise, "verified");
+    });
+  });
+  assert.equal(stopped, 1); // the engine is torn down even on the success path
+});
+
+test("a responding tsnet with an unreachable device reports offline", async () => {
+  await withNativeEngineResolving({ engineStarted: true, proxyEndpoint: "ws://127.0.0.1:39478" }, async () => {
+    await withFakeWebSocket(async () => {
+      const promise = HostConnection.verifySavedHostRegistration(host({ remoteEnrolled: true }));
+      await tick();
+      FakeWebSocket.instances.at(-1).onerror?.(); // device refuses the ping
+      assert.equal(await promise, "offline");
+    });
+  });
+});
+
+test("the device ping is bounded by the check deadline, not its own timer", async () => {
+  // tsnet answers instantly, leaving almost no budget for the ping. The ping
+  // socket never opens, so the shared deadline - not any ping timer - reads
+  // the host as offline. This is the "the check timeout governs the ping"
+  // behavior: a slow device is treated as offline when the check window closes.
+  await withNativeEngineResolving({ engineStarted: true, proxyEndpoint: "ws://127.0.0.1:39478" }, async () => {
+    await withFakeWebSocket(async () => {
+      const promise = HostConnection.verifySavedHostRegistration(host({ remoteEnrolled: true }), 50);
+      await new Promise((resolve) => setTimeout(resolve, 200)); // let the 50ms deadline pass
+      assert.equal(await promise, "offline");
+    });
+  });
+});
+
+test("the hosts-page check budget is 10 seconds", () => {
+  assert.equal(HOST_CHECK_TIMEOUT_MS, 10_000);
+});
+
+test("the device ping falls back to the record's remote endpoint when tsnet gives no proxy", async () => {
+  await withNativeEngineResolving({ engineStarted: true }, async () => {
+    await withFakeWebSocket(async () => {
+      const promise = HostConnection.verifySavedHostRegistration(
+        host({ remoteEnrolled: true, remoteEndpoint: "ws://h1.office-tailnet.net:47831" })
+      );
+      await tick();
+      assert.equal(FakeWebSocket.instances.at(-1).url, "ws://h1.office-tailnet.net:47831");
+      FakeWebSocket.instances.at(-1).setOpen();
+      assert.equal(await promise, "verified");
+    });
+  });
+});
+
+test("the device ping falls back to the default overlay endpoint when no endpoint is configured", async () => {
+  await withNativeEngineResolving({ engineStarted: true }, async () => {
+    await withFakeWebSocket(async () => {
+      const promise = HostConnection.verifySavedHostRegistration(host({ remoteEnrolled: true }));
+      await tick();
+      assert.equal(FakeWebSocket.instances.at(-1).url, "ws://h1.agent-terminal.internal:47831");
+      FakeWebSocket.instances.at(-1).setOpen();
+      assert.equal(await promise, "verified");
+    });
+  });
+});
+
+test("a device that answers after the check deadline has passed still reads offline", async () => {
+  // tsnet answers instantly; the socket opens one tick past the 50ms
+  // deadline. The late answer is ignored - by the time it arrives the
+  // shared deadline has already read the host as offline.
+  await withNativeEngineResolving({ engineStarted: true, proxyEndpoint: "ws://127.0.0.1:39478" }, async () => {
+    await withFakeWebSocket(async () => {
+      const promise = HostConnection.verifySavedHostRegistration(host({ remoteEnrolled: true }), 50);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      FakeWebSocket.instances.at(-1).setOpen(); // late answer
+      assert.equal(await promise, "offline");
+    });
+  });
+});
+
+test("the first ping event wins and the probe socket is closed on success", async () => {
+  // onerror after onopen must not flip a verified result, and the probe
+  // socket must be torn down so it cannot linger.
+  await withNativeEngineResolving({ engineStarted: true, proxyEndpoint: "ws://127.0.0.1:39478" }, async () => {
+    await withFakeWebSocket(async () => {
+      const promise = HostConnection.verifySavedHostRegistration(host({ remoteEnrolled: true }));
+      await tick();
+      const socket = FakeWebSocket.instances.at(-1);
+      socket.setOpen();
+      assert.equal(await promise, "verified");
+      socket.onerror?.(); // too late: the probe already settled
+      assert.equal(socket.readyState, 3);
+    });
+  });
+});
+
+test("the engine is torn down even when the tsnet wait times out", async () => {
+  const realIsNative = Capacitor.isNativePlatform;
+  const originalStart = EmbeddedNodeEngine.prototype.start;
+  const originalStop = EmbeddedNodeEngine.prototype.stop;
+  let stopped = 0;
+  Capacitor.isNativePlatform = () => true;
+  EmbeddedNodeEngine.prototype.start = () => new Promise(() => {}); // tsnet hangs
+  EmbeddedNodeEngine.prototype.stop = async () => { stopped += 1; };
+  try {
+    const verdict = await HostConnection.verifySavedHostRegistration(host({ remoteEnrolled: true }), 50);
+    assert.equal(verdict, "error");
+  } finally {
+    Capacitor.isNativePlatform = realIsNative;
+    EmbeddedNodeEngine.prototype.start = originalStart;
+    EmbeddedNodeEngine.prototype.stop = originalStop;
+  }
+  assert.equal(stopped, 1);
+});
+
+test("a tsnet that reports no started engine falls back to LAN only", async () => {
+  let verdict;
+  await withNativeEngineResolving({ engineStarted: false }, async () => {
+    verdict = await HostConnection.verifySavedHostRegistration(host({ remoteEnrolled: true }));
+  });
+  assert.equal(verdict, "lanOnly");
 });
 
 // ---- saved: launch default protection ---------------------------------------

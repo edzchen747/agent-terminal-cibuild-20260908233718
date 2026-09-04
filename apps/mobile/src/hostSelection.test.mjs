@@ -119,6 +119,26 @@ test("host row registration: only a verified check shows ready", () => {
   assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "unregistered", check: "verified" }), "enrolled");
 });
 
+test("host row registration: a tsnet-timeout check shows Error", () => {
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "unregistered", check: "error" }), "error");
+  assert.equal(hostRowStatusLabel("error", false), "Error");
+  assert.equal(hostRowStatusLabel("error", true), "Error");
+});
+
+test("host row registration: an error verdict stays authoritative over a cleared flag", () => {
+  // A check that read "Error" is the freshest fact we have - even a row that
+  // lost its enrollment flag (or never had one) shows the check's verdict,
+  // because a hung tsnet is more informative than a stale LAN-only badge.
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: false, isCurrent: false, liveStatus: "failed", check: "error" }), "error");
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: undefined, isCurrent: false, liveStatus: "enrolled", check: "error" }), "error");
+});
+
+test("host row registration: the live desktop's badge never shows a check error", () => {
+  // The connected desktop's badge mirrors the live session state, never the
+  // background check's verdict.
+  assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: true, liveStatus: "enrolled", check: "error" }), "enrolled");
+});
+
 test("host row registration: a failed check falls back to LAN only even when previously registered", () => {
   assert.equal(hostRowRegistrationStatus({ remoteEnrolled: true, isCurrent: false, liveStatus: "enrolled", check: "lanOnly" }), "unregistered");
 });
@@ -139,7 +159,8 @@ test("registration labels cover every display status exactly once", () => {
     pending: "Registering",
     enrolled: "Ready",
     failed: "Failed",
-    offline: "Offline"
+    offline: "Offline",
+    error: "Error"
   });
 });
 
@@ -223,6 +244,29 @@ test("checks plan: a stale cache entry is never trusted on a plain visit", () =>
   assert.deepEqual(hostsPageCheckPlan({ records, liveHostId: undefined, cached: new Map([["old", "lanOnly"]]), force: false }).toVerify, []);
   // A cached offline verdict holds its host back just the same.
   assert.deepEqual(hostsPageCheckPlan({ records, liveHostId: undefined, cached: new Map([["old", "offline"]]), force: false }).toVerify, []);
+});
+
+test("checks plan: a cached tsnet-timeout verdict keeps the host in error", () => {
+  const records = [{ id: "e", remoteEnrolled: true }];
+  // A cached error verdict holds the host back from a plain-visit round.
+  const plan = hostsPageCheckPlan({ records, liveHostId: null, cached: new Map([["e", "error"]]), force: false });
+  assert.deepEqual(plan.toVerify, []);
+  assert.equal(plan.states.get("e"), "error");
+  // A manual refresh re-verifies the host despite the cached error.
+  assert.deepEqual(hostsPageCheckPlan({ records, liveHostId: null, cached: new Map([["e", "error"]]), force: true }).toVerify.map((record) => record.id), ["e"]);
+});
+
+test("checks plan: a cached verdict never reaches a never-registered host", () => {
+  // The plan consults the cache only for registered hosts; a stray cached
+  // verdict for an unregistered row must not leak into its state.
+  const records = [
+    { id: "u", remoteEnrolled: false },
+    { id: "r", remoteEnrolled: true }
+  ];
+  const plan = hostsPageCheckPlan({ records, liveHostId: null, cached: new Map([["u", "error"], ["r", "error"]]), force: false });
+  assert.equal(plan.states.has("u"), false);
+  assert.equal(plan.states.get("r"), "error");
+  assert.deepEqual(plan.toVerify, []);
 });
 
 test("checks plan: a manual refresh forces verification for every registered host", () => {

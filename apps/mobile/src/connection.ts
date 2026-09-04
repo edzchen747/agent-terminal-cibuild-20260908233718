@@ -14,6 +14,13 @@ const HOST_KEY = "agent-terminal-host";
 const HOSTS_KEY = "agent-terminal-hosts";
 const REQUEST_TIMEOUT_MS = 12_000;
 const RECONNECT_TIMEOUT_MS = 30_000;
+/**
+ * The hosts-page check budget: wait for tsnet to respond and ping the
+ * device's address once to confirm it is online. The ping has no timeout of
+ * its own; this deadline bounds it. If tsnet never responds within the
+ * budget the check reports "error". (Preempts the native node's 30s poll.)
+ */
+export const HOST_CHECK_TIMEOUT_MS = 10_000;
 const DROPPED_MOBILE_NODE_MESSAGE = "This phone's remote node is no longer registered. Reconnect to the desktop on LAN; remote registration will refresh automatically.";
 
 export interface SavedHost {
@@ -186,36 +193,93 @@ export class HostConnection {
 
   /**
    * Re-verifies a previously paired desktop's phone-side node registration
-   * against the control plane. The persisted `remoteEnrolled` flag is never
-   * trusted: the node may have been revoked or expired since it was written,
-   * so the hosts page only shows "Ready" for a host whose node actually
-   * comes back. A host that was never registered never starts a node. The
-   * verdict follows the node's own failure code: the desktop's node resolved
-   * but refused the dial means both sides are registered and the desktop is
-   * down ("offline"); anything else means registration could not be proven
-   * ("lanOnly").
+   * against the control plane, then pings the device to confirm it is up. The
+   * persisted `remoteEnrolled` flag is never trusted: the node may have been
+   * revoked or expired since it was written, so the hosts page only shows
+   * "Ready" for a host whose node actually comes back. A host that was never
+   * registered never starts a node ("lanOnly"), and the web platform has no
+   * node to start ("verified").
+   *
+   * On the native platform the check is two steps under one shared deadline
+   * (`timeoutMs`): the tsnet engine must start and report an address, then a
+   * single WebSocket open to the device's address confirms the device itself
+   * is online. The ping carries no timeout of its own, so a deadline hit
+   * mid-ping reads as the device being down. The verdict follows the outcome:
+   * tsnet answered and the device ping succeeded is "verified"; tsnet
+   * answered but the device did not answer the ping is "offline"; tsnet never
+   * answered within the budget is "error". A phone-side node that was revoked
+   * or expired marks the host unregistered and reports "lanOnly"; any other
+   * engine failure reports "lanOnly" (or "offline" when the desktop node was
+   * dialed but refused).
    */
-  static async verifySavedHostRegistration(record: SavedHostRecord): Promise<RegistrationVerdict> {
+  static async verifySavedHostRegistration(record: SavedHostRecord, timeoutMs: number = HOST_CHECK_TIMEOUT_MS): Promise<RegistrationVerdict> {
     if (record.remoteEnrolled !== true) return "lanOnly";
     if (!Capacitor.isNativePlatform()) return "verified";
     const engine = new EmbeddedNodeEngine(record.id);
+    // One deadline bounds the whole check: the tsnet wait and the device
+    // ping share it. The ping has no timeout of its own, so when this
+    // deadline is hit mid-ping the check times out with it.
+    const deadlineAt = Date.now() + timeoutMs;
     try {
-      const state = await engine.start(
-        record.controlUrl ?? OVERLAY_CONTROL_URL,
-        record.remoteEndpoint ?? defaultRemoteEndpoint(record.id),
-        record.remoteTransport ?? "overlay"
+      // tsnet must respond before the deadline, or the host shows "Error"
+      // (tsnet did not answer at all) rather than merely "Offline".
+      const state = await raceDeadline(
+        engine.start(
+          record.controlUrl ?? OVERLAY_CONTROL_URL,
+          record.remoteEndpoint ?? defaultRemoteEndpoint(record.id),
+          record.remoteTransport ?? "overlay"
+        ),
+        deadlineAt
       );
-      if (state.engineStarted) return "verified";
+      if (state.engineStarted) {
+        // tsnet responded: ping the device's address once to confirm the
+        // device itself is online. A deadline hit or a failed probe reads
+        // as the device being offline.
+        const endpoint = state.proxyEndpoint ?? record.remoteEndpoint ?? defaultRemoteEndpoint(record.id);
+        let online = false;
+        try {
+          online = await raceDeadline(this.pingDevice(endpoint), deadlineAt);
+        } catch {
+          online = false;
+        }
+        return online ? "verified" : "offline";
+      }
     } catch (error) {
+      if (error instanceof HostCheckTimeoutError) return "error";
       if (isDroppedNodeEnrollmentError(error)) {
         await this.markSavedHostUnregistered(record);
         return "lanOnly";
       }
       return savedHostRegistrationVerdict(error);
     } finally {
-      await engine.stop();
+      // Fire-and-forget: the native start may still be finishing its poll
+      // in the background, and awaiting the stop would let it stretch the
+      // check past the deadline. The verdict is final by the time we get
+      // here, so the cleanup need not block it.
+      void engine.stop();
     }
     return "lanOnly";
+  }
+
+  /**
+   * A single ping to the device's address: open one WebSocket to the
+   * endpoint that reaches the device and report whether it came up. The
+   * caller bounds this against the check's deadline; the probe itself
+   * carries no timeout of its own.
+   */
+  private static pingDevice(endpoint: string): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const socket = new WebSocket(endpoint);
+      const finish = (up: boolean) => {
+        if (settled) return;
+        settled = true;
+        try { socket.close(); } catch { /* already closed */ }
+        resolve(up);
+      };
+      socket.onopen = () => finish(true);
+      socket.onerror = () => finish(false);
+    });
   }
 
   /** A node was revoked or expired: clear both persisted enrollment flags. */
@@ -951,6 +1015,31 @@ export class HostConnection {
     socket?.close();
     this.rejectAll(new Error("Connection attempt was replaced."));
   }
+}
+
+/** The check's deadline fired before tsnet (or the device ping) answered. */
+class HostCheckTimeoutError extends Error {
+  constructor() {
+    super("Host check timed out");
+    this.name = "HostCheckTimeoutError";
+  }
+}
+
+/**
+ * Resolves to `promise`'s value, or rejects with `HostCheckTimeoutError`
+ * when `deadlineAt` passes first. Used to bound the hosts-page check
+ * (tsnet wait and the device ping) to one shared deadline.
+ */
+function raceDeadline<T>(promise: Promise<T>, deadlineAt: number): Promise<T> {
+  const remainingMs = deadlineAt - Date.now();
+  if (remainingMs <= 0) return Promise.reject(new HostCheckTimeoutError());
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new HostCheckTimeoutError()), remainingMs);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); }
+    );
+  });
 }
 
 function defaultRemoteEndpoint(hostId: string): string {

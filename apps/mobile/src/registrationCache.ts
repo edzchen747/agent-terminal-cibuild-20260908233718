@@ -9,7 +9,7 @@ import { Preferences } from "@capacitor/preferences";
  * verdict is remembered per host id and reused until its TTL expires:
  * 1 minute for the hosts-page ping, 1 hour for the startup node check.
  */
-export type RegistrationVerdict = "verified" | "lanOnly" | "offline";
+export type RegistrationVerdict = "verified" | "lanOnly" | "offline" | "error";
 export type RegistrationCheckKind = "hostPing" | "nodeCheck";
 
 const HOST_PING_TTL_MS = 60_000;
