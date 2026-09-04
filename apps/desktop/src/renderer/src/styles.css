@@ -132,7 +132,7 @@ button { color: inherit; }
 .window-title span { min-width: 0; flex: 1 1 auto; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .titlebar-actions { margin-left: auto; display: flex; align-items: center; gap: 4px; }
 .host-online { display: flex; align-items: center; gap: 7px; margin-right: 8px; padding: 4px 9px; border: 1px solid var(--border-strong); border-radius: 99px; color: var(--text-muted); font-size: 11px; }
-.host-online i, .status-dot, .pair-details i { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok-glow); }
+.host-online i, .pair-details i { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok-glow); }
 .host-online.is-unregistered i { background: var(--idle); box-shadow: none; }
 .host-online.is-unpaired { border-color: var(--accent-line); background: var(--accent-tint); color: var(--accent-ink); }
 .host-online.is-unpaired i { background: var(--accent); box-shadow: 0 0 8px var(--accent-glow); }
@@ -272,9 +272,18 @@ button { color: inherit; }
 .link-confirm-actions button:disabled { opacity: .55; cursor: wait; }
 .link-cancel { border: 1px solid var(--border-input); background: var(--surface-raised); color: var(--text-dim); }
 .link-cancel:hover:not(:disabled) { border-color: var(--text-faint); background: var(--surface-hover); color: var(--text-strong); }
-.statusbar { display: grid; grid-template-columns: 140px 1fr 70px; align-items: center; gap: 10px; padding: 0 10px; border-top: 1px solid var(--border); color: var(--text-faint); background: var(--surface); font-size: 9.5px; }
+.statusbar { display: grid; grid-template-columns: minmax(0, 1fr) 70px; align-items: center; gap: 10px; padding: 0 10px; border-top: 1px solid var(--border); color: var(--text-faint); background: var(--surface); font-size: 9.5px; }
 .statusbar span { display: flex; align-items: center; gap: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.statusbar span:last-child { justify-content: end; }
+.statusbar > span:last-child { justify-content: end; }
+/* The device list sits a short gap to the right of the directory; the path
+   gives up width first so the device names stay readable. */
+.statusbar-location { min-width: 0; gap: 30px; }
+.statusbar-location > .display-name { flex: 0 1 auto; }
+.statusbar-devices { flex: 0 1 auto; min-width: 0; gap: 5px; }
+.statusbar-device { flex: 0 1 auto; min-width: 0; gap: 4px; }
+/* Connected reads as an outline; sharing the terminal on screen fills it. */
+.device-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; border: 1px solid currentColor; }
+.device-dot.is-shared { border-color: var(--ok); background: var(--ok); box-shadow: 0 0 8px var(--ok-glow); }
 .empty-terminal, .boot { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--text-muted); }
 .empty-terminal > svg { width: 38px; height: 38px; margin-bottom: 8px; }
 .empty-terminal h2 { margin: 6px 0 0; color: var(--text-dim); font-size: 17px; }

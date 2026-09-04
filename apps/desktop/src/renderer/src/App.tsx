@@ -7,6 +7,7 @@ import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, Mor
 import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
 import type { SplitGroup, SplitLayout } from "./split-tabs";
 import { deviceListEntryModal, nextModalAfterPairing, nextModalOnEscape, pairModalEscapeTarget, type Modal } from "./modal-navigation";
+import { connectedDevices, NO_DEVICES_LABEL } from "./statusbar";
 import { effectiveAutoCollapse, isNarrowLayout, loadSidebarPreferences, NARROW_SIDEBAR_WIDTH, saveSidebarPreferences, sidebarOpenAfterAutoCollapseToggle, sidebarOpenAfterNarrowLayout, shouldCollapseSidebar } from "./sidebar";
 import { applyTheme, loadThemePreference, resolveTheme, saveThemePreference, SYSTEM_DARK_QUERY, THEME_LABELS, THEME_PREFERENCES, type ThemePreference } from "./theme";
 import { TerminalPane } from "./TerminalPane";
@@ -184,6 +185,10 @@ export function App() {
   }, [unorderedProjectSessions, sessionOrder]);
   const activeSession = projectSessions.find((session) => session.id === activeSessionId);
   const activeSplit = findSplitGroup(splitGroups, activeSessionId);
+  // The terminals this window has on screen: both panes of a split, else the
+  // active tab alone. A connected device viewing one of them shares it.
+  const openSessionIds = activeSplit ? activeSplit.sessionIds : activeSessionId ? [activeSessionId] : [];
+  const statusDevices = connectedDevices(state?.devices ?? [], openSessionIds);
   const splitBySession = useMemo(() => {
     const groups = new Map<string, SplitGroup>();
     for (const group of splitGroups) for (const sessionId of group.sessionIds) groups.set(sessionId, group);
@@ -830,7 +835,15 @@ export function App() {
             {splitDropSide && <div className={`split-drop-target is-${splitDropSide}`}><span><SplitViewIcon /> Drop to split {splitDropSide}</span></div>}
             {!projectSessions.length && <div className="empty-terminal"><TerminalIcon /><h2>No open terminals</h2><p className="display-name" title={`Start a session in ${currentProject?.name}.`}>Start a session in {currentProject?.name}.</p><button className="primary" onClick={() => void addTab()}><PlusIcon /> New terminal</button></div>}
           </div>
-          <footer className="statusbar"><span><i className="status-dot" /> {projectSessions.filter((session) => session.status === "running").length} running</span><span>{currentProject?.path}</span><span>UTF-8</span></footer>
+          <footer className="statusbar">
+            <span className="statusbar-location">
+              <span className="display-name" title={currentProject?.path}>{currentProject?.path}</span>
+              <span className="statusbar-devices">{statusDevices.length
+                ? <>{statusDevices.map((device, index) => <span className="statusbar-device" key={device.id} title={device.sharesTerminal ? `${device.name} has this terminal open` : `${device.name} is connected`}><i className={`device-dot ${device.sharesTerminal ? "is-shared" : ""}`} /><span className="display-name">{device.name}{index < statusDevices.length - 1 ? "," : ""}</span></span>)}<span>connected</span></>
+                : NO_DEVICES_LABEL}</span>
+            </span>
+            <span>UTF-8</span>
+          </footer>
         </section>
       </div>
 

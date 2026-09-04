@@ -36,6 +36,11 @@ pub struct AuthorizedDevice {
     /// Whether the device currently holds an authenticated connection.
     #[serde(default)]
     pub online: bool,
+    /// The sessions the device is displaying right now (its viewport entries
+    /// in each session's set S). Runtime-only, like `online`: filled in on
+    /// the way out to clients and never meaningful in the store file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viewing_session_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

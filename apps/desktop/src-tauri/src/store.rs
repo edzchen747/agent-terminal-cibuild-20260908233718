@@ -520,6 +520,7 @@ mod tests {
             added_at: "2026-08-27T00:00:00Z".into(),
             last_seen_at: "2026-08-27T00:00:00Z".into(),
             online: false,
+            viewing_session_ids: Vec::new(),
         };
 
         let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
@@ -637,6 +638,7 @@ mod tests {
             added_at: "2026-08-27T00:00:00Z".into(),
             last_seen_at: "2026-08-27T00:00:00Z".into(),
             online: false,
+            viewing_session_ids: Vec::new(),
         };
         let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
         store

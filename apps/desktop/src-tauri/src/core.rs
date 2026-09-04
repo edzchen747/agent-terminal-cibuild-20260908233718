@@ -350,6 +350,9 @@ pub struct Core {
     /// Last online-device set observed by the presence refresher, so the
     /// periodic check only broadcasts when liveness actually changed.
     presence_cache: Mutex<Option<HashSet<String>>>,
+    /// Last per-device viewing set observed by the viewport watchdog, so a
+    /// phone opening or closing a terminal broadcasts once.
+    viewing_cache: Mutex<Option<HashMap<String, Vec<String>>>>,
     embedded_node: Mutex<Option<Child>>,
     desktop_enrollment_running: AtomicBool,
     /// A saved remote identity re-verification run is in flight. The stored
@@ -432,6 +435,7 @@ impl Core {
             direct_server_ready: AtomicBool::new(false),
             exit_requested: AtomicBool::new(false),
             presence_cache: Mutex::new(None),
+            viewing_cache: Mutex::new(None),
             network_online: AtomicBool::new(true),
         });
         core.spawn_presence_refresh();
@@ -1081,7 +1085,7 @@ impl Core {
 
     fn sweep_stale_viewports(self: &Arc<Self>) {
         let mut changed = Vec::new();
-        {
+        let viewing = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let now = Instant::now();
             for session in inner.sessions.values_mut() {
@@ -1112,10 +1116,27 @@ impl Core {
                     changed.push((session.metadata.id.clone(), epoch));
                 }
             }
-        }
+            viewing_sessions_by_device(&inner)
+        };
         for (session_id, epoch) in changed {
             self.broadcast_grid_change(&session_id, epoch);
         }
+        self.publish_viewing_change(viewing);
+    }
+
+    /// The status bar names which terminal each connected device has open, so
+    /// a device joining or leaving a session's viewport set is state the
+    /// clients need within a watchdog tick - far sooner than the presence
+    /// refresher's minutes-scale sweep. Broadcast only on an actual change so
+    /// an idle host stays quiet.
+    fn publish_viewing_change(&self, viewing: HashMap<String, Vec<String>>) {
+        let mut cache = self.viewing_cache.lock().expect("viewing cache poisoned");
+        if cache.as_ref() == Some(&viewing) {
+            return;
+        }
+        *cache = Some(viewing);
+        drop(cache);
+        self.broadcast();
     }
 
     pub fn broadcast(&self) {
@@ -2812,6 +2833,7 @@ impl Core {
             added_at: now.to_rfc3339(),
             last_seen_at: now.to_rfc3339(),
             online: false,
+            viewing_session_ids: Vec::new(),
         };
         inner
             .store
@@ -3255,6 +3277,53 @@ impl Core {
     }
 }
 
+/// Which sessions each paired device is displaying, read off the sessions'
+/// viewport sets: a remote viewport is keyed by the device id once the socket
+/// is authenticated (`remote_sizing_key`), so set S inverts directly into
+/// per-device viewing lists. Session ids are ordered by `session_order` so a
+/// client can compare them without sorting.
+fn viewing_sessions_by_device(inner: &Inner) -> HashMap<String, Vec<String>> {
+    let mut viewing: HashMap<String, Vec<String>> = HashMap::new();
+    for session_id in ordered_session_ids(inner) {
+        let Some(session) = inner.sessions.get(&session_id) else {
+            continue;
+        };
+        for controller in session.viewports.keys() {
+            if let TerminalController::Remote(device_id) = controller {
+                viewing
+                    .entry(device_id.clone())
+                    .or_default()
+                    .push(session_id.clone());
+            }
+        }
+    }
+    viewing
+}
+
+/// Session ids in presentation order: the explicit order first, then any
+/// session missing from it (oldest first), matching `snapshot_from_inner`.
+fn ordered_session_ids(inner: &Inner) -> Vec<String> {
+    let mut ids = inner
+        .session_order
+        .iter()
+        .filter(|id| inner.sessions.contains_key(*id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut missing = inner
+        .sessions
+        .values()
+        .filter(|session| !inner.session_order.contains(&session.metadata.id))
+        .map(|session| session.metadata.clone())
+        .collect::<Vec<_>>();
+    missing.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    ids.extend(missing.into_iter().map(|session| session.id));
+    ids
+}
+
 fn snapshot_from_inner(inner: &Inner, online_device_ids: &HashSet<String>) -> HostSnapshot {
     let default_shell_id = if inner
         .shells
@@ -3293,6 +3362,8 @@ fn snapshot_from_inner(inner: &Inner, online_device_ids: &HashSet<String>) -> Ho
     });
     sessions.extend(missing_sessions);
 
+    let viewing = viewing_sessions_by_device(inner);
+
     HostSnapshot {
         host: HostInfo {
             id: inner.store.host().id.clone(),
@@ -3308,6 +3379,8 @@ fn snapshot_from_inner(inner: &Inner, online_device_ids: &HashSet<String>) -> Ho
             .map(|device| {
                 let mut entry = device.device.clone();
                 entry.online = online_device_ids.contains(&entry.id);
+                entry.viewing_session_ids =
+                    viewing.get(&entry.id).cloned().unwrap_or_default();
                 entry
             })
             .collect(),
@@ -5468,6 +5541,7 @@ mod tests {
             added_at: "2026-08-27T00:00:00Z".into(),
             last_seen_at: "2026-08-27T00:00:00Z".into(),
             online: false,
+            viewing_session_ids: Vec::new(),
         };
         store
             .authorize_device(device("phone-a", "Pixel 7"), "cred-a")
@@ -5498,6 +5572,86 @@ mod tests {
         assert!(
             snapshot.devices.iter().all(|device| !device.online),
             "devices outside the presence window are offline"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn snapshot_reports_the_sessions_each_device_is_viewing() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
+        let device = |id: &str, name: &str| AuthorizedDevice {
+            id: id.into(),
+            name: name.into(),
+            platform: "android".into(),
+            added_at: "2026-08-27T00:00:00Z".into(),
+            last_seen_at: "2026-08-27T00:00:00Z".into(),
+            online: false,
+            viewing_session_ids: Vec::new(),
+        };
+        store
+            .authorize_device(device("phone-a", "Pixel 7"), "cred-a")
+            .expect("authorize first device");
+        store
+            .authorize_device(device("phone-b", "Galaxy S23"), "cred-b")
+            .expect("authorize second device");
+        let mut inner = test_inner(store, Vec::new());
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "p", r"C:\Work"));
+        inner
+            .sessions
+            .insert("s2".into(), test_session("s2", "p", r"C:\Work"));
+        inner.session_order = vec!["s1".into(), "s2".into()];
+        // phone-a has both terminals open, phone-b only the second; the
+        // desktop pane in s1 is not a device and must not appear anywhere.
+        for session_id in ["s1", "s2"] {
+            let session = inner.sessions.get_mut(session_id).expect("session");
+            set_client_viewport(
+                session,
+                TerminalController::Remote("phone-a".into()),
+                80,
+                24,
+            );
+        }
+        let second = inner.sessions.get_mut("s2").expect("session");
+        set_client_viewport(second, TerminalController::Remote("phone-b".into()), 45, 36);
+        let first = inner.sessions.get_mut("s1").expect("session");
+        set_client_viewport(first, TerminalController::Desktop("window-a".into()), 120, 40);
+
+        let online = HashSet::from(["phone-a".to_string(), "phone-b".to_string()]);
+        let snapshot = snapshot_from_inner(&inner, &online);
+        let viewing = |id: &str| {
+            snapshot
+                .devices
+                .iter()
+                .find(|device| device.id == id)
+                .expect("device in snapshot")
+                .viewing_session_ids
+                .clone()
+        };
+        assert_eq!(viewing("phone-a"), vec!["s1".to_string(), "s2".to_string()]);
+        assert_eq!(viewing("phone-b"), vec!["s2".to_string()]);
+
+        // Leaving a session's viewport set drops it from the device's list.
+        let second = inner.sessions.get_mut("s2").expect("session");
+        second
+            .viewports
+            .remove(&TerminalController::Remote("phone-b".into()));
+        let snapshot = snapshot_from_inner(&inner, &online);
+        assert!(
+            snapshot
+                .devices
+                .iter()
+                .find(|device| device.id == "phone-b")
+                .expect("device in snapshot")
+                .viewing_session_ids
+                .is_empty(),
+            "a device with no viewport entries is viewing nothing"
         );
         fs::remove_file(state_path).expect("remove test state");
     }

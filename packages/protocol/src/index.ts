@@ -216,6 +216,13 @@ export interface AuthorizedDevice extends DeviceIdentity {
   lastSeenAt: string;
   /** True while the device holds an authenticated connection to the desktop. */
   online?: boolean;
+  /**
+   * The sessions the device is displaying right now: its viewport entries in
+   * each session's set S. Empty while the device is connected but has no
+   * terminal open, and cleared with the rest of its viewports when the
+   * watchdog evicts a backgrounded phone.
+   */
+  viewingSessionIds?: string[];
 }
 
 export interface Project {

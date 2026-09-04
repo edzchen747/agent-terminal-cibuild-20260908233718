@@ -3,6 +3,7 @@ import type { CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { applyTerminalModifiers, findHttpLinks, streamByteLength, TERMINAL_SCROLLBACK_LINES, xtermThemeFor, type TerminalModifier, type TerminalScheme } from "@agentterminal/protocol";
+import { gridWithinPane } from "./terminal-geometry";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { sessionId: string; visible: boolean; active: boolean; confirmExternalLinks: boolean; scheme: TerminalScheme; }
@@ -162,10 +163,30 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
     // ---------------------------------------------------------------------
     let viewportCols = 0;
     let viewportRows = 0;
+    // One cell in CSS pixels, read off the rendered grid (the same measurement
+    // the copy toast places itself with). Null until the emulator has painted.
+    const cellSize = () => {
+      const screen = hostRef.current?.querySelector<HTMLElement>(".xterm-screen");
+      if (!screen || terminal.cols < 1 || terminal.rows < 1) return null;
+      const rect = screen.getBoundingClientRect();
+      if (rect.width < 1 || rect.height < 1) return null;
+      return { width: rect.width / terminal.cols, height: rect.height / terminal.rows };
+    };
     const proposeGrid = () => {
       try {
         const dims = fit.proposeDimensions();
-        if (dims && dims.cols > 0 && dims.rows > 0) return { cols: dims.cols, rows: dims.rows };
+        const pane = hostRef.current;
+        if (!dims || dims.cols <= 0 || dims.rows <= 0 || !pane) return null;
+        // The addon measures the pane's border box, so its proposal counts
+        // the letterbox padding as usable: clamp it to what the content box
+        // actually holds (see gridWithinPane).
+        const style = window.getComputedStyle(pane);
+        const rect = pane.getBoundingClientRect();
+        const content = {
+          width: rect.width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+          height: rect.height - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom)
+        };
+        return gridWithinPane({ cols: dims.cols, rows: dims.rows }, content, cellSize());
       } catch { /* hidden pane */ }
       return null;
     };
