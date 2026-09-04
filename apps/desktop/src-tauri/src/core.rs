@@ -1767,13 +1767,12 @@ impl Core {
     pub fn close_session(self: &Arc<Self>, session_id: &str) {
         let project_id = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
-            let Some(mut session) = inner.sessions.remove(session_id) else {
-                return;
-            };
-            inner.session_order.retain(|id| id != session_id);
-            let _ = session.killer.kill();
-            sync_log!("session", "close id={session_id}");
-            session.metadata.project_id
+            match close_session_in_inner(&mut inner, session_id, true) {
+                Some(project_id) => project_id,
+                // The tab was already closed; no state change, no retire,
+                // no broadcast.
+                None => return,
+            }
         };
         self.cleanup_empty_temporary_project(&project_id);
         self.broadcast();
@@ -3149,18 +3148,28 @@ impl Core {
         }
     }
 
-    fn on_terminal_exit(&self, session_id: &str, exit_code: u32) {
-        let changed = {
+    fn on_terminal_exit(self: &Arc<Self>, session_id: &str, exit_code: u32) {
+        let (project_id, changed) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
-            if let Some(session) = inner.sessions.get_mut(session_id) {
-                session.metadata.status = "exited".into();
-                session.metadata.exit_code = Some(exit_code);
-                true
+            if exit_code == 0 {
+                // The shell finished normally: close the tab instead of
+                // leaving a dead one behind. The process is already gone,
+                // so no kill is attempted. If the user closed the tab
+                // first the session is already removed and this is a
+                // no-op.
+                (close_session_in_inner(&mut inner, session_id, false), false)
             } else {
-                false
+                // Non-zero exit: keep the tab so the user can inspect
+                // what failed.
+                (None, mark_session_exited(&mut inner, session_id, exit_code))
             }
         };
-        if changed {
+        if let Some(project_id) = &project_id {
+            self.cleanup_empty_temporary_project(project_id);
+        }
+        // The manual-close path already broadcast when it removed the
+        // session first, so a no-op close here stays silent.
+        if project_id.is_some() || changed {
             self.broadcast();
         }
     }
@@ -3580,6 +3589,38 @@ fn retire_empty_temporary_project(inner: &mut Inner, project_id: &str) -> Retire
         window_label,
         replacement,
     }
+}
+
+/// Removes a session from state (session map and tab order). Returns the
+/// owning project id so the caller can retire an empty temporary project;
+/// `None` when the session was already removed (for example the user closed
+/// the tab first), in which case nothing changed. `kill_process` kills the
+/// child only on a manual close: on the normal-exit path the process has
+/// already terminated and killing is pointless.
+fn close_session_in_inner(
+    inner: &mut Inner,
+    session_id: &str,
+    kill_process: bool,
+) -> Option<String> {
+    let mut session = inner.sessions.remove(session_id)?;
+    inner.session_order.retain(|id| id != session_id);
+    if kill_process {
+        let _ = session.killer.kill();
+    }
+    sync_log!("session", "close id={session_id}");
+    Some(session.metadata.project_id)
+}
+
+/// Marks a still-open session as exited. Returns `true` when the session
+/// was found and updated, `false` when the tab was already closed, so the
+/// caller can skip the redundant broadcast.
+fn mark_session_exited(inner: &mut Inner, session_id: &str, exit_code: u32) -> bool {
+    let Some(session) = inner.sessions.get_mut(session_id) else {
+        return false;
+    };
+    session.metadata.status = "exited".into();
+    session.metadata.exit_code = Some(exit_code);
+    true
 }
 
 /// Picks the project a window should fall back to when its current project is
@@ -4293,7 +4334,7 @@ mod tests {
         apply_owner_grid, drain_journal_front_at, set_client_viewport, should_open_quiet_window, snapshot_from_inner,
         split_journal_by_epochs, startup_project, take_valid_pairing_grant, truncate_journal_front,
         validate_project_name, GridEpoch, SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS,
-        TerminalController,
+        TerminalController, close_session_in_inner, mark_session_exited,
     };
     use crate::{
         models::{AuthorizedDevice, Project, TerminalSession, TuiMode},
@@ -4306,6 +4347,10 @@ mod tests {
         collections::{HashMap, HashSet},
         fs,
         path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         time::{Duration, Instant},
     };
     use uuid::Uuid;
@@ -6617,13 +6662,216 @@ mod tests {
         let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
         let store = DesktopStore::load(state_path.clone()).expect("initial store");
         let mut inner = test_inner(store, Vec::new());
-
         test_project(&mut inner, "saved-a", "C:\\Work\\SavedA", true);
+
         assert!(matches!(
             retire_empty_temporary_project(&mut inner, "does-not-exist"),
-            RetireOutcome::NotEligible,
+            RetireOutcome::NotEligible
         ));
         assert!(inner.project_order.is_empty());
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn normal_exit_closes_the_tab_and_never_kills_the_dead_process() {
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "p", r"C:\Work\P", true);
+        let killed = Arc::new(AtomicBool::new(false));
+        let session = test_session_with_killer(
+            "s1",
+            "p",
+            r"C:\Work\P",
+            Box::new(KillingProbe { killed: killed.clone() }),
+        );
+        inner.sessions.insert("s1".into(), session);
+        inner.session_order.push("s1".into());
+
+        let project_id = close_session_in_inner(&mut inner, "s1", false)
+            .expect("the exited session must be removed");
+        assert_eq!(
+            project_id, "p",
+            "the owning project is reported so an empty temporary project can be retired"
+        );
+        assert!(!inner.sessions.contains_key("s1"), "the tab must be gone");
+        assert!(!inner.session_order.contains(&"s1".to_string()), "the tab must leave the order");
+        assert!(
+            !killed.load(Ordering::SeqCst),
+            "the process already exited; no kill may be attempted"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn manual_close_still_kills_the_running_process() {
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "p", r"C:\Work\P", true);
+        let killed = Arc::new(AtomicBool::new(false));
+        let session = test_session_with_killer(
+            "s1",
+            "p",
+            r"C:\Work\P",
+            Box::new(KillingProbe { killed: killed.clone() }),
+        );
+        inner.sessions.insert("s1".into(), session);
+        inner.session_order.push("s1".into());
+
+        let _ = close_session_in_inner(&mut inner, "s1", true)
+            .expect("the session must be removed");
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "a manual close must kill the live process"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn closing_an_already_closed_session_is_a_noop() {
+        // The user closed the tab manually; the waiter thread's late exit-0
+        // report must not touch the surviving state.
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "p", r"C:\Work\P", true);
+        inner.sessions.insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        inner.sessions.insert("s2".into(), test_session("s2", "p", r"C:\Work\P"));
+        inner.session_order.push("s1".into());
+        inner.session_order.push("s2".into());
+
+        let _ = close_session_in_inner(&mut inner, "s2", true)
+            .expect("the manual close removes the session");
+        assert!(
+            close_session_in_inner(&mut inner, "s2", false).is_none(),
+            "the late exit report for a removed session is a no-op"
+        );
+        assert!(inner.sessions.contains_key("s1"), "the sibling session must survive");
+        assert_eq!(
+            inner.session_order,
+            vec!["s1".to_string()],
+            "the tab order keeps only the surviving session"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn clean_exit_keeps_siblings_and_their_tab_order() {
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "p", r"C:\Work\P", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        inner
+            .sessions
+            .insert("s2".into(), test_session("s2", "p", r"C:\Work\P"));
+        inner
+            .sessions
+            .insert("s3".into(), test_session("s3", "p", r"C:\Work\P"));
+        inner.session_order.extend(["s1".into(), "s2".into(), "s3".into()]);
+
+        let _ = close_session_in_inner(&mut inner, "s2", false)
+            .expect("the middle tab must be closed");
+        assert!(inner.sessions.contains_key("s1") && inner.sessions.contains_key("s3"));
+        assert_eq!(
+            inner.session_order,
+            vec!["s1".to_string(), "s3".to_string()],
+            "closing one tab must not disturb the others' order"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn clean_exit_of_the_last_session_retires_the_temporary_project() {
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        let temp = test_project(&mut inner, "temp", r"C:\Work\Temp", false);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "temp", r"C:\Work\Temp"));
+        inner.session_order.push("s1".into());
+
+        let project_id = close_session_in_inner(&mut inner, "s1", false)
+            .expect("the tab must be closed");
+        assert!(
+            matches!(
+                retire_empty_temporary_project(&mut inner, &project_id),
+                RetireOutcome::Removed { .. }
+            ),
+            "the now-empty temporary project must be retired"
+        );
+        assert!(!inner.temporary_projects.contains_key(&temp.id));
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn clean_exit_keeps_a_persistent_project() {
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        let saved = test_project(&mut inner, "saved", r"C:\Work\Saved", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "saved", r"C:\Work\Saved"));
+        inner.session_order.push("s1".into());
+
+        let project_id = close_session_in_inner(&mut inner, "s1", false)
+            .expect("the tab must be closed");
+        assert!(
+            matches!(
+                retire_empty_temporary_project(&mut inner, &project_id),
+                RetireOutcome::NotEligible
+            ),
+            "a persistent project must never be retired"
+        );
+        assert!(
+            inner
+                .store
+                .projects()
+                .iter()
+                .any(|project| project.id == saved.id),
+            "the saved project stays in the store"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn nonzero_exit_keeps_the_tab_and_records_the_code() {
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "p", r"C:\Work\P", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        inner.session_order.push("s1".into());
+
+        // Any non-zero code - ordinary failures, 128 + signal, or a
+        // platform-maximum code - keeps the tab for inspection.
+        for exit_code in [1_u32, 128, u32::MAX] {
+            assert!(
+                mark_session_exited(&mut inner, "s1", exit_code),
+                "a live session must be marked exited"
+            );
+            let session = &inner.sessions["s1"].metadata;
+            assert_eq!(session.status, "exited");
+            assert_eq!(session.exit_code, Some(exit_code));
+        }
+        assert!(
+            inner.sessions.contains_key("s1"),
+            "a non-zero exit must keep the tab open"
+        );
+        assert_eq!(inner.session_order, vec!["s1".to_string()]);
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn marking_exited_for_a_missing_session_is_a_noop() {
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        assert!(
+            !mark_session_exited(&mut inner, "ghost", 1),
+            "an unknown session cannot be marked"
+        );
+        assert!(inner.sessions.is_empty());
+        assert!(inner.session_order.is_empty());
 
         fs::remove_file(state_path).expect("remove test state");
     }
@@ -6690,7 +6938,38 @@ mod tests {
         }
     }
 
+    /// Records whether it was ever asked to kill - proves the manual-close
+    /// path kills a live process while the normal-exit path does not.
+    struct KillingProbe {
+        killed: Arc<AtomicBool>,
+    }
+    impl std::fmt::Debug for KillingProbe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("KillingProbe")
+        }
+    }
+    impl ChildKiller for KillingProbe {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.killed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(KillingProbe {
+                killed: self.killed.clone(),
+            })
+        }
+    }
+
     fn test_session(session_id: &str, project_id: &str, cwd: &str) -> ManagedSession {
+        test_session_with_killer(session_id, project_id, cwd, Box::new(InertKiller))
+    }
+
+    fn test_session_with_killer(
+        session_id: &str,
+        project_id: &str,
+        cwd: &str,
+        killer: Box<dyn ChildKiller + Send + Sync>,
+    ) -> ManagedSession {
         ManagedSession {
             metadata: TerminalSession {
                 id: session_id.into(),
@@ -6705,7 +6984,7 @@ mod tests {
             },
             master: Box::new(InertMaster),
             writer: Box::new(std::io::sink()),
-            killer: Box::new(InertKiller),
+            killer,
             grid: (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS),
             viewports: HashMap::new(),
             grid_epochs: vec![GridEpoch {
