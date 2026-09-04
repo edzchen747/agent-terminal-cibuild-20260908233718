@@ -4,6 +4,7 @@ import QRCode from "qrcode";
 import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemesFor } from "@agentterminal/protocol";
 import type { DesktopState } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
+import { pruneRememberedActiveSessions, rememberProjectActiveSession, resolveProjectActiveSession } from "./active-tab";
 import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
 import type { SplitGroup, SplitLayout } from "./split-tabs";
 import { deviceListEntryModal, nextModalAfterPairing, nextModalOnEscape, pairModalEscapeTarget, type Modal } from "./modal-navigation";
@@ -264,11 +265,26 @@ export function App() {
     }
   }, [sessionOrder, tabDrag]);
 
+  // Per-project memory of the last selected terminal tab: switching to a
+  // project (and back) restores the tab the user last looked at there
+  // instead of defaulting to the last tab every time. Sessions are
+  // in-memory PTYs, so the memory lives only in this window, where the
+  // sessions live.
+  const rememberedActiveByProjectRef = useRef(new Map<string, string>());
+
   useEffect(() => {
-    if (!projectSessions.some((session) => session.id === activeSessionId)) {
-      setActiveSessionId(projectSessions.at(-1)?.id ?? null);
-    }
-  }, [projectSessions, activeSessionId]);
+    if (!state) return;
+    const remembered = rememberedActiveByProjectRef.current;
+    pruneRememberedActiveSessions(remembered, state.projects.map((project) => project.id));
+    const next = resolveProjectActiveSession({
+      projectId: state.currentProjectId,
+      activeSessionId,
+      projectSessionIds: projectSessions.map((session) => session.id),
+      rememberedByProject: remembered
+    });
+    if (next !== null) rememberProjectActiveSession(remembered, state.currentProjectId, next);
+    if (next !== activeSessionId) setActiveSessionId(next);
+  }, [state, projectSessions, activeSessionId]);
 
   async function showPairing() {
     setModal("pair");
