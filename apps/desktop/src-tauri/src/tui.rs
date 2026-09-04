@@ -3,14 +3,33 @@
 //! The host classifies the running foreground program into grid-ownership
 //! modes (see `TuiMode`). Only definitive program announcements move the
 //! period off `Canonical`, and each commits immediately on the program's
-//! own VT sequence:
+//! own VT sequence. The signals are split by *how much of the grid* the
+//! program is claiming, because that is what decides whether the host may
+//! wrap the period in a synthetic alt-screen pair:
+//!
+//! `Fullscreen` - the program owns the whole grid, so its frames may be
+//! isolated from client scrollback:
 //!
 //! - the program's own alt-screen entry (`CSI ?1049/1047/1048 h`);
+//! - DECSTBM (scroll-region set) plus drawing on two or more rows.
+//!
+//! `Inline` - the program is a TUI (it owns the grid size and raw key
+//! input) but draws on the primary buffer, keeping its own scrollback:
+//!
 //! - sync output (`CSI ?2026 h`);
 //! - mouse/focus tracking (`CSI ?1000/1002/1003/1005/1006/1015 h`);
 //! - kitty keyboard flags / modifyOtherKeys (`CSI > n u`, `CSI = n u`,
-//!   `CSI > 4 ; n m`, `CSI 4 ; n m`);
-//! - DECSTBM (scroll-region set) plus drawing on two or more rows.
+//!   `CSI > 4 ; n m`, `CSI 4 ; n m`).
+//!
+//! None of those three says anything about *where* the program draws:
+//! an agent harness prints a scrolling transcript on the primary buffer
+//! and repaints only a bottom composer band, and it announces itself
+//! with exactly these sequences. Treating them as `Fullscreen` made the
+//! host inject `[?1049h`, which put every frame on a blank alt
+//! screen: the transcript above the composer disappeared and only the
+//! bottom band was ever painted. A period only ever *rises*
+//! (`Canonical` < `Inline` < `Fullscreen`), so a harness that later
+//! sets a scroll region is promoted without restarting the period.
 //!
 //! There is no strong-signal confirmation window: a signal either commits
 //! immediately or is not evidence. The removed signal families (ED-based
@@ -23,15 +42,19 @@
 //! resurfaced). The shell's `clear` (ED2/ED3 + home-CUP) stays
 //! deliberately not evidence, as do focus-event reporting
 //! (`CSI ?1004 h` - PSReadLine enables it at startup and the
-//! `\x1b[I`/`\x1b[O` focus events are not TUI behavior) and bare
+//! `[I`/`[O` focus events are not TUI behavior) and bare
 //! two-byte DECKPAM/DECPAM (`ESC =` / `ESC >`, only meaningful as the
 //! intro of a kitty keyboard-flags sequence).
 //!
-//! `Inline` is retained as a `TuiMode` value but is no longer produced
-//! by the classifier: the inline repaint pattern was a strong signal.
-//! Exits are unchanged: a quiet stream with an observed alt-exit +
-//! visible cursor (`alt-exit`), a quiet newline-terminated prompt
-//! (`exit-quiet`), or an OSC 133 shell marker (`osc133`).
+//! Exits: a quiet stream with an observed alt-exit + visible cursor
+//! (`alt-exit`), a quiet newline-terminated prompt (`exit-quiet`), or an
+//! OSC 133 shell marker (`osc133`). The OSC 133 exit only counts
+//! *outside* a synchronized-output bracket: the markers are ground truth
+//! for "the shell owns the foreground again" only when the shell emitted
+//! them, and an inline harness marks its own composer with the same
+//! `OSC 133 ; A/B/C` inside the `?2026h`/`?2026l` pair that draws the
+//! frame. Counting those exited the period once per frame, which flapped
+//! the mode (and, with the alt wrap, the buffer) at repaint rate.
 //!
 //! Whole-screen clears (`CSI 2 J` / `CSI 3 J`) are not TUI evidence,
 //! but they are journal-history boundaries: [`feed`] records where a
@@ -71,6 +94,13 @@ pub struct TuiTransition {
     /// (`[mode] session=... mode=... reason=...`): e.g. `alt-enter`,
     /// `sync-output`, `stbm-draw`, `alt-exit`, `exit-quiet`, `osc133`.
     pub reason: &'static str,
+    /// Byte index into the chunk just fed where the triggering sequence
+    /// started, so the host splices its synthetic alt-screen bytes at
+    /// the boundary the transition actually happened on. Prepending
+    /// them to the whole chunk swallowed any pre-transition output in
+    /// the same chunk into the alt screen. A signal that started in a
+    /// previous chunk (a split sequence) reports 0.
+    pub at: usize,
 }
 
 pub struct TuiClassifier {
@@ -104,6 +134,11 @@ pub struct TuiClassifier {
     /// DECSTBM was set during the current alt screen; with any drawing
     /// it is a definitive fullscreen signal.
     stbm: bool,
+    /// Open `CSI ?2026 h` brackets. A program's frame is drawn inside
+    /// one, so anything observed at depth > 0 is the program painting,
+    /// not the shell - which is what disqualifies an OSC 133 marker
+    /// from ending the period.
+    sync_depth: u16,
     /// Distinct rows that received text, for the whole foreground
     /// period (the draw-extent measurement behind `stbm-draw`).
     extent_rows: Vec<bool>,
@@ -131,6 +166,7 @@ impl TuiClassifier {
             saw_alt_exit: false,
             alt_open: false,
             stbm: false,
+            sync_depth: 0,
             extent_rows: vec![false; rows.max(1) as usize + 1],
             row_stamps: VecDeque::new(),
             clear_marker: None,
@@ -199,10 +235,10 @@ impl TuiClassifier {
             });
             let stream_exit_ok = visible && newline_recent && quiet_ms >= STREAM_EXIT_QUIET_MS;
             if self.alt_anchored && alt_exit_ok {
-                return self.exit_to_canonical("alt-exit");
+                return self.exit_to_canonical("alt-exit", 0);
             }
             if !self.alt_anchored && stream_exit_ok {
-                return self.exit_to_canonical("exit-quiet");
+                return self.exit_to_canonical("exit-quiet", 0);
             }
         }
 
@@ -213,6 +249,10 @@ impl TuiClassifier {
         self.tail.clear();
         self.clear_marker = None;
 
+        // The net effect of the chunk is what the host acts on, so a
+        // reported transition is measured against the mode the chunk
+        // started in.
+        let mode_before = self.mode;
         let mut transition: Option<TuiTransition> = None;
         let mut last_visible: Option<u8> = None;
         let mut i = 0;
@@ -222,7 +262,10 @@ impl TuiClassifier {
                 if byte == b'\n' || byte == b'\r' || !byte.is_ascii_control() {
                     last_visible = Some(byte);
                 }
-                self.on_plain_byte(byte, now, rows);
+                let at = i.saturating_sub(tail_len);
+                if let Some(t) = self.on_plain_byte(byte, now, rows, at) {
+                    transition = Some(t);
+                }
                 i += 1;
                 continue;
             }
@@ -250,10 +293,15 @@ impl TuiClassifier {
                                 self.clear_marker = Some(esc_at - tail_len);
                             }
                             // Apply the signal's state updates even when a
-                            // transition already fired in this chunk; only
-                            // the transition result is first-wins.
-                            let t = self.on_csi(signal, now, rows);
-                            transition = transition.or(t);
+                            // transition already fired in this chunk, and
+                            // keep the LAST one: a chunk can rise
+                            // (Inline, then Fullscreen) or round-trip, and
+                            // only the net result is actionable.
+                            let at = esc_at.saturating_sub(tail_len);
+                            let t = self.on_csi(signal, now, rows, at);
+                            if t.is_some() {
+                                transition = t;
+                            }
                         }
                         CsiOutcome::Split { keep_from } => {
                             self.tail.push_str(&input[keep_from..]);
@@ -261,16 +309,21 @@ impl TuiClassifier {
                         }
                     }
                 }
-                b']' => match self.scan_osc(&input, &mut i) {
-                    OscOutcome::Complete(payload) => {
-                        let t = self.on_osc(&payload);
-                        transition = transition.or(t);
+                b']' => {
+                    let esc_at = i - 1;
+                    match self.scan_osc(&input, &mut i) {
+                        OscOutcome::Complete(payload) => {
+                            let t = self.on_osc(&payload, esc_at.saturating_sub(tail_len));
+                            if t.is_some() {
+                                transition = t;
+                            }
+                        }
+                        OscOutcome::Split { keep_from } => {
+                            self.tail.push_str(&input[keep_from..]);
+                            i = input.len();
+                        }
                     }
-                    OscOutcome::Split { keep_from } => {
-                        self.tail.push_str(&input[keep_from..]);
-                        i = input.len();
-                    }
-                },
+                }
                 _ => {
                     // ESC c, bare ESC, or any other two-byte escape: no
                     // signal.
@@ -295,16 +348,27 @@ impl TuiClassifier {
             self.extent_rows.fill(false);
             self.row_stamps.clear();
         }
-        transition
+        // A chunk that entered and left a period in the same chunk moved
+        // nothing the host can act on. Reporting only its first half (the
+        // old first-wins rule) desynced the host's synthetic alt-screen
+        // bookkeeping: an inline harness carries `?2026h` and an OSC 133
+        // marker in one chunk, so the enter was reported and the exit
+        // swallowed, and one ten-second session journaled 28 injected
+        // `\x1b[?1049h` against 10 `\x1b[?1049l`.
+        match transition {
+            Some(t) if self.mode != mode_before => Some(t),
+            _ => None,
+        }
     }
 
-    fn exit_to_canonical(&mut self, reason: &'static str) -> Option<TuiTransition> {
+    fn exit_to_canonical(&mut self, reason: &'static str, at: usize) -> Option<TuiTransition> {
         let program_alt_exit = self.saw_alt_exit;
         self.mode = TuiMode::Canonical;
         self.saw_alt_exit = false;
         self.alt_anchored = false;
         self.alt_open = false;
         self.stbm = false;
+        self.sync_depth = 0;
         self.row_stamps.clear();
         self.extent_rows.fill(false);
         Some(TuiTransition {
@@ -312,29 +376,38 @@ impl TuiClassifier {
             via_alt_enter: false,
             program_alt_exit,
             reason,
+            at,
         })
     }
 
     /// Definitive signals commit immediately on the program's own
-    /// announcement sequence.
+    /// announcement sequence. `to` is the mode the signal actually
+    /// proves: `Fullscreen` only for programs that own the whole grid
+    /// (their own alt screen, or a scroll region plus drawing),
+    /// `Inline` for the announcements that prove a TUI without proving
+    /// where it draws. Modes are ordered `Canonical` < `Inline` <
+    /// `Fullscreen` and a period only ever rises, so a harness that
+    /// starts inline and later sets a scroll region is promoted in
+    /// place rather than restarting the period.
     fn commit_definitive(
         &mut self,
         now: Instant,
         rows: u16,
+        to: TuiMode,
         via_alt: bool,
         reason: &'static str,
+        at: usize,
     ) -> Option<TuiTransition> {
-        if self.mode == TuiMode::Canonical {
-            let transition = self.commit_enter(TuiMode::Fullscreen, now, rows, via_alt, reason)?;
-            // The program's own alt-screen enter anchors the matching exit
-            // to the alt-exit sequence, not to stream quiet.
-            if via_alt {
-                self.alt_anchored = true;
-            }
-            Some(transition)
-        } else {
-            None
+        if to <= self.mode {
+            return None;
         }
+        let transition = self.commit_enter(to, now, rows, via_alt, reason, at)?;
+        // The program's own alt-screen enter anchors the matching exit
+        // to the alt-exit sequence, not to stream quiet.
+        if via_alt {
+            self.alt_anchored = true;
+        }
+        Some(transition)
     }
 
     fn commit_enter(
@@ -344,30 +417,46 @@ impl TuiClassifier {
         rows: u16,
         via_alt_enter: bool,
         reason: &'static str,
+        at: usize,
     ) -> Option<TuiTransition> {
         if self.mode == to {
             return None;
         }
+        // Only leaving Canonical starts a new foreground period. A
+        // promotion within one (Inline -> Fullscreen) must keep the
+        // evidence that triggered it: `stbm-draw` fires on the DECSTBM
+        // flag plus the measured draw extent, and clearing them here
+        // would erase the paint evidence the grid-suppression release
+        // reads back.
+        if self.mode == TuiMode::Canonical {
+            self.saw_alt_exit = false;
+            self.stbm = false;
+            self.row_stamps.clear();
+            self.extent_rows = vec![false; rows.max(1) as usize + 1];
+        }
         self.mode = to;
-        self.saw_alt_exit = false;
-        self.stbm = false;
-        self.row_stamps.clear();
-        self.extent_rows = vec![false; rows.max(1) as usize + 1];
         Some(TuiTransition {
             to,
             via_alt_enter,
             program_alt_exit: false,
             reason,
+            at,
         })
     }
 
-    fn on_csi(&mut self, signal: CsiSignal, now: Instant, rows: u16) -> Option<TuiTransition> {
+    fn on_csi(
+        &mut self,
+        signal: CsiSignal,
+        now: Instant,
+        rows: u16,
+        at: usize,
+    ) -> Option<TuiTransition> {
         use CsiSignal::*;
         match signal {
             AltEnter => {
                 self.saw_alt_exit = false;
                 self.alt_open = true;
-                self.commit_definitive(now, rows, true, "alt-enter")
+                self.commit_definitive(now, rows, TuiMode::Fullscreen, true, "alt-enter", at)
             }
             AltExit => {
                 self.saw_alt_exit = true;
@@ -382,13 +471,37 @@ impl TuiClassifier {
                 self.cursor_hidden = false;
                 None
             }
-            SyncOutput => self.commit_definitive(now, rows, false, "sync-output"),
-            MouseOrFocus => self.commit_definitive(now, rows, false, "mouse-focus"),
-            KittyKeyboard => self.commit_definitive(now, rows, false, "kitty-keyboard"),
+            // Sync output, mouse tracking and kitty keyboard flags each
+            // prove a TUI - the program drives the grid size and reads
+            // raw keys - but none of them says the program owns the
+            // whole grid. An agent harness announces itself with exactly
+            // these while printing a scrolling transcript on the primary
+            // buffer and repainting only a bottom composer band, so
+            // wrapping the period in a synthetic alt screen threw the
+            // transcript away and left the composer alone on a blank
+            // screen. They enter `Inline`, which claims the grid without
+            // touching the buffer.
+            SyncOutput => {
+                self.sync_depth = self.sync_depth.saturating_add(1);
+                self.commit_definitive(now, rows, TuiMode::Inline, false, "sync-output", at)
+            }
+            SyncEnd => {
+                self.sync_depth = self.sync_depth.saturating_sub(1);
+                None
+            }
+            MouseOrFocus => {
+                self.commit_definitive(now, rows, TuiMode::Inline, false, "mouse-focus", at)
+            }
+            KittyKeyboard => {
+                self.commit_definitive(now, rows, TuiMode::Inline, false, "kitty-keyboard", at)
+            }
+            // A scroll region plus drawing IS whole-grid ownership: the
+            // program has taken over the scrolling the primary buffer
+            // would otherwise do, so its frames are safe to isolate.
             Decstbm => {
                 self.stbm = true;
                 if self.distinct_extent(rows) >= 2 {
-                    self.commit_definitive(now, rows, false, "stbm-draw")
+                    self.commit_definitive(now, rows, TuiMode::Fullscreen, false, "stbm-draw", at)
                 } else {
                     None
                 }
@@ -411,28 +524,43 @@ impl TuiClassifier {
         }
     }
 
-    fn on_osc(&mut self, payload: &str) -> Option<TuiTransition> {
-        // OSC 133 shell-integration markers are ground truth: the shell
-        // owns the foreground again.
+    fn on_osc(&mut self, payload: &str, at: usize) -> Option<TuiTransition> {
+        // OSC 133 shell-integration markers are ground truth that the
+        // shell owns the foreground again - but only when the shell is
+        // what emitted them. Inside a synchronized-output bracket the
+        // marker is part of a frame the foreground program is painting:
+        // an inline harness brackets each repaint with `?2026h`/`?2026l`
+        // and marks its own composer with `OSC 133 ; A/B/C`. Counting
+        // those ended the period once per frame, so the mode flapped at
+        // repaint rate and every frame swapped the client's buffer.
         if let Some(code) = payload.strip_prefix("133;") {
+            if self.sync_depth > 0 {
+                return None;
+            }
             let marker = code.chars().next().unwrap_or('\0');
             if matches!(marker, 'A' | 'B' | 'C' | 'D') && self.mode != TuiMode::Canonical {
-                return self.exit_to_canonical("osc133");
+                return self.exit_to_canonical("osc133", at);
             }
             return None;
         }
         None
     }
 
-    fn on_plain_byte(&mut self, byte: u8, now: Instant, rows: u16) {
+    fn on_plain_byte(
+        &mut self,
+        byte: u8,
+        now: Instant,
+        rows: u16,
+        at: usize,
+    ) -> Option<TuiTransition> {
         if byte == b'\n' {
             self.cursor_row = (self.cursor_row + 1).min(rows.max(1));
             // The new row was reached by scrolling, not addressing.
             self.cup_entered_row = false;
-            return;
+            return None;
         }
         if byte.is_ascii_control() {
-            return;
+            return None;
         }
         // Printable text lands on the tracked row; record the draw
         // extent for the DECSTBM paint rule.
@@ -449,9 +577,13 @@ impl TuiClassifier {
             }
         }
         // DECSTBM plus any drawing is a definitive fullscreen paint.
+        // The transition is returned, not dropped: swallowing it here
+        // moved the classifier's mode without telling the host, which
+        // then never injected the alt pair the mode implies.
         if self.stbm && self.distinct_extent(rows) >= 2 {
-            self.commit_definitive(now, rows, false, "stbm-draw");
+            return self.commit_definitive(now, rows, TuiMode::Fullscreen, false, "stbm-draw", at);
         }
+        None
     }
 
     fn distinct_extent(&self, rows: u16) -> usize {
@@ -549,6 +681,7 @@ impl TuiClassifier {
                 b'l' => match value {
                     1049 | 1047 | 1048 => AltExit,
                     25 => CursorHidden,
+                    2026 => SyncEnd,
                     _ => NoSignal,
                 },
                 b'u' => KittyKeyboard, // kitty keyboard flags: CSI > n u
@@ -667,6 +800,7 @@ enum CsiSignal {
     CursorHidden,
     CursorVisible,
     SyncOutput,
+    SyncEnd,
     MouseOrFocus,
     KittyKeyboard,
     Decstbm,
@@ -764,7 +898,9 @@ mod tests {
     }
 
     #[test]
-    fn mouse_tracking_commits_fullscreen_immediately() {
+    fn mouse_tracking_commits_inline_immediately() {
+        // Mouse tracking proves a TUI, not whole-grid ownership: the
+        // period claims the grid but the buffer is left alone.
         for seq in [
             "\x1b[?1000h",
             "\x1b[?1002h",
@@ -774,7 +910,7 @@ mod tests {
         ] {
             let out = feed(Instant::now(), 30, &[seq, "x"]);
             assert_eq!(out.len(), 1, "{seq}");
-            assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
+            assert_eq!(mode(&out[0]), TuiMode::Inline, "{seq}");
             assert!(!out[0].via_alt_enter);
         }
     }
@@ -867,18 +1003,18 @@ mod tests {
     }
 
     #[test]
-    fn sync_output_is_a_definitive_enter_signal() {
+    fn sync_output_is_a_definitive_inline_enter_signal() {
         let out = feed(Instant::now(), 30, &["\x1b[?2026h", "frame"]);
         assert_eq!(out.len(), 1);
-        assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
+        assert_eq!(mode(&out[0]), TuiMode::Inline);
     }
 
     #[test]
-    fn kitty_keyboard_modes_are_definitive() {
+    fn kitty_keyboard_modes_are_definitive_inline_signals() {
         for seq in ["\x1b[>1u", "\x1b[>u", "\x1b[=2u", "\x1b[4;2m"] {
             let out = feed(Instant::now(), 30, &[seq, "x"]);
             assert_eq!(out.len(), 1, "{seq}");
-            assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
+            assert_eq!(mode(&out[0]), TuiMode::Inline, "{seq}");
         }
     }
 
@@ -1037,6 +1173,7 @@ mod tests {
 
         let out = feed(Instant::now(), 30, &["\x1b[?2026h", "x"]);
         assert_eq!(out[0].reason, "sync-output");
+        assert_eq!(mode(&out[0]), TuiMode::Inline);
 
         let out = feed_timed(
             30,
@@ -1243,9 +1380,9 @@ mod tests {
 
     #[test]
     fn stream_anchored_exit_on_quiet_newline_terminated_prompt() {
-        // A stream-anchored fullscreen TUI (no alt screen of its own,
-        // entered through sync-output) leaves: the prompt is
-        // newline-terminated and the stream goes quiet.
+        // A stream-anchored TUI (no alt screen of its own, entered
+        // through sync-output) leaves: the prompt is newline-terminated
+        // and the stream goes quiet.
         let out = feed_timed(
             30,
             &[
@@ -1257,7 +1394,7 @@ mod tests {
             ],
         );
         assert_eq!(out.len(), 2);
-        assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
+        assert_eq!(mode(&out[0]), TuiMode::Inline);
         assert_eq!(mode(&out[1]), TuiMode::Canonical);
         assert!(!out[1].program_alt_exit);
         assert_eq!(out[1].reason, "exit-quiet");
@@ -1388,5 +1525,360 @@ mod tests {
         assert!(clf.grid_change_suppressed());
         step(&mut clf, &mut at, 30, "\x1b[1;30r\x1b[2;1Ht", 10);
         assert!(!clf.grid_change_suppressed());
+    }
+
+    /// One `pi`-style frame: the whole repaint bracketed by
+    /// `?2026h`/`?2026l`, the composer addressed near the bottom of the
+    /// grid, and the harness marking its OWN prompt with OSC 133.
+    fn inline_frame(tick: u32) -> String {
+        format!(
+            "{ESC}[?2026h{ESC}[33;1H{ESC}[K{ESC}]133;A\x07{ESC}[34;1H\
+             {ESC}]133;B\x07{ESC}]133;C\x07 thinking {tick}{ESC}[K\r\n\
+             {ESC}[39;1H status{ESC}[K{ESC}[?2026l",
+            ESC = "\x1b"
+        )
+    }
+
+    #[test]
+    fn an_inline_harness_stays_in_one_inline_period_across_frames() {
+        // The regression this whole split exists for. `pi` announces
+        // itself with kitty keyboard + sync output, never touches the
+        // alt screen, and wraps an OSC 133 prompt marker inside every
+        // frame. The old classifier read the marker as "the shell is
+        // back", so it left and re-entered the period once per repaint -
+        // 27 enters against 10 exits in a ten-second session - and the
+        // host's synthetic alt pair flashed the buffer at repaint rate.
+        let mut clf = TuiClassifier::new(39);
+        let mut at = Instant::now();
+        let enter = step(&mut clf, &mut at, 39, "\x1b[?2004h\x1b[>7u\x1b[?25l", 10)
+            .expect("the harness announces itself");
+        assert_eq!(mode(&enter), TuiMode::Inline);
+        assert_eq!(enter.reason, "kitty-keyboard");
+
+        for tick in 0..12u32 {
+            let frame = inline_frame(tick);
+            assert_eq!(
+                step(&mut clf, &mut at, 39, &frame, 30),
+                None,
+                "frame {tick} must not move the period"
+            );
+            assert_eq!(clf.mode(), TuiMode::Inline, "frame {tick}");
+        }
+    }
+
+    #[test]
+    fn an_inline_period_never_reaches_fullscreen_on_its_own() {
+        // The host keys its synthetic alt-screen injection on
+        // `Fullscreen`, so this is the contract that keeps an inline
+        // harness's transcript in the primary buffer.
+        let mut clf = TuiClassifier::new(39);
+        let mut at = Instant::now();
+        step(&mut clf, &mut at, 39, "\x1b[>7u\x1b[?1002h\x1b[?25l", 10);
+        for tick in 0..6u32 {
+            step(&mut clf, &mut at, 39, &inline_frame(tick), 30);
+        }
+        assert_eq!(clf.mode(), TuiMode::Inline);
+    }
+
+    #[test]
+    fn an_osc_133_marker_inside_a_frame_is_not_a_shell_prompt() {
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        step(&mut clf, &mut at, 30, "\x1b[?2026h", 10).expect("inline entry");
+        assert_eq!(
+            step(&mut clf, &mut at, 30, "\x1b]133;A\x07frame", 5),
+            None,
+            "a marker inside the program's own bracket is part of its frame"
+        );
+        assert_eq!(clf.mode(), TuiMode::Inline);
+        // Closing the bracket restores the marker's meaning: the next
+        // one is the shell's and ends the period.
+        step(&mut clf, &mut at, 30, "\x1b[?2026l", 5);
+        let exit = step(&mut clf, &mut at, 30, "\x1b]133;A\x07", 5).expect("shell prompt");
+        assert_eq!(mode(&exit), TuiMode::Canonical);
+        assert_eq!(exit.reason, "osc133");
+    }
+
+    #[test]
+    fn unbalanced_sync_brackets_do_not_wedge_the_period_open() {
+        // A program killed mid-frame leaves the bracket open; the exit
+        // paths must still be able to close the period.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        step(&mut clf, &mut at, 30, "\x1b[?2026h", 10).expect("inline entry");
+        step(&mut clf, &mut at, 30, "frame\r\n\x1b[?25h", 5);
+        let exit = step(&mut clf, &mut at, 30, "PS C:\\> ", 520).expect("quiet exit");
+        assert_eq!(mode(&exit), TuiMode::Canonical);
+        // The bracket depth reset with the period, so the next shell
+        // marker is read as the shell's again.
+        step(&mut clf, &mut at, 30, "\x1b[?2026h", 10).expect("second entry");
+        let second = step(&mut clf, &mut at, 30, "\x1b[?2026l\x1b]133;A\x07", 5);
+        assert_eq!(mode(&second.expect("marker after the bracket closed")), TuiMode::Canonical);
+    }
+
+    #[test]
+    fn an_enter_and_an_exit_in_one_chunk_report_nothing() {
+        // Net effect is what the host acts on. Reporting only the enter
+        // (the old first-wins rule) left it holding a synthetic
+        // alt-screen enter with no matching exit.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        assert_eq!(
+            step(&mut clf, &mut at, 30, "\x1b[?2026h\x1b[?2026l\x1b]133;A\x07", 10),
+            None,
+            "the chunk both entered and left: nothing net changed"
+        );
+        assert_eq!(clf.mode(), TuiMode::Canonical);
+    }
+
+    #[test]
+    fn an_inline_period_is_promoted_in_place_by_a_scroll_region() {
+        // A harness that later takes the whole grid (DECSTBM + drawing)
+        // rises to Fullscreen without restarting the period, and the
+        // promotion is reported so the host can wrap it.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        let enter = step(&mut clf, &mut at, 30, "\x1b[?2026h", 10).expect("inline entry");
+        assert_eq!(mode(&enter), TuiMode::Inline);
+        step(&mut clf, &mut at, 30, "\x1b[?25l\x1b[2;1Ha\x1b[3;1Hb", 5);
+        let promoted = step(&mut clf, &mut at, 30, "\x1b[1;30r", 5).expect("stbm promotion");
+        assert_eq!(mode(&promoted), TuiMode::Fullscreen);
+        assert_eq!(promoted.reason, "stbm-draw");
+        assert!(!promoted.via_alt_enter);
+        // The promotion kept the period's evidence rather than wiping it.
+        assert_eq!(clf.mode(), TuiMode::Fullscreen);
+    }
+
+    #[test]
+    fn a_stbm_promotion_from_drawing_is_reported_not_swallowed() {
+        // The DECSTBM arrives first and the draw extent completes it on
+        // a later plain byte. That path used to change the mode without
+        // returning a transition, so the host never learned about it.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        step(&mut clf, &mut at, 30, "\x1b[?2026h\x1b[?25l", 10).expect("inline entry");
+        step(&mut clf, &mut at, 30, "\x1b[1;30r\x1b[2;1Ha", 5);
+        let promoted = step(&mut clf, &mut at, 30, "\x1b[3;1Hb", 5).expect("promotion on draw");
+        assert_eq!(mode(&promoted), TuiMode::Fullscreen);
+        assert_eq!(promoted.reason, "stbm-draw");
+    }
+
+    #[test]
+    fn a_transition_carries_the_offset_of_the_sequence_that_fired_it() {
+        // The host splices its synthetic alt bytes here, so output the
+        // program wrote before announcing itself stays on the main
+        // screen instead of being swallowed into the alt buffer.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        let chunk = "done.\r\n\x1b[?1049h";
+        let enter = step(&mut clf, &mut at, 30, chunk, 10).expect("alt enter");
+        assert_eq!(enter.at, chunk.find('\x1b').expect("esc"));
+
+        // A signal carried over from a previous chunk cannot anchor a
+        // splice in this one, so it reports the chunk start.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        assert_eq!(step(&mut clf, &mut at, 30, "text\x1b[?104", 10), None);
+        let split = step(&mut clf, &mut at, 30, "9h", 5).expect("alt enter across chunks");
+        assert_eq!(split.at, 0);
+    }
+
+    #[test]
+    fn a_split_sync_bracket_still_gates_the_osc_133_exit() {
+        // `?2026h` arriving in two chunks must open the bracket exactly
+        // once: the tail bridge is what makes the depth trustworthy, and
+        // a missed opener would let the harness's own prompt marker end
+        // the period again.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        assert_eq!(step(&mut clf, &mut at, 30, "\x1b[?202", 10), None);
+        let enter = step(&mut clf, &mut at, 30, "6h", 5).expect("split sync-output");
+        assert_eq!(mode(&enter), TuiMode::Inline);
+        assert_eq!(enter.at, 0, "a signal carried over cannot anchor a splice");
+        assert_eq!(step(&mut clf, &mut at, 30, "\x1b]133;A\x07", 5), None);
+        assert_eq!(clf.mode(), TuiMode::Inline);
+    }
+
+    #[test]
+    fn a_split_osc_133_is_judged_by_the_depth_it_completes_at() {
+        // The marker spans chunks; the bracket is open the whole time.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        step(&mut clf, &mut at, 30, "\x1b[?2026h", 10).expect("inline entry");
+        assert_eq!(step(&mut clf, &mut at, 30, "\x1b]133", 5), None);
+        assert_eq!(step(&mut clf, &mut at, 30, ";A\x07", 5), None, "still inside the frame");
+        assert_eq!(clf.mode(), TuiMode::Inline);
+    }
+
+    #[test]
+    fn nested_sync_brackets_unwind_one_level_at_a_time() {
+        // A frame that opens a second bracket must not be treated as
+        // closed by the inner `?2026l`.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        step(&mut clf, &mut at, 30, "\x1b[?2026h", 10).expect("inline entry");
+        step(&mut clf, &mut at, 30, "\x1b[?2026h", 5);
+        step(&mut clf, &mut at, 30, "\x1b[?2026l", 5);
+        assert_eq!(
+            step(&mut clf, &mut at, 30, "\x1b]133;A\x07", 5),
+            None,
+            "the outer bracket is still open"
+        );
+        step(&mut clf, &mut at, 30, "\x1b[?2026l", 5);
+        let exit = step(&mut clf, &mut at, 30, "\x1b]133;A\x07", 5).expect("both closed");
+        assert_eq!(mode(&exit), TuiMode::Canonical);
+    }
+
+    #[test]
+    fn a_stray_bracket_close_cannot_drive_the_depth_negative() {
+        // A `?2026l` with no opener (a chunk boundary lost in a
+        // reconnect, or a program that closes twice) must leave the
+        // depth at zero rather than wrapping, or every later frame's
+        // marker would be read as the shell's.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        step(&mut clf, &mut at, 30, "\x1b[?2026l\x1b[?2026l", 10);
+        let enter = step(&mut clf, &mut at, 30, "\x1b[?2026h", 5).expect("inline entry");
+        assert_eq!(mode(&enter), TuiMode::Inline);
+        assert_eq!(
+            step(&mut clf, &mut at, 30, "\x1b]133;A\x07", 5),
+            None,
+            "the bracket opened by this frame still gates the marker"
+        );
+    }
+
+    #[test]
+    fn an_alt_screen_tui_that_brackets_its_frames_keeps_the_period() {
+        // The gate is not inline-only: a real alt-screen TUI that wraps
+        // repaints in `?2026h`/`?2026l` and prints an OSC 133 inside one
+        // must not be torn out of its period either.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        let enter = step(&mut clf, &mut at, 30, "\x1b[?1049h\x1b[?25l", 10).expect("alt enter");
+        assert_eq!(mode(&enter), TuiMode::Fullscreen);
+        assert_eq!(
+            step(&mut clf, &mut at, 30, "\x1b[?2026h\x1b]133;C\x07frame\x1b[?2026l", 5),
+            None
+        );
+        assert_eq!(clf.mode(), TuiMode::Fullscreen);
+    }
+
+    #[test]
+    fn an_alt_enter_inside_a_frame_still_promotes() {
+        // Depth gates the OSC 133 exit only. A program that opens its
+        // alt screen mid-frame is still claiming the whole grid.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        step(&mut clf, &mut at, 30, "\x1b[?2026h", 10).expect("inline entry");
+        let promoted = step(&mut clf, &mut at, 30, "\x1b[?1049h", 5).expect("alt enter");
+        assert_eq!(mode(&promoted), TuiMode::Fullscreen);
+        assert!(promoted.via_alt_enter);
+    }
+
+    #[test]
+    fn a_period_never_drops_from_fullscreen_back_to_inline() {
+        // Modes only rise within a period: a fullscreen TUI that later
+        // enables sync output or mouse tracking must not be demoted,
+        // which would leave the host's injected alt pair unclosed.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        step(&mut clf, &mut at, 30, "\x1b[?1049h\x1b[?25l", 10).expect("alt enter");
+        for seq in ["\x1b[?2026h", "\x1b[?1002h", "\x1b[>7u"] {
+            assert_eq!(step(&mut clf, &mut at, 30, seq, 5), None, "{seq}");
+            assert_eq!(clf.mode(), TuiMode::Fullscreen, "{seq}");
+        }
+    }
+
+    #[test]
+    fn a_chunk_that_rises_twice_reports_only_the_mode_it_lands_in() {
+        // Canonical -> Inline -> Fullscreen inside one chunk is one
+        // actionable transition, carrying the rule that took it the
+        // whole way.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        let out = step(
+            &mut clf,
+            &mut at,
+            30,
+            "\x1b[?2026h\x1b[?25l\x1b[2;1Ha\x1b[3;1Hb\x1b[1;30r",
+            10,
+        )
+        .expect("net rise to fullscreen");
+        assert_eq!(mode(&out), TuiMode::Fullscreen);
+        assert_eq!(out.reason, "stbm-draw");
+        assert!(!out.via_alt_enter);
+    }
+
+    #[test]
+    fn an_exit_reports_the_offset_of_the_marker_that_released_it() {
+        // The host splices its `?1049l` here, so bytes the program wrote
+        // before releasing the grid stay on the alt screen.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        step(&mut clf, &mut at, 30, "\x1b[?1049h", 10).expect("alt enter");
+        let chunk = "last frame\x1b]133;D\x07";
+        let exit = step(&mut clf, &mut at, 30, chunk, 5).expect("osc133 exit");
+        assert_eq!(exit.reason, "osc133");
+        assert_eq!(exit.at, chunk.find('\x1b').expect("esc"));
+    }
+
+    #[test]
+    fn a_transition_offset_counts_bytes_not_characters() {
+        // `at` indexes the chunk the host is about to journal, which is
+        // a byte buffer: multi-byte text ahead of the signal shifts it
+        // by its encoded width.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        let chunk = "\u{2500}\u{2500} ready\x1b[?1049h";
+        let enter = step(&mut clf, &mut at, 30, chunk, 10).expect("alt enter");
+        assert_eq!(enter.at, 12, "two 3-byte box glyphs plus ' ready'");
+        assert_eq!(enter.at, chunk.find('\x1b').expect("esc"));
+        assert!(chunk.is_char_boundary(enter.at));
+    }
+
+    #[test]
+    fn an_osc_133_in_canonical_mode_is_not_a_transition() {
+        // The shell's own prompt markers arrive constantly; only ones
+        // that actually end a TUI period are events.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        for marker in ["\x1b]133;A\x07", "\x1b]133;B\x07", "\x1b]133;C\x07", "\x1b]133;D\x07"] {
+            assert_eq!(step(&mut clf, &mut at, 30, marker, 10), None, "{marker}");
+        }
+        assert_eq!(clf.mode(), TuiMode::Canonical);
+    }
+
+    #[test]
+    fn an_exit_clears_the_bracket_depth_for_the_next_program() {
+        // A program killed mid-frame leaves the depth open. The next
+        // program's period must start from zero or its first prompt
+        // marker would be swallowed.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        step(&mut clf, &mut at, 30, "\x1b[?1049h\x1b[?25l", 10).expect("alt enter");
+        step(&mut clf, &mut at, 30, "\x1b[?2026h", 5); // frame opened, never closed
+        step(&mut clf, &mut at, 30, "\x1b[?1049l\x1b[?25h", 5);
+        let exit = step(&mut clf, &mut at, 30, "\r\n", 350).expect("alt-anchored exit");
+        assert_eq!(mode(&exit), TuiMode::Canonical);
+        // Next period: one marker, at depth zero, ends it.
+        step(&mut clf, &mut at, 30, "\x1b[?2026h", 10).expect("second entry");
+        step(&mut clf, &mut at, 30, "\x1b[?2026l", 5);
+        let second = step(&mut clf, &mut at, 30, "\x1b]133;A\x07", 5).expect("shell prompt");
+        assert_eq!(mode(&second), TuiMode::Canonical);
+    }
+
+    #[test]
+    fn a_whole_screen_clear_inside_a_frame_is_still_a_history_boundary() {
+        // The clear marker feeds the host's journal truncation and is
+        // independent of the bracket depth: an inline harness clears the
+        // screen on startup inside its first frame. With an ED2+ED3 pair
+        // in one chunk the LAST clear wins, which is the boundary that
+        // discards the most already-erased history.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        let chunk = "\x1b[?2026h\x1b[2J\x1b[3J\x1b[?2026l";
+        step(&mut clf, &mut at, 30, chunk, 10).expect("inline entry");
+        assert_eq!(clf.take_chunk_clear(), Some(chunk.find("\x1b[3J").expect("ed3")));
+        assert_eq!(clf.mode(), TuiMode::Inline);
     }
 }

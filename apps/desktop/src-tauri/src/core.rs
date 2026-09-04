@@ -2911,28 +2911,46 @@ impl Core {
             // with any host-injected synthetic alt-screen bytes so replay
             // and live clients see the exact same stream.
             let tui_transition = session.tui.feed(&data, Instant::now(), session.grid.1);
-            // History isolation: a fullscreen TUI that never enters the
+            // History isolation: a FULLSCREEN TUI that never enters the
             // alternate screen of its own (a raw primary-buffer harness)
             // is wrapped in a host-injected alt pair so its frames stay
-            // out of client scrollback. The enter is injected BEFORE the
-            // first TUI bytes of this chunk; the exit before the first
-            // post-TUI bytes of theirs.
+            // out of client scrollback. `Inline` is deliberately not
+            // wrapped: an inline harness keeps a scrolling transcript on
+            // the primary buffer and repaints only a bottom band, so the
+            // alt screen would throw the transcript away and leave the
+            // band alone on a blank screen. The enter is spliced in at
+            // the sequence that announced the TUI, the exit at the one
+            // that released it - bytes on either side of that boundary
+            // belong to the buffer they were written for.
             let mut injected = String::new();
+            let mut inject_at = 0usize;
             if let Some(transition) = tui_transition {
-                if transition.to != TuiMode::Canonical && !transition.via_alt_enter {
+                if transition.to == TuiMode::Fullscreen && !transition.via_alt_enter {
                     injected.push_str("\x1b[?1049h");
                     session.synthetic_alt = true;
+                    inject_at = transition.at;
                 } else if transition.to == TuiMode::Canonical
                     && session.synthetic_alt
                     && !transition.program_alt_exit
                 {
                     injected.push_str("\x1b[?1049l");
                     session.synthetic_alt = false;
+                    inject_at = transition.at;
                 }
             }
+            // The classifier counts bytes. Every signal it can anchor a
+            // transition to starts on a char boundary today (an ESC, or
+            // the first byte of a run of text), but the splice is a
+            // slicing operation on a `String`, so it walks forward to a
+            // boundary rather than trusting that and panicking.
+            let mut inject_at = inject_at.min(data.len());
+            while inject_at < data.len() && !data.is_char_boundary(inject_at) {
+                inject_at += 1;
+            }
             let mut payload = String::with_capacity(injected.len() + data.len());
+            payload.push_str(&data[..inject_at]);
             payload.push_str(&injected);
-            payload.push_str(&data);
+            payload.push_str(&data[inject_at..]);
             session.buffer.push_str(&payload);
             let before_trim = session.buffer.len();
             session.journal_len = offset.saturating_add(payload.len() as u64);
@@ -2942,9 +2960,12 @@ impl Core {
             // the clear itself, so a replay still starts blank, then
             // repaints the prompt.
             if let Some(cut_rel) = session.tui.take_chunk_clear() {
+                // Both indices are relative to `data`; the injection only
+                // shifts the clear when it was spliced in ahead of it.
+                let shift = if inject_at <= cut_rel { injected.len() } else { 0 };
                 let clear_at = before_trim
                     .saturating_sub(payload.len())
-                    .saturating_add(injected.len())
+                    .saturating_add(shift)
                     .saturating_add(cut_rel);
                 if drain_journal_front_at(&mut session.buffer, clear_at) {
                     sync_log!(

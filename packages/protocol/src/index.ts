@@ -59,14 +59,22 @@ export type TerminalModifier = "ctrl" | "alt" | "shift";
  * - canonical: the shell owns the line-editor grid. The minimum-boundary
  *   sizing rules apply: the PTY tracks min(W_i), min(H_i) over S and every
  *   client renders it exactly.
- * - inline: the program paints a bounded region in place. The minimum
- *   boundary still applies while the mode is classified; per-client TUI
- *   ownership (the focused client asserting its own grid) returns in the
- *   TUI phase.
- * - fullscreen: the program owns the whole grid. Output is
+ * - inline: the program is a TUI but paints on the primary buffer -
+ *   typically a scrolling transcript plus a bounded band it repaints in
+ *   place (an agent harness's composer, a picker's result list). It owns
+ *   the grid like fullscreen does, but its output is NOT history-isolated:
+ *   the transcript above the repainted band is the program's scrollback
+ *   and has to stay in the buffer. Announced by sync output, mouse
+ *   tracking, or kitty keyboard flags - none of which say where the
+ *   program draws.
+ * - fullscreen: the program owns the whole grid, proven by its own
+ *   alt-screen entry or by a scroll region plus drawing. Output is
  *   history-isolated (a synthetic alt-screen pair is journaled when the
  *   program does not use one itself) so TUI frames never bleed into the
  *   shell history.
+ *
+ * A period only ever rises (canonical < inline < fullscreen), so a harness
+ * that starts inline and later takes the whole grid is promoted in place.
  *
  * The three modes are still classified and broadcast on the stream; clients
  * no longer use the mode for sizing decisions.
