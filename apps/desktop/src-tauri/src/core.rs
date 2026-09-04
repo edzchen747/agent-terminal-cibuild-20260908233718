@@ -4469,6 +4469,55 @@ mod tests {
     }
 
     #[test]
+    fn owner_grid_is_a_noop_when_the_size_matches() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let mut clock = Instant::now();
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
+        let first = apply_owner_grid(&mut session, 90, 30);
+        assert_eq!(first, Some(GridEpoch { offset: 0, cols: 90, rows: 30 }));
+        assert_eq!(session.grid_epochs.len(), 2);
+        // Re-asserting the SAME size is a no-op: no extra epoch, no
+        // spurious SIGWINCH for the running program.
+        let repeat = apply_owner_grid(&mut session, 90, 30);
+        assert_eq!(repeat, None);
+        assert_eq!(session.grid_epochs.len(), 2);
+        assert_eq!(session.requested_viewport, Some((90, 30)));
+    }
+
+    #[test]
+    fn owner_grid_clamps_degenerate_sizes() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let mut clock = Instant::now();
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
+        // A degenerate announce (0 rows, sub-2-column viewport) must not
+        // panic or produce an unusable PTY grid.
+        let epoch = apply_owner_grid(&mut session, 1, 0);
+        assert_eq!(epoch, Some(GridEpoch { offset: 0, cols: 2, rows: 1 }));
+        assert_eq!(session.grid, (2, 1));
+    }
+
+    #[test]
+    fn minimum_resumes_after_the_tui_period_exits() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let mut clock = Instant::now();
+        set_client_viewport(&mut session, TerminalController::Desktop("window".into()), 113, 39);
+        // A real fullscreen TUI (its own alt screen, painted) takes the
+        // interacting client's size...
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
+        assert!(feed_session(&mut session, &mut clock, 5, "\x1b[1;39r").is_none());
+        assert!(apply_owner_grid(&mut session, 90, 30).is_some());
+        assert_eq!(session.grid, (90, 30));
+        // ...and the program leaves via its own alt-exit + quiet.
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049l").is_none());
+        let exit = feed_session(&mut session, &mut clock, 350, "\r\n").expect("quiet exit");
+        assert_eq!(exit.to, TuiMode::Canonical);
+        // Back in canonical mode the minimum boundary over set S resumes.
+        let resumed = apply_min_grid(&mut session);
+        assert_eq!(resumed, Some(GridEpoch { offset: 0, cols: 113, rows: 39 }));
+        assert_eq!(session.grid, (113, 39));
+    }
+
+    #[test]
     fn grid_policy_holds_the_grid_through_a_bare_alt_cycle() {
         let mut session = test_session("s1", "p1", "C:\\repo");
         let mut clock = Instant::now();

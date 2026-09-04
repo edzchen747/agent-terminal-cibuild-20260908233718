@@ -563,6 +563,30 @@ mod tests {
     }
 
     #[test]
+    fn session_input_carries_an_optional_viewport_size() {
+        let with_size: ClientMessage = serde_json::from_str(
+            r#"{"type":"session.input","sessionId":"s1","data":"q","cols":113,"rows":39}"#,
+        )
+        .expect("input with a viewport size");
+        assert!(matches!(
+            with_size,
+            ClientMessage::SessionInput { cols: Some(113), rows: Some(39), .. }
+        ));
+        assert_eq!(with_size.request_id(), None);
+
+        // Legacy clients send no size: the fields decode as None and the
+        // host keeps the previously announced viewport.
+        let legacy: ClientMessage = serde_json::from_str(
+            r#"{"type":"session.input","sessionId":"s1","data":"q"}"#,
+        )
+        .expect("input without a viewport size");
+        assert!(matches!(
+            legacy,
+            ClientMessage::SessionInput { cols: None, rows: None, .. }
+        ));
+    }
+
+    #[test]
     fn auth_message_accepts_an_optional_display_name() {
         let with_name: ClientMessage = serde_json::from_str(
             r#"{"type":"auth","requestId":"r1","deviceId":"d1","deviceToken":"t1","name":"Pixel 9"}"#,

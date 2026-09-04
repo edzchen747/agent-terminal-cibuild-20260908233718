@@ -953,6 +953,33 @@ mod tests {
     }
 
     #[test]
+    fn clear_marker_is_reported_inside_a_fullscreen_period() {
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        at += Duration::from_millis(10);
+        assert!(clf.feed("\x1b[?1049h", at, 30).is_some());
+        assert_eq!(clf.take_chunk_clear(), None);
+        // A mid-TUI ED2 is not a mode event (no double transition), but
+        // it is still a history boundary the host may truncate at.
+        at += Duration::from_millis(5);
+        assert!(clf.feed("\x1b[H\x1b[2J", at, 30).is_none());
+        assert_eq!(clf.take_chunk_clear(), Some(3));
+    }
+
+    #[test]
+    fn a_feed_without_a_clear_consumes_the_marker() {
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        at += Duration::from_millis(10);
+        assert!(clf.feed("\x1b[2J", at, 30).is_none());
+        assert_eq!(clf.take_chunk_clear(), Some(0));
+        // A clear from an earlier chunk must not leak into the next one.
+        at += Duration::from_millis(5);
+        assert!(clf.feed("plain text", at, 30).is_none());
+        assert_eq!(clf.take_chunk_clear(), None);
+    }
+
+    #[test]
     fn clear_then_command_output_stays_canonical() {
         // `clear; ls`: ED2 + home, then plain newline-terminated
         // command output - no cursor hide, no row addressing. Must
