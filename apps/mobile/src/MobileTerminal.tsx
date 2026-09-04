@@ -19,6 +19,14 @@ import "@xterm/xterm/css/xterm.css";
 
 interface Props { connection: HostConnection; session: TerminalSession; active: boolean; fontWidthScale: number; scheme: TerminalScheme; }
 
+// Mobile scroll sensitivity: the touch-drag handler synthesizes a pixel-unit
+// wheel event whose deltaY is the raw per-event finger travel, so scrolling
+// is 1:1 with finger movement. Multiply by this factor before dispatch so the
+// terminal scrolls further per unit of travel. Raise for a snappier scroll,
+// lower below 1 for a slower one. Mobile-only: the desktop pane never
+// synthesizes these events.
+const MOBILE_SCROLL_SENSITIVITY = 5;
+
 // Start fetching the terminal font faces as soon as the app loads so xterm
 // never measures with device fallback glyphs (see fonts.test.mjs).
 void preloadTerminalFonts();
@@ -669,7 +677,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
         bubbles: true,
         cancelable: true,
         deltaMode: 0,
-        deltaY
+        deltaY: deltaY * MOBILE_SCROLL_SENSITIVITY
       }));
     };
     const handleTouchEnd = () => {
