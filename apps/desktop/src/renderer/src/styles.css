@@ -111,11 +111,15 @@ button { color: inherit; }
 .terminal-surface.is-split { box-shadow: inset 0 0 0 1px #2a313c; }
 .terminal-surface.is-split.is-active { z-index: 2; box-shadow: inset 0 0 0 3px #65cdb8; }
 .terminal-surface.is-split.is-inactive { z-index: 1; box-shadow: inset 0 0 0 1px #3c4653; }
-/* The PTY grid follows focus: the focused desktop window owns the grid (its
-   fitted size), and every other client reflows to the announced grid. */
-.terminal-pane { position: absolute; inset: 0; padding: 10px 13px 4px; visibility: hidden; }
+/* The PTY grid is the minimum boundary over the clients viewing the
+   session: this pane renders the host grid exactly and letterboxes the
+   surplus - center the xterm element (the cell grid) inside the pane and
+   paint the surplus in the terminal background so it reads as a frame. */
+.terminal-pane { position: absolute; inset: 0; padding: 10px 13px 4px; display: grid; place-items: center; background: #0C0C0C; visibility: hidden; }
 .terminal-pane.is-visible { visibility: visible; }
 .terminal-pane .xterm { height: 100%; }
+.terminal-pane .xterm .xterm-viewport,
+.terminal-pane .xterm .xterm-scrollable-element { display: grid; place-items: center; background: transparent; }
 .terminal-pane .xterm-viewport { scrollbar-width: thin; scrollbar-color: #323846 transparent; }
 .split-mini-toolbar { max-width: min(280px,calc(100% - 18px)); height: 29px; position: absolute; z-index: 8; right: 9px; bottom: 9px; display: flex; align-items: center; gap: 7px; padding: 0 4px 0 9px; border: 1px solid #3b4653; border-radius: 8px; background: #171c24ed; box-shadow: 0 7px 24px #0009; color: #9da6b4; font-size: 10.5px; backdrop-filter: blur(8px); }
 .split-mini-toolbar > svg { width: 13px; flex: none; color: #75cdbc; }

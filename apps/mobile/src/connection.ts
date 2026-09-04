@@ -1,7 +1,7 @@
 import { Preferences } from "@capacitor/preferences";
 import { Capacitor } from "@capacitor/core";
 import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage, TuiMode } from "@agentterminal/protocol";
-import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN } from "@agentterminal/protocol";
+import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, VIEWPORT_KEEPALIVE_INTERVAL_MS } from "@agentterminal/protocol";
 import { deviceName } from "./device";
 import { canAttemptConnection, heartbeatActive, heartbeatCatchUpNeeded, heartbeatIntervalMs, nextReconnectDelay, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS } from "./connectionPolicy";
 import { EmbeddedNodeEngine, type EmbeddedNodeState } from "./embedded-engine";
@@ -61,6 +61,7 @@ export class HostConnection {
   private authenticated = false;
   private heartbeatTimer?: number;
   private heartbeatInFlight = false;
+  private viewportKeepaliveTimer?: number;
   private screenAwake = true;
   private deviceSleeping = false;
   private lastHeartbeatAt = 0;
@@ -686,12 +687,34 @@ export class HostConnection {
     return () => callbacks.delete(callback as (value: never) => void);
   }
 
+  /**
+   * Viewport set-membership keepalive: a bare `ping` every second while a
+   * terminal page is attached keeps the client in the host's viewport set S
+   * (the minimum-boundary grid). The host evicts a networked client that
+   * goes silent for VIEWPORT_WATCHDOG_TIMEOUT_MS, so ticks skip while the
+   * app is hidden and the phone drops out of S on backgrounding. Deliberately
+   * separate from the snapshot.request presence heartbeat.
+   */
+  startViewportKeepalive(): void {
+    this.stopViewportKeepalive();
+    this.viewportKeepaliveTimer = window.setInterval(() => {
+      if (!this.isConnected() || document.hidden) return;
+      this.send({ type: "ping" });
+    }, VIEWPORT_KEEPALIVE_INTERVAL_MS);
+  }
+
+  stopViewportKeepalive(): void {
+    if (this.viewportKeepaliveTimer !== undefined) window.clearInterval(this.viewportKeepaliveTimer);
+    this.viewportKeepaliveTimer = undefined;
+  }
+
   close(): void {
     this.closed = true;
     this.autoReconnect = false;
     this.clearReconnectTimer();
     this.clearReconnectTimeout();
     this.stopHeartbeat();
+    this.stopViewportKeepalive();
     this.authenticated = false;
     this.socketGeneration += 1;
     const socket = this.socket;

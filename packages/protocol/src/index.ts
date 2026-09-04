@@ -16,13 +16,31 @@ export const MAX_PROJECT_NAME_LENGTH = 100 as const;
 export const MOBILE_HEARTBEAT_INTERVAL_MS = 60_000 as const;
 
 /**
- * The PTY follows focus: whichever client is actively using the session owns
- * the terminal grid (desktop window size while the desktop is focused, mobile
- * dimensions while the phone is), and every emulator reflows to the announced
- * grid. History survives the transitions because the host journals each grid
- * change at its exact stream offset (`session.buffer.segments` + live
- * `session.grid` messages), so a replay reproduces the same resize sequence
- * the live clients applied.
+ * How often a remote terminal client sends a bare `ping` while a session
+ * page is attached and the app is visible. The host treats any message as
+ * viewport liveness: a networked client stays in a session's viewport set S
+ * while it keeps pinging, and drops out after `VIEWPORT_WATCHDOG_TIMEOUT_MS`.
+ * Keep in sync with VIEWPORT_KEEPALIVE_INTERVAL_MS in core.rs.
+ */
+export const VIEWPORT_KEEPALIVE_INTERVAL_MS = 1_000 as const;
+/**
+ * A networked client still counts as viewing a session while its last
+ * message is within this window; then its viewport entry is evicted and the
+ * session's minimum boundary recomputed (a backgrounded phone releases the
+ * grid back to the remaining clients). In-process desktop panes never expire.
+ * Keep in sync with VIEWPORT_WATCHDOG_TIMEOUT_MS in core.rs.
+ */
+export const VIEWPORT_WATCHDOG_TIMEOUT_MS = 2_000 as const;
+
+/**
+ * The PTY grid is the deterministic minimum boundary over the clients
+ * currently viewing the session: W_pty = min(W_i), H_pty = min(H_i). No
+ * client is ever narrower than the PTY, so every emulator renders the host
+ * grid exactly and letterboxes the surplus; the raw journal replays 1:1 with
+ * no re-wrapping and no cursor drift. Grid changes between the previous
+ * and the current boundary are journaled at their exact stream offset
+ * (`session.buffer.segments` + live `session.grid` messages), so a replay
+ * reproduces the same resize sequence the live clients applied.
  */
 /** xterm scrollback on every client; the host journal cap is the same idea in bytes. */
 export const TERMINAL_SCROLLBACK_LINES = 50_000 as const;
@@ -34,15 +52,20 @@ export type TerminalModifier = "ctrl" | "alt" | "shift";
  * How a running foreground program wants to own the terminal grid. The host
  * classifies the PTY stream into one of these modes and tells every client:
  *
- * - canonical: the PTY stays at its snapshot size; each client reflows the
- *   journal at its own size and never resizes the PTY for this program.
- * - inline: the program paints a bounded region in place. The PTY follows
- *   the focused client (resize knob: resize), and its output intentionally
- *   stays in the scrollback, so clients reflow history normally.
- * - fullscreen: the program owns the whole grid. The PTY follows the
- *   focused client; output is history-isolated (a synthetic alt-screen
- *   pair is journaled when the program does not use one itself) so TUI
- *   frames never bleed into the shell history.
+ * - canonical: the shell owns the line-editor grid. The minimum-boundary
+ *   sizing rules apply: the PTY tracks min(W_i), min(H_i) over S and every
+ *   client renders it exactly.
+ * - inline: the program paints a bounded region in place. The minimum
+ *   boundary still applies while the mode is classified; per-client TUI
+ *   ownership (the focused client asserting its own grid) returns in the
+ *   TUI phase.
+ * - fullscreen: the program owns the whole grid. Output is
+ *   history-isolated (a synthetic alt-screen pair is journaled when the
+ *   program does not use one itself) so TUI frames never bleed into the
+ *   shell history.
+ *
+ * The three modes are still classified and broadcast on the stream; clients
+ * no longer use the mode for sizing decisions.
  */
 export type TuiMode = "canonical" | "inline" | "fullscreen";
 export const TERMINAL_TUI_MODES: readonly TuiMode[] = ["canonical", "inline", "fullscreen"];
@@ -231,10 +254,11 @@ export interface TerminalSession {
   exitCode?: number;
   /**
    * The host's TUI classification of the running foreground program
-   * (default canonical). Canonical keeps the PTY frozen at its snapshot
-   * grid and lets each client reflow the journal to its own size; inline
-   * and fullscreen make the PTY follow the focused client, with
-   * fullscreen additionally isolating TUI frames from the scrollback.
+   * (default canonical). The modes determine how a program may draw its
+   * frames (strict cell grid, alt-screen isolation), but they do not change
+   * sizing anymore: the PTY grid is the minimum boundary over the viewing
+   * clients in every mode. Per-client TUI ownership (the focused client
+   * overriding the minimum) returns in the TUI phase.
    */
   tuiMode?: TuiMode;
 }
@@ -290,8 +314,9 @@ export type ClientMessage =
   | { type: "session.close"; requestId: string; sessionId: string }
   | { type: "session.attach"; requestId: string; sessionId: string; cols: number; rows: number }
   | { type: "session.detach"; requestId: string; sessionId: string }
-  | { type: "session.input"; sessionId: string; data: string }
-  | { type: "session.resize"; sessionId: string; cols: number; rows: number; force?: boolean }
+  | { type: "session.input"; sessionId: string; data: string; cols?: number; rows?: number }
+  | { type: "session.resize"; sessionId: string; cols: number; rows: number }
+  | { type: "ping" }
   | { type: "debug.diagnostics"; message: string }
   | { type: "shell.default"; requestId: string; shellId: string };
 

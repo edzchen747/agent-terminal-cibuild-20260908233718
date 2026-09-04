@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, type ClientMessage } from "./index.js";
+import { LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, type ClientMessage } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -328,4 +328,23 @@ test("the terminal ANSI theme bright variants are brighter than their normal pai
       `${brightKey} (${bright}) must be brighter than ${normalKey} (${normal})`
     );
   }
+});
+
+test("the viewport keepalive window mirrors the host constants", () => {
+  assert.equal(VIEWPORT_KEEPALIVE_INTERVAL_MS, 1_000);
+  // The host evicts a networked client after two missed intervals.
+  assert.equal(VIEWPORT_WATCHDOG_TIMEOUT_MS, 2_000);
+});
+
+test("a bare ping is a valid client message with nothing else required", () => {
+  const message = decodeClientMessage({ type: "ping" });
+  assert.equal(message.type, "ping");
+  assert.equal(JSON.stringify(message), JSON.stringify({ type: "ping" }));
+});
+
+test("session.resize carries no force flag anymore", () => {
+  const message: ClientMessage = { type: "session.resize", sessionId: "s1", cols: 120, rows: 30 };
+  const roundTrip = decodeClientMessage(encodeMessage(message));
+  assert.deepEqual(roundTrip, message);
+  assert.equal("force" in roundTrip, false);
 });

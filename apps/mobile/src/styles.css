@@ -128,9 +128,16 @@ button { color: inherit; }
 .terminal-view { background: #080b0f; }
 .mobile-terminal-shell { position: relative; flex: 1; min-height: 0; display: grid; grid-template-rows: 1fr auto; grid-template-columns: minmax(0, 1fr); overflow: hidden; }
 .mobile-terminal-input { position: absolute; top: 0; left: 0; width: 1px; height: 1px; padding: 0; border: 0; opacity: 0; pointer-events: none; font-size: 16px; }
-.mobile-terminal { min-height: 0; padding: 8px 0 4px 8px; overflow: hidden; }
+/* The PTY grid is the minimum boundary over the clients viewing the session:
+   this phone renders the host grid exactly and letterboxes the surplus.
+   Center the cell grid inside the shell (the wrapper width mirrors the
+   squish scale) and paint the surplus in the terminal background so it reads
+   as a frame rather than dead layout. */
+.mobile-terminal { min-height: 0; padding: 8px 0 4px 8px; overflow: hidden; display: grid; place-items: center; background: #0C0C0C; }
 .mobile-terminal .xterm, .mobile-terminal .xterm-scrollable-element { width: 100%; min-width: 0; }
 .mobile-terminal .xterm { height: 100%; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
+.mobile-terminal .xterm-viewport,
+.mobile-terminal .xterm-scrollable-element { display: grid; place-items: center; background: transparent; }
 .mobile-terminal .xterm-viewport, .mobile-terminal .xterm-screen { touch-action: none; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
 .mobile-terminal .xterm-viewport { overflow: hidden !important; }
 .mobile-terminal .xterm .xterm-accessibility:not(.debug) { pointer-events: auto; }

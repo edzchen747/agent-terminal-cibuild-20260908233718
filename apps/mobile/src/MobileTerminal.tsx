@@ -1,13 +1,14 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { applyTerminalModifiers, createRequestId, findHttpLinks, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCROLLBACK_LINES, type TuiMode } from "@agentterminal/protocol";
+import { applyTerminalModifiers, createRequestId, findHttpLinks, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCROLLBACK_LINES } from "@agentterminal/protocol";
 import type { TerminalModifier, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
 import { classifyGestureAxis, type GestureAxis } from "./gesture";
 import { claimNativeInput, isCursorPositionReport, mobileTerminalKeydownInput, nativeTerminalInput } from "./terminalInput";
 import type { TimedTerminalInput } from "./terminalInput";
-import { shouldSendResize } from "./terminalResize";
+import { announcedViewport, shouldSendResize } from "./terminalResize";
+import { keyboardOpenByLayout, keyboardLayoutReference, keyboardOpenState, type KeyboardLayoutReference } from "./terminalKeyboard";
 import { TERMINAL_FONT_SIZE, calibratedSquishFontSize, squishAdvanceRatio, squishInverse as squishInverseValue, squishLineHeight as squishLineHeightValue, squishWidthPercent } from "./terminalSquish";
 import { TERMINAL_FONT_FAMILY, preloadTerminalFonts } from "./terminalFonts";
 import { activateTerminalCursor, deactivateTerminalCursor } from "./terminalCursor";
@@ -79,8 +80,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
   const fontWidthScaleRef = useRef(fontWidthScale);
   fontWidthScaleRef.current = fontWidthScale;
   const a11yAdvanceRatioRef = useRef<number | undefined>(undefined);
-  const resizeRef = useRef<(force?: boolean) => void>(() => undefined);
+  const resizeRef = useRef<() => void>(() => undefined);
   const focusInputRef = useRef<() => void>(() => undefined);
+  // Attach/keepalive owner: the view-activity gate below calls into the
+  // session-join machinery defined inside the terminal effect.
+  const startAttachmentRef = useRef<() => void>(() => undefined);
   const keyPadRef = useRef<ReturnType<typeof createUtilityKeyPad> | null>(null);
   // The utility-key hold boundary: the default until the Android system's
   // own long-press timeout arrives; the pad consults it on every release,
@@ -106,10 +110,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
 
   const sendKeyData = (data: string) => {
     if (!data || !activeRef.current) return;
-    // The mobile terminal owns the PTY grid while it is the focused client,
-    // so reassert its dimensions with the key (see also sendInput).
+    // The grid is the minimum boundary over the viewing clients; typing
+    // never asserts dimensions (that would only seize the grid).
     focusInputRef.current();
-    resizeRef.current(true);
     connection.send({ type: "session.input", sessionId: session.id, data });
   };
 
@@ -184,7 +187,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       }
     });
     if (activeRef.current) focusInput();
-    try { fit.fit(); } catch { /* not laid out yet */ }
+    // No local fit: the emulator grid is the host's (the minimum boundary
+    // over the viewing clients), not the container's.
 
     // The accessibility layer's rows must paint and anchor at the same advance
     // the squished canvas cells have. Rather than trusting the font metrics to
@@ -195,6 +199,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     // DOM advance at the base font size. The ratio reconciles the two so the
     // squished font size lands every accessibility character on its canvas
     // cell, whatever face or rounding the WebView applies to the layer.
+    // cols is always the ANNOUNCED host grid here - never a local fit - so
+    // the squish tracks the columns actually rendered.
     const calibrateAccessibilityMetrics = () => {
       const a11y = hostElement.querySelector<HTMLElement>(".xterm-accessibility");
       const tree = hostElement.querySelector<HTMLElement>(".xterm-accessibility-tree");
@@ -220,56 +226,62 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     };
     calibrateAccessibilityMetrics();
 
-    // Fit-based resize: only the focused (active) terminal page asserts its
-    // dimensions - that is what switches the host PTY grid to the mobile
-    // layout. An unfocused page follows the grid the host announces instead.
+    // Announce, don't assert: the container's fitted size is the announced
+    // viewport (W_m, H_m); the host takes the minimum over every client and
+    // the xterm grid is only ever resized from host announcements. The
+    // software keyboard is an ordinary hardware inset: when it opens the
+    // container shrinks, the announcement follows, and the host's minimum
+    // boundary re-flows every client. While it is open the announced height
+    // is one row short: the keyboard inset overlaps the measured fit's last
+    // row, and a one-row ledger keeps the last visible line clear of the
+    // keyboard.
+    let layoutReference: KeyboardLayoutReference | null = null;
+    const keyboardOpen = () => {
+      if (keyboardOpenState(window.innerHeight, window.visualViewport?.height ?? window.innerHeight)) {
+        return true;
+      }
+      const rect = hostElement.getBoundingClientRect();
+      const current = { width: rect.width, height: rect.height };
+      if (keyboardOpenByLayout(current, layoutReference)) {
+        return true;
+      }
+      // Keyboard closed: track the tallest stable layout so a future open is
+      // measured against the real keyboard-free height.
+      layoutReference = keyboardLayoutReference(current, layoutReference);
+      return false;
+    };
+    const proposeGrid = () => {
+      try {
+        const dims = fit.proposeDimensions();
+        if (dims && dims.cols > 0 && dims.rows > 0) return { cols: dims.cols, rows: dims.rows };
+      } catch {
+        // The WebView can report an intermediate zero-sized layout while the keyboard opens.
+      }
+      return null;
+    };
+    const announcedGrid = () => {
+      const dims = proposeGrid();
+      if (!dims) return null;
+      return announcedViewport(dims, keyboardOpen());
+    };
     let resizeFrame: number | undefined;
-    let forceResizePending = false;
     let lastSize = { cols: 0, rows: 0 };
     const resize = (force = false) => {
-      if (!activeRef.current) {
-        if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
-        resizeFrame = undefined;
-        forceResizePending = false;
-        return;
-      }
-      if (force) {
-        if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
-        resizeFrame = undefined;
-        forceResizePending = false;
-        try {
-          fit.fit();
-          calibrateAccessibilityMetrics();
-          if (shouldSendResize(true, terminal.cols, terminal.rows, lastSize)) {
-            lastSize = { cols: terminal.cols, rows: terminal.rows };
-            syncDebug(`resize session=${session.id} cols=${terminal.cols} rows=${terminal.rows} force=true`);
-            connection.send({ type: "session.resize", sessionId: session.id, cols: terminal.cols, rows: terminal.rows, force: true });
-          }
-        } catch {
-          // The WebView can report an intermediate zero-sized layout while the keyboard opens.
-        }
-        return;
-      }
-      forceResizePending ||= force;
+      if (!activeRef.current) return;
       if (resizeFrame !== undefined) return;
       resizeFrame = requestAnimationFrame(() => {
         resizeFrame = undefined;
-        if (!activeRef.current) {
-          forceResizePending = false;
-          return;
-        }
-        const shouldForce = forceResizePending;
-        forceResizePending = false;
-        try {
-          fit.fit();
-          calibrateAccessibilityMetrics();
-          if (shouldSendResize(shouldForce, terminal.cols, terminal.rows, lastSize)) {
-            lastSize = { cols: terminal.cols, rows: terminal.rows };
-            syncDebug(`resize session=${session.id} cols=${terminal.cols} rows=${terminal.rows} force=${shouldForce}`);
-            connection.send({ type: "session.resize", sessionId: session.id, cols: terminal.cols, rows: terminal.rows, force: shouldForce });
-          }
-        } catch {
-          // The WebView can report an intermediate zero-sized layout while the keyboard opens.
+        if (!activeRef.current) return;
+        const dims = announcedGrid();
+        if (!dims) return;
+        // A tap is an interaction: force the announce so the host applies
+        // this phone's size to the PTY grid in a TUI period even when the
+        // terminal's own size did not change. Unforced announces (layout
+        // observers) send only on a real change.
+        if (force || shouldSendResize(dims.cols, dims.rows, lastSize)) {
+          lastSize = { cols: dims.cols, rows: dims.rows };
+          syncDebug(`resize session=${session.id} cols=${dims.cols} rows=${dims.rows}`);
+          connection.send({ type: "session.resize", sessionId: session.id, cols: dims.cols, rows: dims.rows });
         }
       });
     };
@@ -309,14 +321,14 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     let lastNativeBeforeInput: { data: string; at: number } | undefined;
     const sendInput = (data: string) => {
       if (!data || !activeRef.current) return;
-      // Typing means the phone is the focused client: reassert the mobile
-      // dimensions so the host PTY grid switches to the mobile layout before
-      // the input lands. A plain resize would send nothing while the local
-      // fit is unchanged, and the grid should be ours while we type.
-      resize(true);
+      // Every input carries the sender's viewport: in a TUI period the
+      // client that is typing owns the grid and the host applies it at
+      // once (canonical mode keeps the minimum boundary - typing never
+      // resizes the shell).
+      const dims = announcedGrid();
       const result = keyPadRef.current!.consume(data);
       syncKeyPad();
-      if (result.data) connection.send({ type: "session.input", sessionId: session.id, data: result.data });
+      if (result.data) connection.send({ type: "session.input", sessionId: session.id, data: result.data, cols: dims?.cols, rows: dims?.rows });
     };
     const flushPendingInput = () => {
       nativeInputTimer = undefined;
@@ -392,7 +404,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         return;
       }
       if (activeRef.current) {
-        resize(true);
         connection.send({ type: "session.input", sessionId: session.id, data });
       }
     });
@@ -460,6 +471,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         // every grid epoch even when stream offsets have advanced past it.
         if (item.cols !== terminal.cols || item.rows !== terminal.rows) {
           terminal.resize(item.cols, item.rows);
+          calibrateAccessibilityMetrics();
           syncDebug(`grid session=${session.id} cols=${item.cols} rows=${item.rows} off=${item.offset} reflow`);
         } else {
           syncDebug(`grid session=${session.id} cols=${item.cols} rows=${item.rows} off=${item.offset} same-grid skip`);
@@ -490,18 +502,17 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       }
       applyItem({ kind: "grid", cols: event.cols, rows: event.rows, offset: event.offset });
     });
-    // TUI mode from the host: while the classifier reports inline or
-    // fullscreen, this data block is a strict cell grid - reflow
-    // heuristics are bypassed for it (the host journals a synthetic
-    // alt-screen pair for fullscreen so xterm keeps the TUI isolated from
-    // the primary scrollback) and the TUI repaints natively on SIGWINCH.
-    let tuiMode: TuiMode = "canonical";
+    // TUI mode from the host: classification only - it no longer changes
+    // the sizing or render path (the client follows the host grid in every
+    // mode). The journaled alt-screen isolation still applies per segment.
     const modeChange = connection.on("mode", (event) => {
       if (event.sessionId !== session.id) return;
-      tuiMode = event.mode;
       syncDebug(`mode session=${session.id} mode=${event.mode} off=${event.offset}`);
     });
     const connected = connection.on("connected", () => {
+      // Reconnects re-attach only while the terminal page is the active
+      // view: a background page must stay out of the host's viewport set.
+      if (!activeRef.current) return;
       syncDebug(`connected session=${session.id} -> re-attach`);
       startAttachment();
     });
@@ -703,8 +714,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         // emulator's current one; snapshot epochs already contained in the
         // replayed segments result in a same-grid no-op, stale ones cannot
         // corrupt anything because the call is idempotent per grid state.
+        // cols is the announced host grid, so the accessibility squish is
+        // recalibrated against the columns actually rendered.
         if (item.cols !== terminal.cols || item.rows !== terminal.rows) {
           terminal.resize(item.cols, item.rows);
+          calibrateAccessibilityMetrics();
           syncDebug(`pend grid session=${session.id} cols=${item.cols} rows=${item.rows} off=${item.offset} reflow`);
         }
         replayPendingOutput(index + 1);
@@ -732,13 +746,14 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       replayingSessionBuffer = false;
       pendingOutput.length = 0;
       appliedUpTo = 0;
-      syncDebug(`attach send session=${session.id} cols=${terminal.cols} rows=${terminal.rows}`);
-      attachmentPromise = connection.request({
+      const attachDims = announcedGrid() ?? { cols: terminal.cols, rows: terminal.rows };
+      syncDebug(`attach send session=${session.id} cols=${attachDims.cols} rows=${attachDims.rows}`);
+      connection.request({
         type: "session.attach",
         requestId: createRequestId(),
         sessionId: session.id,
-        cols: terminal.cols,
-        rows: terminal.rows
+        cols: attachDims.cols,
+        rows: attachDims.rows
       }).then((message) => {
         attachmentPromise = undefined;
         if (disposed) return;
@@ -758,14 +773,17 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
           if (segment === undefined) {
             replayingSessionBuffer = false;
             appliedUpTo = Math.max(appliedUpTo, message.endOffset);
+            calibrateAccessibilityMetrics();
             syncDebug(`replay done session=${session.id} upTo=${appliedUpTo} pending=${pendingOutput.length}`);
             replayPendingOutput();
             return;
           }
-          // Outside a TUI the session grid is frozen and the emulator parses
-          // the whole stream at its OWN fitted grid (viewport mode): segment
-          // grids are metadata only. During a TUI the live grid notices
-          // re-anchor the emulator to the session grid.
+          // Under minimum-boundary sizing every segment renders at its
+          // recorded grid: the journal replays 1:1, never re-wrapped at
+          // this client's own size.
+          if (segment.cols !== terminal.cols || segment.rows !== terminal.rows) {
+            terminal.resize(segment.cols, segment.rows);
+          }
           terminal.write(segment.data, () => writeNext(index + 1));
         };
         writeNext();
@@ -775,7 +793,17 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
         if (!disposed) terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
       });
     };
-    startAttachment();
+    // Attachment and viewport keepalive follow the visible view (see the
+    // active-gating effect below), not the mount lifecycle: the pager keeps
+    // this page mounted after the user leaves the terminal, and an attached,
+    // pinging page would keep the phone in the host's viewport set S with
+    // stale dimensions - the PTY would never un-clamp after an exit.
+    // The machine is created inside the font-preload gate, so hand the
+    // owner over AND start when the view is already active: the gating
+    // effect below can run before the fonts resolve (its ref is still the
+    // initial no-op), which would otherwise leave the terminal blank.
+    startAttachmentRef.current = startAttachment;
+    if (activeRef.current) startAttachment();
     const statsTimer = window.setInterval(() => {
       if (disposed || !terminalRef.current) return;
       const buffer = terminal.buffer.active;
@@ -783,9 +811,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     }, 5_000);
       cleanup = () => {
       disposed = true;
+      startAttachmentRef.current = () => undefined;
       void (attachmentPromise ?? Promise.resolve())
         .finally(() => connection.send({ type: "session.detach", requestId: createRequestId(), sessionId: session.id }))
         .catch(() => undefined);
+      connection.stopViewportKeepalive();
       observer.disconnect();
       if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
       window.removeEventListener("pointerdown", handlePointerActivity, true);
@@ -812,12 +842,41 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     };
   }, [connection, session.id]);
 
+  // Set S membership follows the visible view. The pager keeps this page
+  // mounted (for swipe-back) after the user leaves the terminal view, so the
+  // attach + viewport keepalive run only while the terminal page is the
+  // active page: leaving detaches (or the keepalive would keep the phone in
+  // the host's viewport set S with stale dimensions and the PTY would never
+  // reset), and returning re-attaches and replays the journal (§4.2 rejoin).
+  // Foregrounding the app also re-attaches: the host's 2 s watchdog evicts
+  // the viewport while the app is hidden, and a bare keepalive restart never
+  // re-registers it.
+  useEffect(() => {
+    if (!active) {
+      connection.stopViewportKeepalive();
+      connection.send({ type: "session.detach", requestId: createRequestId(), sessionId: session.id });
+      return;
+    }
+    startAttachmentRef.current();
+    connection.startViewportKeepalive();
+    const handleVisibility = () => {
+      if (document.hidden) {
+        connection.stopViewportKeepalive();
+      } else {
+        connection.startViewportKeepalive();
+        startAttachmentRef.current();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => document.removeEventListener("visibilitychange", handleVisibility);
+  }, [active, connection, session.id]);
+
   useLayoutEffect(() => {
     // Adjusting the character-width slider changes this value on every tick
-    // while the settings sheet is up. Refit so the squished columns stay
-    // correct, but never steal focus from the sheet: refocusing the IME
+    // while the settings sheet is up. Re-announce so the squished columns
+    // stay correct, but never steal focus from the sheet: refocusing the IME
     // field would pop Android's keyboard over the overlay.
-    if (activeRef.current) resizeRef.current(true);
+    if (activeRef.current) resizeRef.current();
   }, [fontWidthScale]);
 
   useLayoutEffect(() => {
@@ -843,7 +902,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     const focusFrame = window.requestAnimationFrame(() => {
       if (activeRef.current) focusInputRef.current();
     });
-    resizeRef.current(true);
+    resizeRef.current();
     return () => window.cancelAnimationFrame(focusFrame);
   }, [active]);
 

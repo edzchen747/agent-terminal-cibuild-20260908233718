@@ -42,11 +42,12 @@ use crate::{
     window_clients::WindowClients,
 };
 
-/// The PTY is spawned at this grid, then follows focus: whichever client
-/// actively uses the session (desktop window focused, or the phone) resizes
-/// the PTY to its own dimensions. Every change is journaled as a grid epoch
-/// (see `GridEpoch`), so a later replay reflows history exactly as live
-/// clients did.
+/// The PTY is spawned at this grid, then tracks the minimum boundary over
+/// the clients currently viewing the session: W_pty = min(W_i), H_pty =
+/// min(H_i) over S. Every client is at least as wide and as tall as the PTY,
+/// so each renders the host grid exactly and letterboxes the surplus. Every
+/// change is journaled as a grid epoch (see `GridEpoch`), so a later replay
+/// replays the raw stream 1:1 with no re-wrapping.
 const SESSION_DEFAULT_COLS: u16 = 120;
 const SESSION_DEFAULT_ROWS: u16 = 30;
 /// Append-only raw PTY journal per session (the `session.buffer` replay
@@ -75,6 +76,20 @@ const PRESENCE_WINDOW_MS: i64 = 2 * MOBILE_HEARTBEAT_INTERVAL_MS;
 const PRESENCE_REFRESH_INTERVAL_MS: u64 = (MOBILE_HEARTBEAT_INTERVAL_MS / 2) as u64;
 /// How often the connectivity monitor re-probes for internet access.
 const CONNECTIVITY_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Remote clients join a session's viewport set while they keep sending
+/// anything within a small multiple of this interval (mirrors
+/// VIEWPORT_KEEPALIVE_INTERVAL_MS in packages/protocol/src/index.ts). The
+/// heartbeat doubles as the set-membership signal: a bare `ping` bumps
+/// `last_seen` and nothing else.
+const VIEWPORT_KEEPALIVE_INTERVAL_MS: u64 = 1_000;
+/// A networked viewport whose last message is older than this is evicted from
+/// S and the session's minimum boundary recomputed. Deliberately separate
+/// from MOBILE_HEARTBEAT_INTERVAL_MS / PRESENCE_WINDOW_MS: sizing membership
+/// is a 2-second concern, the green connectivity dot a 2-minute one.
+const VIEWPORT_WATCHDOG_TIMEOUT_MS: u64 = 2_000;
+/// Sweep cadence: half the keepalive interval, so a client that stops
+/// pinging is evicted promptly after its watchdog window lapses.
+const VIEWPORT_WATCHDOG_TICK_MS: u64 = VIEWPORT_KEEPALIVE_INTERVAL_MS / 2;
 
 // ---------------------------------------------------------------------------
 // Terminal sync diagnostics (for debugging history parity between devices).
@@ -199,8 +214,13 @@ struct ManagedSession {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
-    /// Current PTY grid (cols, rows): the focused client's dimensions.
+    /// Current PTY grid (cols, rows): the minimum boundary over the client
+    /// set S currently viewing this session.
     grid: (u16, u16),
+    /// Every client currently displaying this session (the spec's set S),
+    /// keyed by its stable identity so a reconnect on a new socket rebinds in
+    /// place.
+    viewports: HashMap<TerminalController, ClientViewport>,
     /// Grid history in stream order. Always starts with the spawn grid at
     /// offset 0; the last entry is the current grid.
     grid_epochs: Vec<GridEpoch>,
@@ -228,46 +248,31 @@ struct ManagedSession {
     /// receive a SIGWINCH mid-shell-state. Cleared when paint evidence
     /// fires the deferred resize, or when the mode exits to canonical.
     deferred_tui_resize: bool,
-    /// The viewport dimensions the focused client most recently announced
-    /// (recorded even while the PTY is frozen). Applied to the PTY on the
-    /// next alternate-screen entry so a freshly launched TUI opens at the
-    /// focused client's size.
+    /// The most recent grid target: the minimum boundary over set S in
+    /// canonical mode, or the interacting client's viewport in a TUI
+    /// period. Recorded even while the PTY is frozen, and applied to the
+    /// PTY on the next alternate-screen entry so a freshly launched TUI
+    /// opens at that boundary.
     requested_viewport: Option<(u16, u16)>,
     control_tail: String,
     cursor_query_tail: String,
     pending_cursor_reports: usize,
     has_run_command: bool,
-    terminal_controller: Option<TerminalController>,
-    /// The client that last produced user input, with its monotonic
-    /// sequence number. Once ANY client has typed, that client "owns"
-    /// the PTY grid: resize asserts and re-attaches from the OTHER
-    /// client are ignored, so a passive observer can never yank the
-    /// shared grid away from the active device mid-command. Before the
-    /// first input, last-writer-wins (a fresh attach may take the
-    /// grid).
-    last_input: Option<(TerminalController, u64)>,
-    /// Monotonic per-session counter ordering `last_input` (not
-    /// wall-clock).
-    input_seq: u64,
 }
 
-impl ManagedSession {
-    /// Grid-ownership precedence. Until any client has typed, any
-    /// attach/resize may take the grid (last-writer-wins - a fresh
-    /// viewer is the focused client). Once input has happened, the
-    /// last input owner keeps the grid: passive clients' auto-asserts
-    /// (a pane re-attaching after a grid epoch, a pane's automatic
-    /// assert on a TUI mode flip) must not yank the shared PTY away
-    /// from the active device mid-command.
-    fn can_apply_grid_from(&self, client: &TerminalController) -> bool {
-        match &self.last_input {
-            None => true,
-            Some((input_owner, _)) => input_owner == client,
-        }
-    }
+/// One client's announced viewport in a session (the spec's set S member).
+#[derive(Clone, Copy, Debug)]
+struct ClientViewport {
+    cols: u16,
+    rows: u16,
+    /// Last message from this client. Networked clients are evicted after
+    /// VIEWPORT_WATCHDOG_TIMEOUT; in-process desktop panes never expire
+    /// (implicit 0 ms timeout) and are removed only on detach/window close.
+    last_seen: Instant,
+    networked: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum TerminalController {
     Desktop(String),
     Remote(String),
@@ -429,6 +434,7 @@ impl Core {
             network_online: AtomicBool::new(true),
         });
         core.spawn_presence_refresh();
+        core.spawn_viewport_watchdog();
         core
     }
 
@@ -1057,6 +1063,50 @@ impl Core {
         }
     }
 
+    /// Viewport watchdog: every ~500 ms, evict networked viewports that
+    /// stopped pinging (a backgrounded phone leaves set S within the
+    /// timeout) and push the recomputed minimum boundary. Deliberately
+    /// separate from the device-presence monitor: sizing membership is a
+    /// 2-second concern, the green connectivity dot a 2-minute one.
+    fn spawn_viewport_watchdog(self: &Arc<Self>) {
+        let core = Arc::clone(self);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(
+                VIEWPORT_WATCHDOG_TICK_MS,
+            ));
+            core.sweep_stale_viewports();
+        });
+    }
+
+    fn sweep_stale_viewports(self: &Arc<Self>) {
+        let mut changed = Vec::new();
+        {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let now = Instant::now();
+            for session in inner.sessions.values_mut() {
+                if evict_stale_viewports(
+                    session,
+                    now,
+                    std::time::Duration::from_millis(VIEWPORT_WATCHDOG_TIMEOUT_MS),
+                ) && let Some(epoch) = apply_min_grid(session)
+                {
+                    sync_log!(
+                        "grid",
+                        "watchdog evicted for session={} new={}x{} at_offset={}",
+                        session.metadata.id,
+                        epoch.cols,
+                        epoch.rows,
+                        epoch.offset
+                    );
+                    changed.push((session.metadata.id.clone(), epoch));
+                }
+            }
+        }
+        for (session_id, epoch) in changed {
+            self.broadcast_grid_change(&session_id, epoch);
+        }
+    }
+
     pub fn broadcast(&self) {
         for label in self.app.webview_windows().into_keys() {
             let registered = self
@@ -1104,6 +1154,26 @@ impl Core {
             .expect("desktop state poisoned")
             .windows
             .remove_window(label);
+        // A destroyed window can no longer detach its sessions one by one:
+        // drop every Desktop viewport for this label and recompute the
+        // affected minimum boundaries.
+        let mut changed = Vec::new();
+        {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            for session in inner.sessions.values_mut() {
+                if session
+                    .viewports
+                    .remove(&TerminalController::Desktop(label.to_string()))
+                    .is_some()
+                    && let Some(epoch) = apply_min_grid(session)
+                {
+                    changed.push((session.metadata.id.clone(), epoch));
+                }
+            }
+        }
+        for (session_id, epoch) in changed {
+            self.broadcast_grid_change(&session_id, epoch);
+        }
         if let Some(project_id) = project_id {
             self.cleanup_empty_temporary_project(&project_id);
         }
@@ -1563,11 +1633,13 @@ impl Core {
             (project, shell)
         };
 
-        // The PTY starts at a default grid and follows focus afterwards:
-        // whichever client is actively using the session (desktop focused or
-        // the phone) resizes it to its own dimensions. History stays exact
-        // across these grid switches because every change is journaled as an
-        // epoch and every emulator reflows through the same resize sequence.
+        // The PTY starts at a default grid and tracks the minimum boundary
+        // over the clients viewing the session afterwards: whichever device
+        // is the narrowest/shortest defines the shared grid, and every
+        // client renders it exactly, letterboxing the surplus. History stays
+        // exact across these grid switches because every change is
+        // journaled as an epoch and every emulator replays the same stream
+        // at the same grid sequence.
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows: SESSION_DEFAULT_ROWS,
@@ -1603,6 +1675,7 @@ impl Core {
                     writer,
                     killer,
                     grid: (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS),
+                    viewports: HashMap::new(),
                     grid_epochs: vec![GridEpoch {
                         offset: 0,
                         cols: SESSION_DEFAULT_COLS,
@@ -1618,9 +1691,6 @@ impl Core {
             cursor_query_tail: String::new(),
             pending_cursor_reports: 0,
             has_run_command: false,
-                    terminal_controller: None,
-                    last_input: None,
-                    input_seq: 0,
                 },
             );
             inner.session_order.push(id.clone());
@@ -1735,12 +1805,18 @@ impl Core {
                 }
                 session.pending_cursor_reports -= 1;
             } else {
-                session.terminal_controller = Some(controller.clone());
-                session.input_seq += 1;
-                session.last_input = Some((controller.clone(), session.input_seq));
-                if let Some((cols, rows)) = size {
-                    apply_grid_if_tui(session, cols, rows);
+            // The size hint refreshes the writer's viewport entry (the pane's
+            // announced W_i x H_i). In canonical mode the PTY grid is the
+            // minimum boundary over set S; in a TUI period the client that is
+            // typing owns the grid, so its own size applies immediately.
+            if let Some((cols, rows)) = size {
+                set_client_viewport(session, controller.clone(), cols, rows);
+                if session.tui.mode() != TuiMode::Canonical {
+                    apply_owner_grid(session, cols, rows);
+                } else {
+                    apply_min_grid(session);
                 }
+            }
             }
             sync_log!(
                 "input",
@@ -1774,10 +1850,11 @@ impl Core {
         }
     }
 
-    /// The focused client owns the PTY grid. Snapshots and live output never
-    /// re-wrap the stream: the grid change is recorded at its exact stream
-    /// offset, every emulator reflows through the same epoch sequence, and
-    /// history content stays identical on every device.
+    /// Grid ownership: canonical mode sizes the PTY by the minimum boundary
+    /// over set S. A TUI period is owned by the interacting client: the last
+    /// input (typed keys, click, tap) or explicit viewport announce applies
+    /// that client's own size, overriding the minimum for the duration of the
+    /// program.
     fn resize_session_from(
         &self,
         session_id: &str,
@@ -1785,7 +1862,7 @@ impl Core {
         rows: u16,
         controller: TerminalController,
     ) {
-        let (epoch, held, gated) = {
+        let epoch = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
@@ -1793,27 +1870,17 @@ impl Core {
             if session.metadata.status != "running" {
                 return;
             }
-            // Grid-ownership precedence: once another client has typed,
-            // this client's assert must not steal the grid - it may be
-            // a passive observer's automatic assert (mode-flip
-            // re-announce, re-attach). The owner's own asserts always
-            // apply.
-            let gated = !session.can_apply_grid_from(&controller);
-            let epoch = if gated {
-                None
+            set_client_viewport(session, controller.clone(), cols, rows);
+            if session.tui.mode() != TuiMode::Canonical {
+                apply_owner_grid(session, cols, rows)
             } else {
-                session.terminal_controller = Some(controller.clone());
-                apply_grid_if_tui(session, cols, rows)
-            };
-            let held = gated || session.tui.grid_change_suppressed();
-            (epoch, held, gated)
+                apply_min_grid(session)
+            }
         };
         sync_log!(
             "grid",
-            "request session={session_id} controller={controller:?} wanted={cols}x{rows} gated={} applied={} (held={})",
-            gated,
-            epoch.is_some(),
-            held
+            "request session={session_id} controller={controller:?} wanted={cols}x{rows} applied={}",
+            epoch.is_some()
         );
         if let Some(epoch) = epoch {
             self.broadcast_grid_change(session_id, epoch);
@@ -1826,7 +1893,6 @@ impl Core {
         session_id: &str,
         cols: u16,
         rows: u16,
-        _force: bool,
     ) {
         self.resize_session_from(
             session_id,
@@ -1852,42 +1918,53 @@ impl Core {
         );
     }
 
-    fn write_remote_session(&self, client_id: &str, session_id: &str, data: &str) {
-        self.write_session_from(
-            session_id,
-            data,
-            TerminalController::Remote(client_id.to_string()),
-            None,
-        );
+    /// Sizing identity for a remote socket: the paired device when
+    /// authenticated, otherwise the connection id. A device reconnecting on a
+    /// new socket lands on the same key, so its viewport entry is replaced
+    /// atomically - the stale entry's watchdog is moot and no redundant
+    /// SIGWINCH is issued.
+    fn remote_sizing_key(&self, client_id: &str) -> String {
+        self.clients
+            .lock()
+            .expect("remote clients poisoned")
+            .get(client_id)
+            .and_then(|client| client.device_id.clone())
+            .unwrap_or_else(|| client_id.to_string())
+    }
+
+    fn write_remote_session(
+        &self,
+        client_id: &str,
+        session_id: &str,
+        data: &str,
+        size: Option<(u16, u16)>,
+    ) {
+        let key = self.remote_sizing_key(client_id);
+        self.write_session_from(session_id, data, TerminalController::Remote(key), size);
     }
 
     fn resize_remote_session(&self, client_id: &str, session_id: &str, cols: u16, rows: u16) {
+        let key = self.remote_sizing_key(client_id);
         self.resize_session_from(
             session_id,
             cols,
             rows,
-            TerminalController::Remote(client_id.to_string()),
+            TerminalController::Remote(key),
         );
     }
 
     fn release_remote_controller(&self, client_id: &str, session_id: &str) {
-        let mut inner = self.inner.lock().expect("desktop state poisoned");
-        let Some(session) = inner.sessions.get_mut(session_id) else {
-            return;
+        let key = self.remote_sizing_key(client_id);
+        let epoch = {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let Some(session) = inner.sessions.get_mut(session_id) else {
+                return;
+            };
+            session.viewports.remove(&TerminalController::Remote(key));
+            apply_min_grid(session)
         };
-        let leaving = TerminalController::Remote(client_id.to_string());
-        if session.terminal_controller == Some(leaving.clone()) {
-            session.terminal_controller = None;
-            // A departing device releases its input claim: until
-            // someone types again, the grid returns to
-            // last-writer-wins.
-            if session
-                .last_input
-                .as_ref()
-                .is_some_and(|(owner, _)| owner == &leaving)
-            {
-                session.last_input = None;
-            }
+        if let Some(epoch) = epoch {
+            self.broadcast_grid_change(session_id, epoch);
         }
     }
 
@@ -1906,28 +1983,18 @@ impl Core {
             .ok_or_else(|| {
                 anyhow!("Terminal window is no longer registered with the tray host.")
             })?;
-        let (session_project_id, snapshot, epoch, gated) =
-            match inner.sessions.get_mut(session_id) {
-            // Record the attaching window's viewport: the focused client
-            // owns the PTY grid, so the session resizes to it in any mode
-            // (the shell redraws its prompt for the new size). Two holds:
-            // a shell alt-screen cycle in progress, and another client's
-            // more recent input (grid-ownership precedence - a passive
-            // observer re-attaching must not steal the grid).
+        let (session_project_id, snapshot, epoch) = match inner.sessions.get_mut(session_id) {
+            // Record the attaching window's viewport: the pane joins set S,
+            // and the PTY takes the minimum boundary over every viewer. No
+            // ownership gate: grid ownership is deterministic under
+            // minimum-boundary sizing.
             Some(session) => {
                 let controller = TerminalController::Desktop(label.to_string());
-                let gated = !session.can_apply_grid_from(&controller);
-                let epoch = if gated {
-                    None
-                } else {
-                    session.terminal_controller = Some(controller.clone());
-                    apply_grid_if_tui(session, cols, rows)
-                };
+                set_client_viewport(session, controller.clone(), cols, rows);
                 (
                     session.metadata.project_id.clone(),
                     snapshot_of(session),
-                    epoch,
-                    gated,
+                    apply_min_grid(session),
                 )
             }
             None => return Err(anyhow!("Terminal session not found.")),
@@ -1942,8 +2009,7 @@ impl Core {
         }
         sync_log!(
             "attach",
-            "desktop window={label} session={session_id} grid={cols}x{rows} gated={} resized={} segments={} end_offset={}",
-            gated,
+            "desktop window={label} session={session_id} grid={cols}x{rows} resized={} segments={} end_offset={}",
             epoch.is_some(),
             snapshot.segments.len(),
             snapshot.end_offset
@@ -1961,24 +2027,16 @@ impl Core {
             .expect("desktop state poisoned")
             .windows
             .detach(label, session_id);
-        let mut inner = self.inner.lock().expect("desktop state poisoned");
-        let leaving = TerminalController::Desktop(label.to_string());
-        if inner
-            .sessions
-            .get(session_id)
-            .and_then(|session| session.terminal_controller.as_ref())
-            == Some(&leaving)
-        {
-            if let Some(session) = inner.sessions.get_mut(session_id) {
-                session.terminal_controller = None;
-                if session
-                    .last_input
-                    .as_ref()
-                    .is_some_and(|(owner, _)| owner == &leaving)
-                {
-                    session.last_input = None;
-                }
-            }
+        let epoch = {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let Some(session) = inner.sessions.get_mut(session_id) else {
+                return;
+            };
+            session.viewports.remove(&TerminalController::Desktop(label.to_string()));
+            apply_min_grid(session)
+        };
+        if let Some(epoch) = epoch {
+            self.broadcast_grid_change(session_id, epoch);
         }
     }
 
@@ -2009,8 +2067,8 @@ impl Core {
     }
 
     /// Tell every attached device (and every desktop window) that the host
-    /// reclassified the session's TUI mode at this stream offset. Inline and
-    /// fullscreen clients own the PTY grid (strict cell grid, no reflow
+    /// reclassified the session's TUI mode at this stream offset.
+    /// Fullscreen clients own the PTY grid (strict cell grid, no reflow
     /// heuristics); canonical clients render the journal as their own
     /// viewport.
     fn broadcast_tui_mode(&self, session_id: &str, mode: TuiMode, offset: u64) {
@@ -2250,21 +2308,29 @@ impl Core {
             .expect("remote clients poisoned")
             .remove(id)
             .and_then(|client| client.device_id);
-        let mut inner = self.inner.lock().expect("desktop state poisoned");
-        let leaving = TerminalController::Remote(id.to_string());
-        for session in inner.sessions.values_mut() {
-            if session.terminal_controller == Some(leaving.clone()) {
-                session.terminal_controller = None;
+        let key = device_id
+            .as_ref()
+            .map(String::as_str)
+            .unwrap_or(id);
+        // The device's viewport entries leave set S in every session; the
+        // minimum boundary is recomputed and pushed to each PTY it changed.
+        let mut changed = Vec::new();
+        {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            for session in inner.sessions.values_mut() {
                 if session
-                    .last_input
-                    .as_ref()
-                    .is_some_and(|(owner, _)| owner == &leaving)
+                    .viewports
+                    .remove(&TerminalController::Remote(key.to_string()))
+                    .is_some()
+                    && let Some(epoch) = apply_min_grid(session)
                 {
-                    session.last_input = None;
+                    changed.push((session.metadata.id.clone(), epoch));
                 }
             }
         }
-        drop(inner);
+        for (session_id, epoch) in changed {
+            self.broadcast_grid_change(&session_id, epoch);
+        }
         if device_id.is_some() {
             self.broadcast();
         }
@@ -2476,14 +2542,13 @@ impl Core {
             _ => {}
         }
 
-        let authenticated = self
+        let device_id = self
             .clients
             .lock()
             .expect("remote clients poisoned")
             .get(client_id)
-            .and_then(|client| client.device_id.as_ref())
-            .is_some();
-        if !authenticated {
+            .and_then(|client| client.device_id.clone());
+        if device_id.is_none() {
             self.send_to_client(
                 client_id,
                 ServerMessage::Error {
@@ -2493,6 +2558,20 @@ impl Core {
                 },
             );
             return;
+        }
+        // Every message (the bare ping included) is liveness for the
+        // device's viewport entries: the watchdog keeps a networked client
+        // in set S for VIEWPORT_WATCHDOG_TIMEOUT_MS after its last message.
+        {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let controller =
+                TerminalController::Remote(device_id.as_ref().expect("checked above").clone());
+            let now = Instant::now();
+            for session in inner.sessions.values_mut() {
+                if let Some(viewport) = session.viewports.get_mut(&controller) {
+                    viewport.last_seen = now;
+                }
+            }
         }
         {
             let mut clients = self.clients.lock().expect("remote clients poisoned");
@@ -2622,7 +2701,10 @@ impl Core {
                 cols,
                 rows,
             } => {
-                // Attaching focuses this client: the PTY takes its grid.
+                // Joining the session puts this device in set S: its
+                // announced viewport participates in the minimum boundary.
+                // Keyed on the paired device id, so a reconnect on a new
+                // socket replaces the stale entry atomically.
                 self.resize_remote_session(client_id, &session_id, cols, rows);
                 let snapshot = self.session_snapshot(&session_id);
                 Some(ServerMessage::SessionBuffer {
@@ -2639,20 +2721,24 @@ impl Core {
                 self.release_remote_controller(client_id, &session_id);
                 Some(ServerMessage::Ok { request_id })
             }
-            ClientMessage::SessionInput { session_id, data } => {
-                self.write_remote_session(client_id, &session_id, &data);
+            ClientMessage::SessionInput {
+                session_id,
+                data,
+                cols,
+                rows,
+            } => {
+                self.write_remote_session(client_id, &session_id, &data, cols.zip(rows));
                 None
             }
             ClientMessage::SessionResize {
                 session_id,
                 cols,
                 rows,
-                force,
             } => {
-                let _ = force;
                 self.resize_remote_session(client_id, &session_id, cols, rows);
                 None
             }
+            ClientMessage::Ping => None,
             ClientMessage::DebugDiagnostics { message } => {
                 // Phone-side terminal sync diagnostics ([ATSync] lines from
                 // MobileTerminal), mirrored into the host log so a debug run
@@ -2809,6 +2895,24 @@ impl Core {
             session.buffer.push_str(&payload);
             let before_trim = session.buffer.len();
             session.journal_len = offset.saturating_add(payload.len() as u64);
+            // A whole-screen clear (`clear` / Clear-Host) is a history
+            // boundary: drain the journal front up to its ESC so synced
+            // devices never reflow the erased content. The cut keeps
+            // the clear itself, so a replay still starts blank, then
+            // repaints the prompt.
+            if let Some(cut_rel) = session.tui.take_chunk_clear() {
+                let clear_at = before_trim
+                    .saturating_sub(payload.len())
+                    .saturating_add(injected.len())
+                    .saturating_add(cut_rel);
+                if drain_journal_front_at(&mut session.buffer, clear_at) {
+                    sync_log!(
+                        "journal",
+                        "clear session={session_id} trimmed_to={clear_at} remaining={}",
+                        session.buffer.len()
+                    );
+                }
+            }
             truncate_journal_front(&mut session.buffer, MAX_TERMINAL_JOURNAL_BYTES);
             if session.buffer.len() != before_trim {
                 sync_log!(
@@ -3563,16 +3667,94 @@ fn truncate_journal_front(value: &mut String, maximum: usize) {
     value.drain(..start);
 }
 
-/// Grid policy: the focused client owns the PTY grid in EVERY mode. The
-/// PTY resizes to the client's viewport and every attached emulator
-/// reflows through the recorded epoch, so the shell's absolute cursor
-/// addressing (PSReadLine's CUP-based prompt redraws, bottom-row
-/// scrolling) is always expressed in the focused client's own row space.
-/// A frozen grid would desync that: CUP rows land N lines off whenever a
-/// client has more rows than the PTY, and the prompt visibly "jumps up"
-/// into previous output on the first redraw. While a shell alt-screen
-/// cycle is in progress (`grid_change_suppressed`), the grid is held:
-/// the size is recorded but applied only once the program paints a TUI
+/// Drain the journal front up to (not including) a whole-screen clear,
+/// so a replay never reflows content the program erased. The classifier
+/// anchors the cut at the clear's ESC (a sequence boundary); a position
+/// on a non-character boundary is advanced defensively. Returns true
+/// when bytes were removed.
+fn drain_journal_front_at(buffer: &mut String, keep_from: usize) -> bool {
+    if keep_from == 0 || keep_from >= buffer.len() {
+        return false;
+    }
+    let mut start = keep_from;
+    while !buffer.is_char_boundary(start) {
+        start += 1;
+    }
+    if start == buffer.len() {
+        return false;
+    }
+    buffer.drain(..start);
+    true
+}
+
+/// Register (or refresh) a client's announced viewport in the session's set
+/// S. Desktop panes never expire; remote entries carry the watchdog clock.
+fn set_client_viewport(
+    session: &mut ManagedSession,
+    controller: TerminalController,
+    cols: u16,
+    rows: u16,
+) {
+    let networked = matches!(controller, TerminalController::Remote(_));
+    session
+        .viewports
+        .entry(controller)
+        .and_modify(|viewport| {
+            viewport.cols = cols;
+            viewport.rows = rows;
+            viewport.last_seen = Instant::now();
+        })
+        .or_insert(ClientViewport {
+            cols,
+            rows,
+            last_seen: Instant::now(),
+            networked,
+        });
+}
+
+/// W_pty = min(W_i), H_pty = min(H_i) over S. None when S is empty, in which
+/// case the PTY keeps its current grid (nothing is watching it).
+fn min_viewport(session: &ManagedSession) -> Option<(u16, u16)> {
+    let mut min: Option<(u16, u16)> = None;
+    for viewport in session.viewports.values() {
+        min = Some(match min {
+            None => (viewport.cols, viewport.rows),
+            Some((min_cols, min_rows)) => {
+                (min_cols.min(viewport.cols), min_rows.min(viewport.rows))
+            }
+        });
+    }
+    min
+}
+
+/// Pure core of the watchdog sweep: evict networked viewports whose
+/// last_seen is older than `timeout`, leaving desktop entries alone (an
+/// in-process pane has no heartbeat and an implicit 0 ms timeout). Returns
+/// true when anything was evicted.
+fn evict_stale_viewports(
+    session: &mut ManagedSession,
+    now: Instant,
+    timeout: std::time::Duration,
+) -> bool {
+    let mut evicted = false;
+    session.viewports.retain(|_controller, viewport| {
+        let keep = !viewport.networked
+            || now.duration_since(viewport.last_seen) < timeout;
+        if !keep {
+            evicted = true;
+        }
+        keep
+    });
+    evicted
+}
+
+/// Grid policy: the PTY tracks the minimum boundary over the client set S
+/// in EVERY mode, so no client is ever narrower than the PTY and the raw
+/// stream replays 1:1 with no re-wrapping. Every size change is journaled
+/// as an epoch and every attached emulator reflows through the recorded
+/// sequence, so history stays byte-identical on every device. While a shell
+/// alt-screen cycle is in progress (`grid_change_suppressed`), the grid is
+/// held: the size is recorded but applied only once the program paints a TUI
 /// frame (or never, for a bare shell cycle) - a SIGWINCH mid-shell-state
 /// desyncs PSReadLine's prompt-row tracking.
 fn apply_grid_if_tui(session: &mut ManagedSession, cols: u16, rows: u16) -> Option<GridEpoch> {
@@ -3580,6 +3762,33 @@ fn apply_grid_if_tui(session: &mut ManagedSession, cols: u16, rows: u16) -> Opti
     if session.tui.grid_change_suppressed() {
         return None;
     }
+    apply_session_grid(session, cols, rows)
+}
+
+/// Recompute the minimum boundary over set S and push it to the PTY. The
+/// minimum boundary is the canonical-mode rule: in a TUI period the grid
+/// belongs to the interacting client, so this returns `None` and only
+/// explicit input/announce events move the grid (see `write_session_from`
+/// and `resize_session_from`). This also keeps the watchdog, detach, and
+/// disconnect sweeps from re-minimizing a running program.
+fn apply_min_grid(session: &mut ManagedSession) -> Option<GridEpoch> {
+    if session.tui.mode() != TuiMode::Canonical {
+        return None;
+    }
+    let Some((cols, rows)) = min_viewport(session) else {
+        return None;
+    };
+    apply_grid_if_tui(session, cols, rows)
+}
+
+/// TUI mode: the interacting client owns the grid. Its announced viewport is
+/// applied immediately, even while the alt-anchored suppression hold is
+/// still up - a real user action (typing, click, tap) is the strongest
+/// signal that the program should redraw at the new size. The applied size
+/// is recorded as the next TUI entry's target: the program stays at the
+/// last owner's grid.
+fn apply_owner_grid(session: &mut ManagedSession, cols: u16, rows: u16) -> Option<GridEpoch> {
+    session.requested_viewport = Some((cols, rows));
     apply_session_grid(session, cols, rows)
 }
 
@@ -3867,17 +4076,19 @@ fn registration_status_for_display(
 #[cfg(test)]
 mod tests {
     use super::{
-        CdOutcome, CdPlan, ConnectivityAction, ConnectivityTracker, EmbeddedNodeStatus, Inner,
-        ManagedSession, PRESENCE_WINDOW_MS, PairingGrant, RetireOutcome, ensure_home_project,
-        folder_name, is_cursor_position_report, is_dropped_node_status, is_within_project,
-        newest_running_session_project_id, parse_terminal_titles, parse_working_directories,
-        apply_grid_if_tui, apply_session_grid, log_escape, preferred_project, presence_alive,
-        project_is_usable, project_name_or_folder, record_cursor_position_requests,
-        TerminalController,
+        CdOutcome, CdPlan, ConnectivityAction, ConnectivityTracker,
+        EmbeddedNodeStatus, Inner, ManagedSession, PRESENCE_WINDOW_MS, PairingGrant,
+        RetireOutcome, VIEWPORT_WATCHDOG_TIMEOUT_MS, apply_grid_if_tui, apply_min_grid,
+        apply_session_grid, ensure_home_project, evict_stale_viewports, folder_name,
+        is_cursor_position_report, is_dropped_node_status, is_within_project, log_escape,
+        min_viewport, newest_running_session_project_id, parse_terminal_titles,
+        parse_working_directories, preferred_project, presence_alive, project_is_usable,
+        project_name_or_folder, record_cursor_position_requests,
         registration_status_for_display, resolve_working_directory, retire_empty_temporary_project,
-        should_open_quiet_window, snapshot_from_inner,
+        apply_owner_grid, drain_journal_front_at, set_client_viewport, should_open_quiet_window, snapshot_from_inner,
         split_journal_by_epochs, startup_project, take_valid_pairing_grant, truncate_journal_front,
         validate_project_name, GridEpoch, SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS,
+        TerminalController,
     };
     use crate::{
         models::{AuthorizedDevice, Project, TerminalSession, TuiMode},
@@ -3934,6 +4145,35 @@ mod tests {
         assert!(journal.is_empty());
         truncate_journal_front(&mut journal, usize::MAX);
         assert!(journal.is_empty());
+    }
+
+    #[test]
+    fn drain_at_a_clear_keeps_the_clear_from_the_cut() {
+        // The classifier anchors the cut at the clear's ESC; the journal
+        // keeps the clear itself so a replay still starts blank and
+        // repaints the prompt.
+        let mut journal = "history more\r\n\x1b[2J\x1b[HPS C:\\> ".to_string();
+        let cut = journal.find("\x1b[2J").unwrap();
+        assert!(drain_journal_front_at(&mut journal, cut));
+        assert_eq!(journal, "\x1b[2J\x1b[HPS C:\\> ");
+    }
+
+    #[test]
+    fn drain_at_zero_or_past_end_is_a_noop() {
+        let mut journal = "abc".to_string();
+        assert!(!drain_journal_front_at(&mut journal, 0));
+        assert!(!drain_journal_front_at(&mut journal, 3));
+        assert!(!drain_journal_front_at(&mut journal, 10));
+        assert_eq!(journal, "abc");
+    }
+
+    #[test]
+    fn drain_advances_past_a_non_boundary_cut() {
+        // A cut inside a multibyte character moves to the next character
+        // boundary instead of splicing the bytes.
+        let mut journal = "abéx\x1b[2J".to_string();
+        assert!(drain_journal_front_at(&mut journal, 3));
+        assert_eq!(journal, "x\x1b[2J");
     }
 
     #[test]
@@ -4137,7 +4377,7 @@ mod tests {
         let mut clock = Instant::now();
         // An orphan alt exit (no entry), the shell's `clear` (ED2 +
         // home), and bracketed-paste state must never leave canonical
-        // mode - and still must not after the confirmation window.
+        // mode - none of it is TUI evidence.
         assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049l").is_none());
         assert!(feed_session(&mut session, &mut clock, 10, "\x1b[2J\x1b[H").is_none());
         assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?2004h").is_none());
@@ -4148,20 +4388,21 @@ mod tests {
     }
 
     #[test]
-    fn tui_classifier_treats_a_repaint_harness_as_inline() {
+    fn tui_classifier_treats_a_repaint_harness_as_canonical() {
         let mut session = test_session("s1", "p1", "C:\\repo");
         let mut clock = Instant::now();
         // A primary-buffer bottom-region harness (fzf-style) repaints a
-        // bounded region: the session goes inline - output stays in the
-        // scrollback - instead of fullscreen.
+        // bounded region: repaint signals are no longer evidence, so the
+        // session stays canonical instead of going inline.
         assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?25l").is_none());
         assert!(feed_session(&mut session, &mut clock, 5, "\x1b[3A\x1b[2Kline a\r\n").is_none());
         assert!(feed_session(&mut session, &mut clock, 5, "\x1b[3A\x1b[2Kline b\r\n").is_none());
         assert!(feed_session(&mut session, &mut clock, 5, "\x1b[3A\x1b[2Kline c\r\n").is_none());
-        let inline = feed_session(&mut session, &mut clock, 60, "").expect("inline commit");
-        assert_eq!(inline.to, TuiMode::Inline);
-        assert!(!inline.via_alt_enter);
-        // The program's own alt enter upgrades the period to fullscreen.
+        assert!(feed_session(&mut session, &mut clock, 60, "").is_none());
+        assert_eq!(session.tui.mode(), TuiMode::Canonical);
+        assert_eq!(session.metadata.tui_mode, TuiMode::Canonical);
+        // The program's own alt-screen entry is still definitive and
+        // takes the period fullscreen.
         let upgrade = feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").expect("upgrade");
         assert_eq!(upgrade.to, TuiMode::Fullscreen);
         assert!(upgrade.via_alt_enter);
@@ -4193,6 +4434,41 @@ mod tests {
     }
 
     #[test]
+    fn tui_mode_suspends_the_minimum_boundary_until_interaction() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let mut clock = Instant::now();
+        // Canonical: the minimum boundary over set S applies.
+        set_client_viewport(&mut session, TerminalController::Desktop("window-a".into()), 113, 39);
+        assert!(apply_min_grid(&mut session).is_some());
+        assert_eq!(session.grid, (113, 39));
+        // A TUI period owns the grid: no background path (watchdog,
+        // detach, disconnect) may re-minimize a running program.
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
+        assert_eq!(apply_min_grid(&mut session), None, "min is suspended in a TUI period");
+        assert_eq!(session.grid, (113, 39), "no background resize mid-TUI");
+        // Explicit interaction applies the owner's own size.
+        let owner = apply_owner_grid(&mut session, 90, 30);
+        assert_eq!(owner, Some(GridEpoch { offset: 0, cols: 90, rows: 30 }));
+        assert_eq!(session.grid, (90, 30));
+        assert_eq!(session.requested_viewport, Some((90, 30)), "the owner's grid is the next TUI entry target");
+    }
+
+    #[test]
+    fn interaction_overrides_the_alt_suppression_hold() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let mut clock = Instant::now();
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
+        assert!(session.tui.grid_change_suppressed());
+        // Real user action (typed key, click, tap) wins even while the
+        // bare-shell-cycle suppression is up: the program redraws at the
+        // new size.
+        let epoch = apply_owner_grid(&mut session, 72, 26);
+        assert_eq!(epoch, Some(GridEpoch { offset: 0, cols: 72, rows: 26 }));
+        assert_eq!(session.grid, (72, 26));
+        assert!(session.tui.grid_change_suppressed(), "the hold itself is untouched");
+    }
+
+    #[test]
     fn grid_policy_holds_the_grid_through_a_bare_alt_cycle() {
         let mut session = test_session("s1", "p1", "C:\\repo");
         let mut clock = Instant::now();
@@ -4203,8 +4479,7 @@ mod tests {
         // viewport announcement land a SIGWINCH mid-shell-state.
         assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
         let held = apply_grid_if_tui(&mut session, 90, 30);
-        assert_eq!(held, None, "the grid is held through the bare alt cycle");
-        assert_eq!(session.requested_viewport, Some((90, 30)));
+        assert_eq!(held, None, "the grid is held through the bare alt cycle");        assert_eq!(session.requested_viewport, Some((90, 30)));
         assert_eq!(session.grid, (113, 39));
         // A real TUI frame (DECSTBM) releases the hold: the recorded
         // viewport applies.
@@ -4333,29 +4608,251 @@ mod tests {
     }
 
     #[test]
-    fn grid_precedence_gates_passive_clients_after_input() {
+    fn min_boundary_tracks_the_narrowest_shortest_client_per_axis() {
         let mut session = test_session("s1", "p1", "C:\\repo");
-        let mobile = TerminalController::Remote("phone".into());
-        let desktop = TerminalController::Desktop("window".into());
-        // Before any input, either client may take the grid
-        // (last-writer-wins: a fresh attach/resize claims it).
-        assert!(session.can_apply_grid_from(&mobile));
-        assert!(session.can_apply_grid_from(&desktop));
-        // A keystroke claims the grid for ITS device: the passive
-        // desktop observer's auto-asserts (mode-flip re-announce,
-        // re-attach) must not yank the PTY away from the mobile
-        // user's command.
-        session.input_seq += 1;
-        session.last_input = Some((mobile.clone(), session.input_seq));
-        session.terminal_controller = Some(mobile.clone());
-        assert!(session.can_apply_grid_from(&mobile));
-        assert!(!session.can_apply_grid_from(&desktop));
-        // The claim follows the last input owner.
-        session.input_seq += 1;
-        session.last_input = Some((desktop.clone(), session.input_seq));
-        session.terminal_controller = Some(desktop.clone());
-        assert!(session.can_apply_grid_from(&desktop));
-        assert!(!session.can_apply_grid_from(&mobile));
+        assert_eq!(min_viewport(&session), None, "empty set S keeps the grid");
+        // One client: the boundary is its own viewport.
+        set_client_viewport(&mut session, TerminalController::Desktop("window".into()), 113, 39);
+        assert_eq!(min_viewport(&session), Some((113, 39)));
+        // A second, smaller client must clamp both axes independently.
+        set_client_viewport(
+            &mut session,
+            TerminalController::Remote("phone".into()),
+            72,
+            26,
+        );
+        assert_eq!(min_viewport(&session), Some((72, 26)));
+        // A third client that is wider but shorter keeps the min per axis.
+        set_client_viewport(&mut session, TerminalController::Remote("tablet".into()), 100, 20);
+        assert_eq!(min_viewport(&session), Some((72, 20)));
+        // Removing the smallest client widens the boundary again.
+        session.viewports.remove(&TerminalController::Remote("phone".into()));
+        assert_eq!(min_viewport(&session), Some((100, 20)));
+    }
+
+    #[test]
+    fn minimum_boundary_pushes_the_pty_and_keeps_the_spawn_grid_when_set_s_is_empty() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        assert_eq!(
+            apply_min_grid(&mut session),
+            None,
+            "no viewers: the PTY keeps its current grid"
+        );
+        set_client_viewport(&mut session, TerminalController::Desktop("window".into()), 113, 39);
+        assert_eq!(
+            apply_min_grid(&mut session),
+            Some(GridEpoch { offset: 0, cols: 113, rows: 39 })
+        );
+        assert_eq!(session.grid, (113, 39));
+        assert_eq!(session.requested_viewport, Some((113, 39)));
+        // A registered client that announces the same boundary emits no
+        // second epoch (no spurious SIGWINCH).
+        assert_eq!(apply_min_grid(&mut session), None);
+        assert_eq!(session.grid_epochs.len(), 2);
+        // Removing the only client leaves the grid at its last boundary.
+        session.viewports.remove(&TerminalController::Desktop("window".into()));
+        assert_eq!(apply_min_grid(&mut session), None);
+        assert_eq!(session.grid, (113, 39));
+    }
+
+    #[test]
+    fn reconnect_under_the_same_device_key_replaces_the_entry_without_a_new_epoch() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        set_client_viewport(&mut session, TerminalController::Desktop("window".into()), 113, 39);
+        let first = apply_min_grid(&mut session);
+        assert!(first.is_some());
+        let epochs = session.grid_epochs.len();
+        // The phone attaches on socket A, drops, then reconnects on socket B
+        // but the same device id: the entry is replaced atomically, and an
+        // unchanged viewport must not resize the PTY.
+        set_client_viewport(&mut session, TerminalController::Remote("phone-device".into()), 45, 36);
+        assert!(apply_min_grid(&mut session).is_some());
+        let epochs_after_phone = session.grid_epochs.len();
+        assert!(epochs_after_phone > epochs);
+        set_client_viewport(&mut session, TerminalController::Remote("phone-device".into()), 45, 36);
+        assert!(
+            apply_min_grid(&mut session).is_none(),
+            "a rebind with unchanged dimensions is a grid no-op"
+        );
+        assert_eq!(session.grid_epochs.len(), epochs_after_phone);
+        assert_eq!(session.viewports.len(), 2);
+    }
+
+    #[test]
+    fn watchdog_evicts_stale_networked_entries_but_never_a_desktop_entry() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let now = Instant::now();
+        let stale = now - Duration::from_millis(VIEWPORT_WATCHDOG_TIMEOUT_MS + 100);
+        set_client_viewport(&mut session, TerminalController::Desktop("window".into()), 113, 39);
+        set_client_viewport(&mut session, TerminalController::Remote("phone".into()), 45, 36);
+        assert!(apply_min_grid(&mut session).is_some());
+        assert_eq!(session.grid, (45, 36));
+        session
+            .viewports
+            .get_mut(&TerminalController::Remote("phone".into()))
+            .expect("recorded phone entry")
+            .last_seen = stale;
+        let timeout = std::time::Duration::from_millis(VIEWPORT_WATCHDOG_TIMEOUT_MS);
+        assert!(
+            evict_stale_viewports(&mut session, now, timeout),
+            "the stale networked entry is evicted"
+        );
+        assert_eq!(session.viewports.len(), 1);
+        assert!(
+            session.viewports.contains_key(&TerminalController::Desktop("window".into()))
+        );
+        assert_eq!(
+            session
+                .viewports
+                .get(&TerminalController::Desktop("window".into()))
+                .unwrap()
+                .networked,
+            false
+        );
+        assert_eq!(
+            apply_min_grid(&mut session),
+            Some(GridEpoch { offset: 0, cols: 113, rows: 39 }),
+            "the departed phone un-clamps the boundary back to the desktop's size"
+        );
+        assert!(!evict_stale_viewports(&mut session, now, timeout), "a second sweep is a no-op");
+    }
+
+    #[test]
+    fn min_boundary_clamps_absurd_or_zero_announcements() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        // A zero/negative hint cannot produce an unusable PTY: the clamps
+        // from apply_session_grid (cols 2..=500, rows 1..=200) apply to the
+        // computed minimum just like a single client's announce.
+        set_client_viewport(&mut session, TerminalController::Desktop("window".into()), 0, 0);
+        assert_eq!(apply_min_grid(&mut session), Some(GridEpoch { offset: 0, cols: 2, rows: 1 }));
+        assert_eq!(session.grid, (2, 1));
+        session.viewports.remove(&TerminalController::Desktop("window".into()));
+        set_client_viewport(&mut session, TerminalController::Remote("phone".into()), 1, 0);
+        assert_eq!(
+            apply_min_grid(&mut session),
+            None,
+            "the clamped grid is already in effect - no redundant epoch"
+        );
+        assert_eq!(session.grid, (2, 1));
+        // An oversized member does not widen the clamped minimum (the
+        // smaller member owns the boundary per axis).
+        set_client_viewport(&mut session, TerminalController::Desktop("window".into()), 500, 300);
+        assert_eq!(apply_min_grid(&mut session), None);
+        session.viewports.remove(&TerminalController::Remote("phone".into()));
+        assert_eq!(
+            apply_min_grid(&mut session),
+            Some(GridEpoch { offset: 0, cols: 500, rows: 200 }),
+            "oversized announcements are capped at the clamp ceiling"
+        );
+        assert_eq!(session.grid, (500, 200));
+    }
+
+    #[test]
+    fn viewport_registry_update_preserves_kind_and_refreshes_liveness() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        set_client_viewport(&mut session, TerminalController::Remote("phone".into()), 45, 36);
+        let before = session
+            .viewports
+            .get(&TerminalController::Remote("phone".into()))
+            .expect("recorded entry")
+            .last_seen;
+        // The phone announces again after a small pause: the same key keeps
+        // its networked kind, and the watchdog clock moves forward.
+        std::thread::sleep(Duration::from_millis(2));
+        set_client_viewport(&mut session, TerminalController::Remote("phone".into()), 45, 40);
+        let entry = session
+            .viewports
+            .get(&TerminalController::Remote("phone".into()))
+            .expect("updated in place");
+        assert!(entry.networked, "an in-place update must not flip a remote entry into a desktop one");
+        assert!(
+            entry.last_seen >= before,
+            "the entry's liveness clock must refresh on every announcement"
+        );
+        assert_eq!((entry.cols, entry.rows), (45, 40));
+        assert_eq!(session.viewports.len(), 1, "the update replaces, never duplicates");
+    }
+
+    #[test]
+    fn watchdog_evicts_only_stale_members_of_a_mixed_set() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let now = Instant::now();
+        let stale = now - Duration::from_millis(VIEWPORT_WATCHDOG_TIMEOUT_MS + 100);
+        set_client_viewport(&mut session, TerminalController::Desktop("window".into()), 113, 39);
+        set_client_viewport(&mut session, TerminalController::Remote("phone-a".into()), 45, 36);
+        set_client_viewport(&mut session, TerminalController::Remote("phone-b".into()), 100, 20);
+        session
+            .viewports
+            .get_mut(&TerminalController::Remote("phone-a".into()))
+            .expect("stale entry")
+            .last_seen = stale;
+        let timeout = std::time::Duration::from_millis(VIEWPORT_WATCHDOG_TIMEOUT_MS);
+        assert!(evict_stale_viewports(&mut session, now, timeout));
+        assert!(
+            session.viewports.contains_key(&TerminalController::Remote("phone-b".into())),
+            "the still-live networked entry survives"
+        );
+        assert!(
+            session.viewports.contains_key(&TerminalController::Desktop("window".into())),
+            "the desktop entry survives even a stale clock"
+        );
+        assert_eq!(
+            apply_min_grid(&mut session),
+            Some(GridEpoch { offset: 0, cols: 100, rows: 20 }),
+            "the boundary widens to the surviving clients' minimum"
+        );
+    }
+
+    #[test]
+    fn evicting_a_non_min_member_produces_no_grid_epoch() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let now = Instant::now();
+        let stale = now - Duration::from_millis(VIEWPORT_WATCHDOG_TIMEOUT_MS + 100);
+        set_client_viewport(&mut session, TerminalController::Desktop("window".into()), 113, 39);
+        set_client_viewport(&mut session, TerminalController::Remote("phone".into()), 150, 60);
+        assert_eq!(apply_min_grid(&mut session), Some(GridEpoch { offset: 0, cols: 113, rows: 39 }));
+        let epochs = session.grid_epochs.len();
+        // The stale phone was never the minimum: its eviction must not
+        // resize (no redundant SIGWINCH) even though the set changed.
+        session
+            .viewports
+            .get_mut(&TerminalController::Remote("phone".into()))
+            .expect("stale entry")
+            .last_seen = stale;
+        let timeout = std::time::Duration::from_millis(VIEWPORT_WATCHDOG_TIMEOUT_MS);
+        assert!(evict_stale_viewports(&mut session, now, timeout));
+        assert_eq!(apply_min_grid(&mut session), None);
+        assert_eq!(session.grid_epochs.len(), epochs);
+        assert_eq!(session.grid, (113, 39));
+    }
+
+    #[test]
+    fn apply_min_grid_stays_suspended_through_a_tui_period() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let mut clock = Instant::now();
+        set_client_viewport(&mut session, TerminalController::Desktop("window".into()), 113, 39);
+        assert!(apply_min_grid(&mut session).is_some());
+        assert_eq!(session.grid, (113, 39));
+        // A bare alt-enter (the shell's Clear-Host) suppresses grid changes:
+        // the computed minimum is recorded but not applied.
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
+        set_client_viewport(&mut session, TerminalController::Desktop("window".into()), 90, 30);
+        assert_eq!(
+            apply_min_grid(&mut session),
+            None,
+            "the grid is held through the bare alt cycle"
+        );
+        assert_eq!(session.grid, (113, 39));
+        // A real TUI frame (DECSTBM) releases the entry-time suppression
+        // hold, but the minimum boundary itself is a canonical-mode rule:
+        // a running TUI is only resized by the interacting client.
+        assert!(feed_session(&mut session, &mut clock, 5, "\x1b[1;39r").is_none());
+        assert_eq!(apply_min_grid(&mut session), None, "min never moves a TUI grid");
+        assert_eq!(session.grid, (113, 39));
+        // The interacting client's own size applies immediately.
+        let owner = apply_owner_grid(&mut session, 90, 30);
+        assert_eq!(owner, Some(GridEpoch { offset: 0, cols: 90, rows: 30 }));
+        assert_eq!(session.grid, (90, 30));
     }
 
     #[test]
@@ -5395,6 +5892,7 @@ mod tests {
             writer: Box::new(std::io::sink()),
             killer: Box::new(InertKiller),
             grid: (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS),
+            viewports: HashMap::new(),
             grid_epochs: vec![GridEpoch {
                 offset: 0,
                 cols: SESSION_DEFAULT_COLS,
@@ -5410,9 +5908,6 @@ mod tests {
             cursor_query_tail: String::new(),
             pending_cursor_reports: 0,
             has_run_command: false,
-            terminal_controller: None,
-            last_input: None,
-            input_seq: 0,
         }
     }
 

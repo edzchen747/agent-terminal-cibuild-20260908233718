@@ -1,86 +1,57 @@
 //! TUI mode classification for the shared PTY stream.
 //!
-//! The host classifies the running foreground program into one of three
-//! grid-ownership modes (see `TuiMode`):
+//! The host classifies the running foreground program into grid-ownership
+//! modes (see `TuiMode`). Only definitive program announcements move the
+//! period off `Canonical`, and each commits immediately on the program's
+//! own VT sequence:
 //!
-//! - `Canonical`: the PTY stays at its snapshot size; clients reflow the
-//!   journal at their own sizes.
-//! - `Inline`: the program repaints a bounded region in place; the PTY
-//!   follows the focused client and output intentionally stays in the
-//!   scrollback.
-//! - `Fullscreen`: the program owns the whole grid; the PTY follows the
-//!   focused client and the host isolates TUI frames from the scrollback
-//!   (journaled synthetic alt-screen pair when the program does not use
-//!   one itself).
+//! - the program's own alt-screen entry (`CSI ?1049/1047/1048 h`);
+//! - sync output (`CSI ?2026 h`);
+//! - mouse/focus tracking (`CSI ?1000/1002/1003/1005/1006/1015 h`);
+//! - kitty keyboard flags / modifyOtherKeys (`CSI > n u`, `CSI = n u`,
+//!   `CSI > 4 ; n m`, `CSI 4 ; n m`);
+//! - DECSTBM (scroll-region set) plus drawing on two or more rows.
 //!
-//! The classifier runs on stream evidence (the VT sequences the program
-//! emits). The other evidence sources — pty probing (termios raw mode,
-//! foreground pgrp) and shell-rc markers — need platform APIs this
-//! Windows host does not expose: `raw_mode` stays `None`, so strong
-//! signals qualify on their own and the "foreground == shell" veto is
-//! approximated by the newline-terminated quiet exit rule. Both are
-//! documented extension points: a prober calls [`TuiClassifier::set_raw_mode`],
-//! and OSC 133 shell markers are honored when present.
+//! There is no strong-signal confirmation window: a signal either commits
+//! immediately or is not evidence. The removed signal families (ED-based
+//! multi-row draws, cursor-hide durations, bottom-to-top CUP rewinds,
+//! probe bursts, weak-signal accumulation, CUU+clear inline repaints)
+//! all fire on patterns PSReadLine's Clear-Host, prompt redraws, and
+//! startup burst are indistinguishable from: the host used to wrap shell
+//! clears in synthetic alt pairs, and every client split the clear
+//! across two buffers (the prompt vanished twice, stale output
+//! resurfaced). The shell's `clear` (ED2/ED3 + home-CUP) stays
+//! deliberately not evidence, as do focus-event reporting
+//! (`CSI ?1004 h` - PSReadLine enables it at startup and the
+//! `\x1b[I`/`\x1b[O` focus events are not TUI behavior) and bare
+//! two-byte DECKPAM/DECPAM (`ESC =` / `ESC >`, only meaningful as the
+//! intro of a kitty keyboard-flags sequence).
 //!
-//! Deviations from the detection matrix, all due to the missing platform
-//! APIs: bare two-byte DECKPAM/DECPAM (`ESC =` / `ESC >`) are not
-//! treated as strong on their own — the same intro markers open the
-//! kitty keyboard-flags sequences (`ESC = n u`, `ESC > n u`,
-//! `ESC > 4 ; n m`), which are definitive and cover the real apps; and
-//! the cooked-foreground veto (`raw_mode`) applies only when a prober
-//! supplies raw-mode state.
+//! `Inline` is retained as a `TuiMode` value but is no longer produced
+//! by the classifier: the inline repaint pattern was a strong signal.
+//! Exits are unchanged: a quiet stream with an observed alt-exit +
+//! visible cursor (`alt-exit`), a quiet newline-terminated prompt
+//! (`exit-quiet`), or an OSC 133 shell marker (`osc133`).
 //!
-//! The shell's `clear` (ED2/ED3 + home-CUP) is deliberately not a strong
-//! signal on its own: a bottom-to-top home jump only commits when it was
-//! not armed by a recent whole-screen clear, and an ED2-armed home is
-//! held until multi-row absolute CUPs (or drawing) prove a TUI repaint.
-//! Multi-row *scrolled* drawing after an ED2 (and windowed distinct-row
-//! writes in general) additionally require a TUI marker in the window -
-//! a cursor hide or CUP/VPR addressing to a non-home row: shell command
-//! output after `clear` (e.g. `clear; ls`) is ED2 + home + sequential
-//! newline-terminated scrolling, which carries none of those. The
-//! distinct-row rule counts only rows first written while the cursor is
-//! hidden: TUI frames are drawn flicker-free, while shell listings
-//! scroll with the cursor visible. Focus-event reporting (`CSI ?1004 h`)
-//! is not evidence either - PSReadLine (plain PowerShell) enables it at
-//! startup, and the focus events it produces (`\x1b[I`/`\x1b[O`) are
-//! not TUI behavior.
+//! Whole-screen clears (`CSI 2 J` / `CSI 3 J`) are not TUI evidence,
+//! but they are journal-history boundaries: [`feed`] records where a
+//! clear started in the chunk and the host drains the replay journal
+//! at that point, so synced devices never reflow content the program
+//! already erased. See [`TuiClassifier::take_chunk_clear`].
+//!
+//! [`feed`]: TuiClassifier::feed
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::models::TuiMode;
 
-/// Entry confirmation window: batch the program's startup burst, then
-/// decide once (a strong signal alone commits after this window).
-pub const ENTER_CONFIRM_MS: u64 = 50;
-/// Exit hold-off: strong signals that fired this long after a canonical
-/// exit are dropped, so a prompt redraw cannot bounce the mode.
-pub const EXIT_HOLD_MS: u64 = 200;
-/// Cursor hidden for at least this long is a strong signal (prompt
-/// redraws hide the cursor for milliseconds only).
-pub const CURSOR_HIDDEN_MS: u64 = 100;
 /// Alt-anchored exit requires the stream to have been quiet this long
 /// with a visible cursor.
 pub const ALT_EXIT_QUIET_MS: u64 = 300;
 /// Stream-anchored exit: newline-terminated output plus this much quiet
 /// means the foreground is back at a shell prompt.
 pub const STREAM_EXIT_QUIET_MS: u64 = 500;
-/// Window over which distinct-row writes count toward "full-screen
-/// addressing".
-pub const FULLSCREEN_WINDOW_MS: u64 = 250;
-/// Three CUU+clear repaints inside this window is the inline
-/// bottom-region pattern.
-pub const REPAINT_WINDOW_MS: u64 = 1000;
-/// Probe families and weak signals accumulate over this window.
-pub const PROBE_WINDOW_MS: u64 = 2000;
-/// Four weak signals (OSC titles, bracketed paste, ...) inside the probe
-/// window accumulate into a strong one.
-pub const WEAK_TO_STRONG: u32 = 4;
-/// Three distinct probe families (size/capability queries) inside the
-/// probe window is a TUI startup burst; a shell prompt emits at most one
-/// or two.
-pub const PROBE_FAMILIES_TO_STRONG: usize = 3;
 
 /// A mode transition the classifier observed, with the evidence the host
 /// needs for its journaling rules.
@@ -97,19 +68,9 @@ pub struct TuiTransition {
     /// the enter half and the program never sent its own exit.
     pub program_alt_exit: bool,
     /// The classifier rule that fired, for the sync debug log
-    /// (`[mode] session=... mode=... reason=...`): e.g. `cup-rewind`,
-    /// `ed2-multiline-draw`, `cursor-hidden`, `distinct-rows`,
-    /// `alt-exit`, `exit-quiet`, `osc133`.
+    /// (`[mode] session=... mode=... reason=...`): e.g. `alt-enter`,
+    /// `sync-output`, `stbm-draw`, `alt-exit`, `exit-quiet`, `osc133`.
     pub reason: &'static str,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EnterKind {
-    /// Full-screen addressing / ED2+draw / probe burst / cursor hidden:
-    /// commits to FULLSCREEN after the confirmation window.
-    Grid,
-    /// CUU+clear bottom-region repaints: commits to INLINE.
-    Repaint,
 }
 
 pub struct TuiClassifier {
@@ -118,15 +79,11 @@ pub struct TuiClassifier {
     /// sequence bridges chunk boundaries.
     tail: String,
     cursor_hidden: bool,
-    hidden_since: Option<Instant>,
     /// Approximate cursor row (1-based, clamped to the grid).
     cursor_row: u16,
     /// The current row was entered by an absolute CUP rather than by
     /// scrolling (newline) or relative motion. TUI frames are drawn
-    /// with absolute addressing; shell output scrolls. The
-    /// distinct-row and cup-rewind rules only count rows entered
-    /// this way, so a PSReadLine clear (38 CRLFs down, then home)
-    /// or a scrolled `ls` listing cannot arm them.
+    /// with absolute addressing; shell output scrolls.
     cup_entered_row: bool,
     /// The most recent chunk whose *visible* tail (escapes stripped)
     /// ended with a newline: line editing, not a TUI repaint.
@@ -144,47 +101,20 @@ pub struct TuiClassifier {
     /// shell's post-alt main-screen redraws cannot be mistaken for TUI
     /// frames.
     alt_open: bool,
-    /// DECSTBM was set during this period; with any drawing it is a
-    /// definitive fullscreen signal.
+    /// DECSTBM was set during the current alt screen; with any drawing
+    /// it is a definitive fullscreen signal.
     stbm: bool,
-    /// Last ED2/ED3 time; multi-row drawing after it is a strong signal.
-    last_ed: Option<Instant>,
-    /// A home-CUP inside the ED2/ED3 window (the shell's `clear`
-    /// signature): the Grid commit is held until multi-row absolute
-    /// CUPs prove a TUI repaint.
-    ed_home_watch: Option<Instant>,
-    /// Rows targeted by absolute CUPs since `ed_home_watch` armed.
-    ed_home_rows: BTreeSet<u16>,
-    /// Last TUI marker in the current foreground period: a cursor hide
-    /// or CUP/VPR addressing to a non-home row. Shell cooked output
-    /// (`clear` + command output) emits ED2, home-CUP, and sequential
-    /// newline-terminated scrolling only - no marker - so post-ED
-    /// multi-row drawing and windowed distinct-row commits require one.
-    last_tui_marker: Option<Instant>,
-    /// A CUU>=2 is armed; a following EL/ED0 completes a repaint.
-    repaint_armed: Option<Instant>,
-    /// Completed CUU+clear repaint times (the inline pattern).
-    repaints: VecDeque<Instant>,
-    /// (probe family, time): 1 window size, 2 DA, 3 DECRQM, 4 DSR, 5
-    /// OSC color query.
-    probes: VecDeque<(u8, Instant)>,
-    /// Weak signal times (OSC titles, bracketed paste, ...).
-    weaks: VecDeque<Instant>,
-    /// Distinct rows that received text under absolute addressing, for
-    /// the whole foreground period.
+    /// Distinct rows that received text, for the whole foreground
+    /// period (the draw-extent measurement behind `stbm-draw`).
     extent_rows: Vec<bool>,
     /// (row, time) of rows that first received text while the cursor
-    /// was hidden, for the windowed distinct-row count.
+    /// was hidden and the row was CUP-addressed, scoped to the program's
+    /// own alt screen (paint evidence for the grid-suppression release).
     row_stamps: VecDeque<(u16, Instant)>,
-    /// A strong signal awaiting the confirmation window; the reason is
-    /// the rule that queued it, carried to the committing transition.
-    pending: Option<(EnterKind, &'static str, Instant)>,
-    /// No strong signal that fired before this instant may commit.
-    exit_hold_until: Option<Instant>,
-    /// Raw-mode state, probed on platforms with termios. Windows ConPTY
-    /// exposes no termios API, so this stays `None` and strong signals
-    /// qualify on their own.
-    raw_mode: Option<bool>,
+    /// Byte index into the chunk fed last where a whole-screen clear
+    /// (`CSI 2 J` / `CSI 3 J`) started, reported to the host so it can
+    /// truncate the replay journal at the boundary.
+    clear_marker: Option<usize>,
 }
 
 impl TuiClassifier {
@@ -193,7 +123,6 @@ impl TuiClassifier {
             mode: TuiMode::Canonical,
             tail: String::new(),
             cursor_hidden: false,
-            hidden_since: None,
             cursor_row: 1,
             cup_entered_row: false,
             last_newline_chunk_at: None,
@@ -202,24 +131,23 @@ impl TuiClassifier {
             saw_alt_exit: false,
             alt_open: false,
             stbm: false,
-            last_ed: None,
-            ed_home_watch: None,
-            ed_home_rows: BTreeSet::new(),
-            last_tui_marker: None,
-            repaint_armed: None,
-            repaints: VecDeque::new(),
-            probes: VecDeque::new(),
-            weaks: VecDeque::new(),
             extent_rows: vec![false; rows.max(1) as usize + 1],
             row_stamps: VecDeque::new(),
-            pending: None,
-            exit_hold_until: None,
-            raw_mode: None,
+            clear_marker: None,
         }
     }
 
     pub fn mode(&self) -> TuiMode {
         self.mode
+    }
+
+    /// The index into the chunk most recently fed where a whole-screen
+    /// clear (`CSI 2 J` / `CSI 3 J`) started, consumed once by the host
+    /// to truncate the replay journal at that sequence boundary. Clears
+    /// split across chunk boundaries are not reported: the sequence
+    /// start sits in an earlier chunk, which cannot anchor a cut.
+    pub fn take_chunk_clear(&mut self) -> Option<usize> {
+        self.clear_marker.take()
     }
 
     /// Whether the program has painted TUI frames while its own alt
@@ -249,15 +177,6 @@ impl TuiClassifier {
             && !self.has_paint_evidence()
     }
 
-    /// A platform prober (termios on the PTY master) can publish raw
-    /// mode; strong and repaint signals are then vetoed while cooked.
-    /// Definitive signals commit regardless. No prober exists on this
-    /// Windows host yet, so the method stays inert until one lands.
-    #[allow(dead_code)]
-    pub fn set_raw_mode(&mut self, raw: bool) {
-        self.raw_mode = Some(raw);
-    }
-
     /// Feed one PTY output chunk. Returns a mode transition, if this
     /// chunk crossed a boundary. `rows` is the PTY's current height and
     /// `now` the chunk's arrival time.
@@ -280,17 +199,19 @@ impl TuiClassifier {
             });
             let stream_exit_ok = visible && newline_recent && quiet_ms >= STREAM_EXIT_QUIET_MS;
             if self.alt_anchored && alt_exit_ok {
-                return self.exit_to_canonical(now, "alt-exit");
+                return self.exit_to_canonical("alt-exit");
             }
             if !self.alt_anchored && stream_exit_ok {
-                return self.exit_to_canonical(now, "exit-quiet");
+                return self.exit_to_canonical("exit-quiet");
             }
         }
 
         // Bridge a split sequence from the previous chunk.
+        let tail_len = self.tail.len();
         let mut input = self.tail.clone();
         input.push_str(data);
         self.tail.clear();
+        self.clear_marker = None;
 
         let mut transition: Option<TuiTransition> = None;
         let mut last_visible: Option<u8> = None;
@@ -314,22 +235,35 @@ impl TuiClassifier {
             }
             let intro = input.as_bytes()[i];
             match intro {
-                b'[' | b'=' | b'>' | b'<' => match self.scan_csi(&input, &mut i) {
-                    CsiOutcome::Complete(signal) => {
-                        // Apply the signal's state updates even when a
-                        // transition already fired in this chunk; only
-                        // the transition result is first-wins.
-                        let t = self.on_csi(signal, now, rows);
-                        transition = transition.or(t);
+                b'[' | b'=' | b'>' | b'<' => {
+                    // The ESC immediately precedes the intro byte; the
+                    // marker is anchored to the ESC so the host's journal
+                    // cut starts at a sequence boundary.
+                    let esc_at = i - 1;
+                    match self.scan_csi(&input, &mut i) {
+                        CsiOutcome::Complete(signal) => {
+                            // A whole-screen clear is a history boundary:
+                            // report its chunk index (only when the
+                            // sequence start is inside this chunk; a
+                            // split clear cannot anchor a journal cut).
+                            if matches!(signal, CsiSignal::EraseDisplay23) && esc_at >= tail_len {
+                                self.clear_marker = Some(esc_at - tail_len);
+                            }
+                            // Apply the signal's state updates even when a
+                            // transition already fired in this chunk; only
+                            // the transition result is first-wins.
+                            let t = self.on_csi(signal, now, rows);
+                            transition = transition.or(t);
+                        }
+                        CsiOutcome::Split { keep_from } => {
+                            self.tail.push_str(&input[keep_from..]);
+                            i = input.len();
+                        }
                     }
-                    CsiOutcome::Split { keep_from } => {
-                        self.tail.push_str(&input[keep_from..]);
-                        i = input.len();
-                    }
-                },
+                }
                 b']' => match self.scan_osc(&input, &mut i) {
                     OscOutcome::Complete(payload) => {
-                        let t = self.on_osc(&payload, now, rows);
+                        let t = self.on_osc(&payload);
                         transition = transition.or(t);
                     }
                     OscOutcome::Split { keep_from } => {
@@ -343,9 +277,6 @@ impl TuiClassifier {
                     i += 1;
                 }
             }
-        }
-        if transition.is_none() {
-            transition = self.confirm_pending(now, rows);
         }
         // Line-termination is judged on visible text: a chunk that ends
         // in escapes still counts when its last visible byte is a
@@ -367,23 +298,15 @@ impl TuiClassifier {
         transition
     }
 
-    fn exit_to_canonical(&mut self, now: Instant, reason: &'static str) -> Option<TuiTransition> {
+    fn exit_to_canonical(&mut self, reason: &'static str) -> Option<TuiTransition> {
         let program_alt_exit = self.saw_alt_exit;
         self.mode = TuiMode::Canonical;
-        self.pending = None;
         self.saw_alt_exit = false;
         self.alt_anchored = false;
         self.alt_open = false;
         self.stbm = false;
-        self.last_ed = None;
-        self.ed_home_watch = None;
-        self.ed_home_rows.clear();
-        self.last_tui_marker = None;
-        self.repaint_armed = None;
-        self.repaints.clear();
         self.row_stamps.clear();
         self.extent_rows.fill(false);
-        self.exit_hold_until = Some(now + Duration::from_millis(EXIT_HOLD_MS));
         Some(TuiTransition {
             to: TuiMode::Canonical,
             via_alt_enter: false,
@@ -392,37 +315,8 @@ impl TuiClassifier {
         })
     }
 
-    /// Record a strong (non-definitive) signal. An inline -> fullscreen
-    /// grid signal commits immediately, without the confirmation window.
-    fn queue_strong(
-        &mut self,
-        now: Instant,
-        rows: u16,
-        kind: EnterKind,
-        reason: &'static str,
-    ) -> Option<TuiTransition> {
-        if self.mode == TuiMode::Fullscreen {
-            return None;
-        }
-        if self.mode == TuiMode::Inline && kind == EnterKind::Grid {
-            return self.commit_enter(TuiMode::Fullscreen, now, rows, false, reason);
-        }
-        // A grid candidate replaces a pending repaint candidate; the
-        // original time is kept so the window still batches the burst.
-        let (existing, at) = match self.pending.take() {
-            Some((previous, _, at)) => (previous, at),
-            None => (kind, now),
-        };
-        let kind = if existing == EnterKind::Grid || kind == EnterKind::Grid {
-            EnterKind::Grid
-        } else {
-            EnterKind::Repaint
-        };
-        self.pending = Some((kind, reason, at));
-        None
-    }
-
-    /// Definitive signals commit immediately, bypassing the window.
+    /// Definitive signals commit immediately on the program's own
+    /// announcement sequence.
     fn commit_definitive(
         &mut self,
         now: Instant,
@@ -430,7 +324,7 @@ impl TuiClassifier {
         via_alt: bool,
         reason: &'static str,
     ) -> Option<TuiTransition> {
-        if self.mode == TuiMode::Canonical || self.mode == TuiMode::Inline {
+        if self.mode == TuiMode::Canonical {
             let transition = self.commit_enter(TuiMode::Fullscreen, now, rows, via_alt, reason)?;
             // The program's own alt-screen enter anchors the matching exit
             // to the alt-exit sequence, not to stream quiet.
@@ -457,14 +351,6 @@ impl TuiClassifier {
         self.mode = to;
         self.saw_alt_exit = false;
         self.stbm = false;
-        self.last_ed = None;
-        self.ed_home_watch = None;
-        self.ed_home_rows.clear();
-        self.last_tui_marker = None;
-        self.repaint_armed = None;
-        self.repaints.clear();
-        self.probes.clear();
-        self.weaks.clear();
         self.row_stamps.clear();
         self.extent_rows = vec![false; rows.max(1) as usize + 1];
         Some(TuiTransition {
@@ -472,46 +358,6 @@ impl TuiClassifier {
             via_alt_enter,
             program_alt_exit: false,
             reason,
-        })
-    }
-
-    /// Commit a pending strong candidate once the confirmation window
-    /// has elapsed, the exit hold-off has passed, and a probed
-    /// foreground is raw.
-    fn confirm_pending(&mut self, now: Instant, rows: u16) -> Option<TuiTransition> {
-        let Some((kind, reason, at)) = self.pending.take() else {
-            return None;
-        };
-        if now.duration_since(at) < Duration::from_millis(ENTER_CONFIRM_MS) {
-            self.pending = Some((kind, reason, at));
-            return None;
-        }
-        // The signal itself fired inside the post-exit hold-off: drop
-        // it (a prompt redraw is exactly what this prevents).
-        if self.exit_hold_until.is_some_and(|until| at < until) {
-            return None;
-        }
-        // A probed cooked foreground cannot run a TUI: strong and
-        // repaint signals are vetoed (definitive signals are not).
-        if !self.raw_mode.map_or(true, |raw| raw) {
-            return None;
-        }
-        let to = match kind {
-            EnterKind::Grid => TuiMode::Fullscreen,
-            EnterKind::Repaint => TuiMode::Inline,
-        };
-        if to > self.mode {
-            self.commit_enter(to, now, rows, false, reason)
-        } else {
-            None
-        }
-    }
-
-    /// A TUI marker (cursor hide, non-home CUP) fired inside the
-    /// fullscreen window: scrolled or windowed drawing may commit.
-    fn marker_recent(&self, now: Instant) -> bool {
-        self.last_tui_marker.is_some_and(|at| {
-            now.duration_since(at) <= Duration::from_millis(FULLSCREEN_WINDOW_MS)
         })
     }
 
@@ -530,19 +376,15 @@ impl TuiClassifier {
             }
             CursorHidden => {
                 self.cursor_hidden = true;
-                self.hidden_since = Some(now);
-                self.last_tui_marker = Some(now);
                 None
             }
             CursorVisible => {
                 self.cursor_hidden = false;
-                self.hidden_since = None;
                 None
             }
             SyncOutput => self.commit_definitive(now, rows, false, "sync-output"),
             MouseOrFocus => self.commit_definitive(now, rows, false, "mouse-focus"),
             KittyKeyboard => self.commit_definitive(now, rows, false, "kitty-keyboard"),
-            AppCursorKeys => self.queue_strong(now, rows, EnterKind::Grid, "app-cursor-keys"),
             Decstbm => {
                 self.stbm = true;
                 if self.distinct_extent(rows) >= 2 {
@@ -551,154 +393,33 @@ impl TuiClassifier {
                     None
                 }
             }
-            EraseDisplay23 => {
-                // ED2/ED3 alone is not evidence (the shell's `clear`
-                // sends it cooked): it only becomes strong when
-                // multi-row drawing follows inside the fullscreen
-                // window.
-                self.last_ed = Some(now);
-                // A whole-screen clear right after a bottom-to-top jump
-                // is the shell's `clear` (home-then-ED order), not a
-                // TUI frame rewind: drop the candidate the jump queued.
-                // A real repaint re-queues through the drawing that
-                // follows the clear.
-                if self.pending.as_ref().is_some_and(|(kind, _, at)| {
-                    kind == &EnterKind::Grid
-                        && now.duration_since(*at)
-                            <= Duration::from_millis(FULLSCREEN_WINDOW_MS)
-                }) {
-                    self.pending = None;
-                }
-                None
-            }
             CursorUp(n) => {
-                if n >= 2 {
-                    self.repaint_armed = Some(now);
-                }
                 self.cursor_row = self.cursor_row.saturating_sub(n).max(1);
                 self.cup_entered_row = false;
                 None
             }
-            ClearLineOrEraseDown => {
-                if self
-                    .repaint_armed
-                    .is_some_and(|at| now.duration_since(at) <= Duration::from_millis(REPAINT_WINDOW_MS))
-                {
-                    self.repaint_armed = None;
-                    self.repaints.push_back(now);
-                    self.repaints
-                        .retain(|at| now.duration_since(*at) <= Duration::from_millis(REPAINT_WINDOW_MS));
-                    if self.repaints.len() >= 3 {
-                        self.queue_strong(now, rows, EnterKind::Repaint, "inline-repaint");
-                    }
-                }
-                None
-            }
             CursorPosition { row } => {
-                // Full-screen addressing: a jump from the bottom of the
-                // grid (the bottom two rows) back to the top - the
-                // frame rewind of a full-screen repaint. A mid-grid
-                // jump is not evidence. The bottom must have been
-                // *addressed* by a CUP, not reached by scrolling: a
-                // PSReadLine startup clear scrolls the cursor to the
-                // bottom with CRLFs and homes again, which is not a
-                // frame rewind.
-                let from_bottom =
-                    self.cursor_row >= rows.saturating_sub(1) && self.cup_entered_row;
-                let ed2_recent = self.last_ed.is_some_and(|ed| {
-                    now.duration_since(ed) <= Duration::from_millis(FULLSCREEN_WINDOW_MS)
-                });
                 let target = row.clamp(1, rows.max(1));
                 self.cursor_row = target;
                 self.cup_entered_row = true;
-                // Addressing a non-home row is a TUI marker: shell
-                // cooked output positions the cursor only via home
-                // (after ED2) and scrolling.
-                if target > 1 {
-                    self.last_tui_marker = Some(now);
-                }
-                if row == 1 && from_bottom && rows >= 4 && !ed2_recent {
-                    // The rewind is not armed by a whole-screen clear:
-                    // commit. (Needs a big-enough grid for the jump to
-                    // be meaningful.)
-                    self.ed_home_watch = None;
-                    self.ed_home_rows.clear();
-                    self.queue_strong(now, rows, EnterKind::Grid, "cup-rewind")
-                } else if ed2_recent {
-                    // ED2/ED3 + home is the shell's `clear` signature:
-                    // hold the commit. Multi-row absolute CUPs
-                    // (>= 3 distinct rows, matching the drawing rule)
-                    // inside the window are the TUI repaint that
-                    // `clear` does not produce.
-                    let watch_open = self.ed_home_watch.is_some_and(|at| {
-                        now.duration_since(at)
-                            <= Duration::from_millis(FULLSCREEN_WINDOW_MS)
-                    });
-                    if !watch_open {
-                        self.ed_home_watch = Some(now);
-                        self.ed_home_rows.clear();
-                    }
-                    if target > 1 {
-                        self.ed_home_rows.insert(target);
-                        if self.ed_home_rows.len() >= 3 {
-                            self.ed_home_watch = None;
-                            self.ed_home_rows.clear();
-                            self.queue_strong(now, rows, EnterKind::Grid, "ed2-multiline-cup")
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                None
             }
-            Probe(family) => {
-                self.probes.push_back((family, now));
-                self.probes
-                    .retain(|(_, at)| now.duration_since(*at) <= Duration::from_millis(PROBE_WINDOW_MS));
-                let distinct = self
-                    .probes
-                    .iter()
-                    .map(|(family, _)| *family)
-                    .collect::<BTreeSet<u8>>()
-                    .len();
-                if distinct >= PROBE_FAMILIES_TO_STRONG {
-                    self.queue_strong(now, rows, EnterKind::Grid, "probe-burst")
-                } else {
-                    None
-                }
-            }
-            Weak => {
-                self.weaks.push_back(now);
-                self.weaks
-                    .retain(|at| now.duration_since(*at) <= Duration::from_millis(PROBE_WINDOW_MS));
-                if self.weaks.len() as u32 >= WEAK_TO_STRONG {
-                    self.queue_strong(now, rows, EnterKind::Grid, "weak-signals")
-                } else {
-                    None
-                }
-            }
+            // ED2/ED3 is never TUI evidence (the shell's `clear`), but
+            // the feed loop reposts it as a journal-history boundary.
+            EraseDisplay23 => None,
             NoSignal => None,
         }
     }
 
-    fn on_osc(&mut self, payload: &str, now: Instant, rows: u16) -> Option<TuiTransition> {
+    fn on_osc(&mut self, payload: &str) -> Option<TuiTransition> {
         // OSC 133 shell-integration markers are ground truth: the shell
         // owns the foreground again.
         if let Some(code) = payload.strip_prefix("133;") {
             let marker = code.chars().next().unwrap_or('\0');
             if matches!(marker, 'A' | 'B' | 'C' | 'D') && self.mode != TuiMode::Canonical {
-                return self.exit_to_canonical(now, "osc133");
+                return self.exit_to_canonical("osc133");
             }
             return None;
-        }
-        if payload.starts_with("10;?") || payload.starts_with("11;?") || payload.starts_with("12;?") {
-            return self.on_csi(CsiSignal::Probe(5), now, rows);
-        }
-        if payload.starts_with("0;") || payload.starts_with("2;") {
-            return self.on_csi(CsiSignal::Weak, now, rows);
         }
         None
     }
@@ -714,60 +435,22 @@ impl TuiClassifier {
             return;
         }
         // Printable text lands on the tracked row; record the draw
-        // extent for the fullscreen-addressing heuristics.
+        // extent for the DECSTBM paint rule.
         let row = self.cursor_row as usize;
         if row < self.extent_rows.len() && !self.extent_rows[row] {
             self.extent_rows[row] = true;
             // TUI frames are drawn flicker-free: cursor hidden, rows
             // entered by absolute CUP. Shell listings scroll with the
-            // cursor visible, and even when PSReadLine hides the
-            // cursor to redraw the prompt it reaches the listing rows
-            // by scrolling, stamping at most a handful of rows - far
-            // below the threshold. A plain `ls` must not commit.
+            // cursor visible, so they stamp nothing here; the paint
+            // evidence gate releases the grid-suppression hold on a
+            // real alt-screen TUI's first frame.
             if self.cursor_hidden && self.cup_entered_row {
                 self.row_stamps.push_back((self.cursor_row, now));
             }
         }
-        // A full-screen clear followed by multi-row drawing is the
-        // classic TUI repaint - but only with a TUI marker (cursor
-        // hide or row addressing). A bare `clear` followed by
-        // newline-terminated command output (`clear; ls`) carries no
-        // marker and stays canonical.
-        if self
-            .last_ed
-            .is_some_and(|ed| now.duration_since(ed) <= Duration::from_millis(FULLSCREEN_WINDOW_MS))
-            && self.distinct_extent(rows) >= 3
-            && self.marker_recent(now)
-        {
-            self.queue_strong(now, rows, EnterKind::Grid, "ed2-multiline-draw");
-        }
         // DECSTBM plus any drawing is a definitive fullscreen paint.
         if self.stbm && self.distinct_extent(rows) >= 2 {
             self.commit_definitive(now, rows, false, "stbm-draw");
-        }
-        // Cursor hidden long enough is a strong signal on its own.
-        if self.cursor_hidden
-            && self
-                .hidden_since
-                .is_some_and(|at| now.duration_since(at) >= Duration::from_millis(CURSOR_HIDDEN_MS))
-        {
-            self.queue_strong(now, rows, EnterKind::Grid, "cursor-hidden");
-        }
-        // Distinct-row writes inside the window: full-screen
-        // addressing. As with the post-ED rule, the writes must be
-        // accompanied by a TUI marker: a long `ls` listing scrolls
-        // across half the grid without CUP addressing - the scrolled
-        // rows stamp nothing, and its few CUP-targeted redraw rows
-        // stay far below the threshold.
-        self.row_stamps
-            .retain(|(_, at)| now.duration_since(*at) <= Duration::from_millis(FULLSCREEN_WINDOW_MS));
-        let distinct = self
-            .row_stamps
-            .iter()
-            .map(|(row, _)| *row)
-            .collect::<BTreeSet<u16>>();
-        if rows >= 4 && distinct.len() >= (rows / 2) as usize && self.marker_recent(now) {
-            self.queue_strong(now, rows, EnterKind::Grid, "distinct-rows");
         }
     }
 
@@ -857,12 +540,10 @@ impl TuiClassifier {
                     25 => CursorVisible,
                     2026 => SyncOutput,
                     1000 | 1002 | 1003 | 1005 | 1006 | 1015 => MouseOrFocus,
-                    // Focus-event reporting: PSReadLine (plain pwsh)
-                    // enables it at startup; the \x1b[I/\x1b[O focus
-                    // events it produces are not TUI evidence.
-                    1004 => NoSignal,
-                    2004 => Weak,
-                    1 => AppCursorKeys,
+                    // Focus-event reporting (PSReadLine enables it at
+                    // startup) and bracketed paste (`?2004h`) are not
+                    // TUI evidence.
+                    1004 | 2004 | 1 => NoSignal,
                     _ => NoSignal,
                 },
                 b'l' => match value {
@@ -870,10 +551,6 @@ impl TuiClassifier {
                     25 => CursorHidden,
                     _ => NoSignal,
                 },
-                b't' if value == 18 || value == 14 => Probe(1),
-                b'p' if intermediate == b'$' && groups.is_empty() => Probe(3), // DECRQM
-                b'n' if value == 6 => Probe(4), // DSR
-                b'c' => Probe(2), // DA1 (CSI ? c) and DA2 (CSI 0 ? c)
                 b'u' => KittyKeyboard, // kitty keyboard flags: CSI > n u
                 b'm' if groups.len() >= 2 && first == 4 => KittyKeyboard, // modifyOtherKeys: CSI > 4 ; n m
                 _ => NoSignal,
@@ -895,12 +572,16 @@ impl TuiClassifier {
                         NoSignal
                     }
                 }
-                b'J' => match value {
-                    2 | 3 => EraseDisplay23,
-                    _ => NoSignal,
-                },
-                b'K' => ClearLineOrEraseDown,
                 b'A' => CursorUp(if groups.is_empty() { 1 } else { value as u16 }),
+                b'J' => {
+                    // ED2 (screen) / ED3 (scrollback): a whole-screen
+                    // clear, journaled as a history boundary. ED0/ED1
+                    // clear a region and are not.
+                    match value {
+                        2 | 3 => EraseDisplay23,
+                        _ => NoSignal,
+                    }
+                }
                 b'H' | b'f' => {
                     // CUP: CSI row;col H / f. One parameter is the
                     // column only (row 1); none means home.
@@ -916,27 +597,6 @@ impl TuiClassifier {
                 },
                 b'G' => NoSignal, // column movement only
                 b'r' => Decstbm,
-                b't' => {
-                    if value == 18 || value == 14 {
-                        Probe(1)
-                    } else {
-                        NoSignal
-                    }
-                }
-                b'n' => {
-                    if value == 6 {
-                        Probe(4)
-                    } else {
-                        NoSignal
-                    }
-                }
-                b'c' => {
-                    if groups.is_empty() || first == 0 {
-                        Probe(2) // DA1 / DA2
-                    } else {
-                        NoSignal
-                    }
-                }
                 // Kitty keyboard flags: CSI > n u / CSI = n u. The intro
                 // marker covers the two-byte ESC = / ESC > forms; the `>`
                 // / `=` parameter-section byte covers the CSI forms. The
@@ -1009,16 +669,10 @@ enum CsiSignal {
     SyncOutput,
     MouseOrFocus,
     KittyKeyboard,
-    AppCursorKeys,
     Decstbm,
     EraseDisplay23,
     CursorUp(u16),
-    ClearLineOrEraseDown,
     CursorPosition { row: u16 },
-    /// Probe families: 1 window size (18t/14t), 2 DA, 3 DECRQM, 4 DSR,
-    /// 5 OSC color query.
-    Probe(u8),
-    Weak,
 }
 
 #[cfg(test)]
@@ -1149,9 +803,7 @@ mod tests {
         // First `ls` in plain pwsh: PSReadLine redraws the prompt
         // (cursor hidden, CUP to the prompt row, erase + text), shows
         // the cursor, then streams the listing with the cursor
-        // visible across half the grid. The listing stamps no rows
-        // (visible), so the distinct-row rule cannot commit even
-        // though a marker (non-home CUP) is recent.
+        // visible across half the grid. None of it is TUI evidence.
         let mut steps: Vec<(u64, String)> = vec![
             (
                 10,
@@ -1167,17 +819,17 @@ mod tests {
     }
 
     #[test]
-    fn hidden_multi_row_frame_still_commits_fullscreen() {
-        // The distinct-row rule still fires for real repaints: cursor
-        // hidden, absolute CUP addressing across half the grid.
+    fn hidden_multi_row_frame_stays_canonical_without_a_definitive_signal() {
+        // A hidden-cursor multi-row repaint with absolute addressing
+        // (the old distinct-row rule) is no longer evidence: only
+        // definitive program announcements move the period.
         let mut steps: Vec<(u64, String)> = vec![(10, "\x1b[?25l".into())];
         for row in 1..=20u16 {
             steps.push((5, format!("\x1b[{row};1Hrow {row}\r\n")));
         }
         steps.push((60, String::new()));
         let out = feed_timed_owned(30, &steps);
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]
@@ -1185,8 +837,7 @@ mod tests {
         // PSReadLine startup: hide the cursor, clear all rows with
         // EL + CRLF (the cursor scrolls to the bottom row), then
         // home and show the cursor. The home from the bottom looks
-        // like a frame rewind, but the bottom was reached by
-        // scrolling, not a CUP, so cup-rewind must not fire.
+        // like a frame rewind, but none of this is evidence.
         let mut chunk = String::from("\x1b[?25l");
         for _ in 0..38 {
             chunk.push_str("\x1b[K\r\n");
@@ -1232,33 +883,19 @@ mod tests {
     }
 
     #[test]
-    fn full_screen_addressing_commits_fullscreen_after_the_window() {
-        // CUP jumps from the bottom of the grid to row 1, then a burst
-        // of writes across most rows: a classic fullscreen TUI open.
+    fn full_screen_addressing_without_a_definitive_signal_stays_canonical() {
+        // CUP jumps from the bottom of the grid to row 1 plus a burst
+        // of writes across most rows (the old cup-rewind rule) is no
+        // longer evidence: only definitive program announcements move
+        // the period.
         let mut steps: Vec<(u64, &str)> = vec![(10, "\x1b[30;1H")];
         for row in 1..=15u16 {
             let chunk = format!("\x1b[{row};1Htext\r\n");
             steps.push((1, chunk.leak()));
         }
-        steps.push((60, "")); // let the confirmation window elapse
+        steps.push((60, ""));
         let out = feed_timed(30, &steps);
-        assert_eq!(out.len(), 1);
-        assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
-    }
-
-    #[test]
-    fn ed2_plus_multiline_draw_commits_fullscreen() {
-        let out = feed_timed(
-            30,
-            &[
-                (10, "\x1b[?25l"),
-                (5, "\x1b[2J\x1b[1;1H"),
-                (5, "row one\r\nrow two\r\nrow three\r\n"),
-                (60, ""),
-            ],
-        );
-        assert_eq!(out.len(), 1);
-        assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]
@@ -1277,12 +914,50 @@ mod tests {
     }
 
     #[test]
+    fn whole_screen_clear_reports_a_chunk_marker() {
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        at += Duration::from_millis(10);
+        assert!(clf.feed("echo on\r\n\x1b[2J\x1b[HPS C:\\> ", at, 30).is_none());
+        assert_eq!(clf.take_chunk_clear(), Some(9));
+        assert_eq!(clf.take_chunk_clear(), None, "the marker is consumed once");
+        // ED3 (scrollback wipe) is a clear boundary too.
+        at += Duration::from_millis(5);
+        assert!(clf.feed("\x1b[3J\x1b[H", at, 30).is_none());
+        assert_eq!(clf.take_chunk_clear(), Some(0));
+    }
+
+    #[test]
+    fn erase_down_or_up_are_not_clear_markers() {
+        // ED0 (`\x1b[J`) and ED1 (`\x1b[1J`) clear a region, not the
+        // history: the host must not truncate the journal for them.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        at += Duration::from_millis(10);
+        assert!(clf.feed("\x1b[J\x1b[1J", at, 30).is_none());
+        assert_eq!(clf.take_chunk_clear(), None);
+    }
+
+    #[test]
+    fn a_clear_split_across_chunks_is_not_reported() {
+        // The sequence start sits in the previous chunk, so the current
+        // chunk cannot anchor a journal cut.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        at += Duration::from_millis(10);
+        assert!(clf.feed("before\x1b[2", at, 30).is_none());
+        assert_eq!(clf.take_chunk_clear(), None);
+        at += Duration::from_millis(10);
+        assert!(clf.feed("J", at, 30).is_none());
+        assert_eq!(clf.take_chunk_clear(), None);
+    }
+
+    #[test]
     fn clear_then_command_output_stays_canonical() {
         // `clear; ls`: ED2 + home, then plain newline-terminated
         // command output - no cursor hide, no row addressing. Must
         // stay canonical so typing/resize/focus does not claim the
-        // PTY grid (the pending candidate, if any, would only be
-        // confirmed by the next chunk - the user's keystroke).
+        // PTY grid.
         let out = feed_timed(
             30,
             &[
@@ -1297,10 +972,9 @@ mod tests {
 
     #[test]
     fn large_listing_scrolled_without_markers_stays_canonical() {
-        // The rolling distinct-row rule (half the grid written inside
-        // the window) also requires a TUI marker: a long `ls` listing
-        // after `clear` scrolls across the grid without cursor hides
-        // or row addressing, so it must not commit.
+        // A long `ls` listing after `clear` scrolls across the grid
+        // without cursor hides or row addressing, so it must not
+        // commit.
         let mut steps: Vec<(u64, String)> = vec![(10, "\x1b[2J\x1b[1;1H".into())];
         for row in 0..20 {
             steps.push((5, format!("entry {row}\r\n")));
@@ -1311,10 +985,11 @@ mod tests {
     }
 
     #[test]
-    fn cursor_hidden_scrolled_draw_commits_fullscreen() {
-        // The marker gate is a requirement, not a veto on real
-        // repaints: a cursor-hidden ED2 + multi-row draw (no CUPs) is
-        // still a TUI.
+    fn cursor_hidden_ed2_draw_stays_canonical() {
+        // A cursor-hidden multi-row draw after an ED stays canonical:
+        // this was the pattern that got PSReadLine's Clear-Host (ED3 +
+        // prompt + erase sweep + hidden-cursor redraws) misread as a
+        // fullscreen TUI, and it is no longer evidence.
         let out = feed_timed(
             30,
             &[
@@ -1323,8 +998,7 @@ mod tests {
                 (60, ""),
             ],
         );
-        assert_eq!(out.len(), 1);
-        assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]
@@ -1334,15 +1008,8 @@ mod tests {
         let out = feed(Instant::now(), 30, &["\x1b[?1049h", "x"]);
         assert_eq!(out[0].reason, "alt-enter");
 
-        let out = feed_timed(
-            30,
-            &[
-                (10, "\x1b[30;1H"),
-                (5, "\x1b[1;1H"),
-                (60, ""),
-            ],
-        );
-        assert_eq!(out[0].reason, "cup-rewind");
+        let out = feed(Instant::now(), 30, &["\x1b[?2026h", "x"]);
+        assert_eq!(out[0].reason, "sync-output");
 
         let out = feed_timed(
             30,
@@ -1367,8 +1034,7 @@ mod tests {
         at += Duration::from_millis(10);
         assert!(clf.feed(&"entry\r\n".repeat(30), at, 30).is_none());
         at += Duration::from_millis(10);
-        // Home first, ED2 second: the jump queues a candidate, the
-        // clear that follows drops it.
+        // Home first, ED2 second.
         assert!(clf.feed("\x1b[H\x1b[2J", at, 30).is_none());
         at += Duration::from_millis(10);
         assert!(clf.feed("\x1b[H", at, 30).is_none());
@@ -1386,27 +1052,10 @@ mod tests {
     }
 
     #[test]
-    fn ed2_home_repaint_with_multiline_cups_commits_fullscreen() {
-        // ED2 + home is held as the `clear` signature; multi-row
-        // absolute CUPs inside the window prove a TUI repaint.
-        let out = feed_timed(
-            30,
-            &[
-                (10, "\x1b[2J\x1b[1;1H"),
-                (5, "\x1b[2;1Hrow"),
-                (5, "\x1b[3;1Hrow"),
-                (5, "\x1b[4;1Hrow"),
-                (60, ""),
-            ],
-        );
-        assert_eq!(out.len(), 1);
-        assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
-    }
-
-    #[test]
     fn ed2_home_with_a_two_row_prompt_stays_canonical() {
         // Two distinct CUP rows is a multi-line prompt redraw, not a
-        // full-screen repaint (the threshold matches the drawing rule).
+        // full-screen repaint (there is no ED-based detection left to
+        // misread a prompt redraw as a TUI repaint).
         let out = feed_timed(
             30,
             &[
@@ -1419,9 +1068,85 @@ mod tests {
     }
 
     #[test]
-    fn probe_burst_commits_fullscreen() {
-        // Three distinct probe families inside the burst window: a TUI
-        // startup querying the terminal, not a shell prompt.
+    fn psreadline_clear_with_erase_sweep_stays_canonical() {
+        // PSReadLine's Clear-Host on a primary-buffer terminal: ED3 +
+        // prompt + a full-grid `\x1b[K` erase sweep stepped down by
+        // scrolling, then the line editor's absolute-addressed redraws
+        // (the prompt text on row 1, CUP placement at 33/3, hidden
+        // cursor). This pattern is indistinguishable from a primary-
+        // buffer TUI repaint, so none of it is evidence: the host used
+        // to wrap the shell clear in a synthetic alt pair and every
+        // client split the clear across two buffers - the prompt
+        // appeared to vanish twice and stale output replaced the
+        // cleared screen.
+        let sweep: &'static str = Box::leak(("\x1b[K\r\n".repeat(38)).into_boxed_str());
+        let out = feed_timed(
+            39,
+            &[
+                (10, "\x1b[H\x1b[?25h\x1b[3J\x1b]9;9;C:\\repo\x07\x1b[?25lPS C:\\repo> "),
+                (5, sweep),
+                (5, "\x1b[1;31H\x1b[?25h"),
+                (5, "\x1b[?25l\x1b[93ml\x1b[97m\x1b[2m\x1b[3ms\x08\x1b[1;33H\x1b[?25h"),
+                (5, "\x1b[?25l\x1b[93m\x1b[3;1Hrow\x1b[4;1Hrow"),
+                (60, ""),
+            ],
+        );
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn ed2_home_with_multiline_cups_no_longer_commits() {
+        // The old ed2-multiline-cup rule: ED2 + home held as the `clear`
+        // signature, then multi-row absolute CUPs that used to prove a TUI
+        // repaint. With the ED-based detection removed, this shell-clear
+        // follow-up stays canonical too - it is exactly the prompt/editor
+        // placement PSReadLine uses after a clear.
+        let out = feed_timed(
+            30,
+            &[
+                (10, "\x1b[2J\x1b[1;1H"),
+                (5, "\x1b[2;1Hrow"),
+                (5, "\x1b[3;1Hrow"),
+                (5, "\x1b[4;1Hrow"),
+                (60, ""),
+            ],
+        );
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn bottom_up_jump_is_not_tui_evidence_in_any_direction() {
+        // A bottom-to-top frame rewind used to be a candidate (cup-rewind).
+        // With the ED-based detection removed entirely, it stays canonical
+        // whether or not a whole-screen clear preceded it; only definitive
+        // signals (alt-enter, sync-output, DECSTBM paint, mouse/kitty)
+        // commit a fullscreen period now.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        at += Duration::from_millis(10);
+        assert!(clf.feed("\x1b[30;1H", at, 30).is_none());
+        at += Duration::from_millis(10);
+        assert!(clf.feed("\x1b[1;1Hframe", at, 30).is_none());
+        at += Duration::from_millis(60);
+        assert!(clf.feed("", at, 30).is_none());
+        // With a whole-screen clear in between (the shell's `clear` shape).
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        at += Duration::from_millis(10);
+        assert!(clf.feed("\x1b[30;1H", at, 30).is_none());
+        at += Duration::from_millis(10);
+        assert!(clf.feed("\x1b[2J", at, 30).is_none());
+        at += Duration::from_millis(10);
+        assert!(clf.feed("\x1b[1;1Hframe", at, 30).is_none());
+        at += Duration::from_millis(60);
+        assert!(clf.feed("", at, 30).is_none());
+    }
+
+    #[test]
+    fn probe_burst_stays_canonical() {
+        // Probe families (DA, DSR, window size queries) are terminal
+        // capability checks, not TUI evidence - a shell prompt fires
+        // some of them too.
         let out = feed_timed(
             30,
             &[
@@ -1431,14 +1156,13 @@ mod tests {
                 (60, ""),
             ],
         );
-        assert_eq!(out.len(), 1);
-        assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]
-    fn inline_repaint_pattern_commits_inline() {
-        // Three CUU+EL bottom-region repaints: an inline bottom-region
-        // app (fzf-style), not fullscreen.
+    fn inline_repaint_pattern_stays_canonical() {
+        // CUU+EL bottom-region repaints (fzf-style inline apps) are no
+        // longer evidence: the inline mode is not produced anymore.
         let out = feed_timed(
             30,
             &[
@@ -1449,12 +1173,13 @@ mod tests {
                 (60, ""),
             ],
         );
-        assert_eq!(out.len(), 1);
-        assert_eq!(mode(&out[0]), TuiMode::Inline);
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]
-    fn inline_upgrades_to_fullscreen_on_alt_enter() {
+    fn alt_enter_still_commits_after_an_inline_like_harness() {
+        // The repaint harness never commits, but the program's own
+        // alt-screen entry remains definitive whenever it arrives.
         let mut clf = TuiClassifier::new(30);
         let mut at = Instant::now();
         for _ in 0..3 {
@@ -1462,17 +1187,17 @@ mod tests {
             clf.feed("\x1b[3A\x1b[2Kline\r\n", at, 30);
         }
         at += Duration::from_millis(60);
-        assert!(clf.feed("", at, 30).is_some()); // inline commit
+        assert!(clf.feed("", at, 30).is_none(), "no inline commit");
         at += Duration::from_millis(5);
-        let upgrade = clf.feed("\x1b[?1049h", at, 30).expect("alt enter upgrades");
+        let upgrade = clf.feed("\x1b[?1049h", at, 30).expect("alt-enter commits");
         assert_eq!(mode(&upgrade), TuiMode::Fullscreen);
     }
 
     #[test]
-    fn exit_hold_prevents_a_prompt_redraw_bounce() {
-        // Exit fullscreen, then a prompt redraw (clear + a few rows)
-        // inside the hold-off: the strong signal is dropped, so the only
-        // transitions are the enter and the exit.
+    fn post_exit_prompt_redraw_stays_canonical() {
+        // Exit fullscreen, then a prompt redraw (clear + a few rows):
+        // none of it is evidence, so the only transitions are the enter
+        // and the exit.
         let out = feed_timed(
             30,
             &[
@@ -1491,16 +1216,15 @@ mod tests {
 
     #[test]
     fn stream_anchored_exit_on_quiet_newline_terminated_prompt() {
-        // A stream-anchored fullscreen TUI (no alt screen of its own)
-        // leaves: the prompt is newline-terminated and the stream goes
-        // quiet.
+        // A stream-anchored fullscreen TUI (no alt screen of its own,
+        // entered through sync-output) leaves: the prompt is
+        // newline-terminated and the stream goes quiet.
         let out = feed_timed(
             30,
             &[
-                (10, "\x1b[?25l"),
-                (5, "\x1b[2J\x1b[1;1H"),
-                (5, "row one\r\nrow two\r\nrow three\r\n"),
-                (60, ""), // strong commit to fullscreen
+                (10, "\x1b[?2026h"),
+                (5, "frame one\r\nframe two\r\n"),
+                (60, ""), // definitive sync-output entry
                 (5, "done\r\n\x1b[?25h"),
                 (520, "PS C:\\> "),
             ],
@@ -1509,6 +1233,7 @@ mod tests {
         assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
         assert_eq!(mode(&out[1]), TuiMode::Canonical);
         assert!(!out[1].program_alt_exit);
+        assert_eq!(out[1].reason, "exit-quiet");
     }
 
     #[test]
@@ -1531,22 +1256,6 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
-    }
-
-    #[test]
-    fn a_cooked_foreground_vetoes_strong_signals() {
-        let mut clf = TuiClassifier::new(30);
-        clf.set_raw_mode(false);
-        let mut at = Instant::now();
-        at += Duration::from_millis(10);
-        clf.feed("\x1b[2J\x1b[1;1H", at, 30);
-        at += Duration::from_millis(5);
-        clf.feed("row one\r\nrow two\r\nrow three\r\n", at, 30);
-        at += Duration::from_millis(60);
-        assert!(clf.feed("", at, 30).is_none()); // strong, but cooked
-        at += Duration::from_millis(5);
-        // Definitive signals are not vetoed.
-        assert!(clf.feed("\x1b[?2026h", at, 30).is_some());
     }
 
     /// Feed one step on a live classifier, advancing the clock by `gap`.

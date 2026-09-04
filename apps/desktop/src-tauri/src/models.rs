@@ -285,14 +285,28 @@ pub enum ClientMessage {
         session_id: String,
     },
     #[serde(rename = "session.input")]
-    SessionInput { session_id: String, data: String },
+    SessionInput {
+        session_id: String,
+        data: String,
+        /// The sender's viewport at the moment of typing. In a TUI period the
+        /// host applies it immediately (the interacting client owns the grid).
+        #[serde(default)]
+        cols: Option<u16>,
+        #[serde(default)]
+        rows: Option<u16>,
+    },
     #[serde(rename = "session.resize")]
     SessionResize {
         session_id: String,
         cols: u16,
         rows: u16,
-        force: Option<bool>,
     },
+    /// Bare heartbeat with no requestId and no reply: the host only bumps the
+    /// client's viewport liveness so a networked client stays in a session's
+    /// viewport set S. The `snapshot.request` heartbeat (the presence dot)
+    /// stays as-is; a full snapshot every second would be far too heavy.
+    #[serde(rename = "ping")]
+    Ping,
     #[serde(rename = "debug.diagnostics")]
     DebugDiagnostics { message: String },
     #[serde(rename = "shell.default")]
@@ -320,7 +334,7 @@ impl ClientMessage {
             | Self::SessionAttach { request_id, .. }
             | Self::SessionDetach { request_id, .. }
             | Self::ShellDefault { request_id, .. } => Some(request_id),
-            Self::SessionInput { .. } | Self::SessionResize { .. } | Self::DebugDiagnostics { .. } => {
+            Self::SessionInput { .. } | Self::SessionResize { .. } | Self::DebugDiagnostics { .. } | Self::Ping => {
                 None
             }
         }
@@ -402,16 +416,16 @@ mod tests {
     #[test]
     fn protocol_field_names_match_the_mobile_contract() {
         let client: ClientMessage = serde_json::from_str(
-            r#"{"type":"session.resize","sessionId":"s1","cols":120,"rows":40,"force":true}"#,
+            r#"{"type":"session.resize","sessionId":"s1","cols":120,"rows":40}"#,
         )
         .expect("client message");
         assert!(matches!(
             client,
-            ClientMessage::SessionResize {
-                force: Some(true),
-                ..
-            }
+            ClientMessage::SessionResize { cols: 120, rows: 40, .. }
         ));
+
+        let ping: ClientMessage = serde_json::from_str(r#"{"type":"ping"}"#).expect("ping");
+        assert!(matches!(ping, ClientMessage::Ping));
 
         let enrollment: ClientMessage = serde_json::from_str(
             r#"{"type":"node.enroll","requestId":"r2","nonce":"12345678901234567890123456789012"}"#,

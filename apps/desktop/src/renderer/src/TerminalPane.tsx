@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { applyTerminalModifiers, findHttpLinks, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCROLLBACK_LINES, type TerminalModifier, type TuiMode } from "@agentterminal/protocol";
+import { applyTerminalModifiers, findHttpLinks, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCROLLBACK_LINES, type TerminalModifier } from "@agentterminal/protocol";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { sessionId: string; visible: boolean; active: boolean; confirmExternalLinks: boolean; }
@@ -22,7 +22,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const activeRef = useRef(active);
-  const resizeRef = useRef<(force?: boolean) => void>(() => undefined);
+  const resizeRef = useRef<() => void>(() => undefined);
   const confirmExternalLinksRef = useRef(confirmExternalLinks);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const [linkOpening, setLinkOpening] = useState(false);
@@ -157,22 +157,15 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
     };
 
     // ---------------------------------------------------------------------
-    // Dual-path rendering (distinguished by the host's TUI mode, which
-    // the stream-signal classifier reports):
-    //  - CANONICAL (viewport mode): the session grid is frozen; this pane
-    //    renders the journal at its OWN size by re-parsing it at a single
-    //    grid (reset + full replay, coalesced). Idempotent and lossless,
-    //    no reflow, no host resize - resizing a million times is a re-render.
-    //  - INLINE / FULLSCREEN (focus mode): the focused window's size IS the
-    //    PTY grid; the pane calls fit() and pushes the dimensions to the
-    //    host (SIGWINCH), and the TUI repaints natively across the new grid.
+    // Single rendering path (minimum-boundary sizing): the host PTY grid is
+    // the smallest announced viewport over the clients viewing the session,
+    // and this pane is never narrower than the PTY - so the pane renders the
+    // host grid exactly and letterboxes the surplus. The host grid is
+    // followed in EVERY mode; the raw journal replays 1:1 with no
+    // re-wrapping at the pane's own size.
     // ---------------------------------------------------------------------
-    let tuiMode: TuiMode = "canonical";
-    let sessionGrid = { cols: 0, rows: 0 };
-    let viewportGrid = { cols: 0, rows: 0 };
-    let refreshing = false;
-    let refreshQueued = false;
-    let refreshLoopPromise = Promise.resolve();
+    let viewportCols = 0;
+    let viewportRows = 0;
     const proposeGrid = () => {
       try {
         const dims = fit.proposeDimensions();
@@ -180,60 +173,20 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
       } catch { /* hidden pane */ }
       return null;
     };
-    const scheduleRefresh = () => {
-      refreshQueued = true;
-      if (!refreshing) void refreshLoop();
-    };
-    const refreshLoop = () => {
-      if (refreshing) return refreshLoopPromise;
-      refreshing = true;
-      refreshLoopPromise = (async () => {
-        try {
-          while (refreshQueued) {
-            refreshQueued = false;
-            await refreshOnce();
-          }
-        } finally {
-          refreshing = false;
-        }
-      })();
-      return refreshLoopPromise;
-    };
-    const refreshOnce = async () => {
-      if (disposed) return;
+    // Announce, don't assert: the pane's proposed dimensions are its
+    // viewport (W_i, H_i) - the host takes the minimum over all announced
+    // viewports in canonical mode. In a TUI period the interacting client
+    // owns the grid, so a click re-announces (force) even when the pane's
+    // own size has not changed: the host applies it to the PTY. Never
+    // fit(): the emulator's grid is the host's, not the container's.
+    const announceViewport = (force = false) => {
       const dims = proposeGrid();
-      if (dims) viewportGrid = dims;
-      if (!(viewportGrid.cols > 0)) return;
-      const requestGrid = sessionGrid.cols > 0 ? sessionGrid : viewportGrid;
-      dbg(`reparse send session=${sessionId} viewport=${viewportGrid.cols}x${viewportGrid.rows} sessionGrid=${requestGrid.cols}x${requestGrid.rows}`);
-      const snapshot = await window.agentTerminal.attachSession(sessionId, requestGrid.cols, requestGrid.rows);
-      if (disposed) {
-        window.agentTerminal.detachSession(sessionId);
-        return;
-      }
-      const lastSegment = snapshot.segments.at(-1);
-      if (lastSegment) sessionGrid = { cols: lastSegment.cols, rows: lastSegment.rows };
-      initialized = false;
-      replayingSessionBuffer = true;
-      pending.length = 0;
-      appliedUpTo = Math.max(appliedUpTo, snapshot.endOffset);
-      terminal.reset();
-      if (viewportGrid.cols !== terminal.cols || viewportGrid.rows !== terminal.rows) {
-        terminal.resize(viewportGrid.cols, viewportGrid.rows);
-      }
-      const flat = snapshot.segments.map((segment) => segment.data).join("");
-      dbg(`reparse session=${sessionId} viewport=${viewportGrid.cols}x${viewportGrid.rows} sessionGrid=${sessionGrid.cols}x${sessionGrid.rows} bytes=${flat.length} end=${snapshot.endOffset} pending=${pending.length}`);
-      await new Promise<void>((resolve) => terminal.write(flat, () => resolve()));
-      replayingSessionBuffer = false;
-      replayPending();
-    };
-    // TUI path: assert our dimensions to the host (SIGWINCH on the PTY).
-    const announceViewport = () => {
-      try {
-        fit.fit();
-        dbg(`resize(tui) session=${sessionId} cols=${terminal.cols} rows=${terminal.rows}`);
-        window.agentTerminal.resize(sessionId, terminal.cols, terminal.rows, true);
-      } catch { /* hidden pane */ }
+      if (!dims) return;
+      if (!force && dims.cols === viewportCols && dims.rows === viewportRows) return;
+      viewportCols = dims.cols;
+      viewportRows = dims.rows;
+      dbg(`viewport session=${sessionId} cols=${dims.cols} rows=${dims.rows}${force ? " (forced)" : ""}`);
+      window.agentTerminal.resize(sessionId, dims.cols, dims.rows);
     };
     const applyGridInPlace = (cols: number, rows: number) => {
       if (cols !== terminal.cols || rows !== terminal.rows) {
@@ -241,30 +194,13 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
       }
     };
 
-    const resize = (force = false) => {
+    const resize = () => {
       if (!activeRef.current) return;
-      if (tuiMode !== "canonical") {
-        // TUI focus mode: push our dimensions so the TUI repaints (SIGWINCH).
-        announceViewport();
-        return;
-      }
-      const dims = proposeGrid();
-      if (!dims) return;
-      if (dims.cols !== viewportGrid.cols || dims.rows !== viewportGrid.rows) {
-        viewportGrid = dims;
-        scheduleRefresh();
-      }
-      dbg(`viewport session=${sessionId} cols=${dims.cols} rows=${dims.rows} force=${force}`);
+      announceViewport();
     };
     resizeRef.current = resize;
-
     const sendKeyboardInput = (data: string) => {
       if (!data) return;
-      if (tuiMode !== "canonical") {
-        try { fit.fit(); } catch { /* hidden pane */ }
-        window.agentTerminal.write(sessionId, data, terminal.cols, terminal.rows);
-        return;
-      }
       const dims = proposeGrid() ?? { cols: terminal.cols, rows: terminal.rows };
       window.agentTerminal.write(sessionId, data, dims.cols, dims.rows);
     };
@@ -315,27 +251,23 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
     const observer = new ResizeObserver(() => resize());
     observer.observe(hostRef.current);
     const handlePointerActivity = () => {
-      // Only a focused window drives the PTY grid; taps elsewhere (e.g. an
-      // inactive split pane) must not steal focus.
-      if (activeRef.current) resize(true);
+      // A click on the terminal area is an interaction: force a viewport
+      // announce so the host applies this pane's size to the PTY grid in
+      // a TUI period even when the pane's own size did not change.
+      if (activeRef.current) announceViewport(true);
     };
     window.addEventListener("pointerdown", handlePointerActivity, true);
-    const inputDims = () => tuiMode !== "canonical"
-      ? { cols: terminal.cols, rows: terminal.rows }
-      : (proposeGrid() ?? { cols: terminal.cols, rows: terminal.rows });
+    const inputDims = () => proposeGrid() ?? { cols: terminal.cols, rows: terminal.rows };
     const dataSubscription = terminal.onData((data) => {
+      const dims = inputDims();
       if (isCursorPositionReport(data)) {
         // A newly created pane is attached before it becomes the active tab.
         // Forward terminal-generated CPR replies even while hidden; the tray
         // validates them against the shell's outstanding queries.
-        if (tuiMode !== "canonical") { try { fit.fit(); } catch { /* hidden pane */ } }
-        const dims = inputDims();
         window.agentTerminal.write(sessionId, data, dims.cols, dims.rows);
         return;
       }
       if (!activeRef.current) return;
-      if (tuiMode !== "canonical") { try { fit.fit(); } catch { /* hidden pane */ } }
-      const dims = inputDims();
       window.agentTerminal.write(sessionId, data, dims.cols, dims.rows);
     });
 
@@ -346,6 +278,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
     // be applied: any chunk (or grid epoch) at or below this offset is already
     // contained in the replayed segments.
     let appliedUpTo = 0;
+    let initialAttachPromise: Promise<void> | undefined;
     const pending: PendingItem[] = [];
     const offData = window.agentTerminal.onData((id, data, offset) => {
       if (id !== sessionId) return;
@@ -363,28 +296,15 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
     });
     const offGrid = window.agentTerminal.onGrid((id, cols, rows) => {
       if (id !== sessionId) return;
-      sessionGrid = { cols, rows };
-      if (tuiMode !== "canonical") {
-        applyGridInPlace(cols, rows);
-        dbg(`grid(tui) session=${sessionId} cols=${cols} rows=${rows}`);
-      } else {
-        dbg(`grid session=${sessionId} cols=${cols} rows=${rows} recorded`);
-      }
+      applyGridInPlace(cols, rows);
+      dbg(`grid session=${sessionId} cols=${cols} rows=${rows}`);
     });
-    // TUI mode flips the render path. On entry to inline/fullscreen, the
-    // focused pane announces its size so the TUI opens at the right
-    // dimensions; on exit to canonical, the pane returns to viewport
-    // rendering, re-parsing the journal at its own grid (which also heals
-    // any primary history after the TUI).
+    // TUI mode is classification only: it no longer switches the sizing or
+    // render path under minimum-boundary sizing. The pane follows the host
+    // grid in every mode.
     const offMode = window.agentTerminal.onTuiMode((id, mode, offset) => {
       if (id !== sessionId) return;
-      tuiMode = mode;
       dbg(`mode session=${sessionId} mode=${mode} off=${offset}`);
-      if (mode === "canonical") {
-        scheduleRefresh();
-      } else if (activeRef.current) {
-        announceViewport();
-      }
     });
     const finishAttachment = () => {
       if (disposed) return;
@@ -408,7 +328,43 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
       dbg(`pend session=${sessionId} off=${item.offset} len=${streamByteLength(item.data)} upTo=${appliedUpTo}`);
       terminal.write(item.data, () => replayPending(index + 1));
     };
-    void refreshLoop();
+    // Full replay is needed only on initial attach (and reconnect): the
+    // pane's size is at least the PTY's, so the segments replay 1:1 with no
+    // re-wrapping at the pane's own grid.
+    initialAttachPromise = (async () => {
+      const dims = proposeGrid() ?? { cols: terminal.cols, rows: terminal.rows };
+      viewportCols = dims.cols;
+      viewportRows = dims.rows;
+      dbg(`attach send session=${sessionId} viewport=${dims.cols}x${dims.rows}`);
+      const snapshot = await window.agentTerminal.attachSession(sessionId, dims.cols, dims.rows);
+      if (disposed) {
+        window.agentTerminal.detachSession(sessionId);
+        return;
+      }
+      const segments = snapshot.segments;
+      dbg(`buffer session=${sessionId} end=${snapshot.endOffset} segs=${segments.map((s) => `${s.cols}x${s.rows}+${s.data.length}`).join(" ")}`);
+      initialized = false;
+      replayingSessionBuffer = true;
+      pending.length = 0;
+      appliedUpTo = Math.max(appliedUpTo, snapshot.endOffset);
+      terminal.reset();
+      const writeNext = (index = 0) => {
+        if (disposed) return;
+        const segment = segments[index];
+        if (segment === undefined) {
+          replayingSessionBuffer = false;
+          replayPending();
+          return;
+        }
+        // Each segment is rendered at its recorded grid - the journal
+        // replays 1:1 exactly the way the live clients applied it.
+        if (segment.cols !== terminal.cols || segment.rows !== terminal.rows) {
+          terminal.resize(segment.cols, segment.rows);
+        }
+        terminal.write(segment.data, () => writeNext(index + 1));
+      };
+      writeNext();
+    })();
     const statsTimer = window.setInterval(() => {
       if (disposed || !terminalRef.current) return;
       const buffer = terminal.buffer.active;
@@ -422,7 +378,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
       offData();
       offGrid();
       offMode();
-      void refreshLoopPromise.then(() => window.agentTerminal.detachSession(sessionId));
+      void (initialAttachPromise ?? Promise.resolve()).then(() => window.agentTerminal.detachSession(sessionId));
       if (statsTimer !== undefined) window.clearInterval(statsTimer);
       if (copyToastTimer) window.clearTimeout(copyToastTimer);
       httpLinkProvider.dispose();

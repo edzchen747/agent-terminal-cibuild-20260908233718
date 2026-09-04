@@ -672,3 +672,93 @@ test("host record writes are safe when storage throws", async () => {
     restore();
   }
 });
+
+// ---- viewport keepalive -----------------------------------------------------
+// A bare ping every second while a terminal page is attached keeps the phone
+// in the host's viewport set S; the tick is skipped while the app is hidden,
+// so a backgrounded phone drops back out of S within the host's watchdog.
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function pairedConnection(collect) {
+  const pending = HostConnection.pair(pairPayload(), FAKE_DEVICE);
+  const socket = await untilSocket();
+  const originalSend = socket.send.bind(socket);
+  socket.send = (payload) => {
+    collect(payload);
+    originalSend(payload);
+  };
+  socket.setOpen();
+  await pump();
+  socket.serve({ type: "pair.accepted", deviceToken: "device-token", snapshot: SNAPSHOT });
+  const connection = await pending;
+  // The background enrollment must not reach for a real node engine.
+  connection.embeddedEngine = { start: async () => ({ engineStarted: true }), stop: async () => {} };
+  socket.serve({ type: "node.enrollment", authKey: "auth-key", expiresAt: new Date(Date.now() + 60_000).toISOString() });
+  await pump();
+  await pump();
+  return connection;
+}
+
+const pingCount = (sent) => sent.filter((payload) => JSON.parse(payload).type === "ping").length;
+
+test("the viewport keepalive pings once a second and silences on stop", async () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = { hidden: false };
+  try {
+    await withFakeWebSocket(async () => {
+      const sent = [];
+      const connection = await pairedConnection((payload) => sent.push(payload));
+      connection.startViewportKeepalive();
+      await sleep(1_350);
+      assert.equal(pingCount(sent), 1, "one ping must land within the first interval");
+      connection.stopViewportKeepalive();
+      await sleep(1_350);
+      assert.equal(pingCount(sent), 1, "stop must silence the keepalive");
+      connection.close();
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+});
+
+test("the viewport keepalive skips while the app is hidden and resumes on visibility", async () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = { hidden: true };
+  try {
+    await withFakeWebSocket(async () => {
+      const sent = [];
+      const connection = await pairedConnection((payload) => sent.push(payload));
+      connection.startViewportKeepalive();
+      await sleep(1_350);
+      assert.equal(pingCount(sent), 0, "a hidden app must not ping");
+      globalThis.document.hidden = false;
+      await sleep(1_350);
+      assert.equal(pingCount(sent), 1, "visibility must resume the pings");
+      connection.close();
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+});
+
+test("restarting the viewport keepalive does not double the tick", async () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = { hidden: false };
+  try {
+    await withFakeWebSocket(async () => {
+      const sent = [];
+      const connection = await pairedConnection((payload) => sent.push(payload));
+      connection.startViewportKeepalive();
+      connection.startViewportKeepalive();
+      await sleep(1_350);
+      assert.equal(pingCount(sent), 1, "a re-start must replace the interval, not stack it");
+      connection.close();
+    });
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+});

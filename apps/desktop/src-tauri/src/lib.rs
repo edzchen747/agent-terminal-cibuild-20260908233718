@@ -152,15 +152,8 @@ fn resize_session(
     session_id: String,
     cols: u16,
     rows: u16,
-    force: Option<bool>,
 ) {
-    state.resize_desktop_session(
-        window.label(),
-        &session_id,
-        cols,
-        rows,
-        force.unwrap_or(false),
-    );
+    state.resize_desktop_session(window.label(), &session_id, cols, rows);
 }
 
 #[tauri::command]

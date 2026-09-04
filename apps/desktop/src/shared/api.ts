@@ -32,7 +32,7 @@ export interface DesktopApi {
   closeSession(sessionId: string): Promise<void>;
   reorderSessions(projectId: string, sessionIds: string[]): Promise<void>;
   write(sessionId: string, data: string, cols?: number, rows?: number): void;
-  resize(sessionId: string, cols: number, rows: number, force?: boolean): void;
+  resize(sessionId: string, cols: number, rows: number): void;
   attachSession(sessionId: string, cols: number, rows: number): Promise<SessionSnapshot>;
   detachSession(sessionId: string): void;
   copyText(text: string): Promise<void>;
