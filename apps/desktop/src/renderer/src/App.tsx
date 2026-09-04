@@ -837,7 +837,6 @@ export function App() {
           </div>
           <footer className="statusbar">
             <span className="statusbar-location">
-              <span className="display-name" title={currentProject?.path}>{currentProject?.path}</span>
               <span className="statusbar-devices">{statusDevices.length
                 ? <>{statusDevices.map((device, index) => <span className="statusbar-device" key={device.id} title={device.sharesTerminal ? `${device.name} has this terminal open` : `${device.name} is connected`}><i className={`device-dot ${device.sharesTerminal ? "is-shared" : ""}`} /><span className="display-name">{device.name}{index < statusDevices.length - 1 ? "," : ""}</span></span>)}<span>connected</span></>
                 : NO_DEVICES_LABEL}</span>
