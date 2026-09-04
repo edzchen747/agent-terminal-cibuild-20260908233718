@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { applyTerminalModifiers, findHttpLinks, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCROLLBACK_LINES, type TerminalModifier } from "@agentterminal/protocol";
+import { applyTerminalModifiers, findHttpLinks, streamByteLength, TERMINAL_SCROLLBACK_LINES, xtermThemeFor, type TerminalModifier, type TerminalScheme } from "@agentterminal/protocol";
 import "@xterm/xterm/css/xterm.css";
 
-interface Props { sessionId: string; visible: boolean; active: boolean; confirmExternalLinks: boolean; }
+interface Props { sessionId: string; visible: boolean; active: boolean; confirmExternalLinks: boolean; scheme: TerminalScheme; }
 
 const isCursorPositionReport = (data: string) => /^\x1b\[\??\d+;\d+R$/.test(data);
 
@@ -18,17 +19,19 @@ const dbg = (message: string) => {
   window.agentTerminal.logDebug(`[ATSync] ${message}`);
 };
 
-export function TerminalPane({ sessionId, visible, active, confirmExternalLinks }: Props) {
+export function TerminalPane({ sessionId, visible, active, confirmExternalLinks, scheme }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const activeRef = useRef(active);
   const resizeRef = useRef<() => void>(() => undefined);
   const confirmExternalLinksRef = useRef(confirmExternalLinks);
+  const schemeRef = useRef(scheme);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const [linkOpening, setLinkOpening] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
   activeRef.current = active;
   confirmExternalLinksRef.current = confirmExternalLinks;
+  schemeRef.current = scheme;
 
   useEffect(() => {
     setPendingUrl(null);
@@ -99,18 +102,11 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
       linkHandler: {
         activate: (_event, uri) => activateLink(uri)
       },
-      theme: {
-        // Match the native Windows terminal (Windows Terminal's default
-        // "Campbell" scheme) so shell output looks identical to the
-        // original terminal. TERMINAL_ANSI_THEME carries the 16 ANSI
-        // colors; keep it in sync with that scheme.
-        background: "#0C0C0C",
-        foreground: "#CCCCCC",
-        cursor: "#FFFFFF",
-        cursorAccent: "#0C0C0C",
-        selectionBackground: "#FFFFFF",
-        ...TERMINAL_ANSI_THEME
-      }
+      // The scheme is resolved from the host's shared setting, so the phone
+      // and this window render the same session in the same colors. Whole
+      // schemes only: the surface and the 16 ANSI colors always travel
+      // together (see terminal-themes.ts).
+      theme: xtermThemeFor(schemeRef.current)
     });
     terminalRef.current = terminal;
     const fit = new FitAddon();
@@ -403,7 +399,18 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks 
     return () => window.cancelAnimationFrame(frame);
   }, [visible]);
 
-  return <div ref={hostRef} className={`terminal-pane ${visible ? "is-visible" : ""} ${active ? "is-active" : ""}`}>
+  // Repaint a live terminal when the shared scheme changes, so switching the
+  // app between light and dark (or picking another scheme) recolors the open
+  // sessions instead of waiting for a fresh one.
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    terminal.options.theme = xtermThemeFor(scheme);
+  }, [scheme]);
+
+  // The pane letterboxes the host grid, so its surround must be the scheme's
+  // own background rather than a fixed black.
+  return <div ref={hostRef} className={`terminal-pane ${visible ? "is-visible" : ""} ${active ? "is-active" : ""}`} style={{ "--terminal-bg": scheme.background } as CSSProperties}>
     {pendingUrl && <div className="modal-backdrop link-confirm-backdrop" onMouseDown={() => { if (!linkOpening) setPendingUrl(null); }}>
       <section className="modal link-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="link-confirm-title" onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-kicker">Agent Terminal</div>

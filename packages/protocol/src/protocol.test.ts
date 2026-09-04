@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, type ClientMessage } from "./index.js";
+import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemeById, terminalSchemesFor, xtermThemeFor, type ClientMessage, type HostSnapshot } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -347,4 +347,207 @@ test("session.resize carries no force flag anymore", () => {
   const roundTrip = decodeClientMessage(encodeMessage(message));
   assert.deepEqual(roundTrip, message);
   assert.equal("force" in roundTrip, false);
+});
+
+const ANSI_KEYS = Object.keys(TERMINAL_ANSI_THEME) as (keyof typeof TERMINAL_ANSI_THEME)[];
+
+function channels(hex: string): [number, number, number] {
+  const value = hex.slice(1, 7);
+  return [0, 2, 4].map((index) => parseInt(value.slice(index, index + 2), 16)) as [number, number, number];
+}
+
+function relativeLuminance(hex: string): number {
+  const linear = channels(hex).map((channel) => {
+    const ratio = channel / 255;
+    return ratio <= 0.03928 ? ratio / 12.92 : ((ratio + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * linear[0]! + 0.7152 * linear[1]! + 0.0722 * linear[2]!;
+}
+
+function contrast(first: string, second: string): number {
+  const [a, b] = [relativeLuminance(first), relativeLuminance(second)];
+  return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+}
+
+test("every terminal scheme is a complete, well-formed palette", () => {
+  assert.ok(TERMINAL_SCHEMES.length > 0);
+  const ids = new Set<string>();
+  for (const scheme of TERMINAL_SCHEMES) {
+    assert.ok(!ids.has(scheme.id), `duplicate scheme id ${scheme.id}`);
+    ids.add(scheme.id);
+    assert.match(scheme.id, /^[a-z0-9-]+$/, `${scheme.id} must be a url-safe id`);
+    assert.ok(scheme.name.length > 0, `${scheme.id} needs a display name`);
+    assert.ok(scheme.mode === "dark" || scheme.mode === "light");
+    for (const surface of [scheme.background, scheme.foreground, scheme.cursor, scheme.cursorAccent]) {
+      assert.match(surface, /^#[0-9A-Fa-f]{6}$/, `${scheme.id} surface colors must be 6-digit hex`);
+    }
+    assert.match(scheme.selectionBackground, /^#[0-9A-Fa-f]{6,8}$/);
+    // A partial palette would leave xterm falling back to its own Tango
+    // defaults for the missing slots, which is exactly the drift the shared
+    // table exists to prevent.
+    assert.deepEqual(Object.keys(scheme.ansi).sort(), [...ANSI_KEYS].sort(), `${scheme.id} must define all 16 ANSI colors`);
+    for (const [key, color] of Object.entries(scheme.ansi)) {
+      assert.match(color, /^#[0-9A-Fa-f]{6}$/, `${scheme.id}.${key} must be 6-digit hex`);
+    }
+  }
+});
+
+test("both modes offer schemes and the defaults belong to their own mode", () => {
+  assert.ok(terminalSchemesFor("dark").length >= 2);
+  assert.ok(terminalSchemesFor("light").length >= 2);
+  for (const scheme of terminalSchemesFor("dark")) assert.equal(scheme.mode, "dark");
+  for (const scheme of terminalSchemesFor("light")) assert.equal(scheme.mode, "light");
+  assert.equal(terminalSchemeById(DEFAULT_DARK_TERMINAL_SCHEME_ID)?.mode, "dark");
+  assert.equal(terminalSchemeById(DEFAULT_LIGHT_TERMINAL_SCHEME_ID)?.mode, "light");
+  assert.deepEqual(DEFAULT_TERMINAL_THEME_SETTINGS, {
+    darkSchemeId: DEFAULT_DARK_TERMINAL_SCHEME_ID,
+    lightSchemeId: DEFAULT_LIGHT_TERMINAL_SCHEME_ID
+  });
+});
+
+test("the default dark scheme is still the native Windows Campbell palette", () => {
+  // The desktop must keep looking like the Windows terminal out of the box.
+  const campbell = terminalSchemeById(DEFAULT_DARK_TERMINAL_SCHEME_ID)!;
+  assert.equal(campbell.background, "#0C0C0C");
+  assert.equal(campbell.foreground, "#CCCCCC");
+  assert.deepEqual(campbell.ansi, TERMINAL_ANSI_THEME);
+});
+
+test("a scheme id from the wrong mode falls back instead of painting an unreadable terminal", () => {
+  // The whole point of the mode split: a dark palette on a light background
+  // hides every glyph a program prints in ANSI black.
+  assert.equal(resolveTerminalScheme("one-half-light", "dark").id, DEFAULT_DARK_TERMINAL_SCHEME_ID);
+  assert.equal(resolveTerminalScheme("campbell", "light").id, DEFAULT_LIGHT_TERMINAL_SCHEME_ID);
+  assert.equal(resolveTerminalScheme("no-such-scheme", "dark").id, DEFAULT_DARK_TERMINAL_SCHEME_ID);
+  assert.equal(resolveTerminalScheme(undefined, "light").id, DEFAULT_LIGHT_TERMINAL_SCHEME_ID);
+  assert.equal(resolveTerminalScheme("solarized-dark", "dark").id, "solarized-dark");
+  assert.equal(resolveTerminalScheme("novel", "light").id, "novel");
+});
+
+test("stored settings are normalized into a matching dark/light pair", () => {
+  assert.deepEqual(normalizeTerminalThemeSettings(null), DEFAULT_TERMINAL_THEME_SETTINGS);
+  assert.deepEqual(normalizeTerminalThemeSettings({ darkSchemeId: "novel", lightSchemeId: "vintage" }), DEFAULT_TERMINAL_THEME_SETTINGS);
+  assert.deepEqual(
+    normalizeTerminalThemeSettings({ darkSchemeId: "vintage", lightSchemeId: "novel" }),
+    { darkSchemeId: "vintage", lightSchemeId: "novel" }
+  );
+});
+
+test("every scheme keeps its own text legible on its own background", () => {
+  for (const scheme of TERMINAL_SCHEMES) {
+    assert.ok(
+      contrast(scheme.foreground, scheme.background) >= 4.5,
+      `${scheme.id}: foreground ${scheme.foreground} on ${scheme.background} is too faint`
+    );
+  }
+});
+
+test("light schemes keep ANSI-black text readable on their background", () => {
+  // The hazard that makes schemes indivisible: most palettes render ANSI
+  // black as near-black, so a light background needs a scheme whose black is
+  // still dark enough to read, not a dark scheme's palette.
+  for (const scheme of terminalSchemesFor("light")) {
+    assert.ok(
+      contrast(scheme.ansi.black, scheme.background) >= 4.5,
+      `${scheme.id}: ANSI black ${scheme.ansi.black} is unreadable on ${scheme.background}`
+    );
+    assert.ok(relativeLuminance(scheme.background) > 0.5, `${scheme.id} must have a light background`);
+  }
+  for (const scheme of terminalSchemesFor("dark")) {
+    assert.ok(relativeLuminance(scheme.background) < 0.25, `${scheme.id} must have a dark background`);
+  }
+});
+
+test("xtermThemeFor flattens a scheme into the shape xterm expects", () => {
+  const theme = xtermThemeFor(terminalSchemeById("solarized-light")!);
+  assert.equal(theme.background, "#FDF6E3");
+  assert.equal(theme.foreground, "#073642");
+  for (const key of ANSI_KEYS) assert.ok(key in theme, `xterm theme is missing ${key}`);
+});
+
+test("terminal.theme carries the shared scheme pair through the wire contract", () => {
+  const message: ClientMessage = { type: "terminal.theme", requestId: "r9", darkSchemeId: "vintage", lightSchemeId: "novel" };
+  assert.deepEqual(decodeClientMessage(encodeMessage(message)), message);
+});
+
+test("a snapshot from a host older than terminal themes still resolves a scheme", () => {
+  // Regression: the phone pairs with whatever desktop build is installed, and
+  // one older than this field sends no terminalTheme at all. Reaching into it
+  // threw on every render and blanked the mobile app after its first snapshot.
+  const legacy = { defaultShellId: "powershell" } as Partial<HostSnapshot>;
+  const settings = normalizeTerminalThemeSettings(legacy.terminalTheme);
+  assert.deepEqual(settings, DEFAULT_TERMINAL_THEME_SETTINGS);
+  assert.equal(resolveTerminalScheme(settings.darkSchemeId, "dark").mode, "dark");
+  assert.equal(resolveTerminalScheme(settings.lightSchemeId, "light").mode, "light");
+});
+
+test("garbage scheme ids off the wire still resolve to a usable scheme", () => {
+  // Snapshots are JSON from another machine: the declared string type is a
+  // promise, not a guarantee. Anything unusable must land on the mode default
+  // rather than reaching xterm and painting an unreadable terminal.
+  const junk = ["", "   ", "CAMPBELL", "Campbell", "campbell ", "../campbell", null, undefined, 7, {}, [], true];
+  for (const value of junk) {
+    for (const mode of ["dark", "light"] as const) {
+      const scheme = resolveTerminalScheme(value as unknown as string | undefined, mode);
+      assert.equal(scheme.mode, mode, `${JSON.stringify(value)} must resolve to a ${mode} scheme`);
+      assert.ok(terminalSchemeById(scheme.id), `${JSON.stringify(value)} resolved to an unknown scheme`);
+    }
+    const settings = normalizeTerminalThemeSettings({ darkSchemeId: value, lightSchemeId: value } as never);
+    assert.equal(terminalSchemeById(settings.darkSchemeId)?.mode, "dark");
+    assert.equal(terminalSchemeById(settings.lightSchemeId)?.mode, "light");
+  }
+});
+
+test("a half-filled settings pair keeps the good half and defaults the other", () => {
+  assert.deepEqual(normalizeTerminalThemeSettings({ darkSchemeId: "vintage" }), {
+    darkSchemeId: "vintage",
+    lightSchemeId: DEFAULT_LIGHT_TERMINAL_SCHEME_ID
+  });
+  assert.deepEqual(normalizeTerminalThemeSettings({ lightSchemeId: "novel" }), {
+    darkSchemeId: DEFAULT_DARK_TERMINAL_SCHEME_ID,
+    lightSchemeId: "novel"
+  });
+  // Normalizing is idempotent: feeding a result back changes nothing.
+  const once = normalizeTerminalThemeSettings({ darkSchemeId: "novel", lightSchemeId: "vintage" });
+  assert.deepEqual(normalizeTerminalThemeSettings(once), once);
+});
+
+test("xtermThemeFor leaks no scheme metadata into the xterm theme", () => {
+  // id/name/mode are ours, not xterm's. Passing them through would put unknown
+  // keys in the emulator's theme option.
+  const allowed = new Set(["background", "foreground", "cursor", "cursorAccent", "selectionBackground", ...ANSI_KEYS]);
+  for (const scheme of TERMINAL_SCHEMES) {
+    for (const key of Object.keys(xtermThemeFor(scheme))) {
+      assert.ok(allowed.has(key), `${scheme.id}: xterm theme must not carry ${key}`);
+    }
+  }
+});
+
+test("xtermThemeFor hands out a fresh object so one client cannot recolor another", () => {
+  // Both terminals resolve the same shared scheme object; if the flattened
+  // theme aliased it, an emulator mutating its own theme would repaint every
+  // other client's.
+  const scheme = terminalSchemeById("campbell")!;
+  const first = xtermThemeFor(scheme);
+  first.background = "#ff00ff";
+  first.black = "#ff00ff";
+  assert.equal(scheme.background, "#0C0C0C", "the shared scheme must be untouched");
+  assert.equal(scheme.ansi.black, "#0C0C0C", "the shared palette must be untouched");
+  assert.equal(xtermThemeFor(scheme).background, "#0C0C0C");
+  assert.notEqual(xtermThemeFor(scheme), first);
+});
+
+test("scheme names are unique so a picker never shows the same label twice", () => {
+  const names = TERMINAL_SCHEMES.map((scheme) => scheme.name);
+  assert.equal(new Set(names).size, names.length, `duplicate scheme name in ${names.join(", ")}`);
+});
+
+test("the two modes never share a scheme id", () => {
+  // An id in both lists would make the mode check in resolveTerminalScheme
+  // ambiguous, and let one picker's choice satisfy the other's guard.
+  const dark = new Set(terminalSchemesFor("dark").map((scheme) => scheme.id));
+  for (const scheme of terminalSchemesFor("light")) {
+    assert.ok(!dark.has(scheme.id), `${scheme.id} is registered as both dark and light`);
+  }
+  assert.equal(terminalSchemesFor("dark").length + terminalSchemesFor("light").length, TERMINAL_SCHEMES.length);
 });

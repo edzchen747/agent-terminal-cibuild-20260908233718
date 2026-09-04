@@ -31,7 +31,8 @@ use crate::{
         AuthorizedDevice, ClientMessage, DesktopState, DirectoryEntry, DirectoryListing, HostInfo,
         HostSnapshot, PROTOCOL_VERSION, PairingPayload, Project, RemoteRegistration, ServerMessage,
         SessionSegment, SessionSnapshot, ShellProfile, TerminalDataEvent, TerminalGridEvent,
-        TerminalSession, TerminalTuiModeEvent, TuiMode,
+        TerminalSession, TerminalThemeSettings, TerminalTuiModeEvent, TuiMode,
+        normalize_terminal_scheme_id,
     },
     network,
     path_utils::user_visible_path,
@@ -2197,6 +2198,21 @@ impl Core {
         Ok(())
     }
 
+    /// Set the terminal schemes every client uses for its dark and light
+    /// themes. Each id is validated against its own mode, so a dark scheme can
+    /// never land in the light slot regardless of which client sent it.
+    pub fn set_terminal_theme(&self, dark_scheme_id: &str, light_scheme_id: &str) -> Result<()> {
+        {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            inner.store.set_terminal_theme(
+                normalize_terminal_scheme_id(dark_scheme_id, true),
+                normalize_terminal_scheme_id(light_scheme_id, false),
+            )?;
+        }
+        self.broadcast();
+        Ok(())
+    }
+
     pub fn select_shell(
         self: &Arc<Self>,
         session_id: Option<&str>,
@@ -2704,6 +2720,17 @@ impl Core {
             }
             ClientMessage::ShellDefault { request_id, shell_id } => {
                 self.set_default_shell(&shell_id)?;
+                Some(ServerMessage::Snapshot {
+                    request_id: Some(request_id),
+                    snapshot: self.snapshot(),
+                })
+            }
+            ClientMessage::TerminalTheme {
+                request_id,
+                dark_scheme_id,
+                light_scheme_id,
+            } => {
+                self.set_terminal_theme(&dark_scheme_id, &light_scheme_id)?;
                 Some(ServerMessage::Snapshot {
                     request_id: Some(request_id),
                     snapshot: self.snapshot(),
@@ -3265,6 +3292,19 @@ fn snapshot_from_inner(inner: &Inner, online_device_ids: &HashSet<String>) -> Ho
             .collect(),
         shells: inner.shells.clone(),
         default_shell_id,
+        // Re-normalized on the way out so a settings file edited by hand, or
+        // written by a build that knew different scheme ids, still reaches
+        // clients as a readable dark/light pair.
+        terminal_theme: TerminalThemeSettings {
+            dark_scheme_id: normalize_terminal_scheme_id(
+                &inner.store.settings().terminal_dark_scheme_id,
+                true,
+            ),
+            light_scheme_id: normalize_terminal_scheme_id(
+                &inner.store.settings().terminal_light_scheme_id,
+                false,
+            ),
+        },
     }
 }
 
@@ -5640,6 +5680,86 @@ mod tests {
             .unwrap(),
             "Custom name"
         );
+    }
+
+    #[test]
+    fn a_snapshot_corrects_a_wrong_mode_terminal_scheme_before_clients_see_it() {
+        // The settings file is editable, and an older or hostile client could
+        // write anything. Every client resolves the pair straight into xterm,
+        // so a light scheme in the dark slot would paint an unreadable
+        // terminal; the snapshot repairs it on the way out.
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
+        store
+            .set_terminal_theme("vintage".into(), "novel".into())
+            .expect("valid pair");
+
+        let mut inner = test_inner(store, vec![shell_profile("powershell")]);
+        let snapshot = snapshot_from_inner(&inner, &HashSet::new());
+        assert_eq!(snapshot.terminal_theme.dark_scheme_id, "vintage");
+        assert_eq!(snapshot.terminal_theme.light_scheme_id, "novel");
+
+        // Swap the slots the way a hand-edited file or a downgraded build
+        // would: the store writes what it is given, and only Core's setter
+        // normalizes, so this is exactly a bad value already on disk.
+        inner
+            .store
+            .set_terminal_theme("novel".into(), "vintage".into())
+            .expect("stale swapped pair");
+        let repaired = snapshot_from_inner(&inner, &HashSet::new());
+        assert_eq!(
+            repaired.terminal_theme.dark_scheme_id,
+            crate::models::DEFAULT_DARK_TERMINAL_SCHEME_ID,
+            "a light scheme in the dark slot falls back"
+        );
+        assert_eq!(
+            repaired.terminal_theme.light_scheme_id,
+            crate::models::DEFAULT_LIGHT_TERMINAL_SCHEME_ID,
+            "a dark scheme in the light slot falls back"
+        );
+
+        // An id from no scheme at all falls back the same way.
+        inner
+            .store
+            .set_terminal_theme("not-a-scheme".into(), "novel".into())
+            .expect("unknown id");
+        assert_eq!(
+            snapshot_from_inner(&inner, &HashSet::new())
+                .terminal_theme
+                .dark_scheme_id,
+            crate::models::DEFAULT_DARK_TERMINAL_SCHEME_ID
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn setting_a_wrong_mode_terminal_scheme_stores_the_default_instead() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
+        // set_terminal_theme normalizes, so the bad value never reaches disk.
+        store
+            .set_terminal_theme(
+                crate::models::normalize_terminal_scheme_id("novel", true),
+                crate::models::normalize_terminal_scheme_id("vintage", false),
+            )
+            .expect("normalized pair");
+        assert_eq!(
+            store.settings().terminal_dark_scheme_id,
+            crate::models::DEFAULT_DARK_TERMINAL_SCHEME_ID
+        );
+        assert_eq!(
+            store.settings().terminal_light_scheme_id,
+            crate::models::DEFAULT_LIGHT_TERMINAL_SCHEME_ID
+        );
+        fs::remove_file(state_path).expect("remove test state");
     }
 
     #[test]

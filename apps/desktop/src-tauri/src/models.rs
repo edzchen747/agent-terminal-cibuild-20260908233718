@@ -101,6 +101,43 @@ pub struct HostInfo {
     pub version: String,
 }
 
+/// Terminal scheme ids, mirroring TERMINAL_SCHEMES in
+/// packages/protocol/src/terminal-themes.ts. The host validates ids so a
+/// stale or hostile value can never put a dark scheme in the light slot; the
+/// drift guard in the tests below keeps these lists in step with the
+/// TypeScript table that actually carries the colors.
+pub const DARK_TERMINAL_SCHEME_IDS: &[&str] = &[
+    "campbell",
+    "campbell-powershell",
+    "vintage",
+    "one-half-dark",
+    "solarized-dark",
+];
+pub const LIGHT_TERMINAL_SCHEME_IDS: &[&str] = &["one-half-light", "solarized-light", "novel"];
+pub const DEFAULT_DARK_TERMINAL_SCHEME_ID: &str = "campbell";
+pub const DEFAULT_LIGHT_TERMINAL_SCHEME_ID: &str = "one-half-light";
+
+/// An id that is unknown, or that belongs to the other mode, falls back to
+/// that mode's default rather than painting an unreadable terminal.
+pub fn normalize_terminal_scheme_id(id: &str, dark: bool) -> String {
+    let (allowed, fallback) = if dark {
+        (DARK_TERMINAL_SCHEME_IDS, DEFAULT_DARK_TERMINAL_SCHEME_ID)
+    } else {
+        (LIGHT_TERMINAL_SCHEME_IDS, DEFAULT_LIGHT_TERMINAL_SCHEME_ID)
+    };
+    allowed
+        .iter()
+        .find(|candidate| **candidate == id)
+        .map_or_else(|| fallback.to_string(), |candidate| (*candidate).to_string())
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalThemeSettings {
+    pub dark_scheme_id: String,
+    pub light_scheme_id: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostSnapshot {
@@ -110,6 +147,7 @@ pub struct HostSnapshot {
     pub devices: Vec<AuthorizedDevice>,
     pub shells: Vec<ShellProfile>,
     pub default_shell_id: String,
+    pub terminal_theme: TerminalThemeSettings,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -314,6 +352,12 @@ pub enum ClientMessage {
         request_id: String,
         shell_id: String,
     },
+    #[serde(rename = "terminal.theme")]
+    TerminalTheme {
+        request_id: String,
+        dark_scheme_id: String,
+        light_scheme_id: String,
+    },
 }
 
 impl ClientMessage {
@@ -333,7 +377,8 @@ impl ClientMessage {
             | Self::SessionClose { request_id, .. }
             | Self::SessionAttach { request_id, .. }
             | Self::SessionDetach { request_id, .. }
-            | Self::ShellDefault { request_id, .. } => Some(request_id),
+            | Self::ShellDefault { request_id, .. }
+            | Self::TerminalTheme { request_id, .. } => Some(request_id),
             Self::SessionInput { .. } | Self::SessionResize { .. } | Self::DebugDiagnostics { .. } | Self::Ping => {
                 None
             }
@@ -411,7 +456,11 @@ pub enum ServerMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientMessage, ServerMessage, SessionSegment, TerminalTuiModeEvent, TerminalSession, TuiMode};
+    use super::{
+        ClientMessage, DARK_TERMINAL_SCHEME_IDS, DEFAULT_DARK_TERMINAL_SCHEME_ID,
+        DEFAULT_LIGHT_TERMINAL_SCHEME_ID, LIGHT_TERMINAL_SCHEME_IDS, ServerMessage, SessionSegment,
+        TerminalSession, TerminalTuiModeEvent, TuiMode, normalize_terminal_scheme_id,
+    };
 
     #[test]
     fn protocol_field_names_match_the_mobile_contract() {
@@ -605,5 +654,70 @@ mod tests {
             legacy,
             ClientMessage::Auth { name: None, .. }
         ));
+    }
+
+    /// The host validates scheme ids against the lists above, but the colors
+    /// they name live in TypeScript. Read the shared table and prove the two
+    /// stay in step, so adding a scheme on one side can never leave the host
+    /// rejecting an id its clients offer.
+    #[test]
+    fn the_scheme_id_lists_match_the_shared_typescript_table() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../packages/protocol/src/terminal-themes.ts"),
+        )
+        .expect("shared terminal scheme table");
+
+        // Every `id: "..."` entry paired with the `mode: "..."` that follows it.
+        let mut dark = Vec::new();
+        let mut light = Vec::new();
+        let mut pending_id: Option<String> = None;
+        for line in source.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("id: \"") {
+                if let Some(id) = rest.split('"').next() {
+                    pending_id = Some(id.to_string());
+                }
+            } else if let Some(rest) = line.strip_prefix("mode: \"") {
+                if let (Some(id), Some(mode)) = (pending_id.take(), rest.split('"').next()) {
+                    match mode {
+                        "dark" => dark.push(id),
+                        "light" => light.push(id),
+                        other => panic!("unknown scheme mode {other}"),
+                    }
+                }
+            }
+        }
+
+        assert!(!dark.is_empty() && !light.is_empty(), "parsed no schemes");
+        assert_eq!(dark, DARK_TERMINAL_SCHEME_IDS, "dark scheme ids drifted from terminal-themes.ts");
+        assert_eq!(light, LIGHT_TERMINAL_SCHEME_IDS, "light scheme ids drifted from terminal-themes.ts");
+        assert!(dark.contains(&DEFAULT_DARK_TERMINAL_SCHEME_ID.to_string()));
+        assert!(light.contains(&DEFAULT_LIGHT_TERMINAL_SCHEME_ID.to_string()));
+    }
+
+    #[test]
+    fn a_scheme_id_from_the_wrong_mode_falls_back_to_that_modes_default() {
+        assert_eq!(normalize_terminal_scheme_id("vintage", true), "vintage");
+        assert_eq!(normalize_terminal_scheme_id("novel", false), "novel");
+        // A light id in the dark slot (or the reverse) would paint an
+        // unreadable terminal, so it is replaced rather than stored.
+        assert_eq!(normalize_terminal_scheme_id("novel", true), DEFAULT_DARK_TERMINAL_SCHEME_ID);
+        assert_eq!(normalize_terminal_scheme_id("vintage", false), DEFAULT_LIGHT_TERMINAL_SCHEME_ID);
+        assert_eq!(normalize_terminal_scheme_id("", true), DEFAULT_DARK_TERMINAL_SCHEME_ID);
+        assert_eq!(normalize_terminal_scheme_id("nonsense", false), DEFAULT_LIGHT_TERMINAL_SCHEME_ID);
+    }
+
+    #[test]
+    fn terminal_theme_carries_the_shared_scheme_pair_through_the_wire_contract() {
+        let message: ClientMessage = serde_json::from_str(
+            r#"{"type":"terminal.theme","requestId":"r9","darkSchemeId":"vintage","lightSchemeId":"novel"}"#,
+        )
+        .expect("terminal.theme command");
+        assert!(matches!(
+            message,
+            ClientMessage::TerminalTheme { ref dark_scheme_id, ref light_scheme_id, .. }
+                if dark_scheme_id == "vintage" && light_scheme_id == "novel"
+        ));
+        assert_eq!(message.request_id(), Some("r9"));
     }
 }

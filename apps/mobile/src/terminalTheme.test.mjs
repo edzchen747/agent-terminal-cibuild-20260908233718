@@ -3,27 +3,31 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-// Drift guard: the mobile terminal must render the shared Windows Terminal
-// "Campbell" palette (TERMINAL_ANSI_THEME in @agentterminal/protocol), the
-// same one the desktop terminal pins, so the same session looks identical on
-// phone and desktop.
+// Drift guard: the mobile terminal must render whichever shared scheme the
+// host holds (TERMINAL_SCHEMES in @agentterminal/protocol), the same one the
+// desktop terminal resolves, so the same session looks identical on phone and
+// desktop.
 const terminalSource = readFileSync(fileURLToPath(new URL("./MobileTerminal.tsx", import.meta.url)), "utf8");
 const lower = terminalSource.toLowerCase();
 
-test("the mobile terminal spreads the shared ANSI theme into its xterm theme", () => {
-  assert.match(lower, /terminal_ansi_theme/);
-  assert.ok(lower.includes("...terminal_ansi_theme"), "expected the xterm theme to spread TERMINAL_ANSI_THEME");
+test("the mobile terminal builds its xterm theme from the shared scheme", () => {
+  assert.match(lower, /xtermthemefor/);
+  assert.ok(lower.includes("theme: xtermthemefor("), "expected the xterm theme to come from xtermThemeFor(scheme)");
 });
 
-test("the mobile terminal uses the Campbell background and foreground", () => {
-  assert.ok(lower.includes('"#0c0c0c"'), "expected the Campbell background #0C0C0C");
-  assert.ok(lower.includes('"#cccccc"'), "expected the Campbell foreground #CCCCCC");
+test("the mobile terminal takes the scheme as a prop instead of choosing one", () => {
+  assert.match(terminalSource, /scheme: TerminalScheme/, "expected a scheme prop typed by the protocol");
+  assert.match(lower, /terminal\.options\.theme = xtermthemefor\(scheme\)/, "expected a live repaint when the scheme changes");
 });
 
-test("the mobile terminal has no leftover themed palette colors", () => {
-  // The old mobile-only chrome colors and any xterm built-in defaults must
-  // not come back: the palette is pinned in @agentterminal/protocol.
-  for (const hex of ["#080b0f", "#d7dce6", "#79ddc7", "#2e3436", "#3465a4", "#eeeeec"]) {
-    assert.ok(!lower.includes(hex), `${hex} must not reappear in the mobile terminal theme`);
-  }
+test("the mobile terminal letterboxes in the scheme background, not a fixed black", () => {
+  assert.match(terminalSource, /"--terminal-bg": scheme\.background/);
+});
+
+test("the mobile terminal pins no palette colors of its own", () => {
+  // Every color must arrive through the scheme, so no hex literal belongs in
+  // this file at all - not the old Campbell surface it used to hard-code, not
+  // the mobile-only chrome colors, and not xterm's built-in Tango defaults.
+  const literals = terminalSource.match(/#[0-9a-fA-F]{3,8}\b/g) ?? [];
+  assert.deepEqual(literals, [], `MobileTerminal must not pin colors: found ${literals.join(", ")}`);
 });

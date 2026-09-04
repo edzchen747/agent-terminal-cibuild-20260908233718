@@ -1,3 +1,7 @@
+import type { TerminalThemeSettings } from "./terminal-themes.js";
+
+export * from "./terminal-themes.js";
+
 export const PROTOCOL_VERSION = 1 as const;
 
 // Keep the control-plane address in the shared protocol package so the
@@ -83,24 +87,6 @@ export const TERMINAL_TUI_MODES: readonly TuiMode[] = ["canonical", "inline", "f
  * Spread it into the xterm v6 `ITheme` (which uses named color keys, not an
  * `ansi` array).
  */
-export const TERMINAL_ANSI_THEME = {
-  black: "#0C0C0C",
-  red: "#C50F1F",
-  green: "#13A10E",
-  yellow: "#C19C00",
-  blue: "#0037DA",
-  magenta: "#881798",
-  cyan: "#3A96DD",
-  white: "#CCCCCC",
-  brightBlack: "#767676",
-  brightRed: "#E74856",
-  brightGreen: "#16C60C",
-  brightYellow: "#F9F1A5",
-  brightBlue: "#3B78FF",
-  brightMagenta: "#B4009E",
-  brightCyan: "#61D6D6",
-  brightWhite: "#F2F2F2"
-} as const;
 
 export interface HttpLinkMatch {
   text: string;
@@ -281,6 +267,13 @@ export interface HostSnapshot {
   devices: AuthorizedDevice[];
   shells: ShellProfile[];
   defaultShellId: string;
+  /**
+   * The dark/light terminal schemes every client renders. Optional because a
+   * host older than this field omits it entirely, and a phone pairs with
+   * whatever desktop build is installed: read it through
+   * normalizeTerminalThemeSettings rather than reaching into it.
+   */
+  terminalTheme?: TerminalThemeSettings;
 }
 
 export interface PairingPayload {
@@ -318,7 +311,8 @@ export type ClientMessage =
   | { type: "session.resize"; sessionId: string; cols: number; rows: number }
   | { type: "ping" }
   | { type: "debug.diagnostics"; message: string }
-  | { type: "shell.default"; requestId: string; shellId: string };
+  | { type: "shell.default"; requestId: string; shellId: string }
+  | { type: "terminal.theme"; requestId: string; darkSchemeId: string; lightSchemeId: string };
 
 /**
  * One contiguous slice of a session's PTY stream recorded under a single

@@ -1,8 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { applyTerminalModifiers, createRequestId, findHttpLinks, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCROLLBACK_LINES } from "@agentterminal/protocol";
-import type { TerminalModifier, TerminalSession } from "@agentterminal/protocol";
+import { applyTerminalModifiers, createRequestId, findHttpLinks, streamByteLength, TERMINAL_SCROLLBACK_LINES, xtermThemeFor } from "@agentterminal/protocol";
+import type { TerminalModifier, TerminalScheme, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
 import { classifyGestureAxis, type GestureAxis } from "./gesture";
 import { claimNativeInput, isCursorPositionReport, mobileTerminalKeydownInput, nativeTerminalInput } from "./terminalInput";
@@ -17,7 +17,7 @@ import { createUtilityKeyPad, MODIFIER_HOLD_THRESHOLD_MS, type KeyPadResult, typ
 import { systemHoldThresholdMs } from "./systemMetrics";
 import "@xterm/xterm/css/xterm.css";
 
-interface Props { connection: HostConnection; session: TerminalSession; active: boolean; fontWidthScale: number; }
+interface Props { connection: HostConnection; session: TerminalSession; active: boolean; fontWidthScale: number; scheme: TerminalScheme; }
 
 // Start fetching the terminal font faces as soon as the app loads so xterm
 // never measures with device fallback glyphs (see fonts.test.mjs).
@@ -59,7 +59,7 @@ const ACCESSIBILITY_KEY_ROWS: UtilityKey[][] = [
   ]
 ];
 
-export function MobileTerminal({ connection, session, active, fontWidthScale }: Props) {
+export function MobileTerminal({ connection, session, active, fontWidthScale, scheme }: Props) {
   // Terminal sync diagnostics: [ATSync] lines go to the WebView console
   // (logcat tag: Capacitor/Console) and are mirrored to the host through the
   // live connection, where they land in the host's sync log file - so a
@@ -79,6 +79,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
   activeRef.current = active;
   const fontWidthScaleRef = useRef(fontWidthScale);
   fontWidthScaleRef.current = fontWidthScale;
+  const schemeRef = useRef(scheme);
+  schemeRef.current = scheme;
   const a11yAdvanceRatioRef = useRef<number | undefined>(undefined);
   const resizeRef = useRef<() => void>(() => undefined);
   const focusInputRef = useRef<() => void>(() => undefined);
@@ -160,16 +162,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
       scrollback: TERMINAL_SCROLLBACK_LINES,
       screenReaderMode: true,
       smoothScrollDuration: 75,
-      theme: {
-        // The same Windows Terminal "Campbell" palette the desktop terminal
-        // uses, so the same session renders identically on every client.
-        background: "#0C0C0C",
-        foreground: "#CCCCCC",
-        cursor: "#FFFFFF",
-        cursorAccent: "#0C0C0C",
-        selectionBackground: "#315b64aa",
-        ...TERMINAL_ANSI_THEME
-      }
+      // The scheme comes from the host's shared setting, so the same session
+      // renders identically on this phone and on the desktop. Whole schemes
+      // only: the surface and the 16 ANSI colors always travel together (see
+      // terminal-themes.ts).
+      theme: xtermThemeFor(schemeRef.current)
     });
     terminalRef.current = terminal;
     const fit = new FitAddon();
@@ -879,6 +876,15 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
     if (activeRef.current) resizeRef.current();
   }, [fontWidthScale]);
 
+  // Repaint a live terminal when the shared scheme changes, so switching this
+  // phone between light and dark (or the desktop picking another scheme)
+  // recolors the open session instead of waiting for a fresh one.
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    terminal.options.theme = xtermThemeFor(scheme);
+  }, [scheme]);
+
   useLayoutEffect(() => {
     if (!activeRef.current) {
       // Dropping a finger on a bare page change would otherwise keep a held
@@ -936,7 +942,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale }: 
   const squishInverse = squishInverseValue(fontWidthScale);
   return <div className="mobile-terminal-shell">
     <input ref={inputRef} className="mobile-terminal-input" type="text" inputMode="text" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} aria-label="Terminal input" />
-    <div ref={hostRef} className="mobile-terminal" style={{ width: squishWidthPercent(fontWidthScale), transform: `scaleX(${fontWidthScale})`, transformOrigin: "left center", "--terminal-squish-font-size": squishFontSize, "--terminal-squish-line-height": squishLineHeight, "--terminal-squish-inverse": `${squishInverse}` } as CSSProperties} />
+    <div ref={hostRef} className="mobile-terminal" style={{ width: squishWidthPercent(fontWidthScale), transform: `scaleX(${fontWidthScale})`, transformOrigin: "left center", "--terminal-bg": scheme.background, "--terminal-squish-font-size": squishFontSize, "--terminal-squish-line-height": squishLineHeight, "--terminal-squish-inverse": `${squishInverse}` } as CSSProperties} />
     <div className="extra-keys" data-no-swipe aria-label="Terminal function keys" ref={(element) => guardUtilityKeySelection(element)}>
       {ACCESSIBILITY_KEY_ROWS.map((row, rowIndex) => <div className="key-row" key={rowIndex}>{row.map((key) => {
         const latched = latchedKeyIds.has(key.id);

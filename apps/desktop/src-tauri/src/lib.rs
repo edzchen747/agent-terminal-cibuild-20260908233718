@@ -209,6 +209,17 @@ fn set_default_shell(state: State<'_, Arc<Core>>, shell_id: String) -> Result<()
 }
 
 #[tauri::command]
+fn set_terminal_theme(
+    state: State<'_, Arc<Core>>,
+    dark_scheme_id: String,
+    light_scheme_id: String,
+) -> Result<(), String> {
+    state
+        .set_terminal_theme(&dark_scheme_id, &light_scheme_id)
+        .map_err(error_string)
+}
+
+#[tauri::command]
 fn set_open_projects_in_new_windows(
     window: WebviewWindow,
     state: State<'_, Arc<Core>>,
@@ -306,6 +317,7 @@ pub fn run() {
             retry_remote_registration,
             revoke_device,
             set_default_shell,
+            set_terminal_theme,
             set_open_projects_in_new_windows,
             set_confirm_external_links,
             set_follow_working_directory,

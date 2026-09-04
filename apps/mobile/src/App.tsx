@@ -11,7 +11,7 @@ import {
   CapacitorBarcodeScannerTypeHint
 } from "@capacitor/barcode-scanner";
 import type { DirectoryListing, HostSnapshot, PairingPayload, Platform, Project, TerminalSession } from "@agentterminal/protocol";
-import { createRequestId, MAX_PROJECT_NAME_LENGTH, parsePairingPayload } from "@agentterminal/protocol";
+import { createRequestId, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSettings, parsePairingPayload, resolveTerminalScheme, terminalSchemesFor } from "@agentterminal/protocol";
 import { HostConnection, type RemoteRegistrationState, type SavedHost, type SavedHostRecord } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
 import { notificationStateFor, type ConnectionNotificationState } from "./connectionPolicy";
@@ -24,6 +24,8 @@ import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shou
 import { effectiveDefaultShell } from "./defaultShell";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, RefreshIcon, ScanIcon, SettingsIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
+import { applyTheme, loadThemePreference, resolveTheme, saveThemePreference, SYSTEM_DARK_QUERY, THEME_LABELS, THEME_PREFERENCES, type ResolvedTheme, type ThemePreference } from "./theme";
+import { syncSystemBars } from "./systemBars";
 import { backProjectId, resolveViewGeometry } from "./projectNavigation";
 
 type View = { type: "home" } | { type: "hosts" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
@@ -104,6 +106,8 @@ export function App() {
   const [showTerminalSettings, setShowTerminalSettings] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [fontWidthPercent, setFontWidthPercent] = useState(100);
+  const [themePreference, setThemePreference] = useState<ThemePreference>(loadThemePreference);
+  const [systemPrefersDark, setSystemPrefersDark] = useState(() => window.matchMedia(SYSTEM_DARK_QUERY).matches);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [projectOrder, setProjectOrder] = useState<string[]>([]);
@@ -156,6 +160,43 @@ export function App() {
       if (Number.isFinite(parsed)) setFontWidthPercent(Math.max(65, Math.min(100, parsed)));
     });
   }, []);
+
+  // The theme is a client-side preference: nothing about it reaches the paired
+  // desktop, so this phone follows the palette saved here. The "system" choice
+  // tracks the phone's own light/dark setting live.
+  useEffect(() => {
+    const query = window.matchMedia(SYSTEM_DARK_QUERY);
+    const apply = () => setSystemPrefersDark(query.matches);
+    query.addEventListener("change", apply);
+    return () => query.removeEventListener("change", apply);
+  }, []);
+
+  const resolvedTheme = resolveTheme(themePreference, systemPrefersDark);
+
+  useEffect(() => {
+    applyTheme(resolvedTheme);
+    saveThemePreference(themePreference);
+    // Android draws the app behind transparent system bars, so it has to be
+    // told which way to paint their icons; nothing in the web layer reaches
+    // them on its own.
+    void syncSystemBars(resolvedTheme);
+  }, [themePreference, resolvedTheme]);
+
+  // The scheme pair is a host setting shared with the desktop; which of the
+  // two this phone paints is decided by its own light/dark theme. A desktop
+  // older than the setting sends no pair at all, so normalize before reading:
+  // reaching straight into it blanks the whole app on the first snapshot.
+  const terminalTheme = normalizeTerminalThemeSettings(snapshot?.terminalTheme);
+  const terminalScheme = resolveTerminalScheme(
+    resolvedTheme === "dark" ? terminalTheme.darkSchemeId : terminalTheme.lightSchemeId,
+    resolvedTheme
+  );
+
+  // The terminal page paints the scheme background behind the letterboxed
+  // grid, so the variable has to reach those rules too, not just the emulator.
+  useEffect(() => {
+    document.documentElement.style.setProperty("--terminal-bg", terminalScheme.background);
+  }, [terminalScheme]);
 
   useEffect(() => {
     const ids = snapshot?.projects.map((project) => project.id) ?? [];
@@ -1079,14 +1120,14 @@ export function App() {
       {activeProject && <div className="mobile-page"><ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={navigateBack} onRename={() => setProjectToRename(activeProject)} onOpen={openTerminal} /></div>}
       {activeProject && activeSession && <div className="mobile-page"><div className="mobile-app terminal-view">
         <MobileHeader title={activeSession.title} subtitle={activeProject.name} onBack={navigateBack} trailing={<div className="session-actions"><span className={`session-state ${activeSession.status}`}>{activeSession.status}</span><button className="terminal-settings-button" onClick={() => setShowTerminalSettings(true)} aria-label="Terminal display settings"><SettingsIcon /></button><button className="close-session-button" onClick={() => setSessionToClose(activeSession)} aria-label="Close terminal session" title="Close terminal session"><CloseIcon /></button></div>} />
-        <MobileTerminal key={activeSession.id} active={view.type === "terminal"} fontWidthScale={fontWidthPercent / 100} connection={connection} session={activeSession} />
+        <MobileTerminal key={activeSession.id} active={view.type === "terminal"} fontWidthScale={fontWidthPercent / 100} connection={connection} session={activeSession} scheme={terminalScheme} />
       </div></div>}
     </div>
     {showCreateProject && <CreateProjectSheet connection={connection} onClose={() => setShowCreateProject(false)} />}
     {projectToRename && activeProject?.id === projectToRename.id && <RenameProjectSheet project={activeProject} connection={connection} onClose={() => setProjectToRename(null)} />}
     {sessionToClose && activeSession?.id === sessionToClose.id && <CloseSessionSheet session={activeSession} onClose={() => setSessionToClose(null)} onConfirm={() => closeSession(activeSession)} />}
-    {showTerminalSettings && <TerminalSettingsSheet value={fontWidthPercent} onChange={(value) => { setFontWidthPercent(value); void Preferences.set({ key: TERMINAL_FONT_WIDTH_KEY, value: String(value) }); }} onClose={() => setShowTerminalSettings(false)} />}
-    {showSettings && <SettingsSheet snapshot={snapshot} connection={connection} fontWidthPercent={fontWidthPercent} onFontWidthChange={(value) => { setFontWidthPercent(value); void Preferences.set({ key: TERMINAL_FONT_WIDTH_KEY, value: String(value) }); }} onClose={() => setShowSettings(false)} />}
+    {showTerminalSettings && <TerminalSettingsSheet snapshot={snapshot} connection={connection} value={fontWidthPercent} onChange={(value) => { setFontWidthPercent(value); void Preferences.set({ key: TERMINAL_FONT_WIDTH_KEY, value: String(value) }); }} themePreference={themePreference} onThemeChange={setThemePreference} resolvedTheme={resolvedTheme} onClose={() => setShowTerminalSettings(false)} />}
+    {showSettings && <SettingsSheet snapshot={snapshot} connection={connection} fontWidthPercent={fontWidthPercent} onFontWidthChange={(value) => { setFontWidthPercent(value); void Preferences.set({ key: TERMINAL_FONT_WIDTH_KEY, value: String(value) }); }} themePreference={themePreference} onThemeChange={setThemePreference} resolvedTheme={resolvedTheme} onClose={() => setShowSettings(false)} />}
   </div>;
 }
 
@@ -1175,15 +1216,54 @@ function ProjectCard({ project, sessions, dragging, reordering, transform, eleme
   </article>;
 }
 
-function TerminalSettingsSheet({ value, onChange, onClose }: { value: number; onChange: (value: number) => void; onClose: () => void }) {
-  return <div className="sheet-backdrop" onClick={onClose}><section className="bottom-sheet terminal-settings-sheet" data-no-swipe onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Terminal display</span><h2>Fit more text</h2><p>Squish characters horizontally while keeping their height readable. The locked 40-column grid never reflows, so both devices keep identical line wraps.</p><FontWidthControl value={value} onChange={onChange} /><button className="mobile-primary full" onClick={onClose}>Done</button></section></div>;
+function TerminalSettingsSheet({ snapshot, connection, value, onChange, themePreference, onThemeChange, resolvedTheme, onClose }: { snapshot: HostSnapshot; connection: HostConnection; value: number; onChange: (value: number) => void; themePreference: ThemePreference; onThemeChange: (value: ThemePreference) => void; resolvedTheme: ResolvedTheme; onClose: () => void }) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  return <div className="sheet-backdrop" data-busy={saving ? "" : undefined} onClick={saving ? undefined : onClose}><section className="bottom-sheet terminal-settings-sheet" data-no-swipe onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Terminal display</span><h2>Appearance</h2>
+    <TerminalPreferences snapshot={snapshot} connection={connection} fontWidthPercent={value} onFontWidthChange={onChange} themePreference={themePreference} onThemeChange={onThemeChange} resolvedTheme={resolvedTheme} saving={saving} onSavingChange={setSaving} onError={setError} />
+    {error && <div className="form-error">{error}</div>}
+    <button className="mobile-primary full" onClick={onClose}>Done</button></section></div>;
 }
 
+/** The slider and its live preview, in one box. */
 function FontWidthControl({ value, onChange }: { value: number; onChange: (value: number) => void }) {
-  return <><label className="font-width-control"><span><strong>Character width</strong><output>{value}%</output></span><input type="range" min="65" max="100" step="1" value={value} onChange={(event) => onChange(Number(event.target.value))} /></label><div className="font-width-preview"><span className="font-width-preview-text" style={{ transform: `scaleX(${value / 100})` }}>C:\project&gt; npm run dev</span></div></>;
+  return <div className="font-width-control">
+    <label><span><strong>Terminal character width</strong><output>{value}%</output></span><input type="range" min="65" max="100" step="1" value={value} onChange={(event) => onChange(Number(event.target.value))} /></label>
+    <div className="font-width-preview"><span className="font-width-preview-text" style={{ transform: `scaleX(${value / 100})` }}>MyProject&gt; npm run dev</span></div>
+  </div>;
 }
 
-function SettingsSheet({ snapshot, connection, fontWidthPercent, onFontWidthChange, onClose }: { snapshot: HostSnapshot; connection: HostConnection; fontWidthPercent: number; onFontWidthChange: (value: number) => void; onClose: () => void }) {
+/**
+ * Every terminal-facing preference, shared by the terminal page's sheet and
+ * the home settings sheet so the two can never drift apart. The home sheet
+ * adds only the settings that belong to it alone (the default shell).
+ *
+ * The scheme pair is a host setting, so changing it needs the connection and
+ * reports progress up to whichever sheet is hosting this block.
+ */
+function TerminalPreferences({ snapshot, connection, fontWidthPercent, onFontWidthChange, themePreference, onThemeChange, resolvedTheme, saving, onSavingChange, onError }: { snapshot: HostSnapshot; connection: HostConnection; fontWidthPercent: number; onFontWidthChange: (value: number) => void; themePreference: ThemePreference; onThemeChange: (value: ThemePreference) => void; resolvedTheme: ResolvedTheme; saving: boolean; onSavingChange: (saving: boolean) => void; onError: (message: string) => void }) {
+  const terminalTheme = normalizeTerminalThemeSettings(snapshot.terminalTheme);
+  async function syncTerminalTheme(darkSchemeId: string, lightSchemeId: string) {
+    onSavingChange(true); onError("");
+    try {
+      await connection.request({ type: "terminal.theme", requestId: createRequestId(), darkSchemeId, lightSchemeId });
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : "Could not change the terminal colors.");
+    } finally {
+      onSavingChange(false);
+    }
+  }
+  return <>
+    <div className="settings-group">
+      <div className="settings-field"><span><strong>Appearance</strong></span><div className="theme-choice" role="group" aria-label="Appearance">{THEME_PREFERENCES.map((preference) => <button key={preference} type="button" aria-pressed={themePreference === preference} onClick={() => onThemeChange(preference)}>{THEME_LABELS[preference]}</button>)}</div></div>
+      <label className="settings-field"><span><strong>Terminal colors · Dark{resolvedTheme === "dark" && <i className="active-dot" title="Painting this phone now" />}</strong></span><select value={terminalTheme.darkSchemeId} disabled={saving} onChange={(event) => void syncTerminalTheme(event.target.value, terminalTheme.lightSchemeId)}>{terminalSchemesFor("dark").map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}</select></label>
+      <label className="settings-field"><span><strong>Terminal colors · Light{resolvedTheme === "light" && <i className="active-dot" title="Painting this phone now" />}</strong></span><select value={terminalTheme.lightSchemeId} disabled={saving} onChange={(event) => void syncTerminalTheme(terminalTheme.darkSchemeId, event.target.value)}>{terminalSchemesFor("light").map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}</select></label>
+    </div>
+    <FontWidthControl value={fontWidthPercent} onChange={onFontWidthChange} />
+  </>;
+}
+
+function SettingsSheet({ snapshot, connection, fontWidthPercent, onFontWidthChange, themePreference, onThemeChange, resolvedTheme, onClose }: { snapshot: HostSnapshot; connection: HostConnection; fontWidthPercent: number; onFontWidthChange: (value: number) => void; themePreference: ThemePreference; onThemeChange: (value: ThemePreference) => void; resolvedTheme: ResolvedTheme; onClose: () => void }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const selectedShellId = effectiveDefaultShell(snapshot.shells, snapshot.defaultShellId);
@@ -1197,7 +1277,14 @@ function SettingsSheet({ snapshot, connection, fontWidthPercent, onFontWidthChan
       setSaving(false);
     }
   }
-  return <div className="sheet-backdrop" data-busy={saving ? "" : undefined} onClick={saving ? undefined : onClose}><section className="bottom-sheet" data-no-swipe onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Settings</span><h2>Preferences</h2><label className="shell-control"><span><strong>Default terminal</strong><small>New sessions use this shell, on the phone and the desktop</small></span><select value={selectedShellId} disabled={saving || !snapshot.shells.length} onChange={(event) => void syncDefaultShell(event.target.value)}>{snapshot.shells.map((shell) => <option key={shell.id} value={shell.id}>{shell.name}</option>)}</select></label>{!snapshot.shells.length && <div className="form-error">No terminal profiles are available on the desktop.</div>}{error && <div className="form-error">{error}</div>}<FontWidthControl value={fontWidthPercent} onChange={onFontWidthChange} /><button className="mobile-primary full" onClick={onClose}>Done</button></section></div>;
+  return <div className="sheet-backdrop" data-busy={saving ? "" : undefined} onClick={saving ? undefined : onClose}><section className="bottom-sheet" data-no-swipe onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Settings</span><h2>Preferences</h2>
+    <TerminalPreferences snapshot={snapshot} connection={connection} fontWidthPercent={fontWidthPercent} onFontWidthChange={onFontWidthChange} themePreference={themePreference} onThemeChange={onThemeChange} resolvedTheme={resolvedTheme} saving={saving} onSavingChange={setSaving} onError={setError} />
+    <div className="settings-group">
+      <label className="settings-field"><span><strong>Default terminal</strong></span><select value={selectedShellId} disabled={saving || !snapshot.shells.length} onChange={(event) => void syncDefaultShell(event.target.value)}>{snapshot.shells.map((shell) => <option key={shell.id} value={shell.id}>{shell.name}</option>)}</select></label>
+    </div>
+    {!snapshot.shells.length && <div className="form-error">No terminal profiles are available on the desktop.</div>}
+    {error && <div className="form-error">{error}</div>}
+    <button className="mobile-primary full" onClick={onClose}>Done</button></section></div>;
 }
 
 function CreateProjectSheet({ connection, onClose }: { connection: HostConnection; onClose: () => void }) {

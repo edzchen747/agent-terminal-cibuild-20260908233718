@@ -44,6 +44,14 @@ pub struct Settings {
     pub confirm_external_links: bool,
     #[serde(default = "default_follow_working_directory")]
     pub follow_working_directory: bool,
+    /// Terminal scheme ids applied when a client is in dark / light mode.
+    /// Shared by every client, so the same session renders identically on the
+    /// desktop and the phone. Validated against the protocol's scheme table
+    /// on the way in and out (see Core::set_terminal_theme).
+    #[serde(default = "default_terminal_dark_scheme_id")]
+    pub terminal_dark_scheme_id: String,
+    #[serde(default = "default_terminal_light_scheme_id")]
+    pub terminal_light_scheme_id: String,
 }
 
 fn default_open_projects_in_new_windows() -> bool {
@@ -56,6 +64,14 @@ fn default_confirm_external_links() -> bool {
 
 fn default_follow_working_directory() -> bool {
     true
+}
+
+fn default_terminal_dark_scheme_id() -> String {
+    crate::models::DEFAULT_DARK_TERMINAL_SCHEME_ID.to_string()
+}
+
+fn default_terminal_light_scheme_id() -> String {
+    crate::models::DEFAULT_LIGHT_TERMINAL_SCHEME_ID.to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -307,6 +323,12 @@ impl DesktopStore {
         self.write()
     }
 
+    pub fn set_terminal_theme(&mut self, dark_scheme_id: String, light_scheme_id: String) -> Result<()> {
+        self.state.settings.terminal_dark_scheme_id = dark_scheme_id;
+        self.state.settings.terminal_light_scheme_id = light_scheme_id;
+        self.write()
+    }
+
     fn write(&self) -> Result<()> {
         if let Some(parent) = self.file_path.parent() {
             fs::create_dir_all(parent)?;
@@ -340,6 +362,8 @@ fn default_state() -> StoredState {
             open_projects_in_new_windows: true,
             confirm_external_links: true,
             follow_working_directory: true,
+            terminal_dark_scheme_id: default_terminal_dark_scheme_id(),
+            terminal_light_scheme_id: default_terminal_light_scheme_id(),
         },
     }
 }
@@ -388,6 +412,54 @@ mod tests {
     use crate::models::AuthorizedDevice;
     use std::{fs, path::PathBuf};
     use uuid::Uuid;
+
+    #[test]
+    fn a_settings_file_written_before_terminal_themes_loads_the_defaults() {
+        // Upgrading in place must not need the settings file rewritten first:
+        // the fields are simply absent until something sets them.
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        let state = serde_json::json!({
+            "host": { "id": "host-1", "name": "Workstation" },
+            "projects": [],
+            "devices": [],
+            "settings": { "defaultShellId": "powershell", "port": 47831 }
+        });
+        fs::write(&state_path, serde_json::to_vec(&state).expect("serialize")).expect("write");
+
+        let store = DesktopStore::load(state_path.clone()).expect("load legacy settings");
+        assert_eq!(
+            store.settings().terminal_dark_scheme_id,
+            crate::models::DEFAULT_DARK_TERMINAL_SCHEME_ID
+        );
+        assert_eq!(
+            store.settings().terminal_light_scheme_id,
+            crate::models::DEFAULT_LIGHT_TERMINAL_SCHEME_ID
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn the_terminal_theme_pair_survives_a_store_reload() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        {
+            let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
+            store
+                .set_terminal_theme("vintage".into(), "novel".into())
+                .expect("store the pair");
+        }
+        let reloaded = DesktopStore::load(state_path.clone()).expect("reload store");
+        assert_eq!(reloaded.settings().terminal_dark_scheme_id, "vintage");
+        assert_eq!(reloaded.settings().terminal_light_scheme_id, "novel");
+        fs::remove_file(state_path).expect("remove test state");
+    }
 
     #[test]
     fn duplicate_project_paths_are_collapsed_on_reload() {

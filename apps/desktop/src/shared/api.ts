@@ -42,6 +42,7 @@ export interface DesktopApi {
   retryRemoteRegistration(): Promise<void>;
   revokeDevice(deviceId: string): Promise<void>;
   setDefaultShell(shellId: string): Promise<void>;
+  setTerminalTheme(darkSchemeId: string, lightSchemeId: string): Promise<void>;
   setOpenProjectsInNewWindows(enabled: boolean): Promise<void>;
   setConfirmExternalLinks(enabled: boolean): Promise<void>;
   setFollowWorkingDirectory(enabled: boolean): Promise<void>;

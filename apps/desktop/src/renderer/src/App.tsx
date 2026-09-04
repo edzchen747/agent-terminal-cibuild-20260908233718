@@ -1,13 +1,14 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import QRCode from "qrcode";
-import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH } from "@agentterminal/protocol";
+import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemesFor } from "@agentterminal/protocol";
 import type { DesktopState } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
 import type { SplitGroup, SplitLayout } from "./split-tabs";
 import { deviceListEntryModal, nextModalAfterPairing, nextModalOnEscape, pairModalEscapeTarget, type Modal } from "./modal-navigation";
 import { effectiveAutoCollapse, isNarrowLayout, loadSidebarPreferences, NARROW_SIDEBAR_WIDTH, saveSidebarPreferences, sidebarOpenAfterAutoCollapseToggle, sidebarOpenAfterNarrowLayout, shouldCollapseSidebar } from "./sidebar";
+import { applyTheme, loadThemePreference, resolveTheme, saveThemePreference, SYSTEM_DARK_QUERY, THEME_LABELS, THEME_PREFERENCES, type ThemePreference } from "./theme";
 import { TerminalPane } from "./TerminalPane";
 
 interface TabDragState {
@@ -66,6 +67,8 @@ export function App() {
   const [resizingSplitId, setResizingSplitId] = useState<string | null>(null);
   const [autoCollapseSidebar, setAutoCollapseSidebar] = useState(() => loadSidebarPreferences().autoCollapse);
   const [narrowLayout, setNarrowLayout] = useState(() => isNarrowLayout(window.innerWidth));
+  const [themePreference, setThemePreference] = useState<ThemePreference>(loadThemePreference);
+  const [systemPrefersDark, setSystemPrefersDark] = useState(() => window.matchMedia(SYSTEM_DARK_QUERY).matches);
   const tabDragRef = useRef<TabDragState | null>(null);
   const tabElementsRef = useRef(new Map<string, HTMLButtonElement>());
   const pendingTabPositionsRef = useRef<Map<string, number> | null>(null);
@@ -105,6 +108,23 @@ export function App() {
     saveSidebarPreferences({ autoCollapse: autoCollapseSidebar });
   }, [autoCollapseSidebar]);
 
+  // The theme is a client-side preference: nothing about it reaches the host
+  // or a paired phone, so each window follows the palette saved here. The
+  // "system" choice tracks the OS setting live.
+  useEffect(() => {
+    const query = window.matchMedia(SYSTEM_DARK_QUERY);
+    const apply = () => setSystemPrefersDark(query.matches);
+    query.addEventListener("change", apply);
+    return () => query.removeEventListener("change", apply);
+  }, []);
+
+  const resolvedTheme = resolveTheme(themePreference, systemPrefersDark);
+
+  useEffect(() => {
+    applyTheme(resolvedTheme);
+    saveThemePreference(themePreference);
+  }, [themePreference, resolvedTheme]);
+
   // Below the narrow threshold the project sidebar becomes an overlay drawer, so the
   // auto-collapse behavior is implicitly enabled there regardless of the saved
   // preference. This threshold must stay in sync with the CSS overlay breakpoint
@@ -142,6 +162,14 @@ export function App() {
     document.addEventListener("click", handleClick);
     return () => document.removeEventListener("click", handleClick);
   }, [sidebarOpen, autoCollapseEffective, modal]);
+
+  // The scheme pair is a host setting shared with the phone; which of the two
+  // this window paints is decided by its own light/dark theme.
+  const terminalTheme = normalizeTerminalThemeSettings(state?.terminalTheme);
+  const terminalScheme = resolveTerminalScheme(
+    resolvedTheme === "dark" ? terminalTheme.darkSchemeId : terminalTheme.lightSchemeId,
+    resolvedTheme
+  );
 
   const currentProject = state?.projects.find((project) => project.id === state.currentProjectId);
   const unorderedProjectSessions = useMemo(
@@ -788,7 +816,7 @@ export function App() {
                 }
               }
               return <div key={session.id} className={`terminal-surface ${visible ? "is-visible" : ""} ${paneActive ? "is-active" : "is-inactive"} ${activeSplit ? `is-split ${activeSplit.layout}` : ""}`} style={surfaceStyle} onPointerDown={() => { if (visible && !paneActive) setActiveSessionId(session.id); }}>
-                <TerminalPane sessionId={session.id} visible={visible} active={paneActive} confirmExternalLinks={state.confirmExternalLinks} />
+                <TerminalPane sessionId={session.id} visible={visible} active={paneActive} confirmExternalLinks={state.confirmExternalLinks} scheme={terminalScheme} />
                 {visible && activeSplit && !paneActive && <div className="split-mini-toolbar" onPointerDown={(event) => event.stopPropagation()}>
                   <TerminalIcon /><span className="display-name" title={session.title}>{session.title}</span>
                   <button title="Manage split view" aria-label="Manage split view" onClick={(event) => { const bounds = event.currentTarget.getBoundingClientRect(); setSplitMenu({ kind: "manage", groupId: activeSplit.id, x: bounds.right, y: bounds.top }); }}><MoreIcon /></button>
@@ -861,7 +889,12 @@ export function App() {
         <button className="modal-close icon-button" onClick={() => setModal(null)}><CloseIcon /></button>
         <div className="modal-kicker"><SettingsIcon /> Settings</div>
         <h1>Desktop host</h1>
-        <div className="settings-row"><span><strong>Default terminal</strong><small>Used for new tabs and projects</small></span><select value={state.defaultShellId} onChange={(event) => void selectShell(event.target.value)}>{state.shells.map((shell) => <option key={shell.id} value={shell.id}>{shell.name}</option>)}</select></div>
+        <div className="settings-group">
+          <div className="settings-row"><span><strong>Appearance</strong></span><div className="theme-choice" role="group" aria-label="Appearance">{THEME_PREFERENCES.map((preference) => <button key={preference} type="button" aria-pressed={themePreference === preference} onClick={() => setThemePreference(preference)}>{THEME_LABELS[preference]}</button>)}</div></div>
+          <div className="settings-row"><span><strong>Terminal colors · Dark{resolvedTheme === "dark" && <i className="active-dot" title="Painting this window now" />}</strong></span><select value={terminalTheme.darkSchemeId} onChange={(event) => void window.agentTerminal.setTerminalTheme(event.target.value, terminalTheme.lightSchemeId)}>{terminalSchemesFor("dark").map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}</select></div>
+          <div className="settings-row"><span><strong>Terminal colors · Light{resolvedTheme === "light" && <i className="active-dot" title="Painting this window now" />}</strong></span><select value={terminalTheme.lightSchemeId} onChange={(event) => void window.agentTerminal.setTerminalTheme(terminalTheme.darkSchemeId, event.target.value)}>{terminalSchemesFor("light").map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}</select></div>
+        </div>
+        <div className="settings-row"><span><strong>Default terminal</strong></span><select value={state.defaultShellId} onChange={(event) => void selectShell(event.target.value)}>{state.shells.map((shell) => <option key={shell.id} value={shell.id}>{shell.name}</option>)}</select></div>
         <label className="settings-row settings-toggle"><span><strong>Open each project in a new window</strong><small>Turn off to switch projects like tabs in this window</small></span><input type="checkbox" checked={state.openProjectsInNewWindows} onChange={(event) => void window.agentTerminal.setOpenProjectsInNewWindows(event.target.checked)} /><i /></label>
         <label className="settings-row settings-toggle"><span><strong>Move tabs to the matching project</strong><small>Turn off to keep a terminal tab in its current project even when the folder changes</small></span><input type="checkbox" checked={state.followWorkingDirectory} onChange={(event) => void window.agentTerminal.setFollowWorkingDirectory(event.target.checked)} /><i /></label>
         <label className="settings-row settings-toggle"><span><strong>Warn before opening external links</strong><small>Ask for confirmation before sending terminal links to your browser</small></span><input type="checkbox" checked={state.confirmExternalLinks} onChange={(event) => void window.agentTerminal.setConfirmExternalLinks(event.target.checked)} /><i /></label>
