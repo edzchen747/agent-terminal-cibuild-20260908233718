@@ -340,8 +340,12 @@ pub fn run() {
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let exit = MenuItem::with_id(app, "exit", "Exit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&exit])?;
+    // Reuse the icon embedded into the app binary (the same one the window
+    // and taskbar show) so the tray always matches the desktop icon; the
+    // procedural glyph only stands in if no icon was embedded.
+    let tray_icon = app.default_window_icon().cloned().unwrap_or_else(|| tray_icon());
     TrayIconBuilder::with_id("agent-terminal")
-        .icon(tray_icon())
+        .icon(tray_icon)
         .tooltip("Agent Terminal")
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -374,6 +378,7 @@ fn show_terminal_window_from_worker(core: Arc<Core>) {
 }
 
 fn tray_icon() -> Image<'static> {
+    // Fallback only: see build_tray, which prefers the embedded app icon.
     let width = 32_u32;
     let height = 32_u32;
     let mut rgba = vec![0_u8; (width * height * 4) as usize];
