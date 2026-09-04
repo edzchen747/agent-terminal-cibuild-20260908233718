@@ -74,6 +74,37 @@ export function shouldBridgeTapClick(input: {
     && input.movePx <= TAP_MAX_MOVE_PX;
 }
 
+/**
+ * A tap on the terminal body is the one gesture that may focus the IME
+ * field and pop the mobile keyboard; a swipe (scroll) or a hold
+ * (word-selection) must leave the keyboard alone. pointerdown/touchstart
+ * fire at the START of every gesture, so the commit happens when the
+ * gesture ENDS, and only while it still reads as a tap:
+ *
+ * - mouse: a short press that barely moved (the shared tap slop and the
+ *   shared tap window, so a tap means the same thing everywhere in the
+ *   app). A held or dragged button is a swipe/hold, not a tap.
+ * - touch: the terminal arms a long-press (word-selection) timer only for
+ *   a plain press - no pre-existing selection, not the scrollbar - and
+ *   movement cancels it. So "timer still pending" is exactly "the finger
+ *   stayed put and was released inside the hold window": a fired timer
+ *   was a word-selection hold, a cancelled one a swipe.
+ */
+export function commitTapOnGestureEnd(input: {
+  pointerType: string;
+  /** How far the pointer travelled from where the gesture started. */
+  movePx: number;
+  /** How long the gesture lasted before release. */
+  durationMs: number;
+  /** Touch only: whether the long-press timer is still pending. */
+  touchLongPressPending?: boolean;
+}): boolean {
+  if (input.pointerType === "touch") {
+    return input.touchLongPressPending === true && input.movePx <= TAP_MAX_MOVE_PX;
+  }
+  return input.movePx <= TAP_MAX_MOVE_PX && input.durationMs <= TAP_MAX_DURATION_MS;
+}
+
 export interface TapControlInfo {
   /** The tap's own closest interactive ancestor kind, or null. */
   nearestControl: "button" | "link" | "summary" | "label" | "roleButton" | "backdrop" | null;

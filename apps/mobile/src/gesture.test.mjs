@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyGestureAxis, hasScrollableSheetAncestor, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_DISMISS_DISTANCE_PX, SHEET_DISMISS_MIN_FLICK_PX, SHEET_DISMISS_VELOCITY_PX_MS, SHEET_SLIDER_HORIZONTAL_BIAS, TAP_MAX_DURATION_MS, TAP_MAX_MOVE_PX } from "./gesture.ts";
+import { classifyGestureAxis, commitTapOnGestureEnd, hasScrollableSheetAncestor, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_DISMISS_DISTANCE_PX, SHEET_DISMISS_MIN_FLICK_PX, SHEET_DISMISS_VELOCITY_PX_MS, SHEET_SLIDER_HORIZONTAL_BIAS, TAP_MAX_DURATION_MS, TAP_MAX_MOVE_PX } from "./gesture.ts";
 
 test("gesture intent waits through initial touch jitter", () => {
   assert.equal(classifyGestureAxis(5, 4), "pending");
@@ -145,4 +145,43 @@ test("the character-width slider chain never marks the region as scrolling", () 
   assert.equal(hasScrollableSheetAncestor(["visible", "visible", "visible"]), false);
   assert.equal(hasScrollableSheetAncestor(["hidden", "clip", "visible"]), false);
   assert.equal(hasScrollableSheetAncestor([]), false);
+});
+
+// Terminal tap-commit: only a tap may focus the IME field and pop the
+// mobile keyboard; swipes and holds must not (see MobileTerminal.tsx).
+test("a mouse tap commits when it is short and barely moved", () => {
+  assert.equal(commitTapOnGestureEnd({ pointerType: "mouse", movePx: 0, durationMs: 120 }), true);
+});
+
+test("a mouse swipe does not commit", () => {
+  // Dragging the button past the tap slop is a swipe, not a tap.
+  assert.equal(commitTapOnGestureEnd({ pointerType: "mouse", movePx: TAP_MAX_MOVE_PX + 1, durationMs: 80 }), false);
+});
+
+test("a held mouse button does not commit", () => {
+  // Holding the button down past the tap window is a hold, not a tap.
+  assert.equal(commitTapOnGestureEnd({ pointerType: "mouse", movePx: 0, durationMs: TAP_MAX_DURATION_MS + 1 }), false);
+});
+
+test("the mouse tap boundaries are inclusive", () => {
+  assert.equal(commitTapOnGestureEnd({ pointerType: "mouse", movePx: TAP_MAX_MOVE_PX, durationMs: TAP_MAX_DURATION_MS }), true);
+  assert.equal(commitTapOnGestureEnd({ pointerType: "mouse", movePx: TAP_MAX_MOVE_PX + 1, durationMs: 0 }), false);
+  assert.equal(commitTapOnGestureEnd({ pointerType: "mouse", movePx: 0, durationMs: TAP_MAX_DURATION_MS + 1 }), false);
+});
+
+test("a touch tap commits while the long-press timer is still pending", () => {
+  // The finger stayed put and was released inside the hold window: a tap.
+  assert.equal(commitTapOnGestureEnd({ pointerType: "touch", movePx: 4, durationMs: 0, touchLongPressPending: true }), true);
+});
+
+test("a touch hold does not commit: the long-press timer fired", () => {
+  // The hold window elapsed and the word-selection timer fired: the user
+  // was holding, not tapping.
+  assert.equal(commitTapOnGestureEnd({ pointerType: "touch", movePx: 0, durationMs: 0, touchLongPressPending: false }), false);
+});
+
+test("a touch swipe does not commit: movement cancelled the timer", () => {
+  // Any real movement clears the long-press timer (and outruns the slop),
+  // so a scroll that even wanders back to its start point never commits.
+  assert.equal(commitTapOnGestureEnd({ pointerType: "touch", movePx: TAP_MAX_MOVE_PX + 1, durationMs: 0, touchLongPressPending: false }), false);
 });

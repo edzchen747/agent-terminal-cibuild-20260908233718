@@ -4,11 +4,12 @@ import { FitAddon } from "@xterm/addon-fit";
 import { applyTerminalModifiers, createRequestId, findHttpLinks, streamByteLength, TERMINAL_SCROLLBACK_LINES, xtermThemeFor } from "@agentterminal/protocol";
 import type { TerminalModifier, TerminalScheme, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
-import { classifyGestureAxis, type GestureAxis } from "./gesture";
+import { classifyGestureAxis, commitTapOnGestureEnd, type GestureAxis } from "./gesture";
 import { claimNativeInput, isCursorPositionReport, mobileTerminalKeydownInput, nativeTerminalInput } from "./terminalInput";
 import type { TimedTerminalInput } from "./terminalInput";
 import { announcedViewport, shouldSendResize } from "./terminalResize";
 import { keyboardOpenByLayout, keyboardLayoutReference, keyboardOpenState, type KeyboardLayoutReference } from "./terminalKeyboard";
+import { terminalFocusAction, type TerminalFocusAction } from "./terminalFocus";
 import { TERMINAL_FONT_SIZE, calibratedSquishFontSize, squishAdvanceRatio, squishInverse as squishInverseValue, squishLineHeight as squishLineHeightValue, squishWidthPercent } from "./terminalSquish";
 import { TERMINAL_FONT_FAMILY, preloadTerminalFonts } from "./terminalFonts";
 import { activateTerminalCursor, deactivateTerminalCursor } from "./terminalCursor";
@@ -92,6 +93,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
   const a11yAdvanceRatioRef = useRef<number | undefined>(undefined);
   const resizeRef = useRef<() => void>(() => undefined);
   const focusInputRef = useRef<() => void>(() => undefined);
+  // Cursor-only twin of focusInputRef: entry and attach-complete keep the
+  // xterm cursor cell live without focusing the IME field, so entering the
+  // terminal view does not pop the Android soft keyboard. The keyboard now
+  // follows an explicit tap of the terminal or a utility key instead.
+  const activateCursorRef = useRef<() => void>(() => undefined);
   // Attach/keepalive owner: the view-activity gate below calls into the
   // session-join machinery defined inside the terminal effect.
   const startAttachmentRef = useRef<() => void>(() => undefined);
@@ -118,11 +124,20 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     return current;
   };
 
+  // Runs a terminalFocus verdict against the live refs: "input" focuses the
+  // IME field (which is what pops the Android soft keyboard), "cursor" runs
+  // only the xterm cursor hand-off, and "none" does nothing (the inactive
+  // blur is the [active] effect's job, not a focus action).
+  const applyFocusAction = (action: TerminalFocusAction) => {
+    if (action === "input") focusInputRef.current();
+    else if (action === "cursor") activateCursorRef.current();
+  };
+
   const sendKeyData = (data: string) => {
     if (!data || !activeRef.current) return;
     // The grid is the minimum boundary over the viewing clients; typing
     // never asserts dimensions (that would only seize the grid).
-    focusInputRef.current();
+    applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: true }));
     connection.send({ type: "session.input", sessionId: session.id, data });
   };
 
@@ -157,6 +172,13 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
         activateTerminalCursor(terminal.textarea);
       };
       focusInputRef.current = focusInput;
+      const activateCursorOnly = () => {
+        // Same cursor hand-off as focusInput without the IME focus: xterm
+        // must still believe it owns focus or its cursor cell stays
+        // uninitialized, but the keyboard must not open on its own.
+        activateTerminalCursor(terminal.textarea);
+      };
+      activateCursorRef.current = activateCursorOnly;
       // The PTY grid follows focus: while the phone is the focused client,
       // this emulator's fitted dimensions ARE the host PTY grid. When the
       // desktop takes control, the host announces the new grid (session.grid)
@@ -191,7 +213,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
         })));
       }
     });
-    if (activeRef.current) focusInput();
+    applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: false }));
     // No local fit: the emulator grid is the host's (the minimum boundary
     // over the viewing clients), not the container's.
 
@@ -293,15 +315,42 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     resizeRef.current = resize;
     const observer = new ResizeObserver(() => resize());
     observer.observe(hostElement);
+    // Keyboard focus follows a committed tap only. pointerdown fires at the
+    // start of every gesture - including the first moment of a swipe and of
+    // a hold - and focusing the IME field is what pops the Android soft
+    // keyboard, so record the candidate here and commit on pointer-up only
+    // while the gesture still reads as a tap. Touch gestures commit through
+    // the touch handlers (they own the long-press timer); mouse taps commit
+    // here.
+    let pendingTap: { pointerId: number; x: number; y: number; at: number; type: string } | undefined;
     const handlePointerActivity = (event: PointerEvent) => {
       if (!activeRef.current || !(event.target instanceof Node) || !hostElement.contains(event.target)) return;
+      pendingTap = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, at: performance.now(), type: event.pointerType };
+    };
+    const handlePointerUp = (event: PointerEvent) => {
+      const tap = pendingTap;
+      pendingTap = undefined;
+      // Touch pointers are tracked again by the touch handlers, which own
+      // the long-press timer and commit their own taps.
+      if (!tap || tap.pointerId !== event.pointerId || tap.type === "touch") return;
+      if (!commitTapOnGestureEnd({
+        pointerType: tap.type,
+        movePx: Math.hypot(event.clientX - tap.x, event.clientY - tap.y),
+        durationMs: performance.now() - tap.at
+      })) return;
       // Keep tap-to-refit, but do not turn the tap into cursor-key input.
       // PSReadLine treats those synthetic arrows as editing commands and can
       // ring the bell or corrupt the first real key at a line boundary.
-      focusInput();
+      applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: true }));
       resize(true);
     };
+    const handlePointerCancel = (event: PointerEvent) => {
+      // The platform took the gesture away; it can never still be a tap.
+      if (pendingTap?.pointerId === event.pointerId) pendingTap = undefined;
+    };
     window.addEventListener("pointerdown", handlePointerActivity, true);
+    window.addEventListener("pointerup", handlePointerUp, true);
+    window.addEventListener("pointercancel", handlePointerCancel, true);
     const textarea = terminal.textarea;
     // Disable the IME's remembered text/autofill behavior. Android keyboards
     // otherwise keep a history in the textarea and replay it on backspace or
@@ -617,7 +666,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       }
       const touch = event.touches.item(0);
       if (!touch) return;
-      focusInputRef.current();
+      // No focus here: a touchdown is the start of a gesture that may turn
+      // out to be a swipe or a hold, and focusing the IME field is what
+      // pops the soft keyboard. A committed tap focuses on touchend.
       activeTouchId = touch.identifier;
       previousTouchY = touch.clientY;
       touchStartX = touch.clientX;
@@ -680,16 +731,31 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
         deltaY: deltaY * MOBILE_SCROLL_SENSITIVITY
       }));
     };
-    const handleTouchEnd = () => {
+    const handleTouchEnd = (event: TouchEvent) => {
       if (!activeRef.current) {
         clearLongPressTimer();
         resetTouch();
         return;
       }
       if (activeTouchId === undefined) return resetTouch();
+      const ended = event.changedTouches.item(0);
+      // Only a committed tap may bring up the keyboard. The long-press timer
+      // still pending means the finger stayed put and was released inside
+      // the hold window: a fired timer was a word-selection hold and a
+      // cleared one a swipe.
+      const wasTap = ended?.identifier === activeTouchId && commitTapOnGestureEnd({
+        pointerType: "touch",
+        movePx: ended ? Math.hypot(ended.clientX - (touchStartX ?? 0), ended.clientY - (touchStartY ?? 0)) : 0,
+        durationMs: 0,
+        touchLongPressPending: longPressTimer !== undefined
+      });
       clearLongPressTimer();
       if (touchAxis === "horizontal" && !selectionGesture && !terminal.hasSelection() && !hasNativeSelection()) clearTouchSelection();
       resetTouch();
+      if (wasTap) {
+        applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: true }));
+        resize(true);
+      }
     };
     const handleTouchCancel = () => {
       clearLongPressTimer();
@@ -704,7 +770,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     const finishAttachment = () => {
       if (disposed) return;
       initialized = true;
-      if (activeRef.current) focusInput();
+      applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: false }));
     };
     const replayPendingOutput = (index = 0) => {
       if (disposed) return;
@@ -824,6 +890,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       observer.disconnect();
       if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
       window.removeEventListener("pointerdown", handlePointerActivity, true);
+      window.removeEventListener("pointerup", handlePointerUp, true);
+      window.removeEventListener("pointercancel", handlePointerCancel, true);
       inputElement.removeEventListener("keydown", handleNativeKeyDown);
       inputElement.removeEventListener("beforeinput", handleNativeBeforeInput, true);
       inputElement.removeEventListener("input", handleNativeInput);
@@ -839,6 +907,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       connected(); gridChange(); modeChange(); input.dispose(); output(); httpLinkProvider.dispose(); terminal.dispose(); terminalRef.current = null;
       resizeRef.current = () => undefined;
       focusInputRef.current = () => undefined;
+      activateCursorRef.current = () => undefined;
       };
     });
     return () => {
@@ -909,15 +978,17 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       inputRef.current?.blur();
       return;
     }
-    // A fast pager swipe can leave the WebView's pointer-up processing with
-    // focus on the page that was swiped from. Refocus once after that event
-    // cycle has settled so the first terminal character is not dropped.
-    focusInputRef.current();
-    const focusFrame = window.requestAnimationFrame(() => {
-      if (activeRef.current) focusInputRef.current();
+    // Entering the view must not open the soft keyboard (see
+    // terminalFocus.ts): keep the cursor cell live without focusing the
+    // IME field, re-asserted once after a fast swipe's pointer-up cycle
+    // has settled. Taps on the terminal or a utility key are explicit input
+    // gestures, so they still focus the IME field and pop the keyboard.
+    applyFocusAction(terminalFocusAction({ active: true, explicitInput: false }));
+    const cursorFrame = window.requestAnimationFrame(() => {
+      applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: false }));
     });
     resizeRef.current();
-    return () => window.cancelAnimationFrame(focusFrame);
+    return () => window.cancelAnimationFrame(cursorFrame);
   }, [active]);
 
   function pressAccessibilityKey(key: UtilityKey) {
@@ -926,13 +997,13 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     // modifiers only arm and wait, so they stay silent.
     if (!key.modifier) vibrate();
     applyKeyPadResult(keyPadRef.current!.press(key));
-    focusInputRef.current();
+    applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: true }));
   }
 
   function releaseAccessibilityKey(key: UtilityKey) {
     if (!activeRef.current) return;
     applyKeyPadResult(keyPadRef.current!.release(key.id));
-    focusInputRef.current();
+    applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: true }));
   }
 
   function cancelAccessibilityKey(key: UtilityKey) {
@@ -942,7 +1013,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     // arrive for that pointer. The key must not outlive the finger, so a
     // cancel ends with the same end-state as a release.
     applyKeyPadResult(keyPadRef.current!.cancel(key.id));
-    focusInputRef.current();
+    applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: true }));
   }
 
   const squishFontSize = calibratedSquishFontSize(fontWidthScale, a11yAdvanceRatioRef.current);
