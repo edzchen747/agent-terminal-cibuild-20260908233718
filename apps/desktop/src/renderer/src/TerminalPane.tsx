@@ -1,16 +1,24 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import { applyTerminalModifiers, findHttpLinks, streamByteLength, TERMINAL_SCROLLBACK_LINES, xtermThemeFor, type TerminalModifier, type TerminalScheme } from "@agentterminal/protocol";
-import { gridWithinPane } from "./terminal-geometry";
+import { applyTerminalModifiers, findHttpLinks, gridForContent, streamByteLength, TERMINAL_SCROLLBACK_LINES, xtermThemeFor, zoomedFontSize, type Size, type TerminalModifier, type TerminalScheme } from "@agentterminal/protocol";
+import { JournalMerge } from "./terminal-stream";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { sessionId: string; visible: boolean; active: boolean; confirmExternalLinks: boolean; scheme: TerminalScheme; }
 
-const isCursorPositionReport = (data: string) => /^\x1b\[\??\d+;\d+R$/.test(data);
+// The base (unzoomed) font size: the announced viewport is always computed
+// from the cell metrics AT THIS SIZE (cached the first time they are
+// measured), never from the live, possibly-zoomed ones - see zoomedFontSize.
+const BASE_FONT_SIZE = 14;
 
-interface PendingItem { data: string; offset: number; }
+// A zoom correction is a fixed point: raising the font size changes the
+// measured cell size, which can call for another (smaller) correction. Cap
+// the self-correcting loop per trigger so a pathological measurement cannot
+// spin forever; two or three passes is the normal case.
+const MAX_ZOOM_PASSES = 4;
+
+const isCursorPositionReport = (data: string) => /^\x1b\[\??\d+;\d+R$/.test(data);
 
 // Terminal sync diagnostics: mirrored to the host's sync log file (and the
 // WebView2 console) so desktop decisions are captured in the same run as the
@@ -24,6 +32,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const activeRef = useRef(active);
+  const visibleRef = useRef(visible);
   const resizeRef = useRef<() => void>(() => undefined);
   const confirmExternalLinksRef = useRef(confirmExternalLinks);
   const schemeRef = useRef(scheme);
@@ -31,6 +40,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
   const [linkOpening, setLinkOpening] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
   activeRef.current = active;
+  visibleRef.current = visible;
   confirmExternalLinksRef.current = confirmExternalLinks;
   schemeRef.current = scheme;
 
@@ -97,7 +107,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       cursorBlink: true,
       cursorStyle: "bar",
       fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, monospace',
-      fontSize: 14,
+      fontSize: BASE_FONT_SIZE,
       lineHeight: 1,
       scrollback: TERMINAL_SCROLLBACK_LINES,
       linkHandler: {
@@ -110,8 +120,6 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       theme: xtermThemeFor(schemeRef.current)
     });
     terminalRef.current = terminal;
-    const fit = new FitAddon();
-    terminal.loadAddon(fit);
     terminal.open(hostRef.current);
     const httpLinkProvider = terminal.registerLinkProvider({
       provideLinks: (y, callback) => {
@@ -163,32 +171,47 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
     // ---------------------------------------------------------------------
     let viewportCols = 0;
     let viewportRows = 0;
-    // One cell in CSS pixels, read off the rendered grid (the same measurement
-    // the copy toast places itself with). Null until the emulator has painted.
-    const cellSize = () => {
+    // The pane's content box: its border box minus the letterbox padding
+    // that lives on `.terminal-pane`. `getComputedStyle` under this app's
+    // `* { box-sizing: border-box }` reports the border box, which - unlike
+    // the addon proposal this replaced - would otherwise count that padding
+    // as usable and let a proposal land a whole row/col too generous.
+    const contentBox = (): Size | null => {
+      const pane = hostRef.current;
+      if (!pane) return null;
+      const style = window.getComputedStyle(pane);
+      const rect = pane.getBoundingClientRect();
+      return {
+        width: rect.width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+        height: rect.height - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom)
+      };
+    };
+    // One cell in CSS pixels, read off the rendered grid at whatever font
+    // size is currently applied (the same measurement the copy toast places
+    // itself with). Null until the emulator has painted.
+    const cellSize = (): Size | null => {
       const screen = hostRef.current?.querySelector<HTMLElement>(".xterm-screen");
       if (!screen || terminal.cols < 1 || terminal.rows < 1) return null;
       const rect = screen.getBoundingClientRect();
       if (rect.width < 1 || rect.height < 1) return null;
       return { width: rect.width / terminal.cols, height: rect.height / terminal.rows };
     };
+    // The cell size at BASE_FONT_SIZE, cached the first time it is
+    // measurable. The announced viewport is always derived from this, never
+    // from the live (possibly zoomed) cell size: if zooming in shrank the
+    // announcement, it would shrink the host's minimum-boundary PTY grid,
+    // which would call for more zoom - a ratchet that collapses the session.
+    let baseCell: Size | null = null;
+    const captureBaseCell = () => {
+      if (terminal.options.fontSize !== BASE_FONT_SIZE) return;
+      const measured = cellSize();
+      if (measured) baseCell = measured;
+    };
     const proposeGrid = () => {
-      try {
-        const dims = fit.proposeDimensions();
-        const pane = hostRef.current;
-        if (!dims || dims.cols <= 0 || dims.rows <= 0 || !pane) return null;
-        // The addon measures the pane's border box, so its proposal counts
-        // the letterbox padding as usable: clamp it to what the content box
-        // actually holds (see gridWithinPane).
-        const style = window.getComputedStyle(pane);
-        const rect = pane.getBoundingClientRect();
-        const content = {
-          width: rect.width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
-          height: rect.height - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom)
-        };
-        return gridWithinPane({ cols: dims.cols, rows: dims.rows }, content, cellSize());
-      } catch { /* hidden pane */ }
-      return null;
+      captureBaseCell();
+      const content = contentBox();
+      if (!content) return null;
+      return gridForContent(content, baseCell);
     };
     // Announce, don't assert: the pane's proposed dimensions are its
     // viewport (W_i, H_i) - the host takes the minimum over all announced
@@ -203,15 +226,38 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       viewportCols = dims.cols;
       viewportRows = dims.rows;
       dbg(`viewport session=${sessionId} cols=${dims.cols} rows=${dims.rows}${force ? " (forced)" : ""}`);
-      window.agentTerminal.resize(sessionId, dims.cols, dims.rows);
+      // A forced announce is interaction-driven (a click in the pane), so it
+      // claims the PTY grid for this pane; a plain layout resize never does -
+      // the host's grid-owner policy decides what an unclaimed announce may
+      // change.
+      window.agentTerminal.resize(sessionId, dims.cols, dims.rows, force);
+    };
+    // Fill the pane: raise or lower xterm's font size so the rendered grid
+    // consumes as much of the content box as its aspect ratio allows, then
+    // letterbox the rest (the pane aligns the grid to its top-left corner).
+    // This only ever touches rendering (fontSize) - never the announcement
+    // above, which is why it cannot ratchet. A font-size change moves the
+    // measured cell size, so the correction is a fixed point: re-measure and
+    // correct again next frame, capped at MAX_ZOOM_PASSES.
+    const applyZoom = (passesLeft = MAX_ZOOM_PASSES) => {
+      if (!visibleRef.current || passesLeft <= 0) return;
+      const content = contentBox();
+      const cell = cellSize();
+      const next = zoomedFontSize(terminal.options.fontSize ?? BASE_FONT_SIZE, { cols: terminal.cols, rows: terminal.rows }, cell, content);
+      if (next === null) return;
+      terminal.options.fontSize = next;
+      requestAnimationFrame(() => applyZoom(passesLeft - 1));
     };
     const applyGridInPlace = (cols: number, rows: number) => {
       if (cols !== terminal.cols || rows !== terminal.rows) {
         terminal.resize(cols, rows);
+        applyZoom();
       }
     };
 
     const resize = () => {
+      if (!visibleRef.current) return;
+      applyZoom();
       if (!activeRef.current) return;
       announceViewport();
     };
@@ -288,27 +334,22 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       window.agentTerminal.write(sessionId, data, dims.cols, dims.rows);
     });
 
-    let initialized = false;
-    let replayingSessionBuffer = false;
     let disposed = false;
-    // Absolute stream position up to which this emulator's buffer is known to
-    // be applied: any chunk (or grid epoch) at or below this offset is already
-    // contained in the replayed segments.
-    let appliedUpTo = 0;
     let initialAttachPromise: Promise<void> | undefined;
-    const pending: PendingItem[] = [];
+    // Offset bookkeeping for the replay/live merge: what the snapshot already
+    // covers, and what arrived while the attach was in flight (see
+    // terminal-stream.ts). The host subscribes this window inside the lock
+    // that takes the snapshot, so chunks past its end can arrive before the
+    // reply - they must be queued across that window and merged after the
+    // replay, or a just-created tab renders its banner and first prompt as
+    // a permanently blank screen.
+    const merge = new JournalMerge((chunk) => {
+      dbg(`out session=${sessionId} off=${chunk.offset} len=${streamByteLength(chunk.data)} skipped(covered upTo=${merge.appliedUpTo})`);
+    });
     const offData = window.agentTerminal.onData((id, data, offset) => {
       if (id !== sessionId) return;
-      if (replayingSessionBuffer || !initialized) {
-        pending.push({ data, offset });
-        return;
-      }
-      if (offset < appliedUpTo) {
-        dbg(`out session=${sessionId} off=${offset} len=${streamByteLength(data)} skipped(covered upTo=${appliedUpTo})`);
-        return;
-      }
-      appliedUpTo = Math.max(appliedUpTo, offset + streamByteLength(data));
-      dbg(`out session=${sessionId} off=${offset} len=${streamByteLength(data)} upTo=${appliedUpTo}`);
+      if (merge.receive({ data, offset }) !== "write") return;
+      dbg(`out session=${sessionId} off=${offset} len=${streamByteLength(data)} upTo=${merge.appliedUpTo}`);
       terminal.write(data);
     });
     const offGrid = window.agentTerminal.onGrid((id, cols, rows) => {
@@ -325,25 +366,17 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
     });
     const finishAttachment = () => {
       if (disposed) return;
-      initialized = true;
       if (activeRef.current) terminal.focus();
     };
-    const replayPending = (index = 0) => {
+    const replayPending = () => {
       if (disposed) return;
-      const item = pending[index];
-      if (item === undefined) {
-        pending.length = 0;
+      const item = merge.nextQueued();
+      if (item === null) {
         finishAttachment();
         return;
       }
-      if (item.offset < appliedUpTo) {
-        dbg(`pend session=${sessionId} off=${item.offset} skipped(covered upTo=${appliedUpTo})`);
-        replayPending(index + 1);
-        return;
-      }
-      appliedUpTo = Math.max(appliedUpTo, item.offset + streamByteLength(item.data));
-      dbg(`pend session=${sessionId} off=${item.offset} len=${streamByteLength(item.data)} upTo=${appliedUpTo}`);
-      terminal.write(item.data, () => replayPending(index + 1));
+      dbg(`pend session=${sessionId} off=${item.offset} len=${streamByteLength(item.data)} upTo=${merge.appliedUpTo}`);
+      terminal.write(item.data, () => replayPending());
     };
     // Full replay is needed only on initial attach (and reconnect): the
     // pane's size is at least the PTY's, so the segments replay 1:1 with no
@@ -352,24 +385,32 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       const dims = proposeGrid() ?? { cols: terminal.cols, rows: terminal.rows };
       viewportCols = dims.cols;
       viewportRows = dims.rows;
+      // Reset the merge before the request goes out, never after the reply:
+      // the host subscribes this window inside the lock that takes the
+      // snapshot, so chunks past its end arrive while the reply is still in
+      // flight and have to survive until the replay merges them.
+      merge.restart();
       dbg(`attach send session=${sessionId} viewport=${dims.cols}x${dims.rows}`);
-      const snapshot = await window.agentTerminal.attachSession(sessionId, dims.cols, dims.rows);
+      // Claim the grid only when this pane was the active tab at mount: a
+      // background or hidden tab must not steal it from the client that is
+      // actually in use (an ownerless session still grants itself to the
+      // first client that shows up).
+      const snapshot = await window.agentTerminal.attachSession(sessionId, dims.cols, dims.rows, activeRef.current);
       if (disposed) {
         window.agentTerminal.detachSession(sessionId);
         return;
       }
       const segments = snapshot.segments;
-      dbg(`buffer session=${sessionId} end=${snapshot.endOffset} segs=${segments.map((s) => `${s.cols}x${s.rows}+${s.data.length}`).join(" ")}`);
-      initialized = false;
-      replayingSessionBuffer = true;
-      pending.length = 0;
-      appliedUpTo = Math.max(appliedUpTo, snapshot.endOffset);
+      dbg(`buffer session=${sessionId} end=${snapshot.endOffset} segs=${segments.map((s) => `${s.cols}x${s.rows}+${s.data.length}`).join(" ")} queued=${merge.queuedCount}`);
+      // The queue is deliberately kept: what it holds raced the reply and is
+      // not in these segments. replayPending merges it in by offset.
+      merge.openSnapshot(snapshot.endOffset);
       terminal.reset();
       const writeNext = (index = 0) => {
         if (disposed) return;
         const segment = segments[index];
         if (segment === undefined) {
-          replayingSessionBuffer = false;
+          applyZoom();
           replayPending();
           return;
         }
@@ -377,11 +418,20 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
         // replays 1:1 exactly the way the live clients applied it.
         if (segment.cols !== terminal.cols || segment.rows !== terminal.rows) {
           terminal.resize(segment.cols, segment.rows);
+          applyZoom();
         }
         terminal.write(segment.data, () => writeNext(index + 1));
       };
       writeNext();
-    })();
+    })().catch((cause) => {
+      // A rejected attach used to leave the pane queueing forever behind a
+      // silent unhandled rejection - no output, no error, and no detach
+      // either, since cleanup detaches only when this promise settles. Say
+      // so in the pane the way the phone does.
+      if (disposed) return;
+      dbg(`attach session=${sessionId} failed: ${String(cause)}`);
+      terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
+    });
     const statsTimer = window.setInterval(() => {
       if (disposed || !terminalRef.current) return;
       const buffer = terminal.buffer.active;

@@ -66,10 +66,10 @@ const api: DesktopApi = {
   closeSession: (sessionId) => invoke("close_session", { sessionId }),
   reorderSessions: (projectId, sessionIds) => invoke("reorder_sessions", { projectId, sessionIds }),
   write: (sessionId, data, cols, rows) => { void invoke("write_session", { sessionId, data, cols, rows }); },
-  resize: (sessionId, cols, rows) => { void invoke("resize_session", { sessionId, cols, rows }); },
-  attachSession: async (sessionId, cols, rows) => {
+  resize: (sessionId, cols, rows, claim = false) => { void invoke("resize_session", { sessionId, cols, rows, claim }); },
+  attachSession: async (sessionId, cols, rows, claim = false) => {
     await dataBridgeReady;
-    return invoke("attach_session", { sessionId, cols, rows });
+    return invoke("attach_session", { sessionId, cols, rows, claim });
   },
   detachSession: (sessionId) => { void invoke("detach_session", { sessionId }); },
   copyText: (text) => invoke("copy_text", { text }),

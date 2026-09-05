@@ -152,8 +152,9 @@ fn resize_session(
     session_id: String,
     cols: u16,
     rows: u16,
+    claim: bool,
 ) {
-    state.resize_desktop_session(window.label(), &session_id, cols, rows);
+    state.resize_desktop_session(window.label(), &session_id, cols, rows, claim);
 }
 
 #[tauri::command]
@@ -163,9 +164,10 @@ fn attach_session(
     session_id: String,
     cols: u16,
     rows: u16,
+    claim: bool,
 ) -> Result<SessionSnapshot, String> {
     state
-        .attach_window_session(window.label(), &session_id, cols, rows)
+        .attach_window_session(window.label(), &session_id, cols, rows, claim)
         .map_err(error_string)
 }
 

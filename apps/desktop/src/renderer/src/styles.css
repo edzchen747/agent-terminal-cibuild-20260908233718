@@ -229,14 +229,16 @@ button { color: inherit; }
 .terminal-surface.is-split.is-active { z-index: 2; box-shadow: inset 0 0 0 3px var(--accent); }
 .terminal-surface.is-split.is-inactive { z-index: 1; box-shadow: inset 0 0 0 1px var(--border-input); }
 /* The PTY grid is the minimum boundary over the clients viewing the
-   session: this pane renders the host grid exactly and letterboxes the
-   surplus - center the xterm element (the cell grid) inside the pane and
-   paint the surplus in the terminal background so it reads as a frame. */
-.terminal-pane { position: absolute; inset: 0; padding: 10px 13px 4px; display: grid; place-items: center; background: var(--terminal-bg); visibility: hidden; }
+   session: this pane renders the host grid exactly, zoomed to fill as much
+   of the content box as its aspect ratio allows (see applyZoom in
+   TerminalPane.tsx), and letterboxes the rest. Anchor the xterm element (the
+   cell grid) to the pane's top-left corner and paint the surplus in the
+   terminal background so it reads as a frame. */
+.terminal-pane { position: absolute; inset: 0; padding: 10px 13px 4px; display: grid; place-items: start; background: var(--terminal-bg); visibility: hidden; }
 .terminal-pane.is-visible { visibility: visible; }
 .terminal-pane .xterm { height: 100%; }
 .terminal-pane .xterm .xterm-viewport,
-.terminal-pane .xterm .xterm-scrollable-element { display: grid; place-items: center; background: transparent; }
+.terminal-pane .xterm .xterm-scrollable-element { display: grid; place-items: start; background: transparent; }
 .terminal-pane .xterm-viewport { scrollbar-width: thin; scrollbar-color: #323846 transparent; }
 .split-mini-toolbar { max-width: min(280px,calc(100% - 18px)); height: 29px; position: absolute; z-index: 8; right: 9px; bottom: 9px; display: flex; align-items: center; gap: 7px; padding: 0 4px 0 9px; border: 1px solid var(--border-input); border-radius: 8px; background: var(--surface-raised); box-shadow: 0 7px 24px var(--shadow-strong); color: var(--text-dim); font-size: 10.5px; backdrop-filter: blur(8px); }
 .split-mini-toolbar > svg { width: 13px; flex: none; color: var(--accent-ink); }

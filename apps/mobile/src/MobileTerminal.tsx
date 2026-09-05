@@ -1,8 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import { applyTerminalModifiers, createRequestId, findHttpLinks, streamByteLength, TERMINAL_SCROLLBACK_LINES, xtermThemeFor } from "@agentterminal/protocol";
-import type { TerminalModifier, TerminalScheme, TerminalSession } from "@agentterminal/protocol";
+import { applyTerminalModifiers, createRequestId, findHttpLinks, gridForContent, streamByteLength, TERMINAL_SCROLLBACK_LINES, xtermThemeFor, zoomedFontSize } from "@agentterminal/protocol";
+import type { Size, TerminalModifier, TerminalScheme, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
 import { classifyGestureAxis, commitTapOnGestureEnd, type GestureAxis } from "./gesture";
 import { claimNativeInput, isCursorPositionReport, mobileTerminalKeydownInput, nativeTerminalInput } from "./terminalInput";
@@ -27,6 +26,12 @@ interface Props { connection: HostConnection; session: TerminalSession; active: 
 // lower below 1 for a slower one. Mobile-only: the desktop pane never
 // synthesizes these events.
 const MOBILE_SCROLL_SENSITIVITY = 5;
+
+// A zoom correction is a fixed point: raising the font size changes the
+// measured cell size, which can call for another (smaller) correction. Cap
+// the self-correcting loop per trigger so a pathological measurement cannot
+// spin forever; two or three passes is the normal case.
+const MAX_ZOOM_PASSES = 4;
 
 // Start fetching the terminal font faces as soon as the app loads so xterm
 // never measures with device fallback glyphs (see fonts.test.mjs).
@@ -199,8 +204,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       theme: xtermThemeFor(schemeRef.current)
     });
     terminalRef.current = terminal;
-    const fit = new FitAddon();
-    terminal.loadAddon(fit);
     terminal.open(hostElement);
     const httpLinkProvider = terminal.registerLinkProvider({
       provideLinks: (y, callback) => {
@@ -223,11 +226,13 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     // layer, measure what this WebView actually reports: xterm paints the
     // accessibility container at cellWidth * cols (its own css-pixel cell
     // size), and a mirror span inside the accessibility tree yields the real
-    // DOM advance at the base font size. The ratio reconciles the two so the
-    // squished font size lands every accessibility character on its canvas
-    // cell, whatever face or rounding the WebView applies to the layer.
-    // cols is always the ANNOUNCED host grid here - never a local fit - so
-    // the squish tracks the columns actually rendered.
+    // DOM advance at the terminal's CURRENT font size (zoom raises or lowers
+    // it - see applyZoom below - so a hard-coded base size would drift once
+    // zoomed). The ratio reconciles the two so the squished font size lands
+    // every accessibility character on its canvas cell, whatever face or
+    // rounding the WebView applies to the layer. cols is always the
+    // ANNOUNCED host grid here - never a local fit - so the squish tracks
+    // the columns actually rendered.
     const calibrateAccessibilityMetrics = () => {
       const a11y = hostElement.querySelector<HTMLElement>(".xterm-accessibility");
       const tree = hostElement.querySelector<HTMLElement>(".xterm-accessibility-tree");
@@ -235,10 +240,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       const containerWidth = Number.parseFloat(a11y.style.width);
       if (!(containerWidth > 0)) return;
       const cellWidth = containerWidth / terminal.cols;
+      const currentFontSize = terminal.options.fontSize ?? TERMINAL_FONT_SIZE;
       const mirror = document.createElement("span");
       mirror.className = "xterm-char-measure-element";
       mirror.style.fontFamily = TERMINAL_FONT_FAMILY;
-      mirror.style.fontSize = `${TERMINAL_FONT_SIZE}px`;
+      mirror.style.fontSize = `${currentFontSize}px`;
       mirror.style.fontKerning = "none";
       mirror.style.whiteSpace = "pre";
       mirror.textContent = "W".repeat(32);
@@ -249,7 +255,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       const domAdvance = mirror.getBoundingClientRect().width / 32;
       mirror.remove();
       a11yAdvanceRatioRef.current = squishAdvanceRatio(cellWidth, domAdvance);
-      hostElement.style.setProperty("--terminal-squish-font-size", calibratedSquishFontSize(fontWidthScaleRef.current, a11yAdvanceRatioRef.current));
+      hostElement.style.setProperty("--terminal-squish-font-size", calibratedSquishFontSize(currentFontSize, fontWidthScaleRef.current, a11yAdvanceRatioRef.current));
     };
     calibrateAccessibilityMetrics();
 
@@ -277,19 +283,68 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       layoutReference = keyboardLayoutReference(current, layoutReference);
       return false;
     };
+    // The content box xterm can actually paint into: the host element's own
+    // LAYOUT box (offsetWidth/offsetHeight - not getBoundingClientRect,
+    // which reports the box AFTER the horizontal squish transform) minus the
+    // letterbox padding on `.mobile-terminal`. That layout box is already
+    // the wide, pre-squish one the width: squishWidthPercent() style below
+    // sizes to, so measuring here keeps zoom and squish fully independent.
+    const contentBox = (): Size | null => {
+      const style = window.getComputedStyle(hostElement);
+      const width = hostElement.offsetWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+      const height = hostElement.offsetHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+      if (!(width > 0 && height > 0)) return null;
+      return { width, height };
+    };
+    // One cell in that same pre-transform layout space, read off the
+    // rendered grid at whatever font size is currently applied. Null until
+    // the emulator has painted.
+    const cellSize = (): Size | null => {
+      const screen = hostElement.querySelector<HTMLElement>(".xterm-screen");
+      if (!screen || terminal.cols < 1 || terminal.rows < 1) return null;
+      const width = screen.offsetWidth;
+      const height = screen.offsetHeight;
+      if (width < 1 || height < 1) return null;
+      return { width: width / terminal.cols, height: height / terminal.rows };
+    };
+    // The cell size at TERMINAL_FONT_SIZE, cached the first time it is
+    // measurable. The announced viewport is always derived from this, never
+    // from the live (possibly zoomed) cell size: if zooming in shrank the
+    // announcement, it would shrink the host's minimum-boundary PTY grid,
+    // which would call for more zoom - a ratchet that collapses the session.
+    let baseCell: Size | null = null;
+    const captureBaseCell = () => {
+      if (terminal.options.fontSize !== TERMINAL_FONT_SIZE) return;
+      const measured = cellSize();
+      if (measured) baseCell = measured;
+    };
     const proposeGrid = () => {
-      try {
-        const dims = fit.proposeDimensions();
-        if (dims && dims.cols > 0 && dims.rows > 0) return { cols: dims.cols, rows: dims.rows };
-      } catch {
-        // The WebView can report an intermediate zero-sized layout while the keyboard opens.
-      }
-      return null;
+      captureBaseCell();
+      const content = contentBox();
+      if (!content) return null;
+      return gridForContent(content, baseCell);
     };
     const announcedGrid = () => {
       const dims = proposeGrid();
       if (!dims) return null;
       return announcedViewport(dims, keyboardOpen());
+    };
+    // Fill the shell: raise or lower xterm's font size so the rendered grid
+    // consumes as much of the content box as its aspect ratio allows, then
+    // letterbox the rest (the shell aligns the grid to its top-left corner).
+    // Render-only - it never touches the announcement above, which is why it
+    // cannot ratchet. A font-size change moves the measured cell size, so
+    // the correction is a fixed point: re-measure and correct again next
+    // frame, capped at MAX_ZOOM_PASSES.
+    const applyZoom = (passesLeft = MAX_ZOOM_PASSES) => {
+      if (!activeRef.current || passesLeft <= 0) return;
+      const content = contentBox();
+      const cell = cellSize();
+      const next = zoomedFontSize(terminal.options.fontSize ?? TERMINAL_FONT_SIZE, { cols: terminal.cols, rows: terminal.rows }, cell, content);
+      if (next === null) return;
+      terminal.options.fontSize = next;
+      calibrateAccessibilityMetrics();
+      requestAnimationFrame(() => applyZoom(passesLeft - 1));
     };
     let resizeFrame: number | undefined;
     let lastSize = { cols: 0, rows: 0 };
@@ -299,6 +354,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       resizeFrame = requestAnimationFrame(() => {
         resizeFrame = undefined;
         if (!activeRef.current) return;
+        applyZoom();
         const dims = announcedGrid();
         if (!dims) return;
         // A tap is an interaction: force the announce so the host applies
@@ -525,6 +581,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
         // every grid epoch even when stream offsets have advanced past it.
         if (item.cols !== terminal.cols || item.rows !== terminal.rows) {
           terminal.resize(item.cols, item.rows);
+          applyZoom();
           calibrateAccessibilityMetrics();
           syncDebug(`grid session=${session.id} cols=${item.cols} rows=${item.rows} off=${item.offset} reflow`);
         } else {
@@ -789,6 +846,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
         // recalibrated against the columns actually rendered.
         if (item.cols !== terminal.cols || item.rows !== terminal.rows) {
           terminal.resize(item.cols, item.rows);
+          applyZoom();
           calibrateAccessibilityMetrics();
           syncDebug(`pend grid session=${session.id} cols=${item.cols} rows=${item.rows} off=${item.offset} reflow`);
         }
@@ -844,6 +902,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
           if (segment === undefined) {
             replayingSessionBuffer = false;
             appliedUpTo = Math.max(appliedUpTo, message.endOffset);
+            applyZoom();
             calibrateAccessibilityMetrics();
             syncDebug(`replay done session=${session.id} upTo=${appliedUpTo} pending=${pendingOutput.length}`);
             replayPendingOutput();
@@ -854,6 +913,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
           // this client's own size.
           if (segment.cols !== terminal.cols || segment.rows !== terminal.rows) {
             terminal.resize(segment.cols, segment.rows);
+            applyZoom();
           }
           terminal.write(segment.data, () => writeNext(index + 1));
         };
@@ -1016,7 +1076,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: true }));
   }
 
-  const squishFontSize = calibratedSquishFontSize(fontWidthScale, a11yAdvanceRatioRef.current);
+  const currentFontSize = terminalRef.current?.options.fontSize ?? TERMINAL_FONT_SIZE;
+  const squishFontSize = calibratedSquishFontSize(currentFontSize, fontWidthScale, a11yAdvanceRatioRef.current);
   const squishLineHeight = squishLineHeightValue(fontWidthScale);
   const squishInverse = squishInverseValue(fontWidthScale);
   return <div className="mobile-terminal-shell">

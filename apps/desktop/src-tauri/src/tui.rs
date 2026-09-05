@@ -173,6 +173,10 @@ impl TuiClassifier {
         }
     }
 
+    // Sizing no longer branches on this (ownership applies the same way in
+    // every mode - see apply_owner_grid_for in core.rs); kept as the
+    // classifier's own introspection surface and exercised by its tests.
+    #[allow(dead_code)]
     pub fn mode(&self) -> TuiMode {
         self.mode
     }

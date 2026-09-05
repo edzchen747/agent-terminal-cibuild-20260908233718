@@ -1,6 +1,7 @@
 import type { TerminalThemeSettings } from "./terminal-themes.js";
 
 export * from "./terminal-themes.js";
+export * from "./terminal-layout.js";
 
 export const PROTOCOL_VERSION = 1 as const;
 

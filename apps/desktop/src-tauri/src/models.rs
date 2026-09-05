@@ -321,6 +321,13 @@ pub enum ClientMessage {
         session_id: String,
         cols: u16,
         rows: u16,
+        /// Opening a terminal is an explicit interaction: the client always
+        /// sets this, so attaching claims ownership of the PTY grid (see
+        /// `apply_owner_grid_for`) unless a more recent claim already holds
+        /// it. Optional/defaulted so an older client that omits it is simply
+        /// never granted a claim.
+        #[serde(default)]
+        claim: bool,
     },
     #[serde(rename = "session.detach")]
     SessionDetach {
@@ -331,8 +338,9 @@ pub enum ClientMessage {
     SessionInput {
         session_id: String,
         data: String,
-        /// The sender's viewport at the moment of typing. In a TUI period the
-        /// host applies it immediately (the interacting client owns the grid).
+        /// The sender's viewport at the moment of typing. Typing is always
+        /// an interaction: the host applies it immediately and claims the
+        /// PTY grid for the sender (see `apply_owner_grid_for`).
         #[serde(default)]
         cols: Option<u16>,
         #[serde(default)]
@@ -343,6 +351,13 @@ pub enum ClientMessage {
         session_id: String,
         cols: u16,
         rows: u16,
+        /// Set only on a forced/interaction-driven announce (a tap, a click,
+        /// a character-width slider drag) - never on a plain layout resize.
+        /// The PTY grid belongs to whichever client last claimed it (see
+        /// `apply_owner_grid_for`); an unclaimed announce from a non-owner
+        /// is recorded but changes nothing.
+        #[serde(default)]
+        claim: bool,
     },
     /// Bare heartbeat with no requestId and no reply: the host only bumps the
     /// client's viewport liveness so a networked client stays in a session's

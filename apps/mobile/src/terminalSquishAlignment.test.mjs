@@ -29,13 +29,18 @@ test("the accessibility calibration measures the real cell width and DOM advance
     "the container width is the css-pixel canvas width, cellWidth * cols");
   assert.ok(terminal.includes("const cellWidth = containerWidth / terminal.cols"),
     "the cell width must be divided by the current column count");
+  assert.ok(terminal.includes("const currentFontSize = terminal.options.fontSize ?? TERMINAL_FONT_SIZE"),
+    "the calibration must read the terminal's live font size, not assume it is still the base");
 
   assert.ok(terminal.includes('mirror.className = "xterm-char-measure-element"'),
     "the advance must be measured with xterm's hide-offscreen measure element");
   assert.ok(terminal.includes("mirror.style.fontFamily = TERMINAL_FONT_FAMILY"),
     "the mirror span must use the exact terminal font stack");
-  assert.ok(terminal.includes("mirror.style.fontSize = `${TERMINAL_FONT_SIZE}px`"),
-    "the advance must be measured at the base font size");
+  assert.ok(terminal.includes("mirror.style.fontSize = `${currentFontSize}px`"),
+    // Zoom (see applyZoom) raises or lowers xterm's font size to fill the
+    // pane, so the base TERMINAL_FONT_SIZE would drift from reality once
+    // zoomed - the advance must track whatever size is currently applied.
+    "the advance must be measured at the terminal's current (possibly zoomed) font size");
   assert.ok(terminal.includes('mirror.textContent = "W".repeat(32)'),
     "the advance must be averaged over repeated glyphs to stay sub-pixel");
   assert.ok(terminal.includes("mirror.getBoundingClientRect().width / 32"),
@@ -52,10 +57,10 @@ test("the measured ratio is fed into the squished font size the reference CSS co
 
   assert.ok(terminal.includes("a11yAdvanceRatioRef.current = squishAdvanceRatio(cellWidth, domAdvance)"),
     "the ratio must be clamped by squishAdvanceRatio, not applied raw");
-  assert.ok(terminal.includes('hostElement.style.setProperty("--terminal-squish-font-size", calibratedSquishFontSize(fontWidthScaleRef.current, a11yAdvanceRatioRef.current))'),
+  assert.ok(terminal.includes('hostElement.style.setProperty("--terminal-squish-font-size", calibratedSquishFontSize(currentFontSize, fontWidthScaleRef.current, a11yAdvanceRatioRef.current))'),
     "the calibrated size must be painted immediately, without waiting for a render");
-  assert.ok(terminal.includes("calibratedSquishFontSize(fontWidthScale, a11yAdvanceRatioRef.current)"),
-    "renders must repeat the calibrated size so slider updates keep it");
+  assert.ok(terminal.includes("calibratedSquishFontSize(currentFontSize, fontWidthScale, a11yAdvanceRatioRef.current)"),
+    "renders must repeat the calibrated size, at the live font size, so slider updates and zoom changes both keep it");
   assert.ok(terminal.includes("const a11yAdvanceRatioRef = useRef<number | undefined>(undefined)"),
     "an uncalibrated layer must fall back to the plain squish, not a stale value");
 

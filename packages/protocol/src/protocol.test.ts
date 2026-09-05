@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemeById, terminalSchemesFor, xtermThemeFor, type ClientMessage, type HostSnapshot } from "./index.js";
+import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemeById, terminalSchemesFor, xtermThemeFor, zoomedFontSize, type ClientMessage, type HostSnapshot } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -550,4 +550,86 @@ test("the two modes never share a scheme id", () => {
     assert.ok(!dark.has(scheme.id), `${scheme.id} is registered as both dark and light`);
   }
   assert.equal(terminalSchemesFor("dark").length + terminalSchemesFor("light").length, TERMINAL_SCHEMES.length);
+});
+
+// gridForContent: the grid a content box holds at a given cell size. Both
+// desktop and mobile clients announce this (never a raw FitAddon proposal)
+// so the viewport they report the host stays exactly what their own content
+// box - not their border box - can hold.
+test("gridForContent computes whole cells from the content box", () => {
+  const cell = { width: 8.05, height: 16.1026 };
+  const grid = gridForContent({ width: 922, height: 623.51 }, cell);
+  assert.deepEqual(grid, { cols: 114, rows: 38 });
+});
+
+test("gridForContent keeps a row whose fit is exact but lands under it in floating point", () => {
+  const exact = { width: 8, height: 16.1026 };
+  const grid = gridForContent({ width: 800, height: 65 * exact.height }, exact);
+  assert.deepEqual(grid, { cols: 100, rows: 65 });
+});
+
+test("gridForContent reflects the pane's real content box, not its border box (half-screen snap regression)", () => {
+  // Measured: a 1067.12px tall stack with 14px of vertical letterbox padding
+  // leaves a 1053.12px content box, which holds 65 rows - not the 66 a
+  // border-box measurement would suggest.
+  const cell = { width: 8.05, height: 16.1026 };
+  const grid = gridForContent({ width: 1050, height: 1067.12 - 14 }, cell);
+  assert.equal(grid?.rows, 65);
+});
+
+test("gridForContent floors a content box too small for the minimum grid", () => {
+  const cell = { width: 8.05, height: 16.1026 };
+  assert.deepEqual(gridForContent({ width: 9, height: 12 }, cell), { cols: 2, rows: 1 });
+});
+
+test("gridForContent returns null, not a floored grid, when a measurement is not yet usable", () => {
+  // A pane the layout has not sized yet reports 0; computed padding on a
+  // detached element parses to NaN. Neither is grounds for clamping to the
+  // 2x1 floor - the caller falls back to its own default instead.
+  const cell = { width: 8.05, height: 16.1026 };
+  assert.equal(gridForContent({ width: 922, height: 623.51 }, null), null);
+  assert.equal(gridForContent({ width: 922, height: 623.51 }, { width: 0, height: 0 }), null);
+  assert.equal(gridForContent({ width: 0, height: 623.51 }, cell), null);
+  assert.equal(gridForContent({ width: Number.NaN, height: 623.51 }, cell), null);
+  assert.equal(gridForContent({ width: 922, height: -14 }, cell), null);
+  assert.equal(gridForContent({ width: 922, height: 623.51 }, { width: Number.NaN, height: 16 }), null);
+});
+
+// zoomedFontSize: the render-only counterpart to gridForContent. It never
+// feeds the announcement (see gridForContent above) - only xterm's fontSize -
+// so raising it can never shrink the announced grid and ratchet the session
+// down to a couple of columns.
+test("zoomedFontSize grows the font to fill the content box's tighter axis", () => {
+  // A 10x5 grid at a {8,16} cell is 80x80px. A 200x100 box has 2.5x headroom
+  // on width but only 1.25x on height, so height wins and the cell aspect
+  // ratio is preserved.
+  const next = zoomedFontSize(14, { cols: 10, rows: 5 }, { width: 8, height: 16 }, { width: 200, height: 100 });
+  assert.equal(next, 17.5);
+});
+
+test("zoomedFontSize shrinks the font when the grid overflows the content box", () => {
+  const next = zoomedFontSize(14, { cols: 10, rows: 5 }, { width: 8, height: 16 }, { width: 40, height: 40 });
+  assert.equal(next, 7);
+});
+
+test("zoomedFontSize returns null once the correction is under the 0.05px tolerance", () => {
+  // Stops the caller's fixed-point correction loop instead of oscillating
+  // over glyph-advance rounding between font sizes.
+  const next = zoomedFontSize(14, { cols: 10, rows: 5 }, { width: 8, height: 16 }, { width: 1000, height: 80.16 });
+  assert.equal(next, null);
+});
+
+test("zoomedFontSize clamps to a sanity band but never caps ordinary zoom-in", () => {
+  assert.equal(zoomedFontSize(14, { cols: 1, rows: 1 }, { width: 1, height: 1 }, { width: 100_000, height: 100_000 }), 400);
+  assert.equal(zoomedFontSize(14, { cols: 1, rows: 1 }, { width: 1, height: 1 }, { width: 0.001, height: 1_000 }), 4);
+});
+
+test("zoomedFontSize returns null for unusable inputs instead of a bad font size", () => {
+  assert.equal(zoomedFontSize(0, { cols: 10, rows: 5 }, { width: 8, height: 16 }, { width: 200, height: 100 }), null);
+  assert.equal(zoomedFontSize(-14, { cols: 10, rows: 5 }, { width: 8, height: 16 }, { width: 200, height: 100 }), null);
+  assert.equal(zoomedFontSize(14, { cols: 10, rows: 5 }, null, { width: 200, height: 100 }), null);
+  assert.equal(zoomedFontSize(14, { cols: 10, rows: 5 }, { width: 8, height: 16 }, null), null);
+  assert.equal(zoomedFontSize(14, { cols: 0, rows: 5 }, { width: 8, height: 16 }, { width: 200, height: 100 }), null);
+  assert.equal(zoomedFontSize(14, { cols: 10, rows: 0 }, { width: 8, height: 16 }, { width: 200, height: 100 }), null);
+  assert.equal(zoomedFontSize(14, { cols: 10, rows: 5 }, { width: 0, height: 16 }, { width: 200, height: 100 }), null);
 });

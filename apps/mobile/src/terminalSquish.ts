@@ -13,8 +13,11 @@ export function squishWidthPercent(scale: number): string {
   return `${100 / scale}%`;
 }
 
-export function squishFontSize(scale: number): string {
-  return `${TERMINAL_FONT_SIZE * scale}px`;
+// fontSize is the terminal's CURRENT font size, not always TERMINAL_FONT_SIZE:
+// the zoom feature raises or lowers it to fill the pane (see applyZoom in
+// MobileTerminal.tsx), and the squish must track whatever that live value is.
+export function squishFontSize(fontSize: number, scale: number): string {
+  return `${fontSize * scale}px`;
 }
 
 // The accessibility layer can never assume its DOM glyph advance is exactly the
@@ -33,11 +36,11 @@ export function squishAdvanceRatio(cellWidth: number, domAdvance: number): numbe
   return Math.min(CALIBRATION_RATIO_BAND[1], Math.max(CALIBRATION_RATIO_BAND[0], ratio));
 }
 
-export function calibratedSquishFontSize(scale: number, ratio: number | undefined): string {
-  if (!(Number.isFinite(scale) && scale > 0)) return squishFontSize(scale);
+export function calibratedSquishFontSize(fontSize: number, scale: number, ratio: number | undefined): string {
+  if (!(Number.isFinite(scale) && scale > 0)) return squishFontSize(fontSize, scale);
   const safeRatio = ratio ?? 0;
-  if (!(Number.isFinite(safeRatio) && safeRatio > 0)) return squishFontSize(scale);
-  return `${TERMINAL_FONT_SIZE * scale * safeRatio}px`;
+  if (!(Number.isFinite(safeRatio) && safeRatio > 0)) return squishFontSize(fontSize, scale);
+  return `${fontSize * scale * safeRatio}px`;
 }
 
 export function squishLineHeight(scale: number): string {

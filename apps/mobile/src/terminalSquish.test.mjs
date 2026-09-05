@@ -14,7 +14,7 @@ test("the accessibility font size tracks the scale linearly so its layout matche
   // 12 * scale, a base-cell character lands at cellWidth * scale - exactly
   // the visible squished cell width the terminal paints.
   for (const scale of [0.65, 0.8, 1]) {
-    assert.equal(squishFontSize(scale), `${TERMINAL_FONT_SIZE * scale}px`);
+    assert.equal(squishFontSize(TERMINAL_FONT_SIZE, scale), `${TERMINAL_FONT_SIZE * scale}px`);
     assert.equal(squishedCharAdvance(BASE_CELL_WIDTH, scale), BASE_CELL_WIDTH * scale);
   }
   assertMachineEqual(squishedCharAdvance(7.03, 0.65), 7.03 * 0.65);
@@ -29,7 +29,7 @@ test("a DOM advance that disagrees with the canvas cell width is folded into the
   const domAdvance = 7.201171875; // e.g. Roboto Mono at the same size
   const ratio = squishAdvanceRatio(cellWidth, domAdvance);
   assertMachineEqual(ratio, cellWidth / domAdvance);
-  const fontSize = calibratedSquishFontSize(0.65, ratio);
+  const fontSize = calibratedSquishFontSize(TERMINAL_FONT_SIZE, 0.65, ratio);
   assert.equal(fontSize, `${TERMINAL_FONT_SIZE * 0.65 * ratio}px`);
   // calibrated font-size * (ratio-consistent DOM advance per px) == cellWidth * scale
   assertMachineEqual(Number.parseFloat(fontSize) * (domAdvance / TERMINAL_FONT_SIZE), cellWidth * 0.65);
@@ -37,7 +37,7 @@ test("a DOM advance that disagrees with the canvas cell width is folded into the
 
 test("identical canvas and DOM advances leave the squished font unchanged", () => {
   assert.equal(squishAdvanceRatio(7.03125, 7.03125), 1);
-  assert.equal(calibratedSquishFontSize(0.8, 1), squishFontSize(0.8));
+  assert.equal(calibratedSquishFontSize(TERMINAL_FONT_SIZE, 0.8, 1), squishFontSize(TERMINAL_FONT_SIZE, 0.8));
 });
 
 test("a narrower DOM advance is sized up until the row lands on the canvas cells", () => {
@@ -49,7 +49,7 @@ test("a narrower DOM advance is sized up until the row lands on the canvas cells
   const ratio = squishAdvanceRatio(cellWidth, domAdvance);
   assertMachineEqual(ratio, cellWidth / domAdvance);
   assert.ok(ratio > 1);
-  const fontSize = calibratedSquishFontSize(0.8, ratio);
+  const fontSize = calibratedSquishFontSize(TERMINAL_FONT_SIZE, 0.8, ratio);
   // calibrated font-size * (DOM advance per px of font size) == cellWidth * scale
   assertMachineEqual(Number.parseFloat(fontSize) * (domAdvance / TERMINAL_FONT_SIZE), cellWidth * 0.8);
 });
@@ -62,8 +62,8 @@ test("calibration clamps wild ratios and ignores degenerate inputs", () => {
   assert.equal(squishAdvanceRatio(0, 7), undefined);
   assert.equal(squishAdvanceRatio(7, 0), undefined);
   assert.equal(squishAdvanceRatio(Number.NaN, 7), undefined);
-  assert.equal(calibratedSquishFontSize(0.65, undefined), squishFontSize(0.65));
-  assert.equal(calibratedSquishFontSize(0.65, 0), squishFontSize(0.65));
+  assert.equal(calibratedSquishFontSize(TERMINAL_FONT_SIZE, 0.65, undefined), squishFontSize(TERMINAL_FONT_SIZE, 0.65));
+  assert.equal(calibratedSquishFontSize(TERMINAL_FONT_SIZE, 0.65, 0), squishFontSize(TERMINAL_FONT_SIZE, 0.65));
 });
 
 test("band boundary ratios survive and non-finite measurements fall back cleanly", () => {
@@ -77,10 +77,10 @@ test("band boundary ratios survive and non-finite measurements fall back cleanly
 
 test("calibrated sizing degrades to the plain squish on bad scale or ratio inputs", () => {
   for (const scale of [0, -0.65, Number.NaN]) {
-    assert.equal(calibratedSquishFontSize(scale, 1), squishFontSize(scale));
+    assert.equal(calibratedSquishFontSize(TERMINAL_FONT_SIZE, scale, 1), squishFontSize(TERMINAL_FONT_SIZE, scale));
   }
-  assert.equal(calibratedSquishFontSize(0.65, Number.NaN), squishFontSize(0.65));
-  assert.equal(calibratedSquishFontSize(0.65, -1), squishFontSize(0.65));
+  assert.equal(calibratedSquishFontSize(TERMINAL_FONT_SIZE, 0.65, Number.NaN), squishFontSize(TERMINAL_FONT_SIZE, 0.65));
+  assert.equal(calibratedSquishFontSize(TERMINAL_FONT_SIZE, 0.65, -1), squishFontSize(TERMINAL_FONT_SIZE, 0.65));
 });
 
 test("the inverse scale cancels the wrapper scale so layout, paint, and handle anchors coincide", () => {
@@ -107,7 +107,7 @@ test("an invalid scale defaults the squish to no-op instead of breaking", () => 
 });
 
 test("unity scale leaves the terminal and its accessibility layer unchanged", () => {
-  assert.equal(squishFontSize(1), "12px");
+  assert.equal(squishFontSize(TERMINAL_FONT_SIZE, 1), "12px");
   assert.equal(squishLineHeight(1), "1");
   assert.equal(squishWidthPercent(1), "100%");
   assert.equal(squishNetScale(1), 1);
@@ -118,4 +118,15 @@ test("screen-reader rows keep the original cell height despite the smaller glyph
   // 12px * scale * (1/scale) = 12px, the same height as the unscaled cell.
   const lineHeightMultiplier = Number(squishLineHeight(0.65));
   assert.equal((TERMINAL_FONT_SIZE * 0.65) * lineHeightMultiplier, TERMINAL_FONT_SIZE);
+});
+
+test("the squished font size tracks the terminal's live, possibly-zoomed font size, not just the base", () => {
+  // The zoom feature (see applyZoom in MobileTerminal.tsx) raises or lowers
+  // xterm's font size to fill the pane; the accessibility calibration must
+  // scale from whatever that current value is, not a hard-coded base.
+  const zoomedFontSize = 19.5;
+  assert.equal(squishFontSize(zoomedFontSize, 0.8), `${zoomedFontSize * 0.8}px`);
+  const ratio = 1.1;
+  const fontSize = calibratedSquishFontSize(zoomedFontSize, 0.8, ratio);
+  assert.equal(fontSize, `${zoomedFontSize * 0.8 * ratio}px`);
 });
