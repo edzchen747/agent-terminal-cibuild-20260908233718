@@ -1,15 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
-import { applyTerminalModifiers, ConsoleFrame, findHttpLinks, gridForContent, streamByteLength, TERMINAL_SCROLLBACK_LINES, writeHostChunk, xtermThemeFor, zoomedFontSize, type Size, type TerminalModifier, type TerminalScheme } from "@agentterminal/protocol";
+import { applyTerminalModifiers, BASELINE_TERMINAL_ZOOM, ConsoleFrame, findHttpLinks, gridForContent, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, streamByteLength, TERMINAL_SCROLLBACK_LINES, writeHostChunk, terminalZoomFontSize, xtermThemeFor, zoomedFontSize, type Size, type TerminalModifier, type TerminalScheme } from "@agentterminal/protocol";
 import { JournalMerge, planSegmentReplay } from "./terminal-stream";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { sessionId: string; visible: boolean; active: boolean; confirmExternalLinks: boolean; scheme: TerminalScheme; }
 
-// The base (unzoomed) font size: the announced viewport is always computed
-// from the cell metrics AT THIS SIZE (cached the first time they are
-// measured), never from the live, possibly-zoomed ones - see zoomedFontSize.
+// The font size a 100% zoom paints at - the pane's baseline, and the size a
+// desktop that is the session's only client sizes the PTY from.
 const BASE_FONT_SIZE = 14;
 
 // A zoom correction is a fixed point: raising the font size changes the
@@ -148,6 +147,21 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
     copyToast.setAttribute("role", "status");
     copyToast.setAttribute("aria-live", "polite");
     hostRef.current.appendChild(copyToast);
+    // The zoom readout. Unlike the copy toast it needs no measurement to
+    // place - it is pinned to the top of the pane by CSS - so it can report
+    // a zoom press that happens before the grid has been painted.
+    let zoomToastTimer: number | undefined;
+    const zoomToast = document.createElement("div");
+    zoomToast.className = "terminal-zoom-toast";
+    zoomToast.setAttribute("role", "status");
+    zoomToast.setAttribute("aria-live", "polite");
+    hostRef.current.appendChild(zoomToast);
+    const showZoomToast = (percent: number) => {
+      zoomToast.textContent = `${percent}%`;
+      zoomToast.classList.add("is-visible");
+      if (zoomToastTimer) window.clearTimeout(zoomToastTimer);
+      zoomToastTimer = window.setTimeout(() => zoomToast.classList.remove("is-visible"), 1_100);
+    };
 
     const showCopyToast = () => {
       const selection = terminal.getSelectionPosition();
@@ -204,23 +218,59 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       if (rect.width < 1 || rect.height < 1) return null;
       return { width: rect.width / terminal.cols, height: rect.height / terminal.rows };
     };
-    // The cell size at BASE_FONT_SIZE, cached the first time it is
-    // measurable. The announced viewport is always derived from this, never
-    // from the live (possibly zoomed) cell size: if zooming in shrank the
-    // announcement, it would shrink the host's minimum-boundary PTY grid,
-    // which would call for more zoom - a ratchet that collapses the session.
-    let baseCell: Size | null = null;
-    const captureBaseCell = () => {
-      if (terminal.options.fontSize !== BASE_FONT_SIZE) return;
+    // The user's zoom, as a percentage of the baseline (see
+    // terminal-zoom.ts), and the font size it paints at. Zoom asks the host
+    // for a different GRID - fewer, bigger cells, or more, smaller ones -
+    // rather than just repainting this pane at a different size, which no
+    // other client could see.
+    let zoomPercent: number = BASELINE_TERMINAL_ZOOM;
+    const zoomFontSize = () => terminalZoomFontSize(BASE_FONT_SIZE, zoomPercent);
+    // Measured cell sizes, keyed by the font size they were taken at, and
+    // only ever recorded while the emulator is actually painting at a zoom
+    // stop's own size. That exclusion is what keeps the announcement from
+    // feeding back on itself: a pane rendering a grid it does not own is
+    // painting at a fill-derived font size (see applyZoom), and announcing
+    // from THAT cell would just re-announce the grid it was handed, locking
+    // the pane to another client's size for good.
+    const cellByFontSize = new Map<number, Size>();
+    const captureZoomCell = () => {
+      const fontSize = terminal.options.fontSize;
+      if (fontSize === undefined || fontSize !== zoomFontSize()) return;
       const measured = cellSize();
-      if (measured) baseCell = measured;
+      if (measured) cellByFontSize.set(fontSize, measured);
+    };
+    // The cell the current zoom stop actually renders at. Measured once the
+    // stop has painted; until then - the frame between asking for a stop and
+    // rendering it, and only then - extrapolated from the nearest stop that
+    // has, so the pane can still propose a grid rather than stall.
+    const zoomCell = (): Size | null => {
+      const target = zoomFontSize();
+      const measured = cellByFontSize.get(target);
+      if (measured) return measured;
+      let nearest: [number, Size] | null = null;
+      for (const entry of cellByFontSize) {
+        if (!nearest || Math.abs(entry[0] - target) < Math.abs(nearest[0] - target)) nearest = entry;
+      }
+      return nearest ? extrapolatedCell(nearest[1], nearest[0], target) : null;
     };
     const proposeGrid = () => {
-      captureBaseCell();
+      captureZoomCell();
       const content = contentBox();
       if (!content) return null;
-      return gridForContent(content, baseCell);
+      return gridForContent(content, zoomCell());
     };
+    // Whether the emulator is showing the grid this pane last ASKED for.
+    //
+    // Deliberately compared against the last announcement rather than a
+    // freshly proposed grid: between a pane resize and the host echoing the
+    // new grid back, a fresh proposal already reflects the new box while the
+    // emulator still holds the old grid, and reading that momentary
+    // disagreement as "another client owns this" would drop the pane into
+    // the fill search for a frame - the same unsteadiness zooming had. A
+    // grid that comes back DIFFERENT from the one asked for is the real
+    // signal that someone else owns it (and a replay's historical grids,
+    // which the fill is equally right for).
+    const paneOwnsGrid = () => terminal.cols === viewportCols && terminal.rows === viewportRows;
     // Announce, don't assert: the pane's proposed dimensions are its
     // viewport (W_i, H_i), recorded into the host's fallback pool whether
     // or not this pane owns the grid. A real interaction re-announces
@@ -240,21 +290,83 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       // change.
       window.agentTerminal.resize(sessionId, dims.cols, dims.rows, force);
     };
-    // Fill the pane: raise or lower xterm's font size so the rendered grid
-    // consumes as much of the content box as its aspect ratio allows, then
-    // letterbox the rest (the pane aligns the grid to its top-left corner).
-    // This only ever touches rendering (fontSize) - never the announcement
-    // above, which is why it cannot ratchet. A font-size change moves the
-    // measured cell size, so the correction is a fixed point: re-measure and
-    // correct again next frame, capped at MAX_ZOOM_PASSES.
+    // Paint the grid the emulator is holding across the pane.
+    //
+    // When the pane owns that grid there is nothing to search for: the grid
+    // WAS the count of whole cells that fit the content box at this stop's
+    // font size, so painting at that font size fills the pane to within one
+    // cell on each axis by construction. Running a fill on top of it is what
+    // made zooming feel unsteady - each pass re-derived a fractional font
+    // size from the sub-cell slack left over by the flooring, and xterm
+    // requantises glyph advance and line height independently at every one
+    // of those sizes, so the cell's shape, and the letterbox around it,
+    // shifted on every step.
+    //
+    // A grid the pane does NOT own is the case the fill was written for: it
+    // can be any size at all - a phone's 40x20 - so the font size genuinely
+    // is a search for the fit, and stays a fixed point (a font-size change
+    // moves the measured cell, so re-measure and correct again next frame,
+    // capped at MAX_ZOOM_PASSES). It never touches the announcement, which
+    // is derived only from measurements taken at a zoom stop's own size.
     const applyZoom = (passesLeft = MAX_ZOOM_PASSES) => {
       if (!visibleRef.current || passesLeft <= 0) return;
+      if (paneOwnsGrid()) {
+        // Assigning fontSize makes xterm remeasure and repaint, so only do
+        // it when the size actually moves.
+        const exact = zoomFontSize();
+        if (terminal.options.fontSize !== exact) terminal.options.fontSize = exact;
+        return;
+      }
       const content = contentBox();
       const cell = cellSize();
       const next = zoomedFontSize(terminal.options.fontSize ?? BASE_FONT_SIZE, { cols: terminal.cols, rows: terminal.rows }, cell, content);
       if (next === null) return;
       terminal.options.fontSize = next;
       requestAnimationFrame(() => applyZoom(passesLeft - 1));
+    };
+    // Settle on a stop of the zoom ladder and re-announce. The pane's
+    // rendering is deliberately NOT touched here: the announce asks the host
+    // for a new grid, the host echoes it back to every client, and the fill
+    // pass above then grows the font to paint that grid across this pane -
+    // so a zoom takes the same path as any other resize, and a phone sharing
+    // the session sees it too. The toast fires even when the zoom did not
+    // move, so a press at either end of the ladder still reads as handled.
+    const applyZoomPercent = (next: number) => {
+      const settled = nearestTerminalZoom(next);
+      showZoomToast(settled);
+      if (settled === zoomPercent) return;
+      zoomPercent = settled;
+      dbg(`zoom session=${sessionId} percent=${settled}`);
+      // Repaint at the new stop FIRST, then announce off a real measurement
+      // of it a frame later: the grid this pane asks for has to be the cells
+      // that fit at the size it is actually painting at, never an
+      // extrapolation of them. Until the host echoes the new grid back the
+      // emulator holds the old one at the new size, which the pane clips
+      // rather than reflowing - one frame, and no re-wrap of the buffer.
+      terminal.options.fontSize = zoomFontSize();
+      requestAnimationFrame(() => {
+        if (disposed) return;
+        captureZoomCell();
+        // Suppressed for the duration of a journal replay, exactly like a
+        // click-claim: the pane's size is being driven by the replayed
+        // segments. finishAttachment announces once the drain is done, so
+        // the press is never simply lost.
+        if (!merge.attached) return;
+        // Zooming is an explicit interaction with THIS pane, so it claims
+        // the PTY grid the way a click or a tab switch does.
+        announceViewport(true);
+      });
+    };
+    // Ctrl+-, Ctrl+= and Ctrl+0 are the pane's zoom out / in / reset.
+    // Both the printable key and the physical code are accepted: "=" arrives
+    // as "+" when shifted, "-" as "_", and the numpad reports neither (nor
+    // even a digit for Numpad0 with NumLock off).
+    const zoomIntent = (event: KeyboardEvent): number | null => {
+      if (!event.ctrlKey || event.altKey || event.metaKey) return null;
+      if (event.key === "-" || event.key === "_" || event.code === "NumpadSubtract") return -1;
+      if (event.key === "=" || event.key === "+" || event.code === "NumpadAdd") return 1;
+      if (event.key === "0" || event.code === "Numpad0") return 0;
+      return null;
     };
     // Every grid change and every stream write goes through `frame`, never
     // terminal.resize/write: growing the grid back after a smaller client
@@ -317,6 +429,16 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
           const selectedText = terminal.getSelection();
           void window.agentTerminal.copyText(selectedText).then(showCopyToast).catch(() => undefined);
         }
+        return false;
+      }
+
+      // Zoom is claimed before the Ctrl-forwarding below, which would
+      // otherwise turn these into control sequences for the shell.
+      // preventDefault also stops WebView2 scaling the whole window.
+      const zoom = zoomIntent(event);
+      if (zoom !== null) {
+        event.preventDefault();
+        applyZoomPercent(zoom === 0 ? BASELINE_TERMINAL_ZOOM : steppedTerminalZoom(zoomPercent, zoom));
         return false;
       }
 
@@ -499,6 +621,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       void (initialAttachPromise ?? Promise.resolve()).then(() => window.agentTerminal.detachSession(sessionId));
       if (statsTimer !== undefined) window.clearInterval(statsTimer);
       if (copyToastTimer) window.clearTimeout(copyToastTimer);
+      if (zoomToastTimer) window.clearTimeout(zoomToastTimer);
       httpLinkProvider.dispose();
       terminal.dispose();
       terminalRef.current = null;

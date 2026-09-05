@@ -24,7 +24,26 @@ function cellsWithin(span: number, cellSize: number): number {
 }
 
 /**
- * The grid a content box holds at a given cell size (floor: 2 cols x 1 row).
+ * The largest grid the host will size a PTY to (`SESSION_MAX_COLS` /
+ * `SESSION_MAX_ROWS` in apps/desktop/src-tauri/src/core.rs, which clamps to
+ * the same numbers; the two are pinned together by
+ * apps/desktop/src/renderer/src/grid-limits.test.ts).
+ *
+ * A host policy, not a layout fact: the bound is there because a resize makes
+ * ConPTY repaint its whole viewport to every client, and because xterm
+ * allocates its scrollback per column. Applied HERE, on the client, so a
+ * client can never announce a grid the host would silently rewrite - an
+ * announcement that comes back different is what tells a client another
+ * client owns the grid, so a silent rewrite reads as a loss of ownership and
+ * drops the pane into its fill path. A pane that has hit the ceiling simply
+ * stops gaining cells and letterboxes the remainder at its true size.
+ */
+export const MAX_TERMINAL_COLS = 1600;
+export const MAX_TERMINAL_ROWS = 500;
+
+/**
+ * The grid a content box holds at a given cell size (floor: 2 cols x 1 row,
+ * ceiling: MAX_TERMINAL_COLS x MAX_TERMINAL_ROWS).
  * `content` must already exclude any letterbox padding around the grid - the
  * caller measures the terminal element's own content box, not its border box
  * (a border-box parent, under `* { box-sizing: border-box }`, counts padding
@@ -37,8 +56,8 @@ function cellsWithin(span: number, cellSize: number): number {
 export function gridForContent(content: Size, cell: Size | null): Grid | null {
   if (!usableSize(cell) || !usableSize(content)) return null;
   return {
-    cols: Math.max(2, cellsWithin(content.width, cell.width)),
-    rows: Math.max(1, cellsWithin(content.height, cell.height))
+    cols: Math.min(MAX_TERMINAL_COLS, Math.max(2, cellsWithin(content.width, cell.width))),
+    rows: Math.min(MAX_TERMINAL_ROWS, Math.max(1, cellsWithin(content.height, cell.height)))
   };
 }
 
@@ -47,7 +66,7 @@ export function gridForContent(content: Size, cell: Size | null): Grid | null {
 // cell metrics (see gridForContent above), so raising the font size can never
 // feed back into a smaller announced grid. Without that separation, zooming
 // in would shrink the announced grid, which would shrink the host PTY grid
-// (the minimum boundary over viewing clients), which would zoom in further -
+// (which follows the owning client verbatim), which would zoom in further -
 // a ratchet that collapses the session to a couple of columns.
 const ZOOM_TOLERANCE_PX = 0.05;
 const MIN_ZOOM_FONT_SIZE = 4;

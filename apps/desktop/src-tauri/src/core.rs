@@ -56,6 +56,22 @@ use crate::{
 /// `GridEpoch`), so a later replay replays the raw stream 1:1.
 const SESSION_DEFAULT_COLS: u16 = 120;
 const SESSION_DEFAULT_ROWS: u16 = 30;
+/// The largest grid a client may size the PTY to.
+///
+/// A bound, not a fit: it exists because a resize makes ConPTY redraw its
+/// whole viewport, and because xterm allocates its scrollback per COLUMN, so
+/// both the repaint every client has to receive and the client's buffer grow
+/// with the grid's area. Sized to cover a fully zoomed-out pane on an
+/// ultrawide display (a 3440px-wide window at the smallest zoom stop asks for
+/// roughly 1460x460) with headroom, and no further.
+///
+/// Clients clamp their own announcements to the same numbers
+/// (MAX_TERMINAL_COLS/ROWS in packages/protocol) so they can never propose a
+/// grid this would silently rewrite; the clamp here is the backstop for a
+/// client that does not, and the two are pinned together by
+/// apps/desktop/src/renderer/src/grid-limits.test.ts.
+const SESSION_MAX_COLS: u16 = 1600;
+const SESSION_MAX_ROWS: u16 = 500;
 /// Append-only raw PTY journal per session (the `session.buffer` replay
 /// source). Large enough for a full day of use; clients replay it over
 /// WebSocket on every attach, so the cap is the only history boundary.
@@ -261,11 +277,11 @@ struct ManagedSession {
     /// receive a SIGWINCH mid-shell-state. Cleared when paint evidence
     /// fires the deferred resize, or when the mode exits to canonical.
     deferred_tui_resize: bool,
-    /// The most recent grid target: the minimum boundary over set S in
-    /// canonical mode, or the interacting client's viewport in a TUI
-    /// period. Recorded even while the PTY is frozen, and applied to the
-    /// PTY on the next alternate-screen entry so a freshly launched TUI
-    /// opens at that boundary.
+    /// The most recent grid target: the owning client's announced viewport,
+    /// verbatim, in every mode - viewports are never combined across clients
+    /// (see `apply_owner_grid_for`). Recorded even while the PTY is frozen,
+    /// and applied to the PTY on the next alternate-screen entry so a freshly
+    /// launched TUI opens at that grid.
     requested_viewport: Option<(u16, u16)>,
     control_tail: String,
     cursor_query_tail: String,
@@ -4183,8 +4199,8 @@ fn release_viewport(
 /// under the session lock, so the recorded epoch offset is always aligned to
 /// a journal chunk boundary.
 fn apply_session_grid(session: &mut ManagedSession, cols: u16, rows: u16) -> Option<GridEpoch> {
-    let cols = cols.clamp(2, 500);
-    let rows = rows.clamp(1, 200);
+    let cols = cols.clamp(2, SESSION_MAX_COLS);
+    let rows = rows.clamp(1, SESSION_MAX_ROWS);
     if (cols, rows) == session.grid {
         return None;
     }
@@ -4613,7 +4629,7 @@ mod tests {
     use super::{
         CdOutcome, CdPlan, ConnectivityAction, ConnectivityTracker,
         EmbeddedNodeStatus, Inner, ManagedSession, PRESENCE_WINDOW_MS, PairingGrant,
-        RetireOutcome, VIEWPORT_WATCHDOG_TIMEOUT_MS, apply_grid_if_tui,
+        RetireOutcome, SESSION_MAX_COLS, SESSION_MAX_ROWS, VIEWPORT_WATCHDOG_TIMEOUT_MS, apply_grid_if_tui,
         apply_session_grid, ensure_home_project, evict_stale_viewports, folder_name,
         is_cursor_position_report, is_dropped_node_status, is_within_project, log_escape,
         newest_running_session_project_id, parse_terminal_titles,
@@ -5096,21 +5112,45 @@ mod tests {
         assert!(apply_session_grid(&mut session, 0, 0).is_some());
         assert_eq!(session.grid, (2, 1));
         assert!(apply_session_grid(&mut session, 9_000, 9_000).is_some());
-        assert_eq!(session.grid, (500, 200));
+        assert_eq!(session.grid, (SESSION_MAX_COLS, SESSION_MAX_ROWS));
         assert_eq!(
             session.grid_epochs,
             vec![
                 GridEpoch { offset: 0, cols: SESSION_DEFAULT_COLS, rows: SESSION_DEFAULT_ROWS },
-                GridEpoch { offset: 64, cols: 500, rows: 200 },
+                GridEpoch { offset: 64, cols: SESSION_MAX_COLS, rows: SESSION_MAX_ROWS },
             ]
         );
+    }
+
+    #[test]
+    fn a_grid_at_the_ceiling_is_applied_verbatim() {
+        // The ceiling is inclusive. A client that correctly clamps its own
+        // announcement to MAX_TERMINAL_COLS/ROWS must get that grid back
+        // unchanged - an announcement that comes back rewritten is what a
+        // client reads as "another client owns this grid".
+        let mut session = test_session("s1", "p1", "C:\repo");
+        assert!(apply_session_grid(&mut session, SESSION_MAX_COLS, SESSION_MAX_ROWS).is_some());
+        assert_eq!(session.grid, (SESSION_MAX_COLS, SESSION_MAX_ROWS));
+    }
+
+    #[test]
+    fn the_widest_representable_grid_still_clamps_to_the_ceiling() {
+        // u16::MAX is what a corrupt or hostile client can put on the wire;
+        // the clamp is the backstop, so it must saturate rather than wrap.
+        let mut session = test_session("s1", "p1", "C:\repo");
+        assert!(apply_session_grid(&mut session, u16::MAX, u16::MAX).is_some());
+        assert_eq!(session.grid, (SESSION_MAX_COLS, SESSION_MAX_ROWS));
     }
 
     #[test]
     fn a_repeat_of_the_clamped_grid_is_still_a_no_op() {
         let mut session = test_session("s1", "p1", "C:\repo");
         assert!(apply_session_grid(&mut session, 9_000, 9_000).is_some());
-        assert_eq!(apply_session_grid(&mut session, 600, 300), None, "both clamp to the same grid");
+        assert_eq!(
+            apply_session_grid(&mut session, SESSION_MAX_COLS + 100, SESSION_MAX_ROWS + 100),
+            None,
+            "both clamp to the same grid"
+        );
     }
 
     #[test]

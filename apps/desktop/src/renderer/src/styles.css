@@ -234,7 +234,11 @@ button { color: inherit; }
    TerminalPane.tsx), and letterboxes the rest. Anchor the xterm element (the
    cell grid) to the pane's top-left corner and paint the surplus in the
    terminal background so it reads as a frame. */
-.terminal-pane { position: absolute; inset: 0; padding: 10px 13px 4px; display: grid; place-items: start; background: var(--terminal-bg); visibility: hidden; }
+/* Clipped, not scrolled: between asking the host for a zoomed grid and
+   being handed it back, the emulator paints the OLD grid at the new font
+   size for a frame. Clipping that overhang keeps the pane still, where a
+   scrollbar would shift the content box and re-enter the pane's sizing. */
+.terminal-pane { position: absolute; inset: 0; padding: 10px 13px 4px; display: grid; place-items: start; overflow: hidden; background: var(--terminal-bg); visibility: hidden; }
 /* Blocking "replaying" veil for the journal replay (see TerminalPane.tsx):
    it covers the reflow storm with a spinner so a fresh attach reads as
    loading. Below the link-confirm modal (z-index 20). */
@@ -271,6 +275,11 @@ button { color: inherit; }
 .split-drop-target svg { width: 15px; }
 .terminal-copy-toast { position: absolute; z-index: 5; padding: 5px 8px; border: 1px solid var(--accent-line); border-radius: 6px; background: var(--accent-tint); box-shadow: 0 7px 24px var(--shadow-strong); color: var(--accent-ink); font: 700 10px/1 "Segoe UI", sans-serif; letter-spacing: .02em; pointer-events: none; opacity: 0; transform: translateY(4px) scale(.97); transition: opacity .12s ease, transform .12s ease; }
 .terminal-copy-toast.is-visible { opacity: 1; transform: translateY(0) scale(1); }
+/* The zoom readout: pinned to the top centre of the pane rather than placed
+   against the grid, so it lands in the same spot whatever the zoom did to
+   the cells. */
+.terminal-zoom-toast { position: absolute; z-index: 6; top: 12px; left: 50%; padding: 6px 11px; border: 1px solid var(--accent-line); border-radius: 7px; background: var(--accent-tint); box-shadow: 0 7px 24px var(--shadow-strong); color: var(--accent-ink); font: 700 12px/1 "Segoe UI", sans-serif; font-variant-numeric: tabular-nums; letter-spacing: .02em; pointer-events: none; opacity: 0; transform: translate(-50%, -4px); transition: opacity .12s ease, transform .12s ease; }
+.terminal-zoom-toast.is-visible { opacity: 1; transform: translate(-50%, 0); }
 .link-confirm-backdrop { z-index: 40; }
 .link-confirm-modal { width: 430px; }
 .link-confirm-url { margin-top: 18px !important; padding: 10px 11px; overflow: hidden; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface-input); color: var(--accent-ink) !important; font: 11px/1.45 "Cascadia Code", Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, type ClientMessage, type HostSnapshot } from "./index.js";
+import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, BASELINE_TERMINAL_ZOOM, MAX_TERMINAL_ZOOM, MIN_TERMINAL_ZOOM, TERMINAL_ZOOM_STEPS, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, terminalZoomFontSize, type ClientMessage, type HostSnapshot } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -913,4 +913,210 @@ test("writeHostChunk passes the callback through even when nothing is aligned", 
   // real emulator relies on instead: the chunk is the last thing written.
   assert.equal(terminal.writes.at(-1), "output");
   assert.equal(done, 0);
+});
+
+test("the zoom ladder is ascending, spans 25%-200%, and includes the baseline", () => {
+  assert.equal(MIN_TERMINAL_ZOOM, 25);
+  assert.equal(MAX_TERMINAL_ZOOM, 200);
+  assert.ok(TERMINAL_ZOOM_STEPS.includes(BASELINE_TERMINAL_ZOOM));
+  for (let i = 1; i < TERMINAL_ZOOM_STEPS.length; i += 1) {
+    assert.ok(TERMINAL_ZOOM_STEPS[i]! > TERMINAL_ZOOM_STEPS[i - 1]!, `step ${i} does not ascend`);
+  }
+});
+
+test("zoom steps are fine at the bottom of the ladder and coarse at the top", () => {
+  const gap = (from: number) => steppedTerminalZoom(from, 1) - from;
+  assert.equal(gap(25), 5);
+  assert.equal(gap(45), 5);
+  assert.equal(gap(50), 10);
+  assert.equal(gap(90), 10);
+  assert.equal(gap(100), 25);
+  assert.equal(gap(175), 25);
+});
+
+test("stepping walks one stop at a time and clamps at both ends", () => {
+  assert.equal(steppedTerminalZoom(100, -1), 90);
+  assert.equal(steppedTerminalZoom(90, 1), 100);
+  assert.equal(steppedTerminalZoom(MIN_TERMINAL_ZOOM, -1), MIN_TERMINAL_ZOOM);
+  assert.equal(steppedTerminalZoom(MAX_TERMINAL_ZOOM, 1), MAX_TERMINAL_ZOOM);
+});
+
+test("stepping off the ladder moves one stop rather than snapping past it", () => {
+  assert.equal(steppedTerminalZoom(112, 1), 125);
+  assert.equal(steppedTerminalZoom(112, -1), 100);
+  assert.equal(steppedTerminalZoom(1_000, -1), 200);
+  assert.equal(steppedTerminalZoom(1, 1), 25);
+  assert.equal(steppedTerminalZoom(Number.NaN, 1), 125);
+});
+
+test("a zoom settles on the nearest stop, and a corrupt one on the baseline", () => {
+  assert.equal(nearestTerminalZoom(103), 100);
+  assert.equal(nearestTerminalZoom(118), 125);
+  assert.equal(nearestTerminalZoom(0), 25);
+  assert.equal(nearestTerminalZoom(10_000), 200);
+  assert.equal(nearestTerminalZoom(Number.NaN), BASELINE_TERMINAL_ZOOM);
+});
+
+test("a zoom stop paints at its own share of the baseline font size", () => {
+  assert.equal(terminalZoomFontSize(14, 100), 14);
+  assert.equal(terminalZoomFontSize(14, 200), 28);
+  assert.equal(terminalZoomFontSize(14, 50), 7);
+  assert.equal(terminalZoomFontSize(14, 25), 3.5);
+  // Off-ladder and unusable inputs settle the same way the ladder does.
+  assert.equal(terminalZoomFontSize(14, 103), 14);
+  assert.equal(terminalZoomFontSize(0, 150), 0);
+  assert.equal(terminalZoomFontSize(Number.NaN, 150), 0);
+});
+
+test("every zoom stop maps to a distinct font size, ascending with the stop", () => {
+  const sizes = TERMINAL_ZOOM_STEPS.map((step) => terminalZoomFontSize(14, step));
+  assert.equal(new Set(sizes).size, sizes.length);
+  for (let i = 1; i < sizes.length; i += 1) assert.ok(sizes[i]! > sizes[i - 1]!, `stop ${i} does not grow`);
+});
+
+test("a font size is a pure function of the stop, never of the grid it produced", () => {
+  // The property the whole design rests on: measuring a cell, announcing a
+  // grid from it and painting that grid must land back on the same size.
+  const content = { width: 800, height: 400 };
+  const cellAt = (fontSize: number) => ({ width: fontSize * 0.6, height: fontSize * 1.2 });
+  for (const step of TERMINAL_ZOOM_STEPS) {
+    const fontSize = terminalZoomFontSize(14, step);
+    const grid = gridForContent(content, cellAt(fontSize))!;
+    // The grid never overflows the box, and never leaves a whole cell spare.
+    assert.ok(grid.cols * cellAt(fontSize).width <= content.width + 0.01, `cols overflow at ${step}%`);
+    assert.ok(grid.rows * cellAt(fontSize).height <= content.height + 0.01, `rows overflow at ${step}%`);
+    assert.ok((grid.cols + 1) * cellAt(fontSize).width > content.width, `a whole column spare at ${step}%`);
+    assert.ok((grid.rows + 1) * cellAt(fontSize).height > content.height, `a whole row spare at ${step}%`);
+    assert.equal(terminalZoomFontSize(14, step), fontSize);
+  }
+});
+
+test("a zoomed grid is proportionally smaller than the baseline one", () => {
+  const content = { width: 800, height: 400 };
+  const cellAt = (fontSize: number) => ({ width: fontSize * 0.5, height: fontSize });
+  assert.deepEqual(gridForContent(content, cellAt(terminalZoomFontSize(16, 100))), { cols: 100, rows: 25 });
+  assert.deepEqual(gridForContent(content, cellAt(terminalZoomFontSize(16, 200))), { cols: 50, rows: 12 });
+  assert.deepEqual(gridForContent(content, cellAt(terminalZoomFontSize(16, 50))), { cols: 200, rows: 50 });
+});
+
+test("an unpainted stop extrapolates from the nearest measured cell", () => {
+  assert.deepEqual(extrapolatedCell({ width: 8, height: 16 }, 14, 28), { width: 16, height: 32 });
+  assert.deepEqual(extrapolatedCell({ width: 8, height: 16 }, 14, 14), { width: 8, height: 16 });
+  assert.equal(extrapolatedCell(null, 14, 28), null);
+  assert.equal(extrapolatedCell({ width: 8, height: 16 }, 0, 28), null);
+  assert.equal(extrapolatedCell({ width: 8, height: 16 }, 14, 0), null);
+});
+
+test("a grid is capped at the host's ceiling, so a client cannot announce one it would rewrite", () => {
+  // A 1px cell over a huge box: uncapped this would be tens of thousands of
+  // cells on both axes.
+  const huge = gridForContent({ width: 100_000, height: 100_000 }, { width: 1, height: 1 });
+  assert.deepEqual(huge, { cols: MAX_TERMINAL_COLS, rows: MAX_TERMINAL_ROWS });
+});
+
+test("each axis caps independently, and neither cap disturbs a grid under it", () => {
+  // Wide but short: cols saturate, rows must not be touched. This asymmetry is
+  // the original bug - a pane is wider in cells than it is tall, so cols
+  // reaches the ceiling several zoom stops before rows does.
+  assert.deepEqual(
+    gridForContent({ width: 100_000, height: 400 }, { width: 1, height: 10 }),
+    { cols: MAX_TERMINAL_COLS, rows: 40 }
+  );
+  assert.deepEqual(
+    gridForContent({ width: 400, height: 100_000 }, { width: 10, height: 1 }),
+    { cols: 40, rows: MAX_TERMINAL_ROWS }
+  );
+});
+
+test("the ceiling never overrides the floor, or an ordinary grid", () => {
+  assert.deepEqual(gridForContent({ width: 1, height: 1 }, { width: 1_000, height: 1_000 }), { cols: 2, rows: 1 });
+  assert.deepEqual(gridForContent({ width: 800, height: 400 }, { width: 8, height: 16 }), { cols: 100, rows: 25 });
+});
+
+test("the ceiling clears the ultrawide pane that raised it", () => {
+  // A ~3070px content box at the 25% zoom stop (a ~2.1px cell) - the case the
+  // limit was raised for. It must come back uncapped on both axes.
+  const zoomedOut = gridForContent({ width: 3_070, height: 1_300 }, { width: 2.1, height: 2.8 })!;
+  assert.ok(zoomedOut.cols < MAX_TERMINAL_COLS, `${zoomedOut.cols} cols is still capped`);
+  assert.ok(zoomedOut.rows < MAX_TERMINAL_ROWS, `${zoomedOut.rows} rows is still capped`);
+});
+
+test("a zoom exactly between two stops settles on the lower one", () => {
+  // Documented tie-break: the more conservative stop wins, so repeatedly
+  // settling an off-ladder value can never drift upwards.
+  assert.equal(nearestTerminalZoom(112.5), 100);
+  assert.equal(nearestTerminalZoom(27.5), 25);
+  assert.equal(nearestTerminalZoom(55), 50);
+});
+
+test("stepping by zero settles without moving", () => {
+  assert.equal(steppedTerminalZoom(112, 0), 100);
+  assert.equal(steppedTerminalZoom(100, 0), 100);
+});
+
+test("a non-finite or negative baseline font size yields no font size at all", () => {
+  // 0 is the caller's "unusable" signal; a NaN or Infinity baseline must
+  // never reach xterm as a font size.
+  assert.equal(terminalZoomFontSize(Number.POSITIVE_INFINITY, 100), 0);
+  assert.equal(terminalZoomFontSize(Number.NEGATIVE_INFINITY, 100), 0);
+  assert.equal(terminalZoomFontSize(-14, 100), 0);
+  assert.equal(terminalZoomFontSize(0, 100), 0);
+});
+
+test("extrapolation refuses every unusable font size rather than inventing a cell", () => {
+  const cell = { width: 8, height: 16 };
+  assert.equal(extrapolatedCell(cell, Number.POSITIVE_INFINITY, 28), null);
+  assert.equal(extrapolatedCell(cell, 14, Number.POSITIVE_INFINITY), null);
+  assert.equal(extrapolatedCell(cell, Number.NaN, 28), null);
+  assert.equal(extrapolatedCell(cell, 14, Number.NaN), null);
+  assert.equal(extrapolatedCell(cell, -14, 28), null);
+  assert.equal(extrapolatedCell(cell, 14, -28), null);
+});
+
+test("a grid exactly at the ceiling is left alone", () => {
+  // The ceiling is inclusive on both sides of the wire: the host applies this
+  // grid verbatim (see a_grid_at_the_ceiling_is_applied_verbatim in core.rs),
+  // so the client must be able to ask for it.
+  assert.deepEqual(
+    gridForContent({ width: MAX_TERMINAL_COLS, height: MAX_TERMINAL_ROWS }, { width: 1, height: 1 }),
+    { cols: MAX_TERMINAL_COLS, rows: MAX_TERMINAL_ROWS }
+  );
+  // One cell under it is untouched by the cap.
+  assert.deepEqual(
+    gridForContent({ width: MAX_TERMINAL_COLS - 1, height: MAX_TERMINAL_ROWS - 1 }, { width: 1, height: 1 }),
+    { cols: MAX_TERMINAL_COLS - 1, rows: MAX_TERMINAL_ROWS - 1 }
+  );
+});
+
+test("a degenerate cell can no longer produce an infinite grid", () => {
+  // A positive-but-subnormal cell passes the usable-size guard, and
+  // content / cell then overflows to Infinity. Before the ceiling existed
+  // this returned { cols: Infinity, rows: Infinity } and was announced as
+  // such; the cap is what makes the result finite.
+  const degenerate = gridForContent({ width: 800, height: 400 }, { width: 1e-300, height: 1e-300 })!;
+  assert.deepEqual(degenerate, { cols: MAX_TERMINAL_COLS, rows: MAX_TERMINAL_ROWS });
+  assert.ok(Number.isFinite(degenerate.cols) && Number.isFinite(degenerate.rows));
+});
+
+test("no zoom stop on any display can announce a grid the host would rewrite", () => {
+  // The invariant the client-side ceiling exists to hold. Swept over every
+  // stop and a range of displays from a small laptop pane up to an 8K
+  // ultrawide, at a cell aspect typical of a monospace face.
+  const displays = [
+    { width: 640, height: 400 },
+    { width: 1_920, height: 1_080 },
+    { width: 3_070, height: 1_300 },
+    { width: 7_680, height: 2_160 }
+  ];
+  for (const content of displays) {
+    for (const stop of TERMINAL_ZOOM_STEPS) {
+      const fontSize = terminalZoomFontSize(14, stop);
+      const grid = gridForContent(content, { width: fontSize * 0.6, height: fontSize * 1.2 })!;
+      const where = `${content.width}x${content.height} at ${stop}%`;
+      assert.ok(Number.isInteger(grid.cols) && Number.isInteger(grid.rows), `${where}: non-integer grid`);
+      assert.ok(grid.cols >= 2 && grid.rows >= 1, `${where}: under the floor`);
+      assert.ok(grid.cols <= MAX_TERMINAL_COLS, `${where}: ${grid.cols} cols exceeds the host ceiling`);
+      assert.ok(grid.rows <= MAX_TERMINAL_ROWS, `${where}: ${grid.rows} rows exceeds the host ceiling`);
+    }
+  }
 });
