@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { JournalMerge, type StreamChunk } from "./terminal-stream.ts";
+import { JournalMerge, planSegmentReplay, type StreamChunk } from "./terminal-stream.ts";
 
 /** Drain the queue the way replayPending does, collecting what gets written. */
 function drain(merge: JournalMerge): string[] {
@@ -314,5 +314,118 @@ describe("JournalMerge edge cases", () => {
     assert.deepEqual(covered, [0, 0], "the duplicate is seen twice in the queue");
     assert.equal(merge.appliedUpTo, 22);
     assert.equal(merge.attached, true);
+  });
+
+  it("re-closes the replay gate on every restart, even after a completed drain", () => {
+    // The pane gates its organic resize announces and its replay overlay on
+    // attached: a reconnect's second attach must re-close the gate for its
+    // whole drain, not inherit the first attach's open state - otherwise a
+    // mid-replay announce would stamp the PTY again.
+    const merge = new JournalMerge();
+    merge.restart();
+    merge.openSnapshot(0);
+    drain(merge);
+    assert.equal(merge.attached, true, "the first attach drained to live");
+
+    merge.restart();
+    assert.equal(merge.attached, false, "the second attach re-closes the gate");
+    merge.receive({ data: "raced\r\n", offset: 0 });
+    merge.openSnapshot(0);
+    assert.equal(merge.attached, false, "the gate stays closed while the queue drains");
+    assert.deepEqual(drain(merge), ["raced\r\n"]);
+    assert.equal(merge.attached, true, "the gate re-opens only when the drain completes");
+  });
+});
+
+describe("planSegmentReplay", () => {
+  const seg = (cols: number, rows: number, data = "") => ({ cols, rows, data });
+
+  it("writes segments on the running grid without resizes", () => {
+    assert.deepEqual(
+      planSegmentReplay([seg(80, 24, "a\r\n"), seg(80, 24, "b\r\n")], { cols: 80, rows: 24 }),
+      [{ kind: "write", data: "a\r\n" }, { kind: "write", data: "b\r\n" }]
+    );
+  });
+
+  it("resizes once per real grid change and follows it across segments", () => {
+    assert.deepEqual(
+      planSegmentReplay([seg(80, 24, "a"), seg(100, 30, "b"), seg(100, 30, "c"), seg(73, 50, "d")], { cols: 80, rows: 24 }),
+      [
+        { kind: "write", data: "a" },
+        { kind: "resize", cols: 100, rows: 30 },
+        { kind: "write", data: "b" },
+        { kind: "write", data: "c" },
+        { kind: "resize", cols: 73, rows: 50 },
+        { kind: "write", data: "d" }
+      ]
+    );
+  });
+
+  it("emits no ops at all for an empty journal", () => {
+    // A brand-new session's snapshot can be segment-less; the pane must
+    // fall straight through to the pending drain, not spin on nothing.
+    assert.deepEqual(planSegmentReplay([], { cols: 80, rows: 24 }), []);
+  });
+
+  it("keeps the resize of a zero-length segment (back-to-back swap)", () => {
+    // The host keeps zero-length segments for two grid swaps with no bytes
+    // in between; the swap itself is the content, so each one must still
+    // reach the emulator even though there is nothing to write after it.
+    assert.deepEqual(
+      planSegmentReplay([seg(80, 24, ""), seg(100, 30, ""), seg(80, 24, "x")], { cols: 80, rows: 24 }),
+      [
+        { kind: "resize", cols: 100, rows: 30 },
+        { kind: "resize", cols: 80, rows: 24 },
+        { kind: "write", data: "x" }
+      ]
+    );
+  });
+
+  it("drops a zero-length segment that stays on the running grid", () => {
+    // No swap and no bytes: nothing to do at all. A no-op resize would
+    // still cost xterm a full buffer reflow, so the plan must not emit it.
+    assert.deepEqual(planSegmentReplay([seg(80, 24, "")], { cols: 80, rows: 24 }), []);
+  });
+
+  it("keeps both legs of a grid round trip A->B->A", () => {
+    // The plan must not optimize the return leg away: the bytes between the
+    // two grids were wrapped at B's width, so the buffer has to re-flow
+    // back for them to render the way the live clients saw them.
+    assert.deepEqual(
+      planSegmentReplay([seg(80, 24, "a"), seg(100, 30, "b"), seg(80, 24, "c")], { cols: 80, rows: 24 }),
+      [
+        { kind: "write", data: "a" },
+        { kind: "resize", cols: 100, rows: 30 },
+        { kind: "write", data: "b" },
+        { kind: "resize", cols: 80, rows: 24 },
+        { kind: "write", data: "c" }
+      ]
+    );
+  });
+
+  it("resizes the first segment when the journal starts on a foreign grid", () => {
+    // The emulator is left at its container grid after reset(); a journal
+    // whose first epoch is smaller must still be replayed at its own size.
+    assert.deepEqual(
+      planSegmentReplay([seg(73, 50, "a"), seg(73, 50, "b")], { cols: 112, rows: 38 }),
+      [
+        { kind: "resize", cols: 73, rows: 50 },
+        { kind: "write", data: "a" },
+        { kind: "write", data: "b" }
+      ]
+    );
+  });
+
+  it("resizes a grid change even when only one dimension differs", () => {
+    // Cols and rows travel as a pair: a height-only epoch (the phone
+    // rotating in place) is still a real grid change.
+    assert.deepEqual(
+      planSegmentReplay([seg(112, 38, "a"), seg(112, 50, "b")], { cols: 112, rows: 38 }),
+      [
+        { kind: "write", data: "a" },
+        { kind: "resize", cols: 112, rows: 50 },
+        { kind: "write", data: "b" }
+      ]
+    );
   });
 });

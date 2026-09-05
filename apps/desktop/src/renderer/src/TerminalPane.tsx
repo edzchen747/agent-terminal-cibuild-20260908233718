@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
 import { applyTerminalModifiers, findHttpLinks, gridForContent, streamByteLength, TERMINAL_SCROLLBACK_LINES, xtermThemeFor, zoomedFontSize, type Size, type TerminalModifier, type TerminalScheme } from "@agentterminal/protocol";
-import { JournalMerge } from "./terminal-stream";
+import { JournalMerge, planSegmentReplay } from "./terminal-stream";
 import "@xterm/xterm/css/xterm.css";
 
 interface Props { sessionId: string; visible: boolean; active: boolean; confirmExternalLinks: boolean; scheme: TerminalScheme; }
@@ -39,6 +39,11 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
   const [linkOpening, setLinkOpening] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
+  // A blocking "replaying" overlay covers the pane for the whole journal
+  // replay: the buffer is reset and re-rendered segment by segment, and
+  // showing that storm behind a spinner reads as loading, not activity.
+  // false only when the pending drain completes (finishAttachment).
+  const [replaying, setReplaying] = useState(true);
   activeRef.current = active;
   visibleRef.current = visible;
   confirmExternalLinksRef.current = confirmExternalLinks;
@@ -259,6 +264,12 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       if (!visibleRef.current) return;
       applyZoom();
       if (!activeRef.current) return;
+      // Organic viewport announces are suppressed for the whole journal
+      // replay: the ResizeObserver still fires as the replayed segments
+      // resize the emulator, and announcing the container grid then would
+      // stamp the PTY - and re-stamp every other client - mid-replay.
+      // finishAttachment re-announces once the drain is done.
+      if (!merge.attached) return;
       announceViewport();
     };
     resizeRef.current = resize;
@@ -317,7 +328,12 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       // A click on the terminal area is an interaction: force a viewport
       // announce so the host applies this pane's size to the PTY grid in
       // a TUI period even when the pane's own size did not change.
-      if (activeRef.current) announceViewport(true);
+      // While a journal replay is in flight (attach request, segment
+      // writes, pending drain) it is suppressed: the pane's size is being
+      // driven by the replayed segments, and a click-claim would stamp the
+      // PTY - and re-stamp every other client - mid-replay.
+      if (!activeRef.current || !merge.attached) return;
+      announceViewport(true);
     };
     window.addEventListener("pointerdown", handlePointerActivity, true);
     const inputDims = () => proposeGrid() ?? { cols: terminal.cols, rows: terminal.rows };
@@ -367,6 +383,11 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
     const finishAttachment = () => {
       if (disposed) return;
       if (activeRef.current) terminal.focus();
+      setReplaying(false);
+      // The replay's announce gate has lifted: resync the container grid in
+      // case it changed while the replay ran (its ResizeObserver fired but
+      // announceViewport was suppressed).
+      resizeRef.current();
     };
     const replayPending = () => {
       if (disposed) return;
@@ -390,6 +411,13 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       // snapshot, so chunks past its end arrive while the reply is still in
       // flight and have to survive until the replay merges them.
       merge.restart();
+      // Blur the terminal for the replay's whole duration (attach in
+      // flight, segment writes, pending drain): the buffer is about to be
+      // reset and re-rendered segment by segment, and a focused cursor over
+      // a half-replayed buffer just flickers. finishAttachment hands focus
+      // back when the drain completes.
+      terminal.blur();
+      setReplaying(true);
       dbg(`attach send session=${sessionId} viewport=${dims.cols}x${dims.rows}`);
       // Claim the grid only when this pane was the active tab at mount: a
       // background or hidden tab must not steal it from the client that is
@@ -406,23 +434,28 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       // not in these segments. replayPending merges it in by offset.
       merge.openSnapshot(snapshot.endOffset);
       terminal.reset();
-      const writeNext = (index = 0) => {
+      // Execute the snapshot as a plan of ops (see planSegmentReplay): a
+      // resize only when a segment's recorded grid differs from the
+      // running one, so consecutive same-grid segments never re-flow the
+      // buffer, and a zero-length segment still performs its swap.
+      const plan = planSegmentReplay(segments, { cols: terminal.cols, rows: terminal.rows });
+      const runPlanOp = (index = 0) => {
         if (disposed) return;
-        const segment = segments[index];
-        if (segment === undefined) {
+        const op = plan[index];
+        if (op === undefined) {
           applyZoom();
           replayPending();
           return;
         }
-        // Each segment is rendered at its recorded grid - the journal
-        // replays 1:1 exactly the way the live clients applied it.
-        if (segment.cols !== terminal.cols || segment.rows !== terminal.rows) {
-          terminal.resize(segment.cols, segment.rows);
+        if (op.kind === "resize") {
+          terminal.resize(op.cols, op.rows);
           applyZoom();
+          runPlanOp(index + 1);
+          return;
         }
-        terminal.write(segment.data, () => writeNext(index + 1));
+        terminal.write(op.data, () => runPlanOp(index + 1));
       };
-      writeNext();
+      runPlanOp();
     })().catch((cause) => {
       // A rejected attach used to leave the pane queueing forever behind a
       // silent unhandled rejection - no output, no error, and no detach
@@ -430,6 +463,9 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       // so in the pane the way the phone does.
       if (disposed) return;
       dbg(`attach session=${sessionId} failed: ${String(cause)}`);
+      // A failed attach never drains the merge, so close the blur/focus
+      // lifecycle explicitly and let the pane show its error.
+      finishAttachment();
       terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
     });
     const statsTimer = window.setInterval(() => {
@@ -482,6 +518,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
   // The pane letterboxes the host grid, so its surround must be the scheme's
   // own background rather than a fixed black.
   return <div ref={hostRef} className={`terminal-pane ${visible ? "is-visible" : ""} ${active ? "is-active" : ""}`} style={{ "--terminal-bg": scheme.background } as CSSProperties}>
+    {replaying && <div className="replay-overlay"><span className="replay-spinner" /><span>Loading terminal…</span></div>}
     {pendingUrl && <div className="modal-backdrop link-confirm-backdrop" onMouseDown={() => { if (!linkOpening) setPendingUrl(null); }}>
       <section className="modal link-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="link-confirm-title" onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-kicker">Agent Terminal</div>

@@ -111,3 +111,38 @@ export class JournalMerge {
     this.#appliedUpTo = Math.max(this.#appliedUpTo, chunk.offset + streamByteLength(chunk.data));
   }
 }
+
+/** One emulator operation in a replay plan: resize to a recorded grid, or write a segment's bytes. */
+export type ReplayOp =
+  | { kind: "resize"; cols: number; rows: number }
+  | { kind: "write"; data: string };
+
+/**
+ * The ordered operations a segment snapshot needs on an emulator currently
+ * at `initial`: a resize when a segment's recorded grid differs from the
+ * running one, then its bytes. Pure, so the replay's edge cases (back-to-
+ * back grid swaps, zero-length segments, same-grid runs) are testable
+ * without a terminal; the pane executes the plan op by op.
+ *
+ * A resize is emitted only on a REAL grid change, so two consecutive
+ * same-grid segments never re-flow the buffer. A zero-length segment still
+ * produces its resize: the host keeps zero-length segments for back-to-back
+ * swaps (see core.rs's journal split), and the swap itself is the content.
+ */
+export function planSegmentReplay(
+  segments: ReadonlyArray<Readonly<{ cols: number; rows: number; data: string }>>,
+  initial: Readonly<{ cols: number; rows: number }>
+): ReplayOp[] {
+  const ops: ReplayOp[] = [];
+  let cols = initial.cols;
+  let rows = initial.rows;
+  for (const segment of segments) {
+    if (segment.cols !== cols || segment.rows !== rows) {
+      cols = segment.cols;
+      rows = segment.rows;
+      ops.push({ kind: "resize", cols, rows });
+    }
+    if (segment.data.length > 0) ops.push({ kind: "write", data: segment.data });
+  }
+  return ops;
+}

@@ -235,6 +235,11 @@ button { color: inherit; }
    cell grid) to the pane's top-left corner and paint the surplus in the
    terminal background so it reads as a frame. */
 .terminal-pane { position: absolute; inset: 0; padding: 10px 13px 4px; display: grid; place-items: start; background: var(--terminal-bg); visibility: hidden; }
+/* Blocking "replaying" veil for the journal replay (see TerminalPane.tsx):
+   it covers the reflow storm with a spinner so a fresh attach reads as
+   loading. Below the link-confirm modal (z-index 20). */
+.replay-overlay { position: absolute; inset: 0; z-index: 8; display: flex; align-items: center; justify-content: center; gap: 9px; background: var(--terminal-bg); color: var(--text-muted); font-size: 11px; font-weight: 600; letter-spacing: .04em; user-select: none; }
+.replay-spinner { width: 13px; height: 13px; flex: none; border: 2px solid var(--border-strong); border-top-color: var(--accent); border-radius: 50%; animation: remote-registering .8s linear infinite; }
 .terminal-pane.is-visible { visibility: visible; }
 .terminal-pane .xterm { height: 100%; }
 .terminal-pane .xterm .xterm-viewport,
