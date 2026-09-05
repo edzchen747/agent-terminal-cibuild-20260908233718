@@ -169,7 +169,8 @@ button { color: inherit; }
 .project-copy { min-width: 0; display: flex; flex-direction: column; gap: 3px; padding-left: 7px; }
 .project-copy strong { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12.5px; font-weight: 600; color: var(--text-dim); }
 .project-copy small { color: var(--text-muted); font-size: 10.5px; }
-.persistence { color: var(--text-faint); }
+.persistence { width: 24px; height: 24px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent; color: var(--text-faint); cursor: pointer; transition: background .12s ease, color .12s ease; }
+.persistence:hover { background: var(--accent-tint-strong); color: var(--text-strong); }
 .persistence svg { width: 13px; fill: currentColor; stroke-width: 1.4; }
 .project-item-actions { display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
 .project-drag-handle { width: 20px; height: 28px; display: grid; place-items: center; color: var(--text-faint); cursor: grab; touch-action: none; user-select: none; opacity: .65; }

@@ -4,6 +4,7 @@ import QRCode from "qrcode";
 import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemesFor } from "@agentterminal/protocol";
 import type { DesktopState } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
+import { projectPersistenceAction, projectRowOpensOnKey } from "./persistence";
 import { pruneRememberedActiveSessions, rememberProjectActiveSession, resolveProjectActiveSession } from "./active-tab";
 import { shellSwitchSessionOrder, shellSwitchSplitGroups } from "./shell-switch";
 import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
@@ -722,9 +723,10 @@ export function App() {
     setSplitGroups((current) => shellSwitchSplitGroups(current, outgoingId, replacement.id, outgoingRetained));
   }
 
-  async function toggleProjectPersistence() {
-    if (!currentProject) return;
-    await window.agentTerminal.setProjectPersistent(currentProject.id, !currentProject.persistent);
+  async function toggleProjectPersistence(projectId: string) {
+    const project = state?.projects.find((item) => item.id === projectId);
+    if (!project) return;
+    await window.agentTerminal.setProjectPersistent(projectId, projectPersistenceAction(project.persistent).nextPersistent);
   }
 
   if (!state) return <div className="boot"><TerminalIcon/><span>Starting Agent Terminal…</span></div>;
@@ -771,7 +773,7 @@ export function App() {
             <span>{state.remoteRegistration.error ?? "LAN access is still available."}</span>
             <button onClick={() => void window.agentTerminal.retryRemoteRegistration()}>Retry</button>
           </span>}
-          {currentProject && <button className={`project-persistence-action ${currentProject.persistent ? "is-saved" : ""}`} onClick={() => void toggleProjectPersistence()} title={currentProject.persistent ? "Stop saving this project" : "Save this temporary project"}>{currentProject.persistent ? <BookmarkIcon /> : <ClockIcon />}<span>{currentProject.persistent ? "Unsave" : "Save project"}</span></button>}
+          {currentProject && (() => { const action = projectPersistenceAction(currentProject.persistent); return <button className={`project-persistence-action ${currentProject.persistent ? "is-saved" : ""}`} onClick={() => void toggleProjectPersistence(currentProject.id)} title={action.tooltip}>{currentProject.persistent ? <BookmarkIcon /> : <ClockIcon />}<span>{action.shortLabel}</span></button>; })()}
           <button className="icon-button" onClick={() => setModal(deviceListEntryModal(state.devices.length))} title="Connected devices"><PhoneIcon /></button>
           <button className="icon-button" onClick={() => setModal("settings")} title="Settings"><SettingsIcon /></button>
         </div>
@@ -783,10 +785,11 @@ export function App() {
           <nav className="project-list">
             {state.projects.map((project, index) => {
               const count = state.sessions.filter((session) => session.projectId === project.id && session.status === "running").length;
-              return <div key={project.id} ref={(element) => { if (element) projectElementsRef.current.set(project.id, element); else projectElementsRef.current.delete(project.id); }} role="button" tabIndex={0} className={`project-item ${project.id === state.currentProjectId ? "active" : ""} ${project.id === projectDrag?.projectId ? "is-dragging" : ""}`} style={{ transform: projectDragTransform(project.id, index) }} onClick={() => void window.agentTerminal.openProject(project.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") void window.agentTerminal.openProject(project.id); }}>
+              const action = projectPersistenceAction(project.persistent);
+              return <div key={project.id} ref={(element) => { if (element) projectElementsRef.current.set(project.id, element); else projectElementsRef.current.delete(project.id); }} role="button" tabIndex={0} className={`project-item ${project.id === state.currentProjectId ? "active" : ""} ${project.id === projectDrag?.projectId ? "is-dragging" : ""}`} style={{ transform: projectDragTransform(project.id, index) }} onClick={() => void window.agentTerminal.openProject(project.id)} onKeyDown={(event) => { if (projectRowOpensOnKey(event.target, event.currentTarget, event.key)) void window.agentTerminal.openProject(project.id); }}>
                 <span className="project-icon"><FolderIcon /></span>
                 <span className="project-copy"><strong className="display-name" title={project.name}>{project.name}</strong><small>{count ? `${count} active session${count === 1 ? "" : "s"}` : "No active sessions"}</small></span>
-                <span className="project-item-actions"><span className="project-drag-handle" role="button" aria-label={`Reorder ${project.name}`} title="Drag to reorder" onClick={(event) => event.stopPropagation()} onPointerDown={(event) => beginProjectDrag(event, project.id, index)} onPointerMove={moveProjectDrag} onPointerUp={(event) => finishProjectDrag(event, true)} onPointerCancel={(event) => finishProjectDrag(event, false)}>⠿</span><span className="persistence" title={project.persistent ? "Saved project" : "Temporary project"}>{project.persistent ? <BookmarkIcon /> : <ClockIcon />}</span><button className="project-rename" onClick={(event) => { event.stopPropagation(); startRename(project.id); }} title={`Rename ${project.name}`} aria-label={`Rename ${project.name}`}><EditIcon /></button></span>
+                <span className="project-item-actions"><span className="project-drag-handle" role="button" aria-label={`Reorder ${project.name}`} title="Drag to reorder" onClick={(event) => event.stopPropagation()} onPointerDown={(event) => beginProjectDrag(event, project.id, index)} onPointerMove={moveProjectDrag} onPointerUp={(event) => finishProjectDrag(event, true)} onPointerCancel={(event) => finishProjectDrag(event, false)}>⠿</span><button className="persistence" onClick={(event) => { event.stopPropagation(); void toggleProjectPersistence(project.id); }} title={action.tooltip} aria-label={action.tooltip}>{project.persistent ? <BookmarkIcon /> : <ClockIcon />}</button><button className="project-rename" onClick={(event) => { event.stopPropagation(); startRename(project.id); }} title={`Rename ${project.name}`} aria-label={`Rename ${project.name}`}><EditIcon /></button></span>
               </div>;
             })}
           </nav>
