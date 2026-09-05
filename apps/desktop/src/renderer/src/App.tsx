@@ -5,6 +5,7 @@ import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSe
 import type { DesktopState } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { pruneRememberedActiveSessions, rememberProjectActiveSession, resolveProjectActiveSession } from "./active-tab";
+import { shellSwitchSessionOrder, shellSwitchSplitGroups } from "./shell-switch";
 import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
 import type { SplitGroup, SplitLayout } from "./split-tabs";
 import { deviceListEntryModal, nextModalAfterPairing, nextModalOnEscape, pairModalEscapeTarget, type Modal } from "./modal-navigation";
@@ -708,21 +709,17 @@ export function App() {
 
   async function selectShell(shellId: string) {
     const outgoingId = activeSessionId;
-    const outgoingSplit = findSplitGroup(splitGroups, outgoingId);
     const replacement = await window.agentTerminal.selectShell(outgoingId, shellId);
     if (!replacement) return;
     setActiveSessionId(replacement.id);
     if (!outgoingId) return;
-    setSessionOrder((current) => current.map((id) => id === outgoingId ? replacement.id : id));
-    if (outgoingSplit) {
-      setSplitGroups((current) => {
-        const withoutOutgoing = current.filter((group) => group.id !== outgoingSplit.id && !group.sessionIds.includes(replacement.id));
-        const sessionIds: [string, string] = outgoingSplit.sessionIds[0] === outgoingId
-          ? [replacement.id, outgoingSplit.sessionIds[1]]
-          : [outgoingSplit.sessionIds[0], replacement.id];
-        return [...withoutOutgoing, { ...outgoingSplit, sessionIds }];
-      });
-    }
+    const nextState = await window.agentTerminal.getState();
+    // The host keeps the outgoing tab when it has output yet and closes it
+    // otherwise; see shell-switch.ts for what each outcome means for the
+    // tab order and the split groups.
+    const outgoingRetained = nextState.sessions.some((session) => session.id === outgoingId);
+    setSessionOrder((current) => shellSwitchSessionOrder(current, outgoingId, replacement.id, outgoingRetained));
+    setSplitGroups((current) => shellSwitchSplitGroups(current, outgoingId, replacement.id, outgoingRetained));
   }
 
   async function toggleProjectPersistence() {
