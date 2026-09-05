@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
-import { applyTerminalModifiers, findHttpLinks, gridForContent, streamByteLength, TERMINAL_SCROLLBACK_LINES, xtermThemeFor, zoomedFontSize, type Size, type TerminalModifier, type TerminalScheme } from "@agentterminal/protocol";
+import { applyTerminalModifiers, ConsoleFrame, findHttpLinks, gridForContent, streamByteLength, TERMINAL_SCROLLBACK_LINES, writeHostChunk, xtermThemeFor, zoomedFontSize, type Size, type TerminalModifier, type TerminalScheme } from "@agentterminal/protocol";
 import { JournalMerge, planSegmentReplay } from "./terminal-stream";
 import "@xterm/xterm/css/xterm.css";
 
@@ -256,11 +256,13 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       terminal.options.fontSize = next;
       requestAnimationFrame(() => applyZoom(passesLeft - 1));
     };
+    // Every grid change and every stream write goes through `frame`, never
+    // terminal.resize/write: growing the grid back after a smaller client
+    // owned it reclaims scrollback that the console's repaint would then
+    // paint its blank rows over, losing that history (see ConsoleFrame).
+    const frame = new ConsoleFrame();
     const applyGridInPlace = (cols: number, rows: number) => {
-      if (cols !== terminal.cols || rows !== terminal.rows) {
-        terminal.resize(cols, rows);
-        applyZoom();
-      }
+      if (frame.applyGrid(terminal, cols, rows)) applyZoom();
     };
 
     const resize = (claim = false) => {
@@ -376,7 +378,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       if (id !== sessionId) return;
       if (merge.receive({ data, offset }) !== "write") return;
       dbg(`out session=${sessionId} off=${offset} len=${streamByteLength(data)} upTo=${merge.appliedUpTo}`);
-      terminal.write(data);
+      writeHostChunk(frame, terminal, data);
     });
     const offGrid = window.agentTerminal.onGrid((id, cols, rows) => {
       if (id !== sessionId) return;
@@ -407,7 +409,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
         return;
       }
       dbg(`pend session=${sessionId} off=${item.offset} len=${streamByteLength(item.data)} upTo=${merge.appliedUpTo}`);
-      terminal.write(item.data, () => replayPending());
+      writeHostChunk(frame, terminal, item.data, () => replayPending());
     };
     // Full replay is needed only on initial attach (and reconnect): the
     // pane's size is at least the PTY's, so the segments replay 1:1 with no
@@ -460,12 +462,12 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
           return;
         }
         if (op.kind === "resize") {
-          terminal.resize(op.cols, op.rows);
+          frame.applyGrid(terminal, op.cols, op.rows);
           applyZoom();
           runPlanOp(index + 1);
           return;
         }
-        terminal.write(op.data, () => runPlanOp(index + 1));
+        writeHostChunk(frame, terminal, op.data, () => runPlanOp(index + 1));
       };
       runPlanOp();
     })().catch((cause) => {

@@ -6,6 +6,7 @@ mod provisioning;
 mod remote;
 mod shells;
 mod store;
+mod stream_opt;
 mod tui;
 mod window_clients;
 

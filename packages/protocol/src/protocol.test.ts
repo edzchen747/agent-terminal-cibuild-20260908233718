@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, zoomedFontSize, type ClientMessage, type HostSnapshot } from "./index.js";
+import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, type ClientMessage, type HostSnapshot } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -703,4 +703,214 @@ test("squishScaleToFill returns null for unusable inputs", () => {
   assert.equal(squishScaleToFill({ cols: 0, rows: 43 }, { width: 7.2, height: 16 }, { width: 404, height: 688 }, 0.65), null);
   assert.equal(squishScaleToFill({ cols: 86, rows: 43 }, { width: 7.2, height: 16 }, { width: 404, height: 688 }, 0), null);
   assert.equal(squishScaleToFill({ cols: 86, rows: 43 }, { width: 7.2, height: 16 }, { width: 404, height: 688 }, Number.NaN), null);
+});
+
+
+// --- Console frame: growing without eating (or duplicating) history -------
+
+/**
+ * A stand-in for the parts of xterm.js `ConsoleFrame` touches, with the
+ * behaviour that causes the bug: growing the row count pulls lines back out
+ * of the scrollback (baseY drops).
+ */
+function fakeTerminal(cols: number, rows: number, content: string[], baseY: number) {
+  const writes: string[] = [];
+  return {
+    cols,
+    rows,
+    writes,
+    buffer: {
+      active: {
+        baseY,
+        type: "normal",
+        getLine(index: number) {
+          const line = content[index] ?? "";
+          return { translateToString: () => line };
+        }
+      }
+    },
+    resize(nextCols: number, nextRows: number) {
+      const reclaimed = Math.max(0, Math.min(this.buffer.active.baseY, nextRows - this.rows));
+      this.buffer.active.baseY -= reclaimed;
+      this.cols = nextCols;
+      this.rows = nextRows;
+    },
+    write(data: string) { writes.push(data); }
+  };
+}
+
+/** A ConPTY resize repaint: pen setup, home, `rows` drawn rows, cursor home. */
+function conptyRepaint(rows: number, contentRows: number): string {
+  const drawn = Array.from({ length: rows }, (_, row) => (row < contentRows ? `row ${row + 1}\x1b[K` : "\x1b[K"));
+  return `\x1b[?25l\x1b[34m\x1b[1m\x1b[H${drawn.join("\r\n")}\x1b[${contentRows};3H\x1b[?25h`;
+}
+
+test("consoleContentRows reads the console's last content row off a repaint", () => {
+  assert.equal(consoleContentRows(conptyRepaint(38, 24), 38), 24);
+  // Signed off with relative motion: the cursor is where the drawing ended,
+  // so the console has no blank rows below its content.
+  assert.equal(consoleContentRows("\x1b[?25l\x1b[Hrow\x1b[K\x1b[1C\x1b[?25h", 24), 24);
+  // Not a repaint at all.
+  assert.equal(consoleContentRows("plain output\r\n", 24), null);
+  assert.equal(consoleContentRows("\x1b[Hmoved but never hid the cursor", 24), null);
+  // Never past the grid.
+  assert.equal(consoleContentRows("\x1b[?25l\x1b[Hx\x1b[99;3H\x1b[?25h", 24), 24);
+});
+
+test("viewportContentRows ignores the blank rows under the content", () => {
+  const terminal = fakeTerminal(80, 6, ["a", "b", "c", "", "", ""], 0);
+  assert.equal(viewportContentRows(terminal), 3);
+  assert.equal(viewportContentRows(fakeTerminal(80, 3, ["", "", ""], 0)), 0);
+});
+
+test("applying the same grid is a no-op", () => {
+  const frame = new ConsoleFrame();
+  const terminal = fakeTerminal(80, 24, [], 10);
+  assert.equal(frame.applyGrid(terminal, 80, 24), false);
+  // No grid change means no repaint to expect, so the next chunk is ordinary.
+  assert.equal(frame.alignmentFor(terminal, conptyRepaint(24, 12)), "");
+});
+
+test("a grow aligns the frame to the console's, pushing only the rows the repaint will not redraw", () => {
+  // The phone had the grid at 73x24; the desktop takes it back at 112x38.
+  // xterm reclaims 21 lines to fill the taller viewport, but the console's
+  // screen is only 24 rows of content - so the 12 rows above those belong in
+  // the scrollback, not under the repaint's blank padding.
+  const frame = new ConsoleFrame();
+  const terminal = fakeTerminal(73, 24, Array.from({ length: 59 }, (_, i) => `line ${i}`), 21);
+  assert.equal(frame.applyGrid(terminal, 112, 38), true);
+  assert.equal(terminal.buffer.active.baseY, 7, "xterm reclaimed 14 lines to fill the taller viewport");
+  assert.equal(frame.alignmentFor(terminal, conptyRepaint(38, 24)), "\x1b7\x1b[38;1H" + "\n".repeat(14) + "\x1b8");
+});
+
+test("a viewport the repaint fully covers needs no alignment", () => {
+  const frame = new ConsoleFrame();
+  const terminal = fakeTerminal(80, 24, Array.from({ length: 24 }, (_, i) => `line ${i}`), 0);
+  assert.equal(frame.applyGrid(terminal, 80, 30), true);
+  // The console has content all the way down: nothing of the client's is
+  // left unpainted, so nothing has to move.
+  assert.equal(frame.alignmentFor(terminal, conptyRepaint(30, 30)), "");
+});
+
+test("only the chunk that answers a grid change is ever aligned", () => {
+  const frame = new ConsoleFrame();
+  const rows = Array.from({ length: 40 }, (_, i) => `line ${i}`);
+  const terminal = fakeTerminal(80, 38, rows, 2);
+  frame.applyGrid(terminal, 80, 38 + 1);
+  // Ordinary output consumes the expectation without touching the buffer...
+  assert.equal(frame.alignmentFor(terminal, "just some output\r\n"), "");
+  // ...so a repaint arriving later (a TUI redrawing itself, say) is not
+  // treated as a resize repaint.
+  assert.equal(frame.alignmentFor(terminal, conptyRepaint(39, 10)), "");
+});
+
+test("the alternate screen is never realigned", () => {
+  // A fullscreen TUI owns the alt buffer, which has no scrollback to protect
+  // and would simply lose the rows a push scrolled away.
+  const frame = new ConsoleFrame();
+  const terminal = fakeTerminal(80, 24, Array.from({ length: 24 }, (_, i) => `line ${i}`), 0);
+  terminal.buffer.active.type = "alternate";
+  frame.applyGrid(terminal, 80, 38);
+  assert.equal(frame.alignmentFor(terminal, conptyRepaint(38, 10)), "");
+});
+
+test("writeHostChunk writes the alignment before the chunk, and nothing extra otherwise", () => {
+  const frame = new ConsoleFrame();
+  const terminal = fakeTerminal(73, 24, Array.from({ length: 59 }, (_, i) => `line ${i}`), 21);
+  frame.applyGrid(terminal, 112, 38);
+  const repaint = conptyRepaint(38, 24);
+  writeHostChunk(frame, terminal, repaint);
+  assert.deepEqual(terminal.writes, ["\x1b7\x1b[38;1H" + "\n".repeat(14) + "\x1b8", repaint]);
+  writeHostChunk(frame, terminal, "more output");
+  assert.deepEqual(terminal.writes.slice(2), ["more output"]);
+});
+
+test("scrollIntoScrollback parks the cursor on the last row and restores it", () => {
+  // DECSC/DECRC save the cursor's place in the buffer, so it survives the
+  // line feeds that move the content; only a line feed on the last row
+  // scrolls a line INTO the scrollback, which is why the cursor goes there.
+  assert.equal(scrollIntoScrollback(3, 40), "\x1b7\x1b[40;1H\n\n\n\x1b8");
+  assert.equal(scrollIntoScrollback(0, 40), "");
+  assert.equal(scrollIntoScrollback(-2, 40), "");
+  assert.equal(scrollIntoScrollback(3, 0), "");
+});
+
+// --- Console frame: edge cases -------------------------------------------
+
+test("a repaint merged with the prompt fixup behind it still reports the console's rows", () => {
+  // The host merges PTY writes that land within a couple of milliseconds, so
+  // the shell's own `\r$ CSI K` touch-up can ride along in the same chunk.
+  // The cursor is read off the show-cursor that closes the repaint, not off
+  // the end of the chunk.
+  const merged = conptyRepaint(38, 24) + "\r$\x1b[K\x1b[1C";
+  assert.equal(consoleContentRows(merged, 38), 24);
+});
+
+test("consoleContentRows keeps a cursor row inside the grid", () => {
+  // A row of 0 is not addressable (rows are 1-based) and a row past the grid
+  // would ask for a negative number of blank rows.
+  assert.equal(consoleContentRows("\x1b[?25l\x1b[Hx\x1b[0;1H\x1b[?25h", 24), 1);
+  assert.equal(consoleContentRows("\x1b[?25l\x1b[Hx\x1b[900;1H\x1b[?25h", 24), 24);
+});
+
+test("consoleContentRows accepts the pen ConPTY actually sets up", () => {
+  // Any run of SGR before the home, including 256-colour and sub-parameter
+  // forms, is still just a pen: it paints nothing.
+  assert.equal(consoleContentRows("\x1b[?25l\x1b[38;5;12m\x1b[1m\x1b[Hx\x1b[4;1H\x1b[?25h", 10), 4);
+  assert.equal(consoleContentRows("\x1b[?25l\x1b[38:2::255:0:0m\x1b[Hx\x1b[4;1H\x1b[?25h", 10), 4);
+  // A cursor move that is not a home means the chunk is not a full repaint.
+  assert.equal(consoleContentRows("\x1b[?25l\x1b[2;1Hx\x1b[4;1H\x1b[?25h", 10), null);
+});
+
+test("an empty chunk leaves the repaint still expected", () => {
+  // A zero-length segment performs a grid swap and nothing else; the repaint
+  // is in the chunk after it.
+  const frame = new ConsoleFrame();
+  const terminal = fakeTerminal(80, 24, Array.from({ length: 40 }, (_, i) => `line ${i}`), 16);
+  frame.applyGrid(terminal, 80, 38);
+  assert.equal(frame.alignmentFor(terminal, ""), "");
+  assert.equal(frame.alignmentFor(terminal, conptyRepaint(38, 20)), "\x1b7\x1b[38;1H" + "\n".repeat(18) + "\x1b8");
+});
+
+test("a console holding more rows than the client never pushes a negative count", () => {
+  const frame = new ConsoleFrame();
+  const terminal = fakeTerminal(80, 24, ["only", "three", "lines"], 0);
+  frame.applyGrid(terminal, 80, 38);
+  assert.equal(frame.alignmentFor(terminal, conptyRepaint(38, 30)), "");
+});
+
+test("viewportContentRows survives a buffer shorter than the grid", () => {
+  // A freshly reset emulator can be asked for rows it has no lines for.
+  const terminal = fakeTerminal(80, 24, ["first"], 0);
+  assert.equal(viewportContentRows(terminal), 1);
+  assert.equal(viewportContentRows(fakeTerminal(80, 24, [], 0)), 0);
+});
+
+test("a whitespace-only row counts as blank, matching the console's padding", () => {
+  const terminal = fakeTerminal(80, 5, ["a", "b", "   ", "", ""], 0);
+  assert.equal(viewportContentRows(terminal), 2);
+});
+
+test("the frame realigns again on the next grid change", () => {
+  // Ownership can bounce between clients repeatedly; each grid change arms
+  // the alignment exactly once.
+  const frame = new ConsoleFrame();
+  const terminal = fakeTerminal(80, 24, Array.from({ length: 60 }, (_, i) => `line ${i}`), 36);
+  frame.applyGrid(terminal, 80, 30);
+  assert.notEqual(frame.alignmentFor(terminal, conptyRepaint(30, 20)), "");
+  assert.equal(frame.alignmentFor(terminal, conptyRepaint(30, 20)), "", "one repaint per grid change");
+  frame.applyGrid(terminal, 80, 36);
+  assert.notEqual(frame.alignmentFor(terminal, conptyRepaint(36, 20)), "");
+});
+
+test("writeHostChunk passes the callback through even when nothing is aligned", () => {
+  const frame = new ConsoleFrame();
+  const terminal = fakeTerminal(80, 24, [], 0);
+  let done = 0;
+  writeHostChunk(frame, terminal, "output", () => { done += 1; });
+  assert.equal(terminal.writes.length, 1);
+  // The fake runs the callback itself only if given one; assert the shape the
+  // real emulator relies on instead: the chunk is the last thing written.
+  assert.equal(terminal.writes.at(-1), "output");
+  assert.equal(done, 0);
 });

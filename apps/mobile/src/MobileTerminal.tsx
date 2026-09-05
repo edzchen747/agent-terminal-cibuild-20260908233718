@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
-import { applyTerminalModifiers, createRequestId, findHttpLinks, gridForContent, squishScaleToFill, streamByteLength, TERMINAL_SCROLLBACK_LINES, xtermThemeFor, zoomedFontSize } from "@agentterminal/protocol";
+import { applyTerminalModifiers, ConsoleFrame, createRequestId, findHttpLinks, gridForContent, squishScaleToFill, streamByteLength, TERMINAL_SCROLLBACK_LINES, writeHostChunk, xtermThemeFor, zoomedFontSize } from "@agentterminal/protocol";
 import type { Size, TerminalModifier, TerminalScheme, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
 import { classifyGestureAxis, commitTapOnGestureEnd, type GestureAxis } from "./gesture";
@@ -221,6 +221,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       theme: xtermThemeFor(schemeRef.current)
     });
     terminalRef.current = terminal;
+    // Owns the "a grid change just landed, its repaint is next" state that
+    // lines this emulator's frame up with the console's (see ConsoleFrame).
+    const frame = new ConsoleFrame();
     terminal.open(hostElement);
     const httpLinkProvider = terminal.registerLinkProvider({
       provideLinks: (y, callback) => {
@@ -642,8 +645,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
         // A grid change is never "covered" by anything but an equal grid
         // state: offsets only dedupe DATA chunks. Live clients must follow
         // every grid epoch even when stream offsets have advanced past it.
-        if (item.cols !== terminal.cols || item.rows !== terminal.rows) {
-          terminal.resize(item.cols, item.rows);
+        // frame.applyGrid, never terminal.resize: growing back to a bigger
+        // owner's grid reclaims scrollback that the console's repaint would
+        // then paint its blank rows over, losing that history (see
+        // ConsoleFrame, which lines the two frames up instead).
+        if (frame.applyGrid(terminal, item.cols, item.rows)) {
           applyZoom();
           calibrateAccessibilityMetrics();
           syncDebug(`grid session=${session.id} cols=${item.cols} rows=${item.rows} off=${item.offset} reflow`);
@@ -658,7 +664,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       }
       appliedUpTo = Math.max(appliedUpTo, item.offset + streamByteLength(item.data));
       syncDebug(`out session=${session.id} off=${item.offset} len=${streamByteLength(item.data)} upTo=${appliedUpTo}`);
-      terminal.write(item.data);
+      writeHostChunk(frame, terminal, item.data);
     };
     const output = connection.on("output", (event) => {
       if (event.sessionId !== session.id) return;
@@ -907,8 +913,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
         // corrupt anything because the call is idempotent per grid state.
         // cols is the announced host grid, so the accessibility squish is
         // recalibrated against the columns actually rendered.
-        if (item.cols !== terminal.cols || item.rows !== terminal.rows) {
-          terminal.resize(item.cols, item.rows);
+        if (frame.applyGrid(terminal, item.cols, item.rows)) {
           applyZoom();
           calibrateAccessibilityMetrics();
           syncDebug(`pend grid session=${session.id} cols=${item.cols} rows=${item.rows} off=${item.offset} reflow`);
@@ -924,7 +929,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       }
       appliedUpTo = Math.max(appliedUpTo, item.offset + streamByteLength(item.data));
       syncDebug(`pend session=${session.id} off=${item.offset} len=${streamByteLength(item.data)} upTo=${appliedUpTo}`);
-      terminal.write(item.data, () => replayPendingOutput(index + 1));
+      writeHostChunk(frame, terminal, item.data, () => replayPendingOutput(index + 1));
     };
     let attachmentPromise: Promise<unknown> | undefined;
     const startAttachment = () => {
@@ -977,11 +982,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
           }
           // Every segment renders at its recorded grid - the journal
           // replays 1:1, never re-wrapped at this client's own size.
-          if (segment.cols !== terminal.cols || segment.rows !== terminal.rows) {
-            terminal.resize(segment.cols, segment.rows);
-            applyZoom();
-          }
-          terminal.write(segment.data, () => writeNext(index + 1));
+          if (frame.applyGrid(terminal, segment.cols, segment.rows)) applyZoom();
+          writeHostChunk(frame, terminal, segment.data, () => writeNext(index + 1));
         };
         writeNext();
       }).catch((cause) => {

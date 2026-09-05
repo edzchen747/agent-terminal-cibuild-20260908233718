@@ -39,6 +39,10 @@ use crate::{
     provisioning,
     shells::{command_for, detect_shells},
     store::{DesktopStore, NetworkState, random_token},
+    stream_opt::{
+        MAX_MERGED_OUTPUT_BYTES, OUTPUT_MERGE_MAX_SPAN, OUTPUT_MERGE_WINDOW, StreamCompactor,
+        take_decodable,
+    },
     tui::TuiClassifier,
     window_clients::WindowClients,
 };
@@ -1741,18 +1745,68 @@ impl Core {
             inner.session_order.push(id.clone());
         }
 
-        let reader_core = Arc::clone(self);
-        let reader_id = id.clone();
+        // The PTY reader hands raw reads straight to a merge thread. ConPTY
+        // delivers a repainting TUI as a burst of tiny writes - often one per
+        // escape sequence - and each of those would otherwise become its own
+        // journal append, Tauri event and WebSocket frame.
+
+        // Bounded, so a session whose output nobody can keep up with pushes
+        // back on the PTY exactly as it did when the reader appended inline,
+        // instead of growing a queue.
+        let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
         thread::spawn(move || {
             let mut bytes = vec![0_u8; 16_384];
             loop {
                 match reader.read(&mut bytes) {
                     Ok(0) | Err(_) => break,
-                    Ok(size) => reader_core.on_terminal_data(
-                        &reader_id,
-                        String::from_utf8_lossy(&bytes[..size]).into_owned(),
-                    ),
+                    Ok(size) => {
+                        if raw_tx.send(bytes[..size].to_vec()).is_err() {
+                            break;
+                        }
+                    }
                 }
+            }
+        });
+        let reader_core = Arc::clone(self);
+        let reader_id = id.clone();
+        thread::spawn(move || {
+            let mut compactor = StreamCompactor::new();
+            let mut buffered: Vec<u8> = Vec::new();
+            loop {
+                let Ok(chunk) = raw_rx.recv() else { break };
+                buffered.extend_from_slice(&chunk);
+                // Merge whatever else arrives over the next couple of
+                // milliseconds into the same chunk. Bounded by both a total
+                // span and a size: output waiting here has no journal offset
+                // yet, and a resize landing in the gap would record its grid
+                // epoch ahead of bytes the program drew at the previous grid.
+                let deadline = Instant::now() + OUTPUT_MERGE_MAX_SPAN;
+                while buffered.len() < MAX_MERGED_OUTPUT_BYTES {
+                    let wait = OUTPUT_MERGE_WINDOW.min(deadline.saturating_duration_since(Instant::now()));
+                    if wait.is_zero() {
+                        break;
+                    }
+                    match raw_rx.recv_timeout(wait) {
+                        Ok(next) => buffered.extend_from_slice(&next),
+                        Err(_) => break,
+                    }
+                }
+                let text = take_decodable(&mut buffered);
+                if text.is_empty() {
+                    continue;
+                }
+                let payload = compactor.compact(&text);
+                if !payload.is_empty() {
+                    reader_core.on_terminal_data(&reader_id, payload);
+                }
+            }
+            // End of stream: nothing more is coming, so anything held back (a
+            // half-received escape sequence, an undecodable trailing byte) is
+            // emitted as-is rather than swallowed.
+            let mut tail = compactor.flush();
+            tail.push_str(&String::from_utf8_lossy(&buffered));
+            if !tail.is_empty() {
+                reader_core.on_terminal_data(&reader_id, tail);
             }
         });
         let waiter_core = Arc::clone(self);
@@ -1839,6 +1893,13 @@ impl Core {
                 return;
             }
 
+            // The grid the PTY actually ended up on, if this write moved it.
+            // Read from the apply call rather than re-derived from the epoch
+            // list: consecutive resizes are coalesced there, so "the last
+            // epoch sits at the current offset" no longer means this write
+            // was the one that changed the grid.
+            let mut applied_grid: Option<GridEpoch> = None;
+
             // A CPR is valid only as a response to a live query emitted by the
             // shell. Replayed PTY history and duplicate xterm responses otherwise
             // arrive on the same input stream as typed keys; PSReadLine interprets
@@ -1854,7 +1915,7 @@ impl Core {
             // it claims the PTY grid for the sender, in every mode.
             if let Some((cols, rows)) = size {
                 set_client_viewport(session, controller.clone(), cols, rows);
-                apply_owner_grid_for(session, &controller, cols, rows, true);
+                applied_grid = apply_owner_grid_for(session, &controller, cols, rows, true);
             }
             }
             sync_log!(
@@ -1871,11 +1932,7 @@ impl Core {
             let _ = session.writer.write_all(data.as_bytes());
             let _ = session.writer.flush();
 
-            session
-                .grid_epochs
-                .last()
-                .filter(|epoch| epoch.offset == session.journal_len)
-                .copied()
+            applied_grid
         };
         if let Some(epoch) = grid_changed {
             sync_log!(
@@ -4146,14 +4203,41 @@ fn apply_session_grid(session: &mut ManagedSession, cols: u16, rows: u16) -> Opt
         cols,
         rows,
     };
-    session.grid_epochs.push(epoch);
+    // Coalesce consecutive resizes: dragging a window corner produces a burst
+    // of grids, and an epoch the stream never wrote a byte under is one no
+    // replay can observe. Only epochs at the SAME stream offset are merged -
+    // the moment output lands at a size, that size is load-bearing (a TUI
+    // repaints its frame for the grid it was told about), so its epoch stays
+    // and the frame keeps the grid it was drawn for.
+    if session
+        .grid_epochs
+        .last()
+        .is_some_and(|last| last.offset == epoch.offset)
+    {
+        session.grid_epochs.pop();
+    }
+    // A burst that ends back on the grid it started from leaves the surviving
+    // epoch alone; re-recording it would only add a zero-length replay
+    // segment. The epoch is still returned, because live clients are told
+    // about the grid they are on now either way.
+    if !session
+        .grid_epochs
+        .last()
+        .is_some_and(|last| (last.cols, last.rows) == (cols, rows))
+    {
+        session.grid_epochs.push(epoch);
+    }
     Some(epoch)
 }
 
 fn snapshot_of(session: &ManagedSession) -> SessionSnapshot {
     let base = session.journal_len.saturating_sub(session.buffer.len() as u64);
     SessionSnapshot {
-        segments: split_journal_by_epochs(&session.buffer, &session.grid_epochs, base),
+        segments: collapse_superseded_repaints(split_journal_by_epochs(
+            &session.buffer,
+            &session.grid_epochs,
+            base,
+        )),
         end_offset: session.journal_len,
     }
 }
@@ -4234,6 +4318,128 @@ fn split_journal_by_epochs(
         });
     }
     segments
+}
+
+/// Drop the resize repaints a later repaint has already erased.
+///
+/// Every SIGWINCH makes the Windows pseudoconsole redraw the whole visible
+/// screen: hide the cursor, home it, rewrite each row with an erase-to-end,
+/// put the cursor back, show it. So a burst of resizes - dragging a window
+/// edge, or spamming Win+Arrow - journals one full-screen repaint per
+/// intermediate grid, each under its own epoch. Coalescing at record time
+/// cannot touch those (the repaint IS output between the two resizes, and
+/// output between resizes is exactly what must never be collapsed blind), so
+/// a client attaching afterwards replays dozens of grid changes and tens of
+/// kilobytes to arrive at a screen the final repaint would have drawn on its
+/// own.
+///
+/// A repaint immediately followed by another repaint contributes nothing to
+/// the final screen: the next one rewrites every cell of the viewport. It is
+/// dropped only when `is_superseded_repaint` can show it also left nothing
+/// behind it - it never scrolled a line into scrollback, and carried no
+/// metadata a client is meant to keep.
+fn collapse_superseded_repaints(segments: Vec<SessionSegment>) -> Vec<SessionSegment> {
+    let mut kept: Vec<SessionSegment> = Vec::with_capacity(segments.len());
+    for segment in segments {
+        if starts_with_screen_repaint(&segment.data) {
+            while let Some(cut) = superseded_tail(&kept) {
+                kept.truncate(cut);
+            }
+        }
+        kept.push(segment);
+    }
+    kept
+}
+
+/// Where `kept` has to be cut back to for its tail to stop being a repaint
+/// another one replaces. A zero-length segment is a bare grid swap that drew
+/// nothing, so it is transparent here and goes with the repaint it sits
+/// against - dropping the intermediate grid is the point.
+fn superseded_tail(kept: &[SessionSegment]) -> Option<usize> {
+    let mut index = kept.len();
+    while index > 0 && kept[index - 1].data.is_empty() {
+        index -= 1;
+    }
+    (index > 0 && is_superseded_repaint(&kept[index - 1])).then(|| index - 1)
+}
+
+/// The opening of a full-screen repaint: the cursor is hidden and homed
+/// before anything is drawn, so what follows overwrites the viewport from its
+/// first cell rather than continuing from wherever the last write left off.
+fn starts_with_screen_repaint(data: &str) -> bool {
+    let Some(mut rest) = data.strip_prefix("\x1b[?25l") else {
+        return false;
+    };
+    // ConPTY sets the pen up before it homes the cursor (`CSI ?25l CSI 34m
+    // CSI 1m CSI H ...`). SGR paints no cell, so it does not make the repaint
+    // any less of a repaint.
+    while let Some(after) = strip_leading_sgr(rest) {
+        rest = after;
+    }
+    rest.starts_with("\x1b[H") || rest.starts_with("\x1b[1;1H")
+}
+
+/// Strip one leading `CSI ... m`, if that is what `data` starts with.
+fn strip_leading_sgr(data: &str) -> Option<&str> {
+    let rest = data.strip_prefix("\x1b[")?;
+    let end = rest.find(|character: char| !matches!(character, '0'..='9' | ';' | ':'))?;
+    (rest.as_bytes()[end] == b'm').then(|| &rest[end + 1..])
+}
+
+/// True when this segment is a self-contained screen repaint that a later
+/// repaint fully replaces. Every condition here is about what the segment
+/// might have left OUTSIDE the viewport the next repaint redraws:
+///
+/// - fewer line feeds than the grid has rows, and no explicit scroll or
+///   scroll-region change, so nothing it drew can have been pushed into
+///   scrollback;
+/// - no alternate-screen switch, which would make the bytes belong to a
+///   different buffer entirely;
+/// - no OSC and no BEL, so no title or working-directory report is lost.
+fn is_superseded_repaint(segment: &SessionSegment) -> bool {
+    let data = segment.data.as_str();
+    if !starts_with_screen_repaint(data) || !data.contains("\x1b[?25h") {
+        return false;
+    }
+    if data.matches('\n').count() >= segment.rows.max(1) as usize {
+        return false;
+    }
+    if data.contains('\x07') || data.contains("\x1b]") {
+        return false;
+    }
+    if data.contains("\x1b[?1049") || data.contains("\x1b[?1047") || data.contains("\x1b[?47") {
+        return false;
+    }
+    if data.contains("\x1bD") || data.contains("\x1bM") {
+        return false;
+    }
+    // `CSI S` / `CSI T` scroll the screen; `CSI r` (DECSTBM) redefines the
+    // scrolling region, which changes what a later repaint even covers.
+    !contains_csi_final(data, b"STr")
+}
+
+/// Whether any CSI in `data` ends in one of `finals`. Parameter and
+/// intermediate bytes are skipped by class, so parameterized forms
+/// (`CSI 3 S`, `CSI 1;40 r`) are caught as well as the bare ones.
+fn contains_csi_final(data: &str, finals: &[u8]) -> bool {
+    let bytes = data.as_bytes();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index] != 0x1b || bytes[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 2;
+        while cursor < bytes.len() && (0x20..=0x3f).contains(&bytes[cursor]) {
+            cursor += 1;
+        }
+        match bytes.get(cursor) {
+            Some(final_byte) if finals.contains(final_byte) => return true,
+            Some(_) => index = cursor + 1,
+            None => return false,
+        }
+    }
+    false
 }
 
 fn parse_working_directories(value: &str) -> Vec<String> {
@@ -4415,12 +4621,12 @@ mod tests {
         project_name_or_folder, record_cursor_position_requests, reselect_owner_on_departure,
         registration_status_for_display, resolve_working_directory, retire_empty_temporary_project,
         apply_owner_grid, apply_owner_grid_for, attach_owner_grid_for, drain_journal_front_at, release_viewport, set_client_viewport, should_open_quiet_window, snapshot_from_inner,
-        split_journal_by_epochs, startup_project, take_valid_pairing_grant, truncate_journal_front,
+        collapse_superseded_repaints, contains_csi_final, snapshot_of, split_journal_by_epochs, starts_with_screen_repaint, startup_project, take_valid_pairing_grant, truncate_journal_front,
         validate_project_name, GridEpoch, SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS,
         TerminalController, close_session_in_inner, mark_session_exited,
     };
     use crate::{
-        models::{AuthorizedDevice, Project, TerminalSession, TuiMode},
+        models::{AuthorizedDevice, Project, SessionSegment, TerminalSession, TuiMode},
         store::DesktopStore,
         tui::TuiClassifier,
         window_clients::WindowClients,
@@ -4639,20 +4845,292 @@ mod tests {
 
     #[test]
     fn applying_the_same_grid_is_a_no_op_and_changing_it_records_an_epoch() {
-        let mut session = test_session("s1", "p1", "C:\\repo");
+        let mut session = test_session("s1", "p1", "C:\repo");
         let first = apply_session_grid(&mut session, 113, 39);
         assert_eq!(first, Some(GridEpoch { offset: 0, cols: 113, rows: 39 }));
         assert_eq!(session.grid, (113, 39));
-        assert_eq!(session.grid_epochs.len(), 2);
+        assert_eq!(session.grid_epochs.len(), 1, "the spawn epoch had no output under it");
 
         let noop = apply_session_grid(&mut session, 113, 39);
         assert_eq!(noop, None);
-        assert_eq!(session.grid_epochs.len(), 2, "a no-op must not add an epoch");
+        assert_eq!(session.grid_epochs.len(), 1, "a no-op must not add an epoch");
 
+        // Output at 113x39 pins that grid: the next resize is a new epoch
+        // rather than a correction of the last one.
+        session.journal_len = 40;
         let second = apply_session_grid(&mut session, 72, 26);
-        assert_eq!(second, Some(GridEpoch { offset: 0, cols: 72, rows: 26 }));
+        assert_eq!(second, Some(GridEpoch { offset: 40, cols: 72, rows: 26 }));
         assert_eq!(session.grid, (72, 26));
-        assert_eq!(session.grid_epochs.len(), 3);
+        assert_eq!(session.grid_epochs.len(), 2);
+    }
+
+    /// One ConPTY resize repaint, shaped exactly like the ones in a real
+    /// session: hide the cursor, home it, rewrite every row with an
+    /// erase-to-end, restore the cursor, show it again. Deliberately built
+    /// with `rows - 1` line feeds - the last row is drawn without one, which
+    /// is what keeps the repaint from scrolling anything into scrollback.
+    fn conpty_repaint(cols: u16, rows: u16, first_line: &str) -> SessionSegment {
+        // The pen setup before the home is what a real ConPTY repaint emits.
+        let mut data = format!("\x1b[?25l\x1b[34m\x1b[1m\x1b[H\x1b[K{first_line}");
+        for _ in 1..rows {
+            data.push_str("\r\n\x1b[K");
+        }
+        data.push_str("\x1b[2;3H\x1b[?25h");
+        SessionSegment { cols, rows, data }
+    }
+
+    #[test]
+    fn a_burst_of_resize_repaints_replays_as_the_last_one() {
+        // Win+Arrow spam: the shell prints nothing, but every SIGWINCH makes
+        // ConPTY redraw the screen, so each intermediate grid gets an epoch
+        // with a full repaint under it. The replay only needs the last.
+        let segments = vec![
+            SessionSegment { cols: 112, rows: 38, data: "$ ls\r\nfile.txt\r\n".into() },
+            conpty_repaint(209, 65, "$ "),
+            conpty_repaint(209, 28, "$ "),
+            conpty_repaint(72, 51, "$ "),
+            conpty_repaint(118, 65, "$ "),
+            SessionSegment { cols: 118, rows: 65, data: String::new() },
+        ];
+        let collapsed = collapse_superseded_repaints(segments.clone());
+        assert_eq!(
+            collapsed,
+            vec![segments[0].clone(), segments[4].clone(), segments[5].clone()],
+            "only the repaint that survived on screen is replayed"
+        );
+    }
+
+    #[test]
+    fn a_repaint_is_recognized_before_and_after_its_pen_setup() {
+        // ConPTY homes the cursor either straight away or after restoring the
+        // attributes it was drawing with; both are the same repaint.
+        assert!(starts_with_screen_repaint("\x1b[?25l\x1b[H\x1b[Ktext"));
+        assert!(starts_with_screen_repaint("\x1b[?25l\x1b[34m\x1b[1m\x1b[1;1Htext"));
+        // Anything that draws before homing is not a full-screen repaint.
+        assert!(!starts_with_screen_repaint("\x1b[?25l\x1b[5;1Htext"));
+        assert!(!starts_with_screen_repaint("\x1b[?25ltext\x1b[H"));
+        assert!(!starts_with_screen_repaint("\x1b[Htext"));
+    }
+
+    #[test]
+    fn a_repaint_that_could_have_scrolled_is_never_dropped() {
+        // One line feed per row means the last row scrolled: whatever was on
+        // the top row went into scrollback, and dropping the segment would
+        // lose it.
+        let mut scrolled = conpty_repaint(80, 24, "$ ");
+        scrolled.data.push_str("\r\n");
+        let segments = vec![scrolled.clone(), conpty_repaint(80, 30, "$ ")];
+        assert_eq!(collapse_superseded_repaints(segments.clone()), segments);
+    }
+
+    #[test]
+    fn a_repaint_carrying_program_output_is_never_dropped() {
+        // A repaint is only redundant while it is JUST a repaint. Shell
+        // integration metadata, a bell, an alt-screen switch or a scroll all
+        // mean the segment did something the next repaint does not undo.
+        for extra in [
+            "\x1b]9;9;C:\repo\x07",
+            "\x07",
+            "\x1b[?1049h",
+            "\x1b[3S",
+            "\x1b[1;40r",
+            "\x1bM",
+        ] {
+            let mut segment = conpty_repaint(80, 24, "$ ");
+            segment.data.push_str(extra);
+            let segments = vec![segment, conpty_repaint(80, 30, "$ ")];
+            assert_eq!(
+                collapse_superseded_repaints(segments.clone()),
+                segments,
+                "a segment containing {extra:?} is not a pure repaint"
+            );
+        }
+    }
+
+    #[test]
+    fn real_output_between_two_repaints_stops_the_collapse() {
+        // The rule only ever removes a repaint that another repaint replaces.
+        // A command's output in between is history and stays, along with the
+        // repaint that preceded it.
+        let segments = vec![
+            conpty_repaint(80, 24, "$ "),
+            SessionSegment { cols: 80, rows: 24, data: "$ ls\r\nfile.txt\r\n".into() },
+            conpty_repaint(90, 24, "$ "),
+        ];
+        assert_eq!(collapse_superseded_repaints(segments.clone()), segments);
+    }
+
+    #[test]
+    fn a_trailing_repaint_is_always_kept() {
+        // Nothing follows it, so it is the screen: only a LATER repaint can
+        // make one redundant.
+        let segments = vec![conpty_repaint(80, 24, "$ ")];
+        assert_eq!(collapse_superseded_repaints(segments.clone()), segments);
+    }
+
+    #[test]
+    fn each_run_of_repaints_collapses_to_its_own_last() {
+        // Two separate resize bursts with a command between them: each burst
+        // loses its intermediate repaints, and the output between survives.
+        let output = SessionSegment { cols: 90, rows: 24, data: "$ ls\r\nfile.txt\r\n".into() };
+        let segments = vec![
+            conpty_repaint(80, 24, "a"),
+            conpty_repaint(85, 24, "b"),
+            conpty_repaint(90, 24, "c"),
+            output.clone(),
+            conpty_repaint(100, 30, "d"),
+            conpty_repaint(110, 30, "e"),
+        ];
+        assert_eq!(
+            collapse_superseded_repaints(segments.clone()),
+            vec![segments[2].clone(), output, segments[5].clone()]
+        );
+    }
+
+    #[test]
+    fn an_empty_segment_between_two_repaints_does_not_break_the_run() {
+        // A zero-length segment is a bare grid swap - it draws nothing, so
+        // the repaint before it is still superseded by the one after.
+        let empty = SessionSegment { cols: 85, rows: 24, data: String::new() };
+        let segments = vec![conpty_repaint(80, 24, "a"), empty, conpty_repaint(90, 24, "b")];
+        let collapsed = collapse_superseded_repaints(segments.clone());
+        assert_eq!(collapsed, vec![segments[2].clone()]);
+    }
+
+    #[test]
+    fn a_zero_row_segment_never_panics_on_the_scroll_check() {
+        // rows can only be zero through a malformed epoch, but the newline
+        // count is compared against it, so the floor has to hold.
+        let mut segment = conpty_repaint(80, 24, "$ ");
+        segment.rows = 0;
+        let segments = vec![segment, conpty_repaint(80, 30, "$ ")];
+        assert_eq!(collapse_superseded_repaints(segments.clone()), segments);
+    }
+
+    #[test]
+    fn a_repaint_without_its_closing_show_cursor_is_kept() {
+        // Truncated (a journal front-trim can cut a segment short): it cannot
+        // be proven to be a self-contained repaint, so it stays.
+        let mut segment = conpty_repaint(80, 24, "$ ");
+        segment.data = segment.data.replace("\x1b[?25h", "");
+        let segments = vec![segment, conpty_repaint(80, 30, "$ ")];
+        assert_eq!(collapse_superseded_repaints(segments.clone()), segments);
+    }
+
+    #[test]
+    fn an_empty_segment_list_collapses_to_nothing() {
+        assert!(collapse_superseded_repaints(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn a_truncated_csi_at_the_end_of_a_segment_is_not_a_scroll() {
+        // contains_csi_final walks off the end rather than reading past it.
+        assert!(!contains_csi_final("text\x1b[", b"STr"));
+        assert!(!contains_csi_final("text\x1b[1;40", b"STr"));
+        assert!(contains_csi_final("text\x1b[1;40r", b"STr"));
+        assert!(contains_csi_final("\x1b[S", b"STr"));
+        assert!(!contains_csi_final("\x1b[m\x1b[H", b"STr"));
+    }
+
+    #[test]
+    fn a_journal_with_no_repaints_is_returned_untouched() {
+        let segments = vec![
+            SessionSegment { cols: 80, rows: 24, data: "$ ls\r\n".into() },
+            SessionSegment { cols: 90, rows: 24, data: "file.txt\r\n".into() },
+        ];
+        assert_eq!(collapse_superseded_repaints(segments.clone()), segments);
+    }
+
+    #[test]
+    fn consecutive_resizes_with_no_output_between_them_collapse_to_the_last() {
+        // Dragging a window corner: a burst of grids with nothing drawn under
+        // any of them. Only the size the program actually painted at can be
+        // observed on replay, so only the final one is journaled - while
+        // every step still resizes the PTY and is still broadcast live.
+        let mut session = test_session("s1", "p1", "C:\repo");
+        session.journal_len = 512;
+        for (cols, rows) in [(80, 24), (82, 24), (85, 25)] {
+            assert_eq!(
+                apply_session_grid(&mut session, cols, rows),
+                Some(GridEpoch { offset: 512, cols, rows })
+            );
+        }
+        assert_eq!(
+            session.grid_epochs,
+            vec![
+                GridEpoch { offset: 0, cols: SESSION_DEFAULT_COLS, rows: SESSION_DEFAULT_ROWS },
+                GridEpoch { offset: 512, cols: 85, rows: 25 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_resize_burst_that_lands_back_on_the_previous_grid_journals_nothing() {
+        let mut session = test_session("s1", "p1", "C:\repo");
+        session.journal_len = 512;
+        assert!(apply_session_grid(&mut session, 82, 24).is_some());
+        // Back to the spawn grid with still nothing drawn in between: the
+        // journal is exactly as it was, and the live broadcast still says
+        // which grid the PTY ended on.
+        assert_eq!(
+            apply_session_grid(&mut session, SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS),
+            Some(GridEpoch {
+                offset: 512,
+                cols: SESSION_DEFAULT_COLS,
+                rows: SESSION_DEFAULT_ROWS
+            })
+        );
+        assert_eq!(
+            session.grid_epochs,
+            vec![GridEpoch { offset: 0, cols: SESSION_DEFAULT_COLS, rows: SESSION_DEFAULT_ROWS }]
+        );
+        assert_eq!(session.grid, (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS));
+    }
+
+    #[test]
+    fn a_coalesced_burst_still_clamps_to_the_grid_limits() {
+        // The clamp runs before the coalescing, so an out-of-range burst
+        // records the clamped grid once rather than one epoch per attempt.
+        let mut session = test_session("s1", "p1", "C:\repo");
+        session.journal_len = 64;
+        assert!(apply_session_grid(&mut session, 0, 0).is_some());
+        assert_eq!(session.grid, (2, 1));
+        assert!(apply_session_grid(&mut session, 9_000, 9_000).is_some());
+        assert_eq!(session.grid, (500, 200));
+        assert_eq!(
+            session.grid_epochs,
+            vec![
+                GridEpoch { offset: 0, cols: SESSION_DEFAULT_COLS, rows: SESSION_DEFAULT_ROWS },
+                GridEpoch { offset: 64, cols: 500, rows: 200 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_repeat_of_the_clamped_grid_is_still_a_no_op() {
+        let mut session = test_session("s1", "p1", "C:\repo");
+        assert!(apply_session_grid(&mut session, 9_000, 9_000).is_some());
+        assert_eq!(apply_session_grid(&mut session, 600, 300), None, "both clamp to the same grid");
+    }
+
+    #[test]
+    fn a_resize_after_output_keeps_the_grid_the_output_was_drawn_at() {
+        // The unsafe collapse the coalescing must never make: bytes drawn at
+        // 82 columns stay ascribed to 82 columns, however fast the next
+        // resize follows them.
+        let mut session = test_session("s1", "p1", "C:\repo");
+        assert!(apply_session_grid(&mut session, 82, 24).is_some());
+        session.buffer.push_str("frame drawn at 82 columns");
+        session.journal_len = session.buffer.len() as u64;
+        assert!(apply_session_grid(&mut session, 85, 25).is_some());
+        let segments = snapshot_of(&session).segments;
+        let drawn = segments
+            .iter()
+            .find(|segment| !segment.data.is_empty())
+            .expect("the frame is journaled");
+        assert_eq!((drawn.cols, drawn.rows), (82, 24));
+        assert_eq!(drawn.data, "frame drawn at 82 columns");
+        assert_eq!(segments.last().unwrap().cols, 85);
     }
 
     #[test]
@@ -4760,7 +5238,7 @@ mod tests {
         assert_eq!(session.requested_viewport, Some((113, 39)));
         let repeat = apply_grid_if_tui(&mut session, 113, 39);
         assert_eq!(repeat, None, "an unaltered viewport must not re-resize");
-        assert_eq!(session.grid_epochs.len(), 2);
+        assert_eq!(session.grid_epochs.len(), 1, "the resize replaced the spawn epoch it sat on");
         // A changed viewport resizes again.
         let second = apply_grid_if_tui(&mut session, 72, 26);
         assert_eq!(second, Some(GridEpoch { offset: 0, cols: 72, rows: 26 }));
@@ -4823,12 +5301,12 @@ mod tests {
         assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
         let first = apply_owner_grid(&mut session, 90, 30);
         assert_eq!(first, Some(GridEpoch { offset: 0, cols: 90, rows: 30 }));
-        assert_eq!(session.grid_epochs.len(), 2);
+        assert_eq!(session.grid_epochs.len(), 1, "the resize replaced the spawn epoch it sat on");
         // Re-asserting the SAME size is a no-op: no extra epoch, no
         // spurious SIGWINCH for the running program.
         let repeat = apply_owner_grid(&mut session, 90, 30);
         assert_eq!(repeat, None);
-        assert_eq!(session.grid_epochs.len(), 2);
+        assert_eq!(session.grid_epochs.len(), 1, "the resize replaced the spawn epoch it sat on");
         assert_eq!(session.requested_viewport, Some((90, 30)));
     }
 
@@ -4999,7 +5477,7 @@ mod tests {
         // The owner re-asserting the same size emits no second epoch (no
         // spurious SIGWINCH).
         assert_eq!(apply_owner_grid_for(&mut session, &window, 113, 39, false), None);
-        assert_eq!(session.grid_epochs.len(), 2);
+        assert_eq!(session.grid_epochs.len(), 1, "the resize replaced the spawn epoch it sat on");
     }
 
     #[test]

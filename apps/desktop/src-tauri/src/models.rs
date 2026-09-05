@@ -229,7 +229,7 @@ pub struct TerminalTuiModeEvent {
 /// One contiguous slice of the session's PTY stream recorded under a single
 /// terminal grid. Emulators resize to `cols` x `rows` before writing `data`,
 /// so their history reflows exactly the way live clients reflowed it.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSegment {
     pub cols: u16,
