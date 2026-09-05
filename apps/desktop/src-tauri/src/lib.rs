@@ -177,6 +177,11 @@ fn detach_session(window: WebviewWindow, state: State<'_, Arc<Core>>, session_id
 }
 
 #[tauri::command]
+fn release_session_viewport(window: WebviewWindow, state: State<'_, Arc<Core>>, session_id: String) {
+    state.release_window_viewport(window.label(), &session_id);
+}
+
+#[tauri::command]
 fn copy_text(text: String) -> Result<(), String> {
     Clipboard::new()
         .and_then(|mut clipboard| clipboard.set_text(text))
@@ -313,6 +318,7 @@ pub fn run() {
             resize_session,
             attach_session,
             detach_session,
+            release_session_viewport,
             copy_text,
             log_debug,
             start_pairing,

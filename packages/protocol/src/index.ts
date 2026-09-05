@@ -30,20 +30,39 @@ export const MOBILE_HEARTBEAT_INTERVAL_MS = 60_000 as const;
 export const VIEWPORT_KEEPALIVE_INTERVAL_MS = 1_000 as const;
 /**
  * A networked client still counts as viewing a session while its last
- * message is within this window; then its viewport entry is evicted and the
- * session's minimum boundary recomputed (a backgrounded phone releases the
- * grid back to the remaining clients). In-process desktop panes never expire.
+ * message is within this window; then its viewport entry is evicted, and if
+ * it owned the grid, ownership passes to the client that was showing the
+ * session most recently (a backgrounded phone hands the grid back to the
+ * desktop). In-process desktop panes never expire.
  * Keep in sync with VIEWPORT_WATCHDOG_TIMEOUT_MS in core.rs.
  */
 export const VIEWPORT_WATCHDOG_TIMEOUT_MS = 2_000 as const;
 
 /**
- * The PTY grid is the deterministic minimum boundary over the clients
- * currently viewing the session: W_pty = min(W_i), H_pty = min(H_i). No
- * client is ever narrower than the PTY, so every emulator renders the host
- * grid exactly and letterboxes the surplus; the raw journal replays 1:1 with
- * no re-wrapping and no cursor drift. Grid changes between the previous
- * and the current boundary are journaled at their exact stream offset
+ * Grid ownership: the PTY grid is the ACTIVE client's announced viewport,
+ * verbatim. A client claims the grid by interacting with the session -
+ * typing, tapping/clicking it, or explicitly opening it (`claim` on
+ * `session.resize` / `session.attach`) - and keeps it until another client
+ * claims it or it departs, at which point the most recently active
+ * remaining client takes over. A non-owner's announcements are recorded
+ * (they are the fallback pool) but never resize the PTY.
+ *
+ * Viewport membership (set S, the fallback pool) is a separate concept from
+ * stream attachment: a client is a member of S only from a CLAIMED
+ * `session.attach`/`session.resize` onward, and leaves S the moment it stops
+ * actually displaying the session - via `session.detach` (which also leaves
+ * the stream) or `session.viewport.release` (which does not: the client
+ * keeps receiving output, it is just no longer a sizing candidate). An
+ * unclaimed attach - a desktop tab opened in the background - is a pure
+ * stream subscription: it never joins S and so can never be handed the
+ * grid while it is not the one actually shown. The last client to leave S
+ * with no survivor clears ownership and leaves the last grid in place; a
+ * later announce from anyone re-adopts it (the lone-client bootstrap).
+ *
+ * Every other client renders the owner's grid EXACTLY and scales it to fit
+ * its own container - a client narrower than the PTY simply zooms out - so
+ * the raw journal still replays 1:1 with no re-wrapping and no cursor
+ * drift. Grid changes are journaled at their exact stream offset
  * (`session.buffer.segments` + live `session.grid` messages), so a replay
  * reproduces the same resize sequence the live clients applied.
  */
@@ -57,9 +76,8 @@ export type TerminalModifier = "ctrl" | "alt" | "shift";
  * How a running foreground program wants to own the terminal grid. The host
  * classifies the PTY stream into one of these modes and tells every client:
  *
- * - canonical: the shell owns the line-editor grid. The minimum-boundary
- *   sizing rules apply: the PTY tracks min(W_i), min(H_i) over S and every
- *   client renders it exactly.
+ * - canonical: the shell owns the line-editor grid, and every client
+ *   renders the host grid exactly.
  * - inline: the program is a TUI but paints on the primary buffer -
  *   typically a scrolling transcript plus a bounded band it repaints in
  *   place (an agent harness's composer, a picker's result list). It owns
@@ -77,8 +95,9 @@ export type TerminalModifier = "ctrl" | "alt" | "shift";
  * A period only ever rises (canonical < inline < fullscreen), so a harness
  * that starts inline and later takes the whole grid is promoted in place.
  *
- * The three modes are still classified and broadcast on the stream; clients
- * no longer use the mode for sizing decisions.
+ * The three modes are still classified and broadcast on the stream, but
+ * neither the clients nor the host use the mode for sizing decisions: the
+ * grid belongs to whichever client last claimed it, in every mode.
  */
 export type TuiMode = "canonical" | "inline" | "fullscreen";
 export const TERMINAL_TUI_MODES: readonly TuiMode[] = ["canonical", "inline", "fullscreen"];
@@ -258,9 +277,8 @@ export interface TerminalSession {
    * The host's TUI classification of the running foreground program
    * (default canonical). The modes determine how a program may draw its
    * frames (strict cell grid, alt-screen isolation), but they do not change
-   * sizing anymore: the PTY grid is the minimum boundary over the viewing
-   * clients in every mode. Per-client TUI ownership (the focused client
-   * overriding the minimum) returns in the TUI phase.
+   * sizing: the PTY grid is the active client's own viewport in every mode
+   * (see the grid ownership note above).
    */
   tuiMode?: TuiMode;
 }
@@ -321,10 +339,35 @@ export type ClientMessage =
   | { type: "directory.list"; requestId: string; path?: string }
   | { type: "session.create"; requestId: string; projectId: string; shellId?: string }
   | { type: "session.close"; requestId: string; sessionId: string }
-  | { type: "session.attach"; requestId: string; sessionId: string; cols: number; rows: number }
+  /**
+   * Subscribe to a session's stream and replay its journal. Opening a
+   * terminal is an explicit interaction, so a client that the user actually
+   * opened sets `claim`, which both joins the viewport set S and takes
+   * ownership of the PTY grid; a pane that attaches in the background (a
+   * desktop tab that is not the active one) omits it and is a pure stream
+   * subscription - it does not join S and so cannot be handed the grid
+   * later while it remains unshown (see the grid ownership note above).
+   */
+  | { type: "session.attach"; requestId: string; sessionId: string; cols: number; rows: number; claim?: boolean }
   | { type: "session.detach"; requestId: string; sessionId: string }
   | { type: "session.input"; sessionId: string; data: string; cols?: number; rows?: number }
-  | { type: "session.resize"; sessionId: string; cols: number; rows: number }
+  /**
+   * This client's viewport. `claim` is set only on an interaction-driven
+   * announce - a tap, a click, a character-width change - never on a plain
+   * layout resize: a claim takes the PTY grid over, an unclaimed announce
+   * from a non-owner is recorded but changes nothing (see the grid
+   * ownership note above).
+   */
+  | { type: "session.resize"; sessionId: string; cols: number; rows: number; claim?: boolean }
+  /**
+   * Leave the session's viewport set S without leaving its stream: this
+   * client is still attached (it keeps receiving live output) but is no
+   * longer displaying the session, so it must not size the PTY and must not
+   * be a successor candidate. A hidden desktop tab and a backgrounded phone
+   * send this instead of detaching, so switching back needs no journal
+   * replay; `session.detach` implies it.
+   */
+  | { type: "session.viewport.release"; requestId: string; sessionId: string }
   | { type: "ping" }
   | { type: "debug.diagnostics"; message: string }
   | { type: "shell.default"; requestId: string; shellId: string }

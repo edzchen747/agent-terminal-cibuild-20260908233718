@@ -753,11 +753,14 @@ export class HostConnection {
 
   /**
    * Viewport set-membership keepalive: a bare `ping` every second while a
-   * terminal page is attached keeps the client in the host's viewport set S
-   * (the minimum-boundary grid). The host evicts a networked client that
-   * goes silent for VIEWPORT_WATCHDOG_TIMEOUT_MS, so ticks skip while the
-   * app is hidden and the phone drops out of S on backgrounding. Deliberately
-   * separate from the snapshot.request presence heartbeat.
+   * terminal page is attached keeps the client in the host's viewport set S,
+   * the fallback pool `reselect_owner_on_departure` picks a successor from.
+   * The host evicts a networked client that goes silent for
+   * VIEWPORT_WATCHDOG_TIMEOUT_MS, so ticks skip while the app is hidden -
+   * though backgrounding also sends an explicit `session.viewport.release`
+   * (see the active-gating effect in MobileTerminal.tsx), so the watchdog is
+   * now only the safety net for a connection that goes fully silent.
+   * Deliberately separate from the snapshot.request presence heartbeat.
    */
   startViewportKeepalive(): void {
     this.stopViewportKeepalive();

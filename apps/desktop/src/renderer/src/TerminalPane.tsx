@@ -33,7 +33,11 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
   const terminalRef = useRef<Terminal | null>(null);
   const activeRef = useRef(active);
   const visibleRef = useRef(visible);
-  const resizeRef = useRef<() => void>(() => undefined);
+  const resizeRef = useRef<(claim?: boolean) => void>(() => undefined);
+  // The in-flight attach, so the join/leave effect below can sequence a
+  // release after it: a release can never be sent before the claim that
+  // attach may still be about to register (see the [visible] effect).
+  const pendingAttachRef = useRef<Promise<void>>(Promise.resolve());
   const confirmExternalLinksRef = useRef(confirmExternalLinks);
   const schemeRef = useRef(scheme);
   const [pendingUrl, setPendingUrl] = useState<string | null>(null);
@@ -167,12 +171,11 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
     };
 
     // ---------------------------------------------------------------------
-    // Single rendering path (minimum-boundary sizing): the host PTY grid is
-    // the smallest announced viewport over the clients viewing the session,
-    // and this pane is never narrower than the PTY - so the pane renders the
-    // host grid exactly and letterboxes the surplus. The host grid is
-    // followed in EVERY mode; the raw journal replays 1:1 with no
-    // re-wrapping at the pane's own size.
+    // Single rendering path (grid ownership): the host PTY grid is the
+    // active client's own announced viewport, verbatim - a pane narrower
+    // than the PTY simply zooms out, so it still renders the host grid
+    // exactly and the raw journal replays 1:1 with no re-wrapping at the
+    // pane's own size. The host grid is followed in EVERY mode.
     // ---------------------------------------------------------------------
     let viewportCols = 0;
     let viewportRows = 0;
@@ -219,11 +222,11 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       return gridForContent(content, baseCell);
     };
     // Announce, don't assert: the pane's proposed dimensions are its
-    // viewport (W_i, H_i) - the host takes the minimum over all announced
-    // viewports in canonical mode. In a TUI period the interacting client
-    // owns the grid, so a click re-announces (force) even when the pane's
-    // own size has not changed: the host applies it to the PTY. Never
-    // fit(): the emulator's grid is the host's, not the container's.
+    // viewport (W_i, H_i), recorded into the host's fallback pool whether
+    // or not this pane owns the grid. A real interaction re-announces
+    // (force), which both claims ownership and re-applies the size even
+    // when the pane's own size has not changed. Never fit(): the emulator's
+    // grid is the host's, not the container's.
     const announceViewport = (force = false) => {
       const dims = proposeGrid();
       if (!dims) return;
@@ -260,17 +263,20 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       }
     };
 
-    const resize = () => {
+    const resize = (claim = false) => {
       if (!visibleRef.current) return;
       applyZoom();
-      if (!activeRef.current) return;
       // Organic viewport announces are suppressed for the whole journal
       // replay: the ResizeObserver still fires as the replayed segments
       // resize the emulator, and announcing the container grid then would
       // stamp the PTY - and re-stamp every other client - mid-replay.
       // finishAttachment re-announces once the drain is done.
       if (!merge.attached) return;
-      announceViewport();
+      // A visible pane always announces, active or not: a visible-but-
+      // inactive split pane stays in set S (a fallback owner candidate) but
+      // only ever claims when told to (a real interaction, or becoming the
+      // active pane) - never merely because it is visible.
+      announceViewport(claim);
     };
     resizeRef.current = resize;
     const sendKeyboardInput = (data: string) => {
@@ -324,15 +330,19 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
 
     const observer = new ResizeObserver(() => resize());
     observer.observe(hostRef.current);
-    const handlePointerActivity = () => {
-      // A click on the terminal area is an interaction: force a viewport
-      // announce so the host applies this pane's size to the PTY grid in
-      // a TUI period even when the pane's own size did not change.
-      // While a journal replay is in flight (attach request, segment
-      // writes, pending drain) it is suppressed: the pane's size is being
-      // driven by the replayed segments, and a click-claim would stamp the
-      // PTY - and re-stamp every other client - mid-replay.
-      if (!activeRef.current || !merge.attached) return;
+    const handlePointerActivity = (event: PointerEvent) => {
+      // A click on THIS pane is an interaction: force a viewport announce
+      // so the host applies this pane's size to the PTY grid in a TUI
+      // period even when the pane's own size did not change. Scoped to the
+      // pane itself (not the whole window) so a click on the sidebar or
+      // tab bar never claims the grid for whatever pane happens to be
+      // active - matching the mobile client's own tap handling. Suppressed
+      // while a journal replay is in flight (attach request, segment
+      // writes, pending drain): the pane's size is being driven by the
+      // replayed segments, and a click-claim would stamp the PTY - and
+      // re-stamp every other client - mid-replay; finishAttachment
+      // re-announces once the drain is done.
+      if (!activeRef.current || !merge.attached || !(event.target instanceof Node) || !hostRef.current?.contains(event.target)) return;
       announceViewport(true);
     };
     window.addEventListener("pointerdown", handlePointerActivity, true);
@@ -421,9 +431,11 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       dbg(`attach send session=${sessionId} viewport=${dims.cols}x${dims.rows}`);
       // Claim the grid only when this pane was the active tab at mount: a
       // background or hidden tab must not steal it from the client that is
-      // actually in use (an ownerless session still grants itself to the
-      // first client that shows up).
-      const snapshot = await window.agentTerminal.attachSession(sessionId, dims.cols, dims.rows, activeRef.current);
+      // actually in use (an unclaimed attach is a pure stream subscription
+      // - see attach_owner_grid_for). `visibleRef` is defensive: `active`
+      // is only ever true while `visible` is (App.tsx), but the claim
+      // itself must never outrun that invariant.
+      const snapshot = await window.agentTerminal.attachSession(sessionId, dims.cols, dims.rows, visibleRef.current && activeRef.current);
       if (disposed) {
         window.agentTerminal.detachSession(sessionId);
         return;
@@ -468,6 +480,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       finishAttachment();
       terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
     });
+    pendingAttachRef.current = initialAttachPromise;
     const statsTimer = window.setInterval(() => {
       if (disposed || !terminalRef.current) return;
       const buffer = terminal.buffer.active;
@@ -496,15 +509,33 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       terminalRef.current?.blur();
       return;
     }
-    resizeRef.current();
+    // Selecting this tab is an explicit open of THIS terminal, so the
+    // announce claims the PTY grid: the phone may have owned it, and the
+    // pane the user just brought to the front is the one that should size
+    // the session now.
+    resizeRef.current(true);
     terminalRef.current?.focus();
   }, [active]);
 
   useEffect(() => {
-    if (!visible) return;
-    const frame = window.requestAnimationFrame(() => resizeRef.current());
+    if (!visible) {
+      // Every session's pane stays mounted and subscribed for as long as
+      // its project is open (App.tsx renders them all); only the viewport
+      // - set S membership - follows visibility. A hidden pane releases
+      // instead of detaching, so switching back needs no journal replay,
+      // and ownership deterministically hands off to whichever other
+      // client is still actually showing the session. Sequenced after the
+      // in-flight attach: a release can never be overtaken by the claim
+      // that attach may still be about to register.
+      void pendingAttachRef.current.then(() => window.agentTerminal.releaseSessionViewport(sessionId));
+      return;
+    }
+    // Becoming visible re-joins set S, claiming only if this is also the
+    // active tab (a visible-but-inactive split pane joins unclaimed - see
+    // the resize() comment above).
+    const frame = window.requestAnimationFrame(() => resizeRef.current(activeRef.current));
     return () => window.cancelAnimationFrame(frame);
-  }, [visible]);
+  }, [visible, sessionId]);
 
   // Repaint a live terminal when the shared scheme changes, so switching the
   // app between light and dark (or picking another scheme) recolors the open

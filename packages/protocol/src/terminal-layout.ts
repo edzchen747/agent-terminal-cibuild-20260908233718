@@ -81,3 +81,33 @@ export function zoomedFontSize(fontSize: number, grid: Grid, cell: Size | null, 
   if (Math.abs(next - fontSize) < ZOOM_TOLERANCE_PX) return null;
   return Math.min(MAX_ZOOM_FONT_SIZE, Math.max(MIN_ZOOM_FONT_SIZE, next));
 }
+
+/**
+ * The horizontal cell scale to actually paint on a phone, where the user's
+ * character-width slider sets how NARROW the cells may go, not how narrow
+ * they must be.
+ *
+ * The announced viewport is computed at the slider's density
+ * (`gridForContent` with a `cell.width * userScale`), so when the phone owns
+ * the PTY grid it gets exactly the columns it asked for and this returns
+ * `userScale` - the slider behaves as set. When the grid it actually renders
+ * is NARROWER than that (another client owns a smaller grid), squishing to
+ * the slider value would leave dead space down the right-hand side, so the
+ * cells relax back towards their natural width until the grid spans the box,
+ * bounded by 1 (never wider than the font's own metrics).
+ *
+ * `cell` is measured at the CURRENT font size and `content` is the visual
+ * box, both in the same space; deriving the paint scale from the rendered
+ * grid (and the announcement from the slider) is what keeps the two from
+ * feeding back into each other. Null when a measurement is unusable.
+ */
+export function squishScaleToFill(grid: Grid, cell: Size | null, content: Size | null, userScale: number): number | null {
+  if (!usableSize(cell) || !usableSize(content)) return null;
+  if (!(grid.cols > 0)) return null;
+  if (!(Number.isFinite(userScale) && userScale > 0)) return null;
+  const gridWidth = grid.cols * cell.width;
+  if (!(gridWidth > 0)) return null;
+  const fill = content.width / gridWidth;
+  if (!(Number.isFinite(fill) && fill > 0)) return null;
+  return Math.min(1, Math.max(Math.min(userScale, 1), fill));
+}

@@ -288,7 +288,10 @@ struct ClientViewport {
     networked: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+// `Ord` gives `reselect_owner_on_departure` a deterministic tiebreak when two
+// viewports share the same `last_active` instant (the resolution of the
+// underlying clock, or two announces landing in the same tick).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum TerminalController {
     Desktop(String),
     Remote(String),
@@ -1989,6 +1992,29 @@ impl Core {
         );
     }
 
+    /// Viewport registration for a remote client's attach - a claimed attach
+    /// only (see `attach_owner_grid_for`); the desktop counterpart is
+    /// `attach_window_session`.
+    fn attach_remote_session(&self, client_id: &str, session_id: &str, cols: u16, rows: u16, claim: bool) {
+        let key = self.remote_sizing_key(client_id);
+        let controller = TerminalController::Remote(key);
+        let epoch = {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let Some(session) = inner.sessions.get_mut(session_id) else {
+                return;
+            };
+            attach_owner_grid_for(session, &controller, cols, rows, claim)
+        };
+        if let Some(epoch) = epoch {
+            self.broadcast_grid_change(session_id, epoch);
+        }
+    }
+
+    /// Leave set S, whether or not the stream itself is also being left:
+    /// shared by `session.detach` (which additionally drops the device from
+    /// `attached_sessions` - see the dispatch bookkeeping) and
+    /// `session.viewport.release` (which does not, so the device keeps
+    /// receiving output).
     fn release_remote_controller(&self, client_id: &str, session_id: &str) {
         let key = self.remote_sizing_key(client_id);
         let controller = TerminalController::Remote(key);
@@ -1997,8 +2023,7 @@ impl Core {
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
             };
-            session.viewports.remove(&controller);
-            reselect_owner_on_departure(session, std::slice::from_ref(&controller))
+            release_viewport(session, &controller)
         };
         if let Some(epoch) = epoch {
             self.broadcast_grid_change(session_id, epoch);
@@ -2022,15 +2047,14 @@ impl Core {
                 anyhow!("Terminal window is no longer registered with the tray host.")
             })?;
         let (session_project_id, snapshot, epoch) = match inner.sessions.get_mut(session_id) {
-            // Record the attaching window's viewport, then claim ownership
-            // only when `claim` is set (the pane was the active tab at
-            // mount) or no client owns the session yet - a background or
-            // hidden tab attaching must never steal the grid from whichever
-            // client is actually in use.
+            // A claimed attach (the pane was the active tab at mount) joins
+            // set S and takes ownership at once; an unclaimed attach (a
+            // background or hidden tab) is a pure stream subscription - it
+            // must never steal the grid from whichever client is actually
+            // in use (see `attach_owner_grid_for`).
             Some(session) => {
                 let controller = TerminalController::Desktop(label.to_string());
-                set_client_viewport(session, controller.clone(), cols, rows);
-                let epoch = apply_owner_grid_for(session, &controller, cols, rows, claim);
+                let epoch = attach_owner_grid_for(session, &controller, cols, rows, claim);
                 (session.metadata.project_id.clone(), snapshot_of(session), epoch)
             }
             None => return Err(anyhow!("Terminal session not found.")),
@@ -2069,8 +2093,26 @@ impl Core {
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
             };
-            session.viewports.remove(&controller);
-            reselect_owner_on_departure(session, std::slice::from_ref(&controller))
+            release_viewport(session, &controller)
+        };
+        if let Some(epoch) = epoch {
+            self.broadcast_grid_change(session_id, epoch);
+        }
+    }
+
+    /// Leave set S without leaving the stream: a hidden desktop tab (its
+    /// pane stays mounted and subscribed - see `TerminalPane.tsx`) sends
+    /// this instead of detaching, so switching back needs no journal
+    /// replay. Unlike `detach_window_session`, the window's subscriber
+    /// entry (`windows.attach`/`.detach`) is left untouched.
+    pub fn release_window_viewport(&self, label: &str, session_id: &str) {
+        let controller = TerminalController::Desktop(label.to_string());
+        let epoch = {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let Some(session) = inner.sessions.get_mut(session_id) else {
+                return;
+            };
+            release_viewport(session, &controller)
         };
         if let Some(epoch) = epoch {
             self.broadcast_grid_change(session_id, epoch);
@@ -2766,13 +2808,13 @@ impl Core {
                 rows,
                 claim,
             } => {
-                // Joining the session puts this device in set S. Opening a
-                // terminal is an explicit interaction, so this claims
-                // ownership of the PTY grid (see apply_owner_grid_for)
-                // unless a more recent claim already holds it. Keyed on the
-                // paired device id, so a reconnect on a new socket replaces
-                // the stale entry atomically.
-                self.resize_remote_session(client_id, &session_id, cols, rows, claim);
+                // A claimed attach joins this device into set S and takes
+                // ownership of the PTY grid at once; an unclaimed attach (a
+                // plain buffer re-request) is a pure stream subscription
+                // (see attach_owner_grid_for). Keyed on the paired device
+                // id, so a reconnect on a new socket replaces the stale
+                // entry atomically.
+                self.attach_remote_session(client_id, &session_id, cols, rows, claim);
                 let snapshot = self.session_snapshot(&session_id);
                 Some(ServerMessage::SessionBuffer {
                     request_id,
@@ -2805,6 +2847,17 @@ impl Core {
             } => {
                 self.resize_remote_session(client_id, &session_id, cols, rows, claim);
                 None
+            }
+            ClientMessage::SessionViewportRelease {
+                request_id,
+                session_id,
+            } => {
+                // Unlike SessionDetach, this deliberately leaves
+                // attached_sessions untouched (see the dispatch bookkeeping
+                // above) - the device stays subscribed, just no longer a
+                // sizing candidate.
+                self.release_remote_controller(client_id, &session_id);
+                Some(ServerMessage::Ok { request_id })
             }
             ClientMessage::Ping => None,
             ClientMessage::DebugDiagnostics { message } => {
@@ -3988,15 +4041,39 @@ fn apply_owner_grid(session: &mut ManagedSession, cols: u16, rows: u16) -> Optio
     apply_session_grid(session, cols, rows)
 }
 
+/// Viewport registration for the attach path only: an unclaimed attach is a
+/// pure stream subscription - a background desktop tab, or a device
+/// re-requesting the buffer - and must never join set S or be handed the
+/// grid while it is not actually shown (an ownerless session would
+/// otherwise bootstrap onto whichever background pane happens to attach
+/// first). A claimed attach joins S and takes ownership at once, exactly
+/// like a real interaction.
+fn attach_owner_grid_for(
+    session: &mut ManagedSession,
+    controller: &TerminalController,
+    cols: u16,
+    rows: u16,
+    claim: bool,
+) -> Option<GridEpoch> {
+    if !claim {
+        return None;
+    }
+    set_client_viewport(session, controller.clone(), cols, rows);
+    apply_owner_grid_for(session, controller, cols, rows, true)
+}
+
 /// Grid policy for one or more departing clients (socket disconnect, remote
-/// detach, window destroy, or a watchdog sweep evicting several at once).
-/// The PTY grid is untouched unless the current owner is among `departed`,
-/// in which case ownership passes to whichever SURVIVING client was most
-/// recently active in this session (`last_active`) - the "last used client"
-/// - and its announced viewport applies. An empty survivor set clears the
-/// owner and keeps the last grid. This is a background event, not a real
-/// interaction, so it respects the fullscreen suppression hold
-/// (`apply_grid_if_tui`) instead of bypassing it like `apply_owner_grid`.
+/// detach, remote viewport release, window destroy/hide, or a watchdog
+/// sweep evicting several at once). The PTY grid is untouched unless the
+/// current owner is among `departed`, in which case ownership passes to
+/// whichever SURVIVING client was most recently active in this session
+/// (`last_active`) - the "last used client" - and its announced viewport
+/// applies. Ties (the same instant, or two clients that never differ once
+/// clock resolution is spent) break on controller identity, so the choice
+/// is always deterministic. An empty survivor set clears the owner and
+/// keeps the last grid. This is a background event, not a real interaction,
+/// so it respects the fullscreen suppression hold (`apply_grid_if_tui`)
+/// instead of bypassing it like `apply_owner_grid`.
 fn reselect_owner_on_departure(
     session: &mut ManagedSession,
     departed: &[TerminalController],
@@ -4011,7 +4088,12 @@ fn reselect_owner_on_departure(
     let successor = session
         .viewports
         .iter()
-        .max_by_key(|(_, viewport)| viewport.last_active)
+        .max_by(|(a_controller, a_viewport), (b_controller, b_viewport)| {
+            a_viewport
+                .last_active
+                .cmp(&b_viewport.last_active)
+                .then_with(|| a_controller.cmp(b_controller))
+        })
         .map(|(controller, viewport)| (controller.clone(), viewport.cols, viewport.rows));
     match successor {
         Some((controller, cols, rows)) => {
@@ -4023,6 +4105,20 @@ fn reselect_owner_on_departure(
             None
         }
     }
+}
+
+/// Remove `controller`'s entry from set S (it is no longer displaying the
+/// session) and reselect the owner if it was the one departing. Shared by
+/// every departure path - `session.detach`, `session.viewport.release`, a
+/// hidden/destroyed desktop window, a socket disconnect, and the watchdog
+/// sweep - so they all resolve ownership identically regardless of client
+/// kind.
+fn release_viewport(
+    session: &mut ManagedSession,
+    controller: &TerminalController,
+) -> Option<GridEpoch> {
+    session.viewports.remove(controller);
+    reselect_owner_on_departure(session, std::slice::from_ref(controller))
 }
 
 /// Resize the PTY to the requesting client's grid and record the epoch, or
@@ -4318,7 +4414,7 @@ mod tests {
         parse_working_directories, preferred_project, presence_alive, project_is_usable,
         project_name_or_folder, record_cursor_position_requests, reselect_owner_on_departure,
         registration_status_for_display, resolve_working_directory, retire_empty_temporary_project,
-        apply_owner_grid, apply_owner_grid_for, drain_journal_front_at, set_client_viewport, should_open_quiet_window, snapshot_from_inner,
+        apply_owner_grid, apply_owner_grid_for, attach_owner_grid_for, drain_journal_front_at, release_viewport, set_client_viewport, should_open_quiet_window, snapshot_from_inner,
         split_journal_by_epochs, startup_project, take_valid_pairing_grant, truncate_journal_front,
         validate_project_name, GridEpoch, SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS,
         TerminalController, close_session_in_inner, mark_session_exited,
@@ -5158,6 +5254,121 @@ mod tests {
             Some(GridEpoch { offset: 0, cols: 45, rows: 36 })
         );
         assert_eq!(session.owner, Some(phone));
+    }
+
+    #[test]
+    fn releasing_a_viewport_hands_the_grid_to_the_remaining_client() {
+        // release_viewport is what a hidden desktop tab and a backgrounded
+        // phone both call (session.viewport.release / a window losing
+        // focus) - it must resolve identically to a real departure.
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let window = TerminalController::Desktop("window".into());
+        let phone = TerminalController::Remote("phone".into());
+        set_client_viewport(&mut session, window.clone(), 113, 39);
+        set_client_viewport(&mut session, phone.clone(), 45, 36);
+        assert!(apply_owner_grid_for(&mut session, &window, 113, 39, true).is_some());
+        assert_eq!(
+            release_viewport(&mut session, &window),
+            Some(GridEpoch { offset: 0, cols: 45, rows: 36 }),
+            "the sole survivor takes over"
+        );
+        assert_eq!(session.grid, (45, 36));
+        assert_eq!(session.owner, Some(phone));
+        assert!(!session.viewports.contains_key(&window), "the releasing client leaves set S");
+    }
+
+    #[test]
+    fn releasing_a_non_owner_keeps_the_owner_grid() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let window = TerminalController::Desktop("window".into());
+        let phone = TerminalController::Remote("phone".into());
+        set_client_viewport(&mut session, window.clone(), 113, 39);
+        set_client_viewport(&mut session, phone.clone(), 45, 36);
+        assert!(apply_owner_grid_for(&mut session, &window, 113, 39, true).is_some());
+        assert_eq!(release_viewport(&mut session, &phone), None, "a non-owner's departure is a no-op");
+        assert_eq!(session.grid, (113, 39));
+        assert_eq!(session.owner, Some(window));
+        assert!(!session.viewports.contains_key(&phone));
+    }
+
+    #[test]
+    fn releasing_the_sole_viewer_keeps_the_last_grid_and_clears_ownership() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let window = TerminalController::Desktop("window".into());
+        set_client_viewport(&mut session, window.clone(), 113, 39);
+        assert!(apply_owner_grid_for(&mut session, &window, 113, 39, true).is_some());
+        assert_eq!(release_viewport(&mut session, &window), None, "no survivor to take over");
+        assert_eq!(session.grid, (113, 39));
+        assert_eq!(session.owner, None);
+    }
+
+    #[test]
+    fn an_unclaimed_attach_never_joins_the_viewport_set() {
+        // A desktop tab that mounts in the background, or a device
+        // re-requesting the buffer, must not size the PTY or become a
+        // reselection candidate while it is not actually shown.
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let window = TerminalController::Desktop("window".into());
+        let background = TerminalController::Desktop("background-window".into());
+        assert!(apply_owner_grid_for(&mut session, &window, 113, 39, true).is_some());
+        assert_eq!(attach_owner_grid_for(&mut session, &background, 210, 66, false), None);
+        assert_eq!(session.grid, (113, 39));
+        assert_eq!(session.owner, Some(window.clone()));
+        assert!(
+            !session.viewports.contains_key(&background),
+            "an unclaimed attach is a pure stream subscription, not a member of set S"
+        );
+        // Departing the (unregistered) background attach is a no-op, and
+        // departing the real owner has no fallback candidate to reselect.
+        assert_eq!(release_viewport(&mut session, &background), None);
+        assert_eq!(release_viewport(&mut session, &window), None);
+        assert_eq!(session.owner, None);
+        assert_eq!(session.grid, (113, 39));
+    }
+
+    #[test]
+    fn a_claimed_attach_joins_the_viewport_set_and_takes_ownership() {
+        let mut session = test_session("s1", "p1", "C:\\repo");
+        let window = TerminalController::Desktop("window".into());
+        let phone = TerminalController::Remote("phone".into());
+        assert!(apply_owner_grid_for(&mut session, &window, 113, 39, true).is_some());
+        assert_eq!(
+            attach_owner_grid_for(&mut session, &phone, 45, 36, true),
+            Some(GridEpoch { offset: 0, cols: 45, rows: 36 }),
+            "opening a terminal claims the grid back from whoever held it"
+        );
+        assert_eq!(session.grid, (45, 36));
+        assert_eq!(session.owner, Some(phone.clone()));
+        assert_eq!(session.viewports.get(&phone).map(|v| (v.cols, v.rows)), Some((45, 36)));
+    }
+
+    #[test]
+    fn successor_selection_is_deterministic_when_last_active_ties() {
+        // Two viewports that share the exact same last_active instant (the
+        // resolution of the clock, or two announces landing in the same
+        // tick) must still resolve to the same survivor regardless of
+        // HashMap iteration order - proven here by inserting them in both
+        // orders and checking the pick does not flip.
+        let window = TerminalController::Desktop("window".into());
+        let phone_a = TerminalController::Remote("phone-a".into());
+        let phone_b = TerminalController::Remote("phone-b".into());
+        let tie = |first: &TerminalController, second: &TerminalController| {
+            let mut session = test_session("s1", "p1", "C:\\repo");
+            set_client_viewport(&mut session, window.clone(), 113, 39);
+            assert!(apply_owner_grid_for(&mut session, &window, 113, 39, true).is_some());
+            set_client_viewport(&mut session, first.clone(), 45, 36);
+            set_client_viewport(&mut session, second.clone(), 100, 20);
+            let tied = session.viewports.get(first).expect("first entry").last_active;
+            session.viewports.get_mut(second).expect("second entry").last_active = tied;
+            session.viewports.remove(&window);
+            reselect_owner_on_departure(&mut session, std::slice::from_ref(&window))
+                .map(|_| session.owner.clone())
+        };
+        assert_eq!(
+            tie(&phone_a, &phone_b),
+            tie(&phone_b, &phone_a),
+            "the same tie must resolve to the same successor regardless of insertion order"
+        );
     }
 
     #[test]

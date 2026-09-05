@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemeById, terminalSchemesFor, xtermThemeFor, zoomedFontSize, type ClientMessage, type HostSnapshot } from "./index.js";
+import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, zoomedFontSize, type ClientMessage, type HostSnapshot } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -342,11 +342,47 @@ test("a bare ping is a valid client message with nothing else required", () => {
   assert.equal(JSON.stringify(message), JSON.stringify({ type: "ping" }));
 });
 
-test("session.resize carries no force flag anymore", () => {
+test("a plain layout announce carries no claim, so it can never take the grid over", () => {
+  // The claim is what makes a client the grid owner, so it must never ride
+  // along on an ordinary layout-driven resize: the host records an
+  // unclaimed announce from a non-owner and changes nothing.
   const message: ClientMessage = { type: "session.resize", sessionId: "s1", cols: 120, rows: 30 };
   const roundTrip = decodeClientMessage(encodeMessage(message));
   assert.deepEqual(roundTrip, message);
-  assert.equal("force" in roundTrip, false);
+  assert.equal("claim" in roundTrip, false);
+});
+
+test("an interaction-driven resize claims the grid on the wire", () => {
+  const message: ClientMessage = { type: "session.resize", sessionId: "s1", cols: 45, rows: 36, claim: true };
+  assert.equal(
+    encodeMessage(message),
+    '{"type":"session.resize","sessionId":"s1","cols":45,"rows":36,"claim":true}'
+  );
+  assert.deepEqual(decodeClientMessage(encodeMessage(message)), message);
+});
+
+test("opening a terminal claims the grid through session.attach", () => {
+  // Explicitly opening a session is an interaction; a background pane
+  // attaching (a desktop tab that is not the active one) omits the flag.
+  const opened: ClientMessage = { type: "session.attach", requestId: "r1", sessionId: "s1", cols: 45, rows: 36, claim: true };
+  assert.deepEqual(decodeClientMessage(encodeMessage(opened)), opened);
+  const background: ClientMessage = { type: "session.attach", requestId: "r2", sessionId: "s1", cols: 210, rows: 66 };
+  const roundTrip = decodeClientMessage(encodeMessage(background));
+  assert.deepEqual(roundTrip, background);
+  assert.equal("claim" in roundTrip, false);
+});
+
+test("session.viewport.release leaves set S without leaving the stream", () => {
+  // A hidden desktop tab or a backgrounded phone sends this instead of
+  // session.detach: it stays attached (still receiving output) but drops
+  // out of the fallback pool, so it can never be handed the grid back
+  // while it is not actually shown.
+  const message: ClientMessage = { type: "session.viewport.release", requestId: "r1", sessionId: "s1" };
+  assert.equal(
+    encodeMessage(message),
+    '{"type":"session.viewport.release","requestId":"r1","sessionId":"s1"}'
+  );
+  assert.deepEqual(decodeClientMessage(encodeMessage(message)), message);
 });
 
 const ANSI_KEYS = Object.keys(TERMINAL_ANSI_THEME) as (keyof typeof TERMINAL_ANSI_THEME)[];
@@ -632,4 +668,39 @@ test("zoomedFontSize returns null for unusable inputs instead of a bad font size
   assert.equal(zoomedFontSize(14, { cols: 0, rows: 5 }, { width: 8, height: 16 }, { width: 200, height: 100 }), null);
   assert.equal(zoomedFontSize(14, { cols: 10, rows: 0 }, { width: 8, height: 16 }, { width: 200, height: 100 }), null);
   assert.equal(zoomedFontSize(14, { cols: 10, rows: 5 }, { width: 0, height: 16 }, { width: 200, height: 100 }), null);
+});
+
+// squishScaleToFill: the phone's slider sets how narrow cells MAY go, so the
+// terminal always spans the screen - it never leaves the slider's fraction of
+// the width painted and the rest dead.
+test("squishScaleToFill keeps the slider's density when the phone got the columns it asked for", () => {
+  // 86 columns announced at 0.65 density fill a 404px box exactly:
+  // 86 * 7.2 * 0.65 = 402.5, so the cells stay at the user's width.
+  const scale = squishScaleToFill({ cols: 86, rows: 43 }, { width: 7.2, height: 16 }, { width: 404, height: 688 }, 0.65);
+  assert.ok(scale !== null);
+  assert.ok(Math.abs(scale! - 0.6524) < 0.001, `expected ~0.65, got ${scale}`);
+});
+
+test("squishScaleToFill relaxes the cells when the grid is narrower than the box", () => {
+  // The phone asked for 86 columns but renders a 56-column grid (another
+  // client owns it). Squishing to 0.65 would paint 262px of a 404px screen;
+  // relaxing to ~1.0 spans it instead.
+  const scale = squishScaleToFill({ cols: 56, rows: 43 }, { width: 7.2, height: 16 }, { width: 404, height: 688 }, 0.65);
+  assert.equal(scale, 1, "cells never stretch past their natural width, but they do fill");
+});
+
+test("squishScaleToFill never squishes past the slider when the grid overflows", () => {
+  // A far wider grid than the box can hold at any allowed density: the paint
+  // scale bottoms out at the slider value and the font size (zoomedFontSize)
+  // shrinks the rest.
+  const scale = squishScaleToFill({ cols: 190, rows: 50 }, { width: 7.2, height: 16 }, { width: 404, height: 688 }, 0.65);
+  assert.equal(scale, 0.65);
+});
+
+test("squishScaleToFill returns null for unusable inputs", () => {
+  assert.equal(squishScaleToFill({ cols: 86, rows: 43 }, null, { width: 404, height: 688 }, 0.65), null);
+  assert.equal(squishScaleToFill({ cols: 86, rows: 43 }, { width: 7.2, height: 16 }, null, 0.65), null);
+  assert.equal(squishScaleToFill({ cols: 0, rows: 43 }, { width: 7.2, height: 16 }, { width: 404, height: 688 }, 0.65), null);
+  assert.equal(squishScaleToFill({ cols: 86, rows: 43 }, { width: 7.2, height: 16 }, { width: 404, height: 688 }, 0), null);
+  assert.equal(squishScaleToFill({ cols: 86, rows: 43 }, { width: 7.2, height: 16 }, { width: 404, height: 688 }, Number.NaN), null);
 });

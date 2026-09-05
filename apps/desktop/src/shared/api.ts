@@ -35,6 +35,10 @@ export interface DesktopApi {
   resize(sessionId: string, cols: number, rows: number, claim: boolean): void;
   attachSession(sessionId: string, cols: number, rows: number, claim: boolean): Promise<SessionSnapshot>;
   detachSession(sessionId: string): void;
+  /** Leave the session's viewport set S without leaving its stream: the
+   * pane stays attached (still receiving output) but is no longer a sizing
+   * candidate. A hidden tab sends this instead of detaching. */
+  releaseSessionViewport(sessionId: string): void;
   copyText(text: string): Promise<void>;
   logDebug(message: string): void;
   openExternalUrl(url: string): Promise<void>;

@@ -72,6 +72,7 @@ const api: DesktopApi = {
     return invoke("attach_session", { sessionId, cols, rows, claim });
   },
   detachSession: (sessionId) => { void invoke("detach_session", { sessionId }); },
+  releaseSessionViewport: (sessionId) => { void invoke("release_session_viewport", { sessionId }); },
   copyText: (text) => invoke("copy_text", { text }),
   logDebug: (message) => { void invoke("log_debug", { message }); },
   openExternalUrl: (url) => openUrl(url),

@@ -359,6 +359,16 @@ pub enum ClientMessage {
         #[serde(default)]
         claim: bool,
     },
+    /// Leave the session's viewport set S without leaving its stream: the
+    /// client is still attached (still receiving output) but is no longer
+    /// displaying the session, so it must not size the PTY and must not be
+    /// a successor candidate (`release_viewport`). A hidden desktop tab and
+    /// a backgrounded phone send this instead of `session.detach`.
+    #[serde(rename = "session.viewport.release")]
+    SessionViewportRelease {
+        request_id: String,
+        session_id: String,
+    },
     /// Bare heartbeat with no requestId and no reply: the host only bumps the
     /// client's viewport liveness so a networked client stays in a session's
     /// viewport set S. The `snapshot.request` heartbeat (the presence dot)
@@ -397,6 +407,7 @@ impl ClientMessage {
             | Self::SessionClose { request_id, .. }
             | Self::SessionAttach { request_id, .. }
             | Self::SessionDetach { request_id, .. }
+            | Self::SessionViewportRelease { request_id, .. }
             | Self::ShellDefault { request_id, .. }
             | Self::TerminalTheme { request_id, .. } => Some(request_id),
             Self::SessionInput { .. } | Self::SessionResize { .. } | Self::DebugDiagnostics { .. } | Self::Ping => {
@@ -653,6 +664,19 @@ mod tests {
             legacy,
             ClientMessage::SessionInput { cols: None, rows: None, .. }
         ));
+    }
+
+    #[test]
+    fn session_viewport_release_decodes_with_a_request_id() {
+        let message: ClientMessage = serde_json::from_str(
+            r#"{"type":"session.viewport.release","requestId":"r1","sessionId":"s1"}"#,
+        )
+        .expect("viewport release");
+        assert!(matches!(
+            message,
+            ClientMessage::SessionViewportRelease { ref session_id, .. } if session_id == "s1"
+        ));
+        assert_eq!(message.request_id(), Some("r1"));
     }
 
     #[test]

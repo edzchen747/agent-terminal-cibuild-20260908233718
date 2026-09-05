@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
-import { applyTerminalModifiers, createRequestId, findHttpLinks, gridForContent, streamByteLength, TERMINAL_SCROLLBACK_LINES, xtermThemeFor, zoomedFontSize } from "@agentterminal/protocol";
+import { applyTerminalModifiers, createRequestId, findHttpLinks, gridForContent, squishScaleToFill, streamByteLength, TERMINAL_SCROLLBACK_LINES, xtermThemeFor, zoomedFontSize } from "@agentterminal/protocol";
 import type { Size, TerminalModifier, TerminalScheme, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
 import { classifyGestureAxis, commitTapOnGestureEnd, type GestureAxis } from "./gesture";
@@ -93,10 +93,16 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
   activeRef.current = active;
   const fontWidthScaleRef = useRef(fontWidthScale);
   fontWidthScaleRef.current = fontWidthScale;
+  // The horizontal scale actually painted. It starts at the slider value and
+  // is relaxed back towards 1 whenever the grid the host gave this phone is
+  // narrower than the columns it asked for, so the terminal always spans the
+  // screen (see squishScaleToFill). The slider still drives the ANNOUNCED
+  // viewport, which is what keeps the two from feeding back into each other.
+  const renderScaleRef = useRef(fontWidthScale);
   const schemeRef = useRef(scheme);
   schemeRef.current = scheme;
   const a11yAdvanceRatioRef = useRef<number | undefined>(undefined);
-  const resizeRef = useRef<() => void>(() => undefined);
+  const resizeRef = useRef<(force?: boolean) => void>(() => undefined);
   const focusInputRef = useRef<() => void>(() => undefined);
   // Cursor-only twin of focusInputRef: entry and attach-complete keep the
   // xterm cursor cell live without focusing the IME field, so entering the
@@ -106,6 +112,15 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
   // Attach/keepalive owner: the view-activity gate below calls into the
   // session-join machinery defined inside the terminal effect.
   const startAttachmentRef = useRef<() => void>(() => undefined);
+  // Forgets the last size resize() announced, so leaving and returning to
+  // the terminal view always re-announces on the way back in even if the
+  // phone's own dimensions have not changed (see the active-gating effect).
+  const forgetLastSizeRef = useRef<() => void>(() => undefined);
+  // The utility-key pad (sendKeyData) lives outside the terminal effect but
+  // still has to carry the announced viewport on every keystroke, exactly
+  // like the native input paths inside the effect - typing is always an
+  // interaction and must claim the grid (see apply_owner_grid_for).
+  const announcedGridRef = useRef<() => { cols: number; rows: number } | null>(() => null);
   const keyPadRef = useRef<ReturnType<typeof createUtilityKeyPad> | null>(null);
   // The utility-key hold boundary: the default until the Android system's
   // own long-press timeout arrives; the pad consults it on every release,
@@ -140,10 +155,12 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
 
   const sendKeyData = (data: string) => {
     if (!data || !activeRef.current) return;
-    // The grid is the minimum boundary over the viewing clients; typing
-    // never asserts dimensions (that would only seize the grid).
+    // Every input carries the sender's viewport: typing is always an
+    // interaction, and the host applies it and claims the grid at once
+    // (see apply_owner_grid_for) - matching the native input paths below.
+    const dims = announcedGridRef.current();
     applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: true }));
-    connection.send({ type: "session.input", sessionId: session.id, data });
+    connection.send({ type: "session.input", sessionId: session.id, data, cols: dims?.cols, rows: dims?.rows });
   };
 
   const vibrate = () => {
@@ -217,8 +234,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       }
     });
     applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: false }));
-    // No local fit: the emulator grid is the host's (the minimum boundary
-    // over the viewing clients), not the container's.
+    // No local fit: the emulator grid is the host's - the current owner's
+    // own announced viewport - not the container's.
 
     // The accessibility layer's rows must paint and anchor at the same advance
     // the squished canvas cells have. Rather than trusting the font metrics to
@@ -255,7 +272,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       const domAdvance = mirror.getBoundingClientRect().width / 32;
       mirror.remove();
       a11yAdvanceRatioRef.current = squishAdvanceRatio(cellWidth, domAdvance);
-      hostElement.style.setProperty("--terminal-squish-font-size", calibratedSquishFontSize(currentFontSize, fontWidthScaleRef.current, a11yAdvanceRatioRef.current));
+      // The paint scale, not the slider: Android's selection handles are
+      // anchored through this layer, so it has to match what is on screen.
+      hostElement.style.setProperty("--terminal-squish-font-size", calibratedSquishFontSize(currentFontSize, renderScaleRef.current, a11yAdvanceRatioRef.current));
     };
     calibrateAccessibilityMetrics();
 
@@ -283,22 +302,24 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       layoutReference = keyboardLayoutReference(current, layoutReference);
       return false;
     };
-    // The content box xterm can actually paint into: the host element's own
-    // LAYOUT box (offsetWidth/offsetHeight - not getBoundingClientRect,
-    // which reports the box AFTER the horizontal squish transform) minus the
-    // letterbox padding on `.mobile-terminal`. That layout box is already
-    // the wide, pre-squish one the width: squishWidthPercent() style below
-    // sizes to, so measuring here keeps zoom and squish fully independent.
-    const contentBox = (): Size | null => {
+    // The box the terminal actually occupies ON SCREEN. The host element is
+    // laid out `100 / renderScale` % wide and then squished back by
+    // `scaleX(renderScale)`, so its LAYOUT box (offsetWidth/offsetHeight -
+    // never getBoundingClientRect, which reports the post-transform box)
+    // times that scale is the same visual box whatever scale is applied.
+    // Measuring in visual space is what lets the paint scale change without
+    // moving the announced viewport underneath it.
+    const visualContentBox = (): Size | null => {
       const style = window.getComputedStyle(hostElement);
-      const width = hostElement.offsetWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+      const layoutWidth = hostElement.offsetWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
       const height = hostElement.offsetHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+      const width = layoutWidth * renderScaleRef.current;
       if (!(width > 0 && height > 0)) return null;
       return { width, height };
     };
-    // One cell in that same pre-transform layout space, read off the
-    // rendered grid at whatever font size is currently applied. Null until
-    // the emulator has painted.
+    // One UNSQUISHED cell, read off the rendered grid at whatever font size
+    // is currently applied (layout space, so the wrapper's scaleX is not
+    // baked in). Null until the emulator has painted.
     const cellSize = (): Size | null => {
       const screen = hostElement.querySelector<HTMLElement>(".xterm-screen");
       if (!screen || terminal.cols < 1 || terminal.rows < 1) return null;
@@ -308,10 +329,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       return { width: width / terminal.cols, height: height / terminal.rows };
     };
     // The cell size at TERMINAL_FONT_SIZE, cached the first time it is
-    // measurable. The announced viewport is always derived from this, never
-    // from the live (possibly zoomed) cell size: if zooming in shrank the
-    // announcement, it would shrink the host's minimum-boundary PTY grid,
-    // which would call for more zoom - a ratchet that collapses the session.
+    // measurable. The announced viewport is always derived from this and the
+    // user's slider, never from the live (possibly zoomed) cell size or the
+    // live paint scale: if the rendering fed back into the announcement, a
+    // zoom or a relaxed squish would shrink the grid, which would call for
+    // more of both - a ratchet that collapses the session.
     let baseCell: Size | null = null;
     const captureBaseCell = () => {
       if (terminal.options.fontSize !== TERMINAL_FONT_SIZE) return;
@@ -320,55 +342,93 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     };
     const proposeGrid = () => {
       captureBaseCell();
-      const content = contentBox();
-      if (!content) return null;
-      return gridForContent(content, baseCell);
+      const content = visualContentBox();
+      if (!content || !baseCell) return null;
+      // The slider is a DENSITY, not a width: ask for the columns that fit
+      // the screen at the user's character width, so owning the grid gives
+      // exactly that many and the terminal spans the screen.
+      return gridForContent(content, { width: baseCell.width * fontWidthScaleRef.current, height: baseCell.height });
     };
     const announcedGrid = () => {
       const dims = proposeGrid();
       if (!dims) return null;
       return announcedViewport(dims, keyboardOpen());
     };
-    // Fill the shell: raise or lower xterm's font size so the rendered grid
-    // consumes as much of the content box as its aspect ratio allows, then
-    // letterbox the rest (the shell aligns the grid to its top-left corner).
-    // Render-only - it never touches the announcement above, which is why it
-    // cannot ratchet. A font-size change moves the measured cell size, so
+    announcedGridRef.current = announcedGrid;
+    // The horizontal paint scale (see squishScaleToFill): written straight
+    // to the wrapper and the accessibility layer's custom properties, like
+    // the calibrated font size, so a mid-gesture correction needs no React
+    // render. The JSX reads the same ref.
+    const applyRenderScale = (scale: number | null): boolean => {
+      if (scale === null) return false;
+      const rounded = Math.round(scale * 10_000) / 10_000;
+      if (Math.abs(rounded - renderScaleRef.current) < 0.0005) return false;
+      renderScaleRef.current = rounded;
+      hostElement.style.width = squishWidthPercent(rounded);
+      hostElement.style.transform = `scaleX(${rounded})`;
+      hostElement.style.setProperty("--terminal-squish-line-height", squishLineHeightValue(rounded));
+      hostElement.style.setProperty("--terminal-squish-inverse", `${squishInverseValue(rounded)}`);
+      return true;
+    };
+    // Fill the shell on both axes: the font size grows or shrinks until the
+    // grid fits the visual box at the densest cell the slider allows, and
+    // whatever width is still unspent relaxes the cells back towards their
+    // natural shape, so the terminal always spans the screen instead of
+    // leaving the slider's fraction of it painted and the rest dead.
+    // Render-only - it never touches the announcement above, which is why
+    // it cannot ratchet. A font-size change moves the measured cell size, so
     // the correction is a fixed point: re-measure and correct again next
     // frame, capped at MAX_ZOOM_PASSES.
     const applyZoom = (passesLeft = MAX_ZOOM_PASSES) => {
       if (!activeRef.current || passesLeft <= 0) return;
-      const content = contentBox();
+      const content = visualContentBox();
       const cell = cellSize();
-      const next = zoomedFontSize(terminal.options.fontSize ?? TERMINAL_FONT_SIZE, { cols: terminal.cols, rows: terminal.rows }, cell, content);
+      const grid = { cols: terminal.cols, rows: terminal.rows };
+      const userScale = fontWidthScaleRef.current;
+      const densestCell = cell && { width: cell.width * userScale, height: cell.height };
+      const next = zoomedFontSize(terminal.options.fontSize ?? TERMINAL_FONT_SIZE, grid, densestCell, content);
+      if (next !== null) terminal.options.fontSize = next;
+      const scaled = applyRenderScale(squishScaleToFill(grid, cell, content, userScale));
+      if (next !== null || scaled) calibrateAccessibilityMetrics();
       if (next === null) return;
-      terminal.options.fontSize = next;
-      calibrateAccessibilityMetrics();
       requestAnimationFrame(() => applyZoom(passesLeft - 1));
     };
     let resizeFrame: number | undefined;
+    let pendingForce = false;
     let lastSize = { cols: 0, rows: 0 };
     const resize = (force = false) => {
       if (!activeRef.current) return;
+      // A force must never be dropped by coalescing: a tap that lands
+      // while a plain layout announce is already queued for this frame
+      // used to have its claim silently discarded (the queued frame's
+      // closure had already captured force=false). OR the flags instead,
+      // so whichever call claims wins even when several land in one frame.
+      pendingForce ||= force;
       if (resizeFrame !== undefined) return;
       resizeFrame = requestAnimationFrame(() => {
         resizeFrame = undefined;
+        const claim = pendingForce;
+        pendingForce = false;
         if (!activeRef.current) return;
         applyZoom();
         const dims = announcedGrid();
         if (!dims) return;
-        // A tap is an interaction: force the announce so the host applies
-        // this phone's size to the PTY grid in a TUI period even when the
-        // terminal's own size did not change. Unforced announces (layout
-        // observers) send only on a real change.
-        if (force || shouldSendResize(dims.cols, dims.rows, lastSize)) {
+        // A tap, a slider drag, or entering the terminal view is an
+        // interaction: force the announce AND claim the PTY grid, so this
+        // phone's size becomes the host grid even when its own size did not
+        // change. Unforced announces (layout observers) send only on a real
+        // change and never claim - the desktop keeps the grid it owns.
+        if (claim || shouldSendResize(dims.cols, dims.rows, lastSize)) {
           lastSize = { cols: dims.cols, rows: dims.rows };
-          syncDebug(`resize session=${session.id} cols=${dims.cols} rows=${dims.rows}`);
-          connection.send({ type: "session.resize", sessionId: session.id, cols: dims.cols, rows: dims.rows });
+          syncDebug(`resize session=${session.id} cols=${dims.cols} rows=${dims.rows} claim=${claim}`);
+          connection.send({ type: "session.resize", sessionId: session.id, cols: dims.cols, rows: dims.rows, claim });
         }
       });
     };
     resizeRef.current = resize;
+    forgetLastSizeRef.current = () => {
+      lastSize = { cols: 0, rows: 0 };
+    };
     const observer = new ResizeObserver(() => resize());
     observer.observe(hostElement);
     // Keyboard focus follows a committed tap only. pointerdown fires at the
@@ -431,10 +491,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     let lastNativeBeforeInput: { data: string; at: number } | undefined;
     const sendInput = (data: string) => {
       if (!data || !activeRef.current) return;
-      // Every input carries the sender's viewport: in a TUI period the
-      // client that is typing owns the grid and the host applies it at
-      // once (canonical mode keeps the minimum boundary - typing never
-      // resizes the shell).
+      // Every input carries the sender's viewport: typing is always an
+      // interaction, so the host applies it and claims the grid for this
+      // phone at once (see apply_owner_grid_for).
       const dims = announcedGrid();
       const result = keyPadRef.current!.consume(data);
       syncKeyPad();
@@ -514,7 +573,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
         return;
       }
       if (activeRef.current) {
-        connection.send({ type: "session.input", sessionId: session.id, data });
+        // Every input carries the sender's viewport: typing is always an
+        // interaction, and the host applies it and claims the grid at once
+        // (see apply_owner_grid_for), matching sendInput/sendKeyData.
+        const dims = announcedGrid();
+        connection.send({ type: "session.input", sessionId: session.id, data, cols: dims?.cols, rows: dims?.rows });
       }
     });
     const handleNativeBeforeInput = (event: Event) => {
@@ -882,7 +945,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
         requestId: createRequestId(),
         sessionId: session.id,
         cols: attachDims.cols,
-        rows: attachDims.rows
+        rows: attachDims.rows,
+        // The phone only attaches when the user actually opened this
+        // terminal (the page is the active one), so opening it claims the
+        // PTY grid back from whichever client last held it.
+        claim: true
       }).then((message) => {
         attachmentPromise = undefined;
         if (disposed) return;
@@ -908,9 +975,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
             replayPendingOutput();
             return;
           }
-          // Under minimum-boundary sizing every segment renders at its
-          // recorded grid: the journal replays 1:1, never re-wrapped at
-          // this client's own size.
+          // Every segment renders at its recorded grid - the journal
+          // replays 1:1, never re-wrapped at this client's own size.
           if (segment.cols !== terminal.cols || segment.rows !== terminal.rows) {
             terminal.resize(segment.cols, segment.rows);
             applyZoom();
@@ -949,6 +1015,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       connection.stopViewportKeepalive();
       observer.disconnect();
       if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
+      pendingForce = false;
       window.removeEventListener("pointerdown", handlePointerActivity, true);
       window.removeEventListener("pointerup", handlePointerUp, true);
       window.removeEventListener("pointercancel", handlePointerCancel, true);
@@ -968,6 +1035,8 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       resizeRef.current = () => undefined;
       focusInputRef.current = () => undefined;
       activateCursorRef.current = () => undefined;
+      announcedGridRef.current = () => null;
+      forgetLastSizeRef.current = () => undefined;
       };
     });
     return () => {
@@ -989,28 +1058,62 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     if (!active) {
       connection.stopViewportKeepalive();
       connection.send({ type: "session.detach", requestId: createRequestId(), sessionId: session.id });
+      // A return to this page must always re-announce a claim: forget the
+      // size resize() last sent, so shouldSendResize cannot see an
+      // apparently-unchanged size and suppress the next announce.
+      forgetLastSizeRef.current();
       return;
     }
     startAttachmentRef.current();
     connection.startViewportKeepalive();
+    let claimFrame: number | undefined;
+    // The attach's own claim measures mid page-transition (or before first
+    // paint), so it can land at a stale or fallback size. Re-measure and
+    // re-claim once the page has actually laid out, rather than trusting
+    // that first measurement. Cancels any frame still pending from a
+    // previous call, so a claim scheduled just before a background/hide
+    // can never fire after the release that follows it.
+    const scheduleClaim = () => {
+      if (claimFrame !== undefined) window.cancelAnimationFrame(claimFrame);
+      claimFrame = window.requestAnimationFrame(() => {
+        claimFrame = undefined;
+        resizeRef.current(true);
+      });
+    };
+    scheduleClaim();
     const handleVisibility = () => {
       if (document.hidden) {
+        // Leave set S without leaving the stream - the phone stays
+        // attached (still receiving output), just no longer a sizing
+        // candidate - deterministically, rather than waiting on the
+        // host's watchdog to infer it from silence.
+        if (claimFrame !== undefined) {
+          window.cancelAnimationFrame(claimFrame);
+          claimFrame = undefined;
+        }
         connection.stopViewportKeepalive();
+        connection.send({ type: "session.viewport.release", requestId: createRequestId(), sessionId: session.id });
       } else {
         connection.startViewportKeepalive();
         startAttachmentRef.current();
+        scheduleClaim();
       }
     };
     document.addEventListener("visibilitychange", handleVisibility);
-    return () => document.removeEventListener("visibilitychange", handleVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+      if (claimFrame !== undefined) window.cancelAnimationFrame(claimFrame);
+    };
   }, [active, connection, session.id]);
 
   useLayoutEffect(() => {
     // Adjusting the character-width slider changes this value on every tick
-    // while the settings sheet is up. Re-announce so the squished columns
-    // stay correct, but never steal focus from the sheet: refocusing the IME
-    // field would pop Android's keyboard over the overlay.
-    if (activeRef.current) resizeRef.current();
+    // while the settings sheet is up. Dragging it is an interaction with
+    // THIS terminal, so the re-announce claims the grid: asking for more
+    // columns is pointless if another client still owns the size. Never
+    // steal focus from the sheet, though: refocusing the IME field would pop
+    // Android's keyboard over the overlay.
+    if (activeRef.current) resizeRef.current(true);
   }, [fontWidthScale]);
 
   // Repaint a live terminal when the shared scheme changes, so switching this
@@ -1076,13 +1179,18 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: true }));
   }
 
+  // Every squished value paints from the live scale (the slider relaxed to
+  // whatever fills the screen - see squishScaleToFill), not from the slider
+  // itself, and applyRenderScale writes the same values imperatively between
+  // renders. The ref is the single source of truth for both paths.
   const currentFontSize = terminalRef.current?.options.fontSize ?? TERMINAL_FONT_SIZE;
-  const squishFontSize = calibratedSquishFontSize(currentFontSize, fontWidthScale, a11yAdvanceRatioRef.current);
-  const squishLineHeight = squishLineHeightValue(fontWidthScale);
-  const squishInverse = squishInverseValue(fontWidthScale);
+  const renderScale = renderScaleRef.current;
+  const squishFontSize = calibratedSquishFontSize(currentFontSize, renderScale, a11yAdvanceRatioRef.current);
+  const squishLineHeight = squishLineHeightValue(renderScale);
+  const squishInverse = squishInverseValue(renderScale);
   return <div className="mobile-terminal-shell">
     <input ref={inputRef} className="mobile-terminal-input" type="text" inputMode="text" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} aria-label="Terminal input" />
-    <div ref={hostRef} className="mobile-terminal" style={{ width: squishWidthPercent(fontWidthScale), transform: `scaleX(${fontWidthScale})`, transformOrigin: "left center", "--terminal-bg": scheme.background, "--terminal-squish-font-size": squishFontSize, "--terminal-squish-line-height": squishLineHeight, "--terminal-squish-inverse": `${squishInverse}` } as CSSProperties} />
+    <div ref={hostRef} className="mobile-terminal" style={{ width: squishWidthPercent(renderScale), transform: `scaleX(${renderScale})`, transformOrigin: "left center", "--terminal-bg": scheme.background, "--terminal-squish-font-size": squishFontSize, "--terminal-squish-line-height": squishLineHeight, "--terminal-squish-inverse": `${squishInverse}` } as CSSProperties} />
     <div className="extra-keys" data-no-swipe aria-label="Terminal function keys" ref={(element) => guardUtilityKeySelection(element)}>
       {ACCESSIBILITY_KEY_ROWS.map((row, rowIndex) => <div className="key-row" key={rowIndex}>{row.map((key) => {
         const latched = latchedKeyIds.has(key.id);
