@@ -163,6 +163,14 @@ button { color: inherit; }
 .project-item { width: 100%; min-width: 0; height: 58px; margin-bottom: 3px; padding: 0 7px 0 10px; display: grid; grid-template-columns: 32px 1fr 66px; align-items: center; position: relative; text-align: left; border: 1px solid transparent; border-radius: 9px; background: transparent; cursor: pointer; transition: transform .14s cubic-bezier(.2,.8,.2,1), background .12s ease; }
 .project-item.is-dragging { z-index: 3; border-color: var(--accent-line-strong); background: var(--accent-tint-strong); box-shadow: 0 9px 24px var(--shadow-strong); transition: none; }
 .project-item.is-reordering { transition: none; }
+/* A project that just left the list keeps a ghost card in its old slot while
+   it plays the leave: the card first slides off the left edge, then the slot
+   collapses so the cards below slide up into the freed space. Keep the
+   timings in sync with PROJECT_LEAVE_MS in project-leave.ts. */
+.project-item.is-leaving { pointer-events: none; overflow: hidden; border: 0; animation: project-leave-slide .15s cubic-bezier(.2,.8,.2,1) both, project-leave-collapse .27s cubic-bezier(.4,0,.2,1) .15s both; }
+@keyframes project-leave-slide { from { transform: translateX(0); opacity: 1; } to { transform: translateX(-112%); opacity: 0; } }
+@keyframes project-leave-collapse { from { height: 58px; margin-bottom: 3px; } to { height: 0; margin-bottom: 0; } }
+@media (prefers-reduced-motion: reduce) { .project-item.is-leaving { animation: none; } }
 .project-item:hover { background: var(--surface-hover); }
 .project-item.active { background: var(--accent-tint); border-color: var(--accent-line); }
 .project-icon { width: 27px; height: 27px; display: grid; place-items: center; color: var(--text-muted); border-radius: 6px; background: var(--surface-raised); }

@@ -2,10 +2,12 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import QRCode from "qrcode";
 import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemesFor } from "@agentterminal/protocol";
+import type { Project, TerminalSession } from "@agentterminal/protocol";
 import type { DesktopState } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { projectPersistenceAction, projectRowOpensOnKey } from "./persistence";
 import { projectDragTransform, reorderBlock, shouldCommitProjectReorder } from "./project-drag";
+import { departedProjects, PROJECT_LEAVE_MS, projectListEntries, type LeavingProject } from "./project-leave";
 import { pruneRememberedActiveSessions, rememberProjectActiveSession, resolveProjectActiveSession } from "./active-tab";
 import { shellSwitchSessionOrder, shellSwitchSplitGroups } from "./shell-switch";
 import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
@@ -66,6 +68,7 @@ export function App() {
   const [closingSessionIds, setClosingSessionIds] = useState<Set<string>>(() => new Set());
   const [projectDrag, setProjectDrag] = useState<ProjectDragState | null>(null);
   const [projectReordering, setProjectReordering] = useState(false);
+  const [leavingProjects, setLeavingProjects] = useState<LeavingProject[]>([]);
   const [splitGroups, setSplitGroups] = useState<SplitGroup[]>(() => loadSplitPreferences().groups);
   const [allowSplitEdgeDrop, setAllowSplitEdgeDrop] = useState(() => loadSplitPreferences().allowEdgeDrop);
   const [splitMenu, setSplitMenu] = useState<SplitMenu | null>(null);
@@ -81,6 +84,8 @@ export function App() {
   const suppressTabClickRef = useRef(false);
   const projectDragRef = useRef<ProjectDragState | null>(null);
   const projectElementsRef = useRef(new Map<string, HTMLDivElement>());
+  const previousProjectsRef = useRef<readonly Project[] | null>(null);
+  const previousSessionsRef = useRef<readonly TerminalSession[] | null>(null);
   const sidebarRef = useRef<HTMLElement>(null);
   const terminalStackRef = useRef<HTMLDivElement>(null);
   const splitButtonRef = useRef<HTMLButtonElement>(null);
@@ -92,6 +97,32 @@ export function App() {
     void window.agentTerminal.getState().then(setState);
     return window.agentTerminal.onState(setState);
   }, []);
+
+  // When a project disappears from the host list (e.g. it was removed), keep
+  // a ghost card in its old slot so the sidebar can play the leave: the card
+  // slides off the left edge, then its slot collapses and the cards below
+  // slide up to close the gap. Ghosts are unmounted once the animation runs
+  // out (PROJECT_LEAVE_MS); the CSS side lives on `.project-item.is-leaving`.
+  useEffect(() => {
+    const projects = state?.projects ?? [];
+    const previousProjects = previousProjectsRef.current;
+    const previousSessions = previousSessionsRef.current ?? [];
+    previousProjectsRef.current = projects;
+    previousSessionsRef.current = state?.sessions ?? [];
+    if (!previousProjects || previousProjects === projects) return;
+    const leavings = departedProjects(previousProjects, projects, previousSessions);
+    if (!leavings.length) return;
+    // The tab-reorder slides skip animation under the same setting, so the
+    // leave does too.
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    setLeavingProjects((current) => [
+      ...current.filter((entry) => !leavings.some((leaving) => leaving.project.id === entry.project.id)),
+      ...leavings
+    ]);
+    window.setTimeout(() => {
+      setLeavingProjects((current) => current.filter((entry) => !leavings.some((leaving) => leaving.project.id === entry.project.id)));
+    }, PROJECT_LEAVE_MS);
+  }, [state]);
 
   useEffect(() => window.agentTerminal.onPairingSucceeded(() => {
     setModal((current) => nextModalAfterPairing(current));
@@ -200,6 +231,13 @@ export function App() {
     return groups;
   }, [splitGroups]);
   const renamingProject = state?.projects.find((project) => project.id === renamingProjectId);
+  // Sidebar render list: live cards with leaving ghosts spliced back into the
+  // slots their projects used to hold, so a removed card can play its leave
+  // while the cards below slide up into the freed space.
+  const projectList = useMemo(
+    () => projectListEntries(state?.projects ?? [], leavingProjects),
+    [state?.projects, leavingProjects]
+  );
 
   useEffect(() => {
     if (!state) return;
@@ -778,7 +816,19 @@ export function App() {
         <aside ref={sidebarRef} className={`sidebar ${sidebarOpen ? "" : "is-collapsed"}`}>
           <div className="sidebar-heading"><span>Projects</span><button className="icon-button small" onClick={() => void window.agentTerminal.createProject()} title="Add project"><PlusIcon /></button></div>
           <nav className="project-list">
-            {state.projects.map((project, index) => {
+            {projectList.map((entry) => {
+              if (entry.kind === "leaving") {
+                // The ghost card playing its leave: it slides off the left
+                // edge first, then its slot collapses. Not interactive, and
+                // App unmounts it once the animation completes.
+                const count = entry.entry.count;
+                return <div key={`leaving-${entry.entry.project.id}`} className="project-item is-leaving" aria-hidden="true">
+                  <span className="project-icon"><FolderIcon /></span>
+                  <span className="project-copy"><strong className="display-name">{entry.entry.project.name}</strong><small>{count ? `${count} active session${count === 1 ? "" : "s"}` : "No active sessions"}</small></span>
+                </div>;
+              }
+              const project = entry.project;
+              const index = entry.index;
               const count = state.sessions.filter((session) => session.projectId === project.id && session.status === "running").length;
               const action = projectPersistenceAction(project.persistent);
               return <div key={project.id} ref={(element) => { if (element) projectElementsRef.current.set(project.id, element); else projectElementsRef.current.delete(project.id); }} role="button" tabIndex={0} className={`project-item ${project.id === state.currentProjectId ? "active" : ""} ${project.id === projectDrag?.projectId ? "is-dragging" : ""} ${projectReordering ? "is-reordering" : ""}`} style={{ transform: projectDragTransform(projectDrag, project.id, index) }} onClick={() => void window.agentTerminal.openProject(project.id)} onKeyDown={(event) => { if (projectRowOpensOnKey(event.target, event.currentTarget, event.key)) void window.agentTerminal.openProject(project.id); }}>
