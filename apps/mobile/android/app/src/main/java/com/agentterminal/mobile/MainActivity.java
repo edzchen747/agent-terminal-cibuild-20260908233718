@@ -6,6 +6,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.webkit.RenderProcessGoneDetail;
+import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.util.Log;
 
@@ -24,6 +25,26 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(SystemMetricsPlugin.class);
         super.onCreate(savedInstanceState);
         getBridge().getWebView().setLongClickable(true);
+        // xterm's DOM renderer aligns glyphs to cells with
+        //   letter-spacing = cellWidth - glyphAdvance
+        // where cellWidth is measured on an OffscreenCanvas and glyphAdvance is
+        // a DOM offsetWidth. Blink's minimum font size floors DOM text layout
+        // but NOT canvas measureText, so at the 8px WebView default any smaller
+        // terminal font makes that subtraction negative and the glyphs collide -
+        // and stop shrinking, because the DOM side is pinned at 8px while the
+        // cells keep narrowing. Drop the floors so both sides of the
+        // subtraction agree all the way down to the app's own 4px clamp
+        // (MIN_ZOOM_FONT_SIZE in packages/protocol/src/terminal-layout.ts).
+        // setTextZoom(100) closes the same gap from the other side: the OS font
+        // scale multiplies DOM text and is likewise invisible to the canvas.
+        // It pins the whole WebView against the system font-size setting, which
+        // is deliberate - the app's chrome is laid out in fixed px throughout
+        // apps/mobile/src/styles.css, and a terminal whose cell metrics drift
+        // under text scaling is unusable.
+        WebSettings settings = getBridge().getWebView().getSettings();
+        settings.setMinimumFontSize(1);
+        settings.setMinimumLogicalFontSize(1);
+        settings.setTextZoom(100);
         rendererListener = new WebViewListener() {
             @Override
             public boolean onRenderProcessGone(WebView webView, RenderProcessGoneDetail detail) {

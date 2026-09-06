@@ -69,8 +69,19 @@ export function gridForContent(content: Size, cell: Size | null): Grid | null {
 // (which follows the owning client verbatim), which would zoom in further -
 // a ratchet that collapses the session to a couple of columns.
 const ZOOM_TOLERANCE_PX = 0.05;
-const MIN_ZOOM_FONT_SIZE = 4;
-const MAX_ZOOM_FONT_SIZE = 400;
+/**
+ * The sanity band every path that sets xterm's font size clamps into - the
+ * fill pass below and the desktop zoom ladder (terminalZoomFontSize) alike.
+ * Exported so there is one band rather than two that can drift apart.
+ *
+ * The floor is not cosmetic. xterm's DOM renderer derives its letter-spacing
+ * from a canvas-measured cell width minus a DOM-measured glyph advance, and a
+ * browser's minimum-font-size setting floors the DOM side only; drive the font
+ * far enough below what the engine will actually lay out and the two
+ * measurements diverge until the spacing goes negative and glyphs overlap.
+ */
+export const MIN_ZOOM_FONT_SIZE = 4;
+export const MAX_ZOOM_FONT_SIZE = 400;
 
 /**
  * The next font size for `grid` to fill `content` while keeping its cell

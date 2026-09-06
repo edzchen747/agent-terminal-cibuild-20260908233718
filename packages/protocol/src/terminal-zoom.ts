@@ -19,7 +19,7 @@
  * roughly the same visible jump.
  */
 
-import type { Size } from "./terminal-layout.js";
+import { MAX_ZOOM_FONT_SIZE, MIN_ZOOM_FONT_SIZE, type Size } from "./terminal-layout.js";
 
 /** The zoom the desktop's fixed baseline cell size represents. */
 export const BASELINE_TERMINAL_ZOOM = 100 as const;
@@ -82,10 +82,17 @@ export function steppedTerminalZoom(percent: number, direction: number): number 
  * extrapolated cell is wrong by a fraction that changes from stop to stop -
  * which is felt as the cell (and the letterbox around it) changing shape as
  * you zoom.
+ *
+ * Clamped into the same [MIN_ZOOM_FONT_SIZE, MAX_ZOOM_FONT_SIZE] band the fill
+ * pass uses: the bottom stops of the ladder are small enough to land under a
+ * browser's own minimum font size, where the DOM renderer's glyphs stop
+ * shrinking but its cells do not and the text collapses into an overlapping
+ * smear. A stop that hits the floor simply stops getting smaller.
  */
 export function terminalZoomFontSize(baseFontSize: number, percent: number): number {
   if (!(Number.isFinite(baseFontSize) && baseFontSize > 0)) return 0;
-  return Math.round(baseFontSize * nearestTerminalZoom(percent)) / 100;
+  const size = Math.round(baseFontSize * nearestTerminalZoom(percent)) / 100;
+  return Math.min(MAX_ZOOM_FONT_SIZE, Math.max(MIN_ZOOM_FONT_SIZE, size));
 }
 
 /**

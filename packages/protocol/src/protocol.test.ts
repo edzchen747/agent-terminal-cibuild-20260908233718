@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, BASELINE_TERMINAL_ZOOM, MAX_TERMINAL_ZOOM, MIN_TERMINAL_ZOOM, TERMINAL_ZOOM_STEPS, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, terminalZoomFontSize, type ClientMessage, type HostSnapshot } from "./index.js";
+import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, MAX_ZOOM_FONT_SIZE, MIN_ZOOM_FONT_SIZE, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, BASELINE_TERMINAL_ZOOM, MAX_TERMINAL_ZOOM, MIN_TERMINAL_ZOOM, TERMINAL_ZOOM_STEPS, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, terminalZoomFontSize, type ClientMessage, type HostSnapshot } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -961,7 +961,11 @@ test("a zoom stop paints at its own share of the baseline font size", () => {
   assert.equal(terminalZoomFontSize(14, 100), 14);
   assert.equal(terminalZoomFontSize(14, 200), 28);
   assert.equal(terminalZoomFontSize(14, 50), 7);
-  assert.equal(terminalZoomFontSize(14, 25), 3.5);
+  // The bottom of the ladder is clamped into the shared font band rather
+  // than emitting the raw 3.5px, which is under what a browser will lay DOM
+  // text out at and so paints as overlapping glyphs.
+  assert.equal(terminalZoomFontSize(14, 25), MIN_ZOOM_FONT_SIZE);
+  assert.equal(terminalZoomFontSize(4000, 200), MAX_ZOOM_FONT_SIZE);
   // Off-ladder and unusable inputs settle the same way the ladder does.
   assert.equal(terminalZoomFontSize(14, 103), 14);
   assert.equal(terminalZoomFontSize(0, 150), 0);
@@ -1061,6 +1065,57 @@ test("a non-finite or negative baseline font size yields no font size at all", (
   assert.equal(terminalZoomFontSize(Number.NEGATIVE_INFINITY, 100), 0);
   assert.equal(terminalZoomFontSize(-14, 100), 0);
   assert.equal(terminalZoomFontSize(0, 100), 0);
+});
+
+test("no zoom stop, at any baseline, can leave the band the renderer needs", () => {
+  // The floor is what stops the DOM renderer's letter-spacing (a canvas cell
+  // width minus a DOM glyph advance) going negative when a browser's own
+  // minimum font size floors the DOM side and not the canvas one. A stop that
+  // would land under it must clamp, never escape.
+  for (const baseFontSize of [4, 6, 8, 12, 14, 16, 20, 96, 1_000]) {
+    for (const step of TERMINAL_ZOOM_STEPS) {
+      const fontSize = terminalZoomFontSize(baseFontSize, step);
+      const where = `${baseFontSize}px at ${step}%`;
+      assert.ok(fontSize >= MIN_ZOOM_FONT_SIZE, `${where}: ${fontSize} is under the floor`);
+      assert.ok(fontSize <= MAX_ZOOM_FONT_SIZE, `${where}: ${fontSize} is over the ceiling`);
+    }
+  }
+});
+
+test("clamping the ladder never turns an unusable baseline into a usable font size", () => {
+  // 0 is the "no font size at all" sentinel, and it sits below the floor -
+  // so the clamp must run only on a size that was computed, never on the
+  // refusal, or an unmeasured pane would silently paint at 4px.
+  for (const baseFontSize of [0, -14, Number.NaN, Number.POSITIVE_INFINITY]) {
+    for (const step of TERMINAL_ZOOM_STEPS) assert.equal(terminalZoomFontSize(baseFontSize, step), 0);
+  }
+});
+
+test("a baseline small enough to clamp collapses the bottom stops rather than inverting them", () => {
+  // With a small baseline several stops share the floor. Distinctness is the
+  // casualty (the ladder simply stops getting smaller); the ordering is not,
+  // and no stop may ever be smaller than a lower one.
+  const sizes = TERMINAL_ZOOM_STEPS.map((step) => terminalZoomFontSize(6, step));
+  assert.equal(sizes[0], MIN_ZOOM_FONT_SIZE);
+  assert.ok(sizes.filter((size) => size === MIN_ZOOM_FONT_SIZE).length > 1, "the floor is never reused");
+  for (let i = 1; i < sizes.length; i += 1) assert.ok(sizes[i]! >= sizes[i - 1]!, `stop ${i} goes backwards`);
+});
+
+test("the fill pass and the zoom ladder clamp into one and the same band", () => {
+  // Both paths write xterm's fontSize, so a size the ladder refuses to emit
+  // must be one the fill pass refuses to emit too.
+  const cell = { width: 10, height: 20 };
+  assert.equal(zoomedFontSize(14, { cols: 100, rows: 100 }, cell, { width: 1, height: 1 }), MIN_ZOOM_FONT_SIZE);
+  assert.equal(zoomedFontSize(14, { cols: 1, rows: 1 }, cell, { width: 100_000, height: 100_000 }), MAX_ZOOM_FONT_SIZE);
+  assert.equal(terminalZoomFontSize(MIN_ZOOM_FONT_SIZE, MIN_TERMINAL_ZOOM), MIN_ZOOM_FONT_SIZE);
+});
+
+test("a grid too large to fit even at the floor is floored, not refused", () => {
+  // The pane clips the overflow (`.mobile-terminal { overflow: hidden }`);
+  // what matters is that it paints at a legible 4px rather than at a size no
+  // engine will lay out, or than declining to shrink at all.
+  const floored = zoomedFontSize(12, { cols: 400, rows: 200 }, { width: 7, height: 14 }, { width: 390, height: 720 });
+  assert.equal(floored, MIN_ZOOM_FONT_SIZE);
 });
 
 test("extrapolation refuses every unusable font size rather than inventing a cell", () => {
