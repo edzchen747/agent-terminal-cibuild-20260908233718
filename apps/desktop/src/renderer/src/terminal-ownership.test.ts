@@ -52,7 +52,27 @@ test("a pointerdown claims only when it lands inside this pane", () => {
     "the claiming pointerdown handler must be scoped to this pane's own host element");
 });
 
-test("an unclaimed attach is a pure stream subscription, gated on visibility as well as being active", () => {
-  assert.ok(terminalPaneSource.includes("window.agentTerminal.attachSession(sessionId, dims.cols, dims.rows, visibleRef.current && activeRef.current)"),
-    "the initial attach must not claim for a pane that is active but not (yet) visible");
+test("an attach claims only a measured viewport, gated on visibility as well as being active", () => {
+  // Claiming xterm's unfitted default grid (what terminal.cols/rows still
+  // are before the first paint) would resize the shared PTY to a size the
+  // pane never displayed. An unmeasured attach is a pure stream
+  // subscription; finishAttachment claims with the real post-replay size.
+  assert.ok(terminalPaneSource.includes("const claim = proposed !== null && visibleRef.current && activeRef.current;"),
+    "the initial attach must not claim for a pane that is active but not (yet) visible, and must not claim an unmeasured viewport");
+  assert.ok(terminalPaneSource.includes("window.agentTerminal.attachSession(sessionId, dims.cols, dims.rows, claim)"),
+    "the attach's claim flag must be the measured-and-visible-and-active gate, not a raw visibility check");
+});
+
+test("finishAttachment re-measures and claims for the active tab after the replay", () => {
+  // A fresh active mount's attach claim (if any) predates the first paint.
+  // Once the replay has painted, the pane's real size exists and opening
+  // the tab is an interaction: claim it then. A same-size claim is a no-op
+  // at the host (apply_session_grid skips an unchanged grid), so a
+  // well-measured attach costs nothing.
+  const finish = terminalPaneSource.slice(
+    terminalPaneSource.indexOf("const finishAttachment = () => {"),
+    terminalPaneSource.indexOf("const replayPending = () => {")
+  );
+  assert.ok(finish.includes("resizeRef.current(activeRef.current);"),
+    "the post-replay resync must claim when this pane is the active tab");
 });

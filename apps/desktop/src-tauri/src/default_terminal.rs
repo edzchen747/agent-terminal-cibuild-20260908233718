@@ -1695,9 +1695,6 @@ mod win {
     // ------------------------------------------------------------------
 
     struct HandoffMasterInner {
-        /// Packed ConPTY control handle; resized in place, owned (and
-        /// released) by the session's killer.
-        hpc: HANDLE,
         /// Our duplex pipe end, readable side.
         readable: FileDescriptor,
         /// Our duplex pipe end, writable side (taken by the session layer).
@@ -1796,7 +1793,6 @@ mod win {
             .ok();
         HandoffMasterPty {
             inner: Arc::new(Mutex::new(HandoffMasterInner {
-                hpc,
                 readable: FileDescriptor::new(unsafe {
                     StdOwnedHandle::from_raw_handle(reader as *mut std::ffi::c_void)
                 }),

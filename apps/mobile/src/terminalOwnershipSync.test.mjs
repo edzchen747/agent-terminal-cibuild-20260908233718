@@ -7,7 +7,9 @@ import { fileURLToPath } from "node:url";
 const SRC_DIR = dirname(fileURLToPath(import.meta.url));
 
 function source(name) {
-  return readFileSync(join(SRC_DIR, name), "utf8");
+  // The working tree may be checked out with CRLF terminators while these
+  // source-grep assertions use "\n"; normalize so they hold under either.
+  return readFileSync(join(SRC_DIR, name), "utf8").replace(/\r\n/g, "\n");
 }
 
 const terminal = source("MobileTerminal.tsx");
@@ -79,4 +81,52 @@ test("every input path carries the sender's viewport, so typing always claims", 
   const sendInput = terminal.slice(terminal.indexOf("const sendInput = (data: string) => {"), terminal.indexOf("const flushPendingInput = "));
   assert.ok(sendInput.includes("cols: dims?.cols, rows: dims?.rows"),
     "the native IME input path must keep forwarding cols/rows on session.input");
+});
+
+test("the baseline cell exists even when the baseline font never paints", () => {
+  // captureBaseCell used to record a cell only while the emulator painted
+  // at TERMINAL_FONT_SIZE - which only happens before the first host grid
+  // lands. Once the fill pass moves the font, baseCell stayed null forever
+  // (or the terminal simply never painted at the baseline), announcedGrid()
+  // returned null, and every claiming resize silently no-opped: opening
+  // the terminal on the phone resized the PTY only when a desktop tab
+  // happened to hold the grid. When the live font is not the baseline, the
+  // face must be probed at the baseline font instead (same mirror-span
+  // pattern calibrateAccessibilityMetrics uses).
+  const capture = terminal.slice(terminal.indexOf("const captureBaseCell = () => {"), terminal.indexOf("const proposeGrid = () => {"));
+  assert.ok(capture.includes("probe.className = \"xterm-char-measure-element\";"),
+    "a non-baseline font must be replaced by a probe of the face at TERMINAL_FONT_SIZE");
+  assert.ok(capture.includes("probe.style.fontSize = `${TERMINAL_FONT_SIZE}px`;"),
+    "the probe must measure at the baseline font, not at the live fill size");
+  assert.ok(capture.includes("const width = probe.offsetWidth / 32;"),
+    "the probe must report layout-space (pre-squish) - what cellSize() and the announcement both use");
+  assert.ok(capture.includes("baseCell = { width, height: TERMINAL_FONT_SIZE };"),
+    "the probed cell must become the announcement's baseline reference");
+  assert.ok(capture.includes("fontSize === TERMINAL_FONT_SIZE"),
+    "a direct capture at the baseline font must keep being taken (it is the most exact source)");
+});
+
+test("the attach claim only carries a measured viewport", () => {
+  // claim: true unconditionally would claim xterm's unfitted default
+  // (80x24 - what terminal.cols/rows still are before the first paint)
+  // for the phone, resizing the shared PTY to a size it never displayed.
+  // An unmeasured attach is a pure stream subscription; the post-replay
+  // claiming resize takes the grid over with a real measurement.
+  assert.ok(terminal.includes("const announced = announcedGrid();"),
+    "the attach must check whether the viewport was actually measured");
+  assert.ok(terminal.includes("claim: announced !== null"),
+    "only a measured viewport may be claimed on attach");
+});
+
+test("finishAttachment re-measures and claims after the replay, so a fresh open always lands the phone's grid", () => {
+  // The attach's claim (when it had one) measured mid-transition, and the
+  // [active] effect's rAF claim usually fires before the attach reply has
+  // even arrived. Once the replay has painted the host grid and the fill
+  // pass settled, the real post-replay measurement exists: opening the
+  // view is an interaction, so claim it then. A same-size claim is a no-op
+  // at the host (apply_session_grid skips an unchanged grid), so a
+  // well-measured attach costs nothing.
+  const finish = terminal.slice(terminal.indexOf("const finishAttachment = () => {"), terminal.indexOf("const replayPendingOutput = () => {"));
+  assert.ok(finish.includes("if (activeRef.current) resize(true);"),
+    "a fresh open (or reconnect) must claim with the post-replay measurement");
 });

@@ -119,8 +119,8 @@ test("interactions claim the pty grid so the phone can actually get the columns 
 
   assert.ok(terminal.includes("connection.send({ type: \"session.resize\", sessionId: session.id, cols: dims.cols, rows: dims.rows, claim });"),
     "a forced (interaction-driven) announce claims; a layout announce does not");
-  assert.ok(terminal.includes("claim: true"),
-    "attaching - the user explicitly opening this terminal - claims the grid");
+  assert.ok(terminal.includes("claim: announced !== null"),
+    "attaching - the user explicitly opening this terminal - claims the grid (with a measured viewport; an unmeasured attach defers the claim to the post-replay resize)");
   assert.ok(terminal.includes("if (activeRef.current) resizeRef.current(true);"),
     "a character-width change is an interaction with this terminal, so it claims too");
 });

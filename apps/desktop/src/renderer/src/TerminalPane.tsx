@@ -527,8 +527,13 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       setReplaying(false);
       // The replay's announce gate has lifted: resync the container grid in
       // case it changed while the replay ran (its ResizeObserver fired but
-      // announceViewport was suppressed).
-      resizeRef.current();
+      // announceViewport was suppressed). Opening the active tab is an
+      // interaction, so the active pane claims here: its attach claim
+      // predated the first paint (or was absent), and this is the pane's
+      // real post-replay size. A same-size claim is a no-op at the host
+      // (no second PTY resize, no extra reflow), so a well-measured
+      // attach costs nothing.
+      resizeRef.current(activeRef.current);
     };
     const replayPending = () => {
       if (disposed) return;
@@ -544,7 +549,8 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
     // pane's size is at least the PTY's, so the segments replay 1:1 with no
     // re-wrapping at the pane's own grid.
     initialAttachPromise = (async () => {
-      const dims = proposeGrid() ?? { cols: terminal.cols, rows: terminal.rows };
+      const proposed = proposeGrid();
+      const dims = proposed ?? { cols: terminal.cols, rows: terminal.rows };
       viewportCols = dims.cols;
       viewportRows = dims.rows;
       // Reset the merge before the request goes out, never after the reply:
@@ -559,14 +565,20 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       // back when the drain completes.
       terminal.blur();
       setReplaying(true);
-      dbg(`attach send session=${sessionId} viewport=${dims.cols}x${dims.rows}`);
-      // Claim the grid only when this pane was the active tab at mount: a
-      // background or hidden tab must not steal it from the client that is
-      // actually in use (an unclaimed attach is a pure stream subscription
-      // - see attach_owner_grid_for). `visibleRef` is defensive: `active`
-      // is only ever true while `visible` is (App.tsx), but the claim
-      // itself must never outrun that invariant.
-      const snapshot = await window.agentTerminal.attachSession(sessionId, dims.cols, dims.rows, visibleRef.current && activeRef.current);
+      dbg(`attach send session=${sessionId} viewport=${dims.cols}x${dims.rows}${proposed ? "" : " (unmeasured - claiming deferred to finishAttachment)"}`);
+      // Claim the grid only for a pane that (a) was the active tab at
+      // mount - a background or hidden tab must not steal it from the
+      // client that is actually in use (an unclaimed attach is a pure
+      // stream subscription - see attach_owner_grid_for); `visibleRef`
+      // is defensive: `active` is only ever true while `visible` is
+      // (App.tsx), but the claim itself must never outrun that invariant
+      // - AND (b) with a MEASURED viewport. Before the first paint,
+      // proposeGrid is null and `dims` is xterm's own unfitted grid,
+      // not this pane's size: claiming it would resize the shared PTY to
+      // a grid the pane never displayed. finishAttachment then claims
+      // with the pane's real post-replay size.
+      const claim = proposed !== null && visibleRef.current && activeRef.current;
+      const snapshot = await window.agentTerminal.attachSession(sessionId, dims.cols, dims.rows, claim);
       if (disposed) {
         window.agentTerminal.detachSession(sessionId);
         return;

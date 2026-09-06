@@ -338,10 +338,63 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     // zoom or a relaxed squish would shrink the grid, which would call for
     // more of both - a ratchet that collapses the session.
     let baseCell: Size | null = null;
+    // A baseline cell is the face's glyph metrics at TERMINAL_FONT_SIZE -
+    // it never moves with the fill pass, which is what lets the announced
+    // viewport stay this phone's measurement no matter what font the fill
+    // just picked. Two ways to get one:
+    //
+    // (a) Direct - the emulator is actually painting at TERMINAL_FONT_SIZE
+    //     (only true before the first host grid lands, or when the host
+    //     grid happens to fill at the baseline font): xterm's own layout
+    //     is the reference.
+    //
+    // (b) Probed - the emulator is painting at some other fill size (the
+    //     usual state after a grid lands). A cell measured at that size is
+    //     not the baseline cell, and a naive "scale it back" extrapolation
+    //     drifts badly when the fill font is far from the baseline (a wide
+    //     desktop grid clamps the fill to MIN_ZOOM_FONT_SIZE, where the
+    //     advance-per-font-size is not 1:1 with the baseline face). Probe
+    //     the face at the baseline font instead, the same way
+    //     calibrateAccessibilityMetrics mirrors a span: layout-space
+    //     (offsetWidth, pre-squish - what cellSize() also reports) and
+    //     trustworthy, because the WebView has no minimum-font floor
+    //     (MainActivity sets setMinimumFontSize(1) + setTextZoom(100)).
+    //
+    // Without either, the announced viewport degrades to the grid the host
+    // currently hands out (a desktop's) or to nothing, and the claiming
+    // resizes that carry it silently no-op - which is exactly the
+    // "opening on the phone only resizes the PTY when a desktop tab is
+    // open" failure: the claim never carried this phone's dimensions.
     const captureBaseCell = () => {
-      if (terminal.options.fontSize !== TERMINAL_FONT_SIZE) return;
-      const measured = cellSize();
-      if (measured) baseCell = measured;
+      const fontSize = terminal.options.fontSize ?? TERMINAL_FONT_SIZE;
+      if (fontSize === TERMINAL_FONT_SIZE) {
+        // Painting at the baseline: always (re)capture - it is the most
+        // exact source and replaces any probed value.
+        const measured = cellSize();
+        if (measured) baseCell = measured;
+        return;
+      }
+      if (baseCell) return;
+      const probe = document.createElement("span");
+      probe.className = "xterm-char-measure-element";
+      probe.style.fontFamily = TERMINAL_FONT_FAMILY;
+      probe.style.fontSize = `${TERMINAL_FONT_SIZE}px`;
+      probe.style.fontKerning = "none";
+      probe.style.whiteSpace = "pre";
+      probe.textContent = "W".repeat(32);
+      hostElement.appendChild(probe);
+      try {
+        // offsetWidth, like cellSize() above, is LAYOUT space (pre-squish):
+        // the host element's scaleX transform does not affect it, and the
+        // announcement is derived in exactly this coordinate space.
+        const width = probe.offsetWidth / 32;
+        if (!Number.isFinite(width) || width <= 0) return;
+        // lineHeight is 1, so the baseline row height is the font size
+        // itself (xterm's own measurement agrees within a pixel).
+        baseCell = { width, height: TERMINAL_FONT_SIZE };
+      } finally {
+        probe.remove();
+      }
     };
     const proposeGrid = () => {
       captureBaseCell();
@@ -897,6 +950,16 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       if (disposed) return;
       initialized = true;
       applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: false }));
+      // The replay has landed the host grid and the fill pass has
+      // settled, so a fresh measurement exists now (and the attach's own
+      // claim may have been unmeasured, or measured mid-transition). A
+      // fresh open is an interaction: re-measure and claim, so the PTY
+      // is resized to this phone's dimensions no matter which client
+      // held the grid before it - a desktop tab, a previous phone
+      // visit, or nobody. A same-size claim is a no-op at the host (no
+      // second PTY resize, no extra reflow), so a well-measured attach
+      // costs nothing.
+      if (activeRef.current) resize(true);
     };
     const replayPendingOutput = (index = 0) => {
       if (disposed) return;
@@ -943,8 +1006,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       replayingSessionBuffer = false;
       pendingOutput.length = 0;
       appliedUpTo = 0;
-      const attachDims = announcedGrid() ?? { cols: terminal.cols, rows: terminal.rows };
-      syncDebug(`attach send session=${session.id} cols=${attachDims.cols} rows=${attachDims.rows}`);
+      const announced = announcedGrid();
+      const attachDims = announced ?? { cols: terminal.cols, rows: terminal.rows };
+      syncDebug(`attach send session=${session.id} cols=${attachDims.cols} rows=${attachDims.rows}${announced ? "" : " (unmeasured - claiming deferred to the post-replay resize)"}`);
       connection.request({
         type: "session.attach",
         requestId: createRequestId(),
@@ -953,8 +1017,15 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
         rows: attachDims.rows,
         // The phone only attaches when the user actually opened this
         // terminal (the page is the active one), so opening it claims the
-        // PTY grid back from whichever client last held it.
-        claim: true
+        // PTY grid back from whichever client last held it - but only
+        // with a MEASURED viewport. When the measurement is not ready,
+        // attachDims is xterm's unfitted default (80x24, what
+        // terminal.cols/rows still are before the first paint), and
+        // claiming it would resize the shared PTY to a size this phone
+        // never displayed. An unclaimed attach is a pure stream
+        // subscription; finishAttachment then claims with the
+        // post-replay measurement.
+        claim: announced !== null
       }).then((message) => {
         attachmentPromise = undefined;
         if (disposed) return;
