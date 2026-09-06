@@ -1889,6 +1889,13 @@ impl Core {
         Ok(project)
     }
 
+    /// How many terminal tabs are open, including a tab kept for
+    /// inspection after its shell exited non-zero. The tray's session
+    /// label reports this number.
+    pub fn session_count(&self) -> usize {
+        open_session_count(&self.inner.lock().expect("desktop state poisoned"))
+    }
+
     pub fn create_session(
         self: &Arc<Self>,
         project_id: &str,
@@ -4196,6 +4203,13 @@ fn mark_session_exited(inner: &mut Inner, session_id: &str, exit_code: u32) -> b
     true
 }
 
+/// How many terminal tabs are open, including a tab kept for inspection
+/// after its shell exited non-zero: that tab stays until the user closes
+/// it, so it is part of the count the tray's session label reports.
+fn open_session_count(inner: &Inner) -> usize {
+    inner.sessions.len()
+}
+
 /// Picks the project a window should fall back to when its current project is
 /// being removed: the last focused project still in use, the most recently
 /// created running session's project, or the first public project. As a last
@@ -5075,7 +5089,7 @@ mod tests {
         apply_session_grid, ensure_home_project, evict_stale_viewports, folder_name,
         is_cursor_position_report, is_device_attributes_report, is_dropped_node_status,
         is_system_directory, is_within_project, log_escape,
-        newest_running_session_project_id, parse_terminal_titles,
+        newest_running_session_project_id, open_session_count, parse_terminal_titles,
         parse_working_directories, preferred_project, presence_alive, project_is_usable,
         project_for_directory, project_name_or_folder, record_cursor_position_requests,
         record_device_attribute_requests, reselect_owner_on_departure,
@@ -7853,6 +7867,33 @@ mod tests {
             vec!["s1".to_string()],
             "the tab order keeps only the surviving session"
         );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn open_session_count_tracks_tabs_through_exit_and_close() {
+        // The tray's session label reports this count, so its edge cases
+        // must hold: an empty tray reads zero, a tab kept for inspection
+        // after a non-zero exit still counts, and only a close removes it.
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "p", r"C:\Work\P", true);
+        assert_eq!(open_session_count(&inner), 0, "no tabs before a session opens");
+
+        inner.sessions.insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        inner.sessions.insert("s2".into(), test_session("s2", "p", r"C:\Work\P"));
+        assert_eq!(open_session_count(&inner), 2, "every open tab counts");
+
+        // A non-zero exit marks the tab exited but keeps it open for
+        // inspection, so the count must not drop.
+        assert!(mark_session_exited(&mut inner, "s1", 1));
+        assert_eq!(open_session_count(&inner), 2, "a kept-for-inspection tab still counts");
+
+        close_session_in_inner(&mut inner, "s2", true).expect("the close removes the session");
+        assert_eq!(open_session_count(&inner), 1, "closing a tab removes it from the count");
+
+        close_session_in_inner(&mut inner, "s1", false).expect("the close removes the session");
+        assert_eq!(open_session_count(&inner), 0, "closing the last tab empties the count");
 
         fs::remove_file(state_path).expect("remove test state");
     }

@@ -26,7 +26,7 @@ use models::{
 };
 use store::DesktopStore;
 use tauri::{
-    Manager, State, WebviewWindow,
+    Manager, State, WebviewWindow, Wry,
     image::Image,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -395,8 +395,18 @@ pub fn run() {
 }
 
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    // The label above Exit is a read-only status line, so it is built
+    // disabled: it renders but never fires a menu event.
+    let core = Arc::clone(app.state::<Arc<Core>>().inner());
+    let session_count = MenuItem::with_id(
+        app,
+        "session-count",
+        session_count_label(core.session_count()),
+        false,
+        None::<&str>,
+    )?;
     let exit = MenuItem::with_id(app, "exit", "Exit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&exit])?;
+    let menu = Menu::with_items(app, &[&session_count, &exit])?;
     // Reuse the icon embedded into the app binary (the same one the window
     // and taskbar show) so the tray always matches the desktop icon; the
     // procedural glyph only stands in if no icon was embedded.
@@ -425,7 +435,34 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
             }
         })
         .build(app)?;
+    spawn_tray_session_count_refresher(core, session_count);
     Ok(())
+}
+
+/// How often the tray's session label re-reads the live count. Half a second
+/// keeps it responsive to tabs opening and closing; the label is rewritten
+/// in place only when the count actually moved, so an idle host never hands
+/// work to the main thread between changes.
+const TRAY_SESSION_COUNT_TICK_MS: u64 = 500;
+
+fn spawn_tray_session_count_refresher(core: Arc<Core>, label: MenuItem<Wry>) {
+    let mut last = session_count_label(core.session_count());
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(TRAY_SESSION_COUNT_TICK_MS));
+        let text = session_count_label(core.session_count());
+        if text != last {
+            last = text.clone();
+            let _ = label.set_text(&text);
+        }
+    });
+}
+
+fn session_count_label(count: usize) -> String {
+    match count {
+        0 => "No open sessions".to_string(),
+        1 => "1 open session".to_string(),
+        count => format!("{count} open sessions"),
+    }
 }
 
 // WebView2 can deadlock when a second webview is constructed directly inside a
@@ -479,4 +516,25 @@ fn set_pixel(rgba: &mut [u8], width: u32, x: u32, y: u32, color: [u8; 4]) {
 
 fn error_string(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_count_label;
+
+    #[test]
+    fn label_reports_zero_as_no_open_sessions() {
+        assert_eq!(session_count_label(0), "No open sessions");
+    }
+
+    #[test]
+    fn label_uses_the_singular_form_for_one_session() {
+        assert_eq!(session_count_label(1), "1 open session");
+    }
+
+    #[test]
+    fn label_uses_the_plural_form_from_two_sessions_up() {
+        assert_eq!(session_count_label(2), "2 open sessions");
+        assert_eq!(session_count_label(42), "42 open sessions");
+    }
 }
