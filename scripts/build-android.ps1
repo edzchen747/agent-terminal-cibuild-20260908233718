@@ -92,6 +92,19 @@ if (Get-Command go.exe -ErrorAction SilentlyContinue) {
     Write-Host "Go not found - reusing the existing libembedded-node.so (if present)."
 }
 
+# The .so is gitignored, so a fresh checkout (or a machine without Go) can
+# silently produce an APK without the embedded node. That build still works
+# over LAN, but every phone's remote registration then fails with "Remote
+# connection registration failed. LAN access is still available." - warn
+# here instead of discovering it on the phone after installing the APK.
+$EmbeddedNodeLib = Join-Path $AndroidDir "app\src\main\jniLibs\arm64-v8a\libembedded-node.so"
+$EmbeddedNodeMissing = -not (Test-Path $EmbeddedNodeLib)
+if ($EmbeddedNodeMissing) {
+    Write-Warning "libembedded-node.so is missing (app\src\main\jniLibs\arm64-v8a)."
+    Write-Warning "This APK will be built without the process-isolated tsnet node: the LAN connection keeps working, but remote (off-LAN) registration on the phone will fail."
+    Write-Warning "Install Go 1.24+ and run scripts\build-embedded-node-android.ps1, or restore the .so from a previous build or a CI APK, then rebuild."
+}
+
 # ------------------------------------------------------- Web layer -----
 Write-Host "Building web layer and syncing Capacitor..."
 & npm.cmd "run" "android:sync" --prefix $MobileDir
@@ -146,6 +159,9 @@ if ($Debug) {
 Write-Host ""
 if (Test-Path $Apk) {
     Write-Host "APK ready: $Apk"
+    if ($EmbeddedNodeMissing) {
+        Write-Host "WARNING: built without libembedded-node.so - the phone will stay LAN-only until this APK is rebuilt with the embedded node."
+    }
     Write-Host "Install with: adb install -r `"$Apk`""
 } else {
     Write-Warning "APK not found at the expected path: $Apk"
