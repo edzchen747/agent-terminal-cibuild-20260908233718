@@ -12,6 +12,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[target.'cfg(windows)'.dependencies]
+filedescriptor = "0.8"
+winapi = { version = "0.3", features = ["combaseapi", "fileapi", "guiddef", "handleapi", "heapapi", "minwinbase", "namedpipeapi", "processthreadsapi", "synchapi", "winbase", "wincon", "winnt"] }
+winreg = "0.52"
+
 [dependencies]
 anyhow = "1"
 arboard = "3"

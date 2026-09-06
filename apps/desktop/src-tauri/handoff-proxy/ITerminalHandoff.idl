@@ -1,0 +1,86 @@
+// MIDL definition for the Windows default-terminal handoff interfaces.
+//
+// This is the same interface set the console host (conhost) uses to hand a
+// console session's ConPTY over to the registered default terminal. The
+// proxy/stub DLL built from this IDL is what COM loads (registered under
+// HKCU\Interface\{...}\ProxyStub by Agent Terminal's "set as default"
+// flow) to marshal the system handle parameters across the process
+// boundary. Without a registered proxy/stub for these IIDs, COM's
+// generic proxy cannot duplicate the HANDLE parameters, and the handoff
+// fails (the console then keeps its built-in UI).
+//
+// The interface layout, IIDs, and `system_handle` attributes match the
+// console host's expectations exactly; the shapes mirror the IDL the
+// Windows Terminal project ships for its own OpenConsoleProxy.dll
+// (terminal/terminal, MIT licensed, Copyright (c) Microsoft Corporation).
+
+import "unknwn.idl";
+
+typedef struct _TERMINAL_STARTUP_INFO
+{
+    // In STARTUPINFO
+    BSTR pszTitle;
+
+    // Also wanted
+    BSTR pszIconPath;
+    LONG iconIndex;
+
+    // The rest of STARTUPINFO
+    DWORD dwX;
+    DWORD dwY;
+    DWORD dwXSize;
+    DWORD dwYSize;
+    DWORD dwXCountChars;
+    DWORD dwYCountChars;
+    DWORD dwFillAttribute;
+    DWORD dwFlags;
+    WORD wShowWindow;
+} TERMINAL_STARTUP_INFO;
+
+// The original handoff shape. Kept (and its proxy kept in the DLL) because
+// the proxy is process-lifetime shared: old console hosts may still ask
+// for the first version.
+[
+    object,
+    uuid(59D55CCE-FC8A-48B4-ACE8-0A9286C6557F)
+] interface ITerminalHandoff : IUnknown
+{
+    HRESULT EstablishPtyHandoff([in, system_handle(sh_pipe)] HANDLE in,
+                                [in, system_handle(sh_pipe)] HANDLE out,
+                                [in, system_handle(sh_pipe)] HANDLE signal,
+                                [in, system_handle(sh_file)] HANDLE ref,
+                                [in, system_handle(sh_process)] HANDLE server,
+                                [in, system_handle(sh_process)] HANDLE client);
+};
+
+// Short-lived version that added startup information.
+[
+    object,
+    uuid(AA6B364F-4A50-4176-9002-0AE755E7B5EF)
+] interface ITerminalHandoff2 : IUnknown
+{
+    HRESULT EstablishPtyHandoff([in, system_handle(sh_pipe)] HANDLE in,
+                                [in, system_handle(sh_pipe)] HANDLE out,
+                                [in, system_handle(sh_pipe)] HANDLE signal,
+                                [in, system_handle(sh_file)] HANDLE ref,
+                                [in, system_handle(sh_process)] HANDLE server,
+                                [in, system_handle(sh_process)] HANDLE client,
+                                [in] TERMINAL_STARTUP_INFO startupInfo);
+};
+
+// The current shape: the terminal creates its own pipe and returns its
+// client ends; the other handles are the ConPTY pieces the console side
+// created.
+[
+    object,
+    uuid(6F23DA90-15C5-4203-9DB0-64E73F1B1B00)
+] interface ITerminalHandoff3 : IUnknown
+{
+    HRESULT EstablishPtyHandoff([out, system_handle(sh_pipe)] HANDLE* in,
+                                [out, system_handle(sh_pipe)] HANDLE* out,
+                                [in, system_handle(sh_pipe)] HANDLE signal,
+                                [in, system_handle(sh_file)] HANDLE reference,
+                                [in, system_handle(sh_process)] HANDLE server,
+                                [in, system_handle(sh_process)] HANDLE client,
+                                [in] const TERMINAL_STARTUP_INFO* startupInfo);
+};

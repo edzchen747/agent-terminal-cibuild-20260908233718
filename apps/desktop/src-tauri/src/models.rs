@@ -165,6 +165,8 @@ pub struct DesktopState {
     pub confirm_external_links: bool,
     pub follow_working_directory: bool,
     pub remote_registration: RemoteRegistration,
+    /// Whether this app is registered as the user's default terminal app.
+    pub is_default_terminal: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -204,6 +206,15 @@ pub struct TerminalDataEvent {
     pub data: String,
     /// Absolute byte offset of `data` in the session's PTY stream.
     pub offset: u64,
+}
+
+/// Windows handed us a console: the window owning `project_id` should open
+/// that project and bring `session_id` to the front.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FocusSessionEvent {
+    pub project_id: String,
+    pub session_id: String,
 }
 
 /// The focus-dependent grid of a session changed at stream offset `offset`.
