@@ -5,6 +5,7 @@ import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSe
 import type { DesktopState } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { projectPersistenceAction, projectRowOpensOnKey } from "./persistence";
+import { projectDragTransform, reorderBlock, shouldCommitProjectReorder } from "./project-drag";
 import { pruneRememberedActiveSessions, rememberProjectActiveSession, resolveProjectActiveSession } from "./active-tab";
 import { shellSwitchSessionOrder, shellSwitchSplitGroups } from "./shell-switch";
 import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
@@ -64,6 +65,7 @@ export function App() {
   const [tabDrag, setTabDrag] = useState<TabDragState | null>(null);
   const [closingSessionIds, setClosingSessionIds] = useState<Set<string>>(() => new Set());
   const [projectDrag, setProjectDrag] = useState<ProjectDragState | null>(null);
+  const [projectReordering, setProjectReordering] = useState(false);
   const [splitGroups, setSplitGroups] = useState<SplitGroup[]>(() => loadSplitPreferences().groups);
   const [allowSplitEdgeDrop, setAllowSplitEdgeDrop] = useState(() => loadSplitPreferences().allowEdgeDrop);
   const [splitMenu, setSplitMenu] = useState<SplitMenu | null>(null);
@@ -638,30 +640,23 @@ export function App() {
   function finishProjectDrag(event: ReactPointerEvent<HTMLElement>, commit: boolean) {
     const current = projectDragRef.current;
     if (!current || current.pointerId !== event.pointerId || !state) return;
-    if (commit && current.didMove && current.targetIndex !== current.startIndex) {
-      const projects = [...state.projects];
-      projects.splice(current.targetIndex, 0, ...projects.splice(current.startIndex, 1));
+    if (shouldCommitProjectReorder({ commit, didMove: current.didMove, startIndex: current.startIndex, targetIndex: current.targetIndex })) {
+      const projects = reorderBlock(state.projects, current.startIndex, current.targetIndex);
       const previous = state;
+      setProjectReordering(true);
       setState({ ...state, projects });
       void window.agentTerminal.reorderProjects(projects.map((project) => project.id)).catch(() => {
         setState(previous);
         void window.agentTerminal.getState().then(setState);
       });
+      // Let the reordered layout paint once with transitions disabled before
+      // restoring the normal sibling-shift animation for the next drag.
+      window.requestAnimationFrame(() => setProjectReordering(false));
     }
     projectDragRef.current = null;
     setProjectDrag(null);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
     event.stopPropagation();
-  }
-
-  function projectDragTransform(projectId: string, index: number): string | undefined {
-    if (!projectDrag) return undefined;
-    if (projectId === projectDrag.projectId) return `translate3d(0,${projectDrag.deltaY}px,0)`;
-    const gap = projectDrag.centers[Math.min(projectDrag.startIndex + 1, projectDrag.centers.length - 1)]! - projectDrag.centers[Math.max(0, projectDrag.startIndex - 1)]!;
-    const step = projectDrag.centers.length > 1 ? Math.abs(gap) / (projectDrag.startIndex > 0 && projectDrag.startIndex < projectDrag.centers.length - 1 ? 2 : 1) : 61;
-    if (projectDrag.startIndex < projectDrag.targetIndex && index > projectDrag.startIndex && index <= projectDrag.targetIndex) return `translate3d(0,-${step}px,0)`;
-    if (projectDrag.startIndex > projectDrag.targetIndex && index >= projectDrag.targetIndex && index < projectDrag.startIndex) return `translate3d(0,${step}px,0)`;
-    return undefined;
   }
 
   function beginSplitResize(event: ReactPointerEvent<HTMLDivElement>, groupId: string) {
@@ -786,7 +781,7 @@ export function App() {
             {state.projects.map((project, index) => {
               const count = state.sessions.filter((session) => session.projectId === project.id && session.status === "running").length;
               const action = projectPersistenceAction(project.persistent);
-              return <div key={project.id} ref={(element) => { if (element) projectElementsRef.current.set(project.id, element); else projectElementsRef.current.delete(project.id); }} role="button" tabIndex={0} className={`project-item ${project.id === state.currentProjectId ? "active" : ""} ${project.id === projectDrag?.projectId ? "is-dragging" : ""}`} style={{ transform: projectDragTransform(project.id, index) }} onClick={() => void window.agentTerminal.openProject(project.id)} onKeyDown={(event) => { if (projectRowOpensOnKey(event.target, event.currentTarget, event.key)) void window.agentTerminal.openProject(project.id); }}>
+              return <div key={project.id} ref={(element) => { if (element) projectElementsRef.current.set(project.id, element); else projectElementsRef.current.delete(project.id); }} role="button" tabIndex={0} className={`project-item ${project.id === state.currentProjectId ? "active" : ""} ${project.id === projectDrag?.projectId ? "is-dragging" : ""} ${projectReordering ? "is-reordering" : ""}`} style={{ transform: projectDragTransform(projectDrag, project.id, index) }} onClick={() => void window.agentTerminal.openProject(project.id)} onKeyDown={(event) => { if (projectRowOpensOnKey(event.target, event.currentTarget, event.key)) void window.agentTerminal.openProject(project.id); }}>
                 <span className="project-icon"><FolderIcon /></span>
                 <span className="project-copy"><strong className="display-name" title={project.name}>{project.name}</strong><small>{count ? `${count} active session${count === 1 ? "" : "s"}` : "No active sessions"}</small></span>
                 <span className="project-item-actions"><span className="project-drag-handle" role="button" aria-label={`Reorder ${project.name}`} title="Drag to reorder" onClick={(event) => event.stopPropagation()} onPointerDown={(event) => beginProjectDrag(event, project.id, index)} onPointerMove={moveProjectDrag} onPointerUp={(event) => finishProjectDrag(event, true)} onPointerCancel={(event) => finishProjectDrag(event, false)}>⠿</span><button className="persistence" onClick={(event) => { event.stopPropagation(); void toggleProjectPersistence(project.id); }} title={action.tooltip} aria-label={action.tooltip}>{project.persistent ? <BookmarkIcon /> : <ClockIcon />}</button><button className="project-rename" onClick={(event) => { event.stopPropagation(); startRename(project.id); }} title={`Rename ${project.name}`} aria-label={`Rename ${project.name}`}><EditIcon /></button></span>

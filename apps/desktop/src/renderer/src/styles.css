@@ -162,6 +162,7 @@ button { color: inherit; }
 .project-list { flex: 1; padding: 0 8px; overflow-y: auto; overflow-x: hidden; }
 .project-item { width: 100%; min-width: 0; height: 58px; margin-bottom: 3px; padding: 0 7px 0 10px; display: grid; grid-template-columns: 32px 1fr 66px; align-items: center; position: relative; text-align: left; border: 1px solid transparent; border-radius: 9px; background: transparent; cursor: pointer; transition: transform .14s cubic-bezier(.2,.8,.2,1), background .12s ease; }
 .project-item.is-dragging { z-index: 3; border-color: var(--accent-line-strong); background: var(--accent-tint-strong); box-shadow: 0 9px 24px var(--shadow-strong); transition: none; }
+.project-item.is-reordering { transition: none; }
 .project-item:hover { background: var(--surface-hover); }
 .project-item.active { background: var(--accent-tint); border-color: var(--accent-line); }
 .project-icon { width: 27px; height: 27px; display: grid; place-items: center; color: var(--text-muted); border-radius: 6px; background: var(--surface-raised); }
