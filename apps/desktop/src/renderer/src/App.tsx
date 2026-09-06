@@ -1,8 +1,8 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import QRCode from "qrcode";
 import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemesFor } from "@agentterminal/protocol";
-import type { DesktopState } from "../../shared/api";
+import type { DesktopState, FocusSessionEvent } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { projectPersistenceAction, projectRowOpensOnKey } from "./persistence";
 import { projectDragTransform, reorderBlock, shouldCommitProjectReorder } from "./project-drag";
@@ -54,6 +54,7 @@ export function App() {
   const [state, setState] = useState<DesktopState | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const currentProjectRef = useRef<string | null>(null);
   const [modal, setModal] = useState<Modal>(null);
   const [qr, setQr] = useState("");
   const [pairError, setPairError] = useState("");
@@ -75,6 +76,7 @@ export function App() {
   const [narrowLayout, setNarrowLayout] = useState(() => isNarrowLayout(window.innerWidth));
   const [themePreference, setThemePreference] = useState<ThemePreference>(loadThemePreference);
   const [systemPrefersDark, setSystemPrefersDark] = useState(() => window.matchMedia(SYSTEM_DARK_QUERY).matches);
+  const [defaultTerminalError, setDefaultTerminalError] = useState("");
   const tabDragRef = useRef<TabDragState | null>(null);
   const tabElementsRef = useRef(new Map<string, HTMLButtonElement>());
   const pendingTabPositionsRef = useRef<Map<string, number> | null>(null);
@@ -92,6 +94,33 @@ export function App() {
     void window.agentTerminal.getState().then(setState);
     return window.agentTerminal.onState(setState);
   }, []);
+
+  // A console handed to us by Windows opens as a tab like any other, but the
+  // user launched it and expects to be looking at it. Switching project is
+  // driven from here, through the same command the sidebar uses — the host
+  // cannot do it itself without deadlocking against its own state lock.
+  const showHandoffSession = useCallback(async ({ projectId, sessionId }: FocusSessionEvent) => {
+    // Switch first, then select: the tab only exists in this window once its
+    // project is the one on screen.
+    if (currentProjectRef.current !== projectId) {
+      await window.agentTerminal.openProject(projectId);
+    }
+    setActiveSessionId(sessionId);
+  }, []);
+
+  useEffect(() => window.agentTerminal.onFocusSession((event) => {
+    void showHandoffSession(event);
+  }), [showHandoffSession]);
+
+  // A console that started the app finishes its handoff long before this
+  // webview exists, so its focus event goes nowhere. Claim it on mount
+  // instead - the host holds it briefly for exactly this.
+  useEffect(() => {
+    void (async () => {
+      const pending = await window.agentTerminal.takeFocusSession();
+      if (pending) await showHandoffSession(pending);
+    })();
+  }, [showHandoffSession]);
 
   useEffect(() => window.agentTerminal.onPairingSucceeded(() => {
     setModal((current) => nextModalAfterPairing(current));
@@ -287,6 +316,7 @@ export function App() {
       rememberedByProject: remembered
     });
     if (next !== null) rememberProjectActiveSession(remembered, state.currentProjectId, next);
+    currentProjectRef.current = state.currentProjectId;
     if (next !== activeSessionId) setActiveSessionId(next);
   }, [state, projectSessions, activeSessionId]);
 
@@ -718,6 +748,22 @@ export function App() {
     setSplitGroups((current) => shellSwitchSplitGroups(current, outgoingId, replacement.id, outgoingRetained));
   }
 
+  // Registers the app as the user's default terminal app (Windows). The
+  // success path needs no local state: the host recomputes the snapshot and
+  // broadcasts it, and the settings row disappears with it.
+  async function applyDefaultTerminal() {
+    setDefaultTerminalError("");
+    try {
+      // Both directions are a couple of per-user registry writes, so there is
+      // no in-flight state worth showing: the label flips with the next
+      // broadcast.
+      if (state?.isDefaultTerminal) await window.agentTerminal.unsetDefaultTerminal();
+      else await window.agentTerminal.setDefaultTerminal();
+    } catch (cause) {
+      setDefaultTerminalError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
   async function toggleProjectPersistence(projectId: string) {
     const project = state?.projects.find((item) => item.id === projectId);
     if (!project) return;
@@ -912,6 +958,18 @@ export function App() {
         <button className="modal-close icon-button" onClick={() => setModal(null)}><CloseIcon /></button>
         <div className="modal-kicker"><SettingsIcon /> Settings</div>
         <h1>Desktop host</h1>
+        <div className="settings-group">
+          <div className="settings-row">
+            <span>
+              <strong>Set as default terminal app</strong>
+              <small>{state.isDefaultTerminal
+                ? "New Windows console sessions (cmd, PowerShell, etc.) open in Agent Terminal."
+                : "Route new Windows console sessions (cmd, PowerShell, etc.) into Agent Terminal."}</small>
+              {defaultTerminalError && <small className="form-error" role="alert">{defaultTerminalError}</small>}
+            </span>
+            <button type="button" className="primary" onClick={() => void applyDefaultTerminal()}>{state.isDefaultTerminal ? "Undo" : "Apply"}</button>
+          </div>
+        </div>
         <div className="settings-group">
           <div className="settings-row"><span><strong>Appearance</strong></span><div className="theme-choice" role="group" aria-label="Appearance">{THEME_PREFERENCES.map((preference) => <button key={preference} type="button" aria-pressed={themePreference === preference} onClick={() => setThemePreference(preference)}>{THEME_LABELS[preference]}</button>)}</div></div>
           <div className="settings-row"><span><strong>Terminal colors · Dark{resolvedTheme === "dark" && <i className="active-dot" title="Painting this window now" />}</strong></span><select value={terminalTheme.darkSchemeId} onChange={(event) => void window.agentTerminal.setTerminalTheme(event.target.value, terminalTheme.lightSchemeId)}>{terminalSchemesFor("dark").map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}</select></div>

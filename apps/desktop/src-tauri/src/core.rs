@@ -28,7 +28,8 @@ use uuid::Uuid;
 
 use crate::{
     models::{
-        AuthorizedDevice, ClientMessage, DesktopState, DirectoryEntry, DirectoryListing, HostInfo,
+        AuthorizedDevice, ClientMessage, DesktopState, DirectoryEntry, DirectoryListing,
+        FocusSessionEvent, HostInfo,
         HostSnapshot, PROTOCOL_VERSION, PairingPayload, Project, RemoteRegistration, ServerMessage,
         SessionSegment, SessionSnapshot, ShellProfile, TerminalDataEvent, TerminalGridEvent,
         TerminalSession, TerminalThemeSettings, TerminalTuiModeEvent, TuiMode,
@@ -54,8 +55,8 @@ use crate::{
 /// that grid at whatever size fits its own container (scaled to fill,
 /// never re-wrapped). Every change is journaled as a grid epoch (see
 /// `GridEpoch`), so a later replay replays the raw stream 1:1.
-const SESSION_DEFAULT_COLS: u16 = 120;
-const SESSION_DEFAULT_ROWS: u16 = 30;
+pub(crate) const SESSION_DEFAULT_COLS: u16 = 120;
+pub(crate) const SESSION_DEFAULT_ROWS: u16 = 30;
 /// The largest grid a client may size the PTY to.
 ///
 /// A bound, not a fit: it exists because a resize makes ConPTY redraw its
@@ -123,7 +124,7 @@ const VIEWPORT_WATCHDOG_TICK_MS: u64 = VIEWPORT_KEEPALIVE_INTERVAL_MS / 2;
 
 static SYNC_DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
 
-fn sync_debug_enabled() -> bool {
+pub(crate) fn sync_debug_enabled() -> bool {
     *SYNC_DEBUG_ENABLED.get_or_init(|| {
         std::env::var("AGENT_TERMINAL_SYNC_DEBUG")
             .is_ok_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "no" | "off"))
@@ -140,7 +141,7 @@ fn journal_dump_path(session_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!("agent-terminal-journal-{session_id}.log"))
 }
 
-fn sync_log_line(scope: &str, message: fmt::Arguments<'_>) {
+pub(crate) fn sync_log_line(scope: &str, message: fmt::Arguments<'_>) {
     let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
     let line = format!("{timestamp} [{scope}] {message}\n");
     let _ = fs::OpenOptions::new()
@@ -200,41 +201,144 @@ fn is_cursor_position_report(data: &str) -> bool {
     index > second_start && bytes.get(index) == Some(&b'R') && index + 1 == bytes.len()
 }
 
-fn record_cursor_position_requests(tail: &mut String, data: &str) -> usize {
-    const STANDARD: &[u8] = b"\x1b[6n";
-    const DEC_PRIVATE: &[u8] = b"\x1b[?6n";
+/// Whether `data` is a Device Attributes reply - `ESC [ ? ... c` (primary)
+/// or `ESC [ > ... c` (secondary), and nothing else.
+fn is_device_attributes_report(data: &str) -> bool {
     let bytes = data.as_bytes();
-    let crosses_boundary = |query: &[u8]| {
-        (1..query.len()).any(|split| {
+    if bytes.len() < 4 || bytes[0] != 0x1b || bytes[1] != b'[' {
+        return false;
+    }
+    let mut index = 2;
+    if bytes[index] == b'?' || bytes[index] == b'>' {
+        index += 1;
+    } else {
+        return false;
+    }
+    let start = index;
+    while bytes
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_digit() || *byte == b';')
+    {
+        index += 1;
+    }
+    index > start && bytes.get(index) == Some(&b'c') && index + 1 == bytes.len()
+}
+
+/// Counts the queries the shell issued in one output chunk, including a
+/// query split across the chunk boundary (`tail` carries the bytes needed to
+/// recognize the leading half).
+fn record_queries(tail: &mut String, data: &str, queries: &[&[u8]]) -> usize {
+    let bytes = data.as_bytes();
+    let mut found = 0;
+    for query in queries {
+        found += bytes
+            .windows(query.len())
+            .filter(|window| window == query)
+            .count();
+        found += usize::from((1..query.len()).any(|split| {
             tail.as_bytes().ends_with(&query[..split]) && bytes.starts_with(&query[split..])
-        })
-    };
-    let standard = bytes
-        .windows(4)
-        .filter(|window| *window == STANDARD)
-        .count();
-    let dec_private = bytes
-        .windows(5)
-        .filter(|window| *window == DEC_PRIVATE)
-        .count();
-    let boundary_count =
-        usize::from(crosses_boundary(STANDARD)) + usize::from(crosses_boundary(DEC_PRIVATE));
+        }));
+    }
+    let keep = queries.iter().map(|query| query.len()).max().unwrap_or(1) - 1;
     let combined = format!("{tail}{data}");
     *tail = combined
         .chars()
         .rev()
-        .take(4)
+        .take(keep)
         .collect::<String>()
         .chars()
         .rev()
         .collect();
-    standard + dec_private + boundary_count
+    found
+}
+
+fn record_cursor_position_requests(tail: &mut String, data: &str) -> usize {
+    record_queries(tail, data, &[b"\x1b[6n", b"\x1b[?6n"])
+}
+
+/// Device Attributes queries: primary (`ESC [ c`, `ESC [ 0 c`), secondary
+/// (`ESC [ > c`) and tertiary (`ESC [ = c`).
+fn record_device_attribute_requests(tail: &mut String, data: &str) -> usize {
+    record_queries(
+        tail,
+        data,
+        &[
+            b"\x1b[c",
+            b"\x1b[0c",
+            b"\x1b[>c",
+            b"\x1b[>0c",
+            b"\x1b[=c",
+            b"\x1b[=0c",
+        ],
+    )
+}
+
+/// PTY input, kept off the desktop lock and off the UI thread.
+///
+/// A write into a pseudoconsole can block for as long as the console
+/// declines to drain it - a handed-off console that has stopped reading its
+/// input pipe never completes one at all. This write used to run inline, on
+/// the main thread (`write_session` is a synchronous command), with the
+/// desktop lock held, so a single wedged console froze every window and
+/// every other session with it. Bytes now cross to a per-session thread
+/// that owns the blocking half, and the caller returns immediately.
+struct SessionWriter {
+    bytes: std::sync::mpsc::SyncSender<Vec<u8>>,
+}
+
+impl SessionWriter {
+    fn spawn(session_id: &str, mut writer: Box<dyn Write + Send>) -> Self {
+        // Bounded: input nobody is consuming must not grow a queue. The
+        // depth is a burst of paste-sized chunks, far more than a console
+        // that is reading at all will ever leave outstanding.
+        let (bytes, pending) = std::sync::mpsc::sync_channel::<Vec<u8>>(256);
+        let session_id = session_id.to_owned();
+        thread::Builder::new()
+            .name("agent-terminal-pty-writer".into())
+            .spawn(move || {
+                while let Ok(chunk) = pending.recv() {
+                    // Timed, because "the console stopped reading its input
+                    // pipe" is otherwise invisible from this side: the write
+                    // simply never returns.
+                    let started = Instant::now();
+                    let wrote = writer.write_all(&chunk).and_then(|()| writer.flush());
+                    let elapsed = started.elapsed();
+                    if elapsed > std::time::Duration::from_millis(500) {
+                        sync_log!(
+                            "input",
+                            "slow write session={session_id} bytes={} took_ms={}",
+                            chunk.len(),
+                            elapsed.as_millis()
+                        );
+                    }
+                    if wrote.is_err() {
+                        sync_log!("input", "writer ended session={session_id}");
+                        break;
+                    }
+                }
+            })
+            .ok();
+        Self { bytes }
+    }
+
+    /// Queues one write. Never blocks: a full queue means the console has
+    /// stopped reading, and dropping that session's input is strictly
+    /// better than stalling a caller that holds the desktop lock.
+    fn write(&self, session_id: &str, data: &str) {
+        if self.bytes.try_send(data.as_bytes().to_vec()).is_err() {
+            sync_log!(
+                "input",
+                "dropped session={session_id} bytes={} (console not reading)",
+                data.len()
+            );
+        }
+    }
 }
 
 struct ManagedSession {
     metadata: TerminalSession,
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: SessionWriter,
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// Current PTY grid (cols, rows): the current owner's announced
     /// viewport, verbatim (see `owner`).
@@ -286,6 +390,13 @@ struct ManagedSession {
     control_tail: String,
     cursor_query_tail: String,
     pending_cursor_reports: usize,
+    /// Outstanding Device Attributes queries, counted exactly like
+    /// `pending_cursor_reports`: a replayed journal carries the shell's
+    /// original `ESC [ c` with it, and the client answers it again on every
+    /// remount. Without this the stale reply reaches the shell as typed
+    /// input and lands at the prompt as `[?1;2c`.
+    device_attributes_tail: String,
+    pending_device_attributes: usize,
     has_run_command: bool,
 }
 
@@ -404,7 +515,58 @@ pub struct Core {
     /// keeps it updated so the badge can show "no internet" instead of a
     /// stale stored verdict while the machine has no network.
     network_online: AtomicBool,
+    /// The console handoff waiting to be brought to the front, claimed by
+    /// the renderer when it mounts. A cold start - Windows launching us
+    /// *because* a console was opened - has no window to emit to yet, and a
+    /// window that has just been created has not finished loading its
+    /// webview, so the event alone is lost exactly when it matters most.
+    pending_focus: Mutex<Option<PendingFocus>>,
 }
+
+/// Claims `pending` for the window `label`, if it holds a focus meant for
+/// that window and still inside its TTL. A claim clears the entry, so only
+/// one window ever acts on a handoff; so does finding it expired, rather
+/// than leaving a stale focus for the next window that happens to open.
+fn claim_pending_focus(
+    pending: &mut Option<PendingFocus>,
+    label: &str,
+) -> Option<FocusSessionEvent> {
+    let expired = pending
+        .as_ref()
+        .is_some_and(|focus| focus.at.elapsed() >= PENDING_FOCUS_TTL);
+    if expired {
+        *pending = None;
+        return None;
+    }
+    // A focus recorded before any window existed (a cold start) names no
+    // window, and the first one up takes it.
+    let claimable = pending
+        .as_ref()
+        .is_some_and(|focus| focus.label.as_deref().is_none_or(|target| target == label));
+    if !claimable {
+        return None;
+    }
+    pending.take().map(|focus| FocusSessionEvent {
+        project_id: focus.project_id,
+        session_id: focus.session_id,
+    })
+}
+
+/// A handoff session that should be shown as soon as a window can show it.
+struct PendingFocus {
+    /// The window the host picked, when one already existed; `None` on a
+    /// cold start, where whichever window comes up first takes it.
+    label: Option<String>,
+    project_id: String,
+    session_id: String,
+    at: Instant,
+}
+
+/// How long a pending focus stays claimable. Long enough to cover a cold
+/// start (process launch, window creation, webview load), short enough that
+/// a handoff nobody claimed cannot yank a much later window onto a stale
+/// tab.
+const PENDING_FOCUS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One in-flight network drop should not reset the registration: the monitor
 /// only acts on actual connectivity transitions.
@@ -475,6 +637,7 @@ impl Core {
             presence_cache: Mutex::new(None),
             viewing_cache: Mutex::new(None),
             network_online: AtomicBool::new(true),
+            pending_focus: Mutex::new(None),
         });
         core.spawn_presence_refresh();
         core.spawn_viewport_watchdog();
@@ -1062,6 +1225,7 @@ impl Core {
                 status: remote_status,
                 error: network.registration_error.clone(),
             },
+            is_default_terminal: crate::default_terminal::is_default_terminal(),
         }
     }
 
@@ -1321,6 +1485,54 @@ impl Core {
         };
         window.show()?;
         Ok(())
+    }
+
+    /// Puts the project's window on screen for a handed-off console.
+    ///
+    /// Deliberately narrower than `ensure_project_window_with_focus`: that
+    /// one honours single-window mode by reassigning whichever window was
+    /// last used, which destroys the window it displaces. Tearing a window
+    /// down mid-handoff deadlocks — the teardown holds the desktop lock
+    /// while the sessions it owns are still being read — and a console the
+    /// user launched has no business closing an unrelated project either.
+    /// So: reuse this project's own window if it has one, otherwise open a
+    /// new one, and never take a window away from another project.
+    /// The window a handed-off console should surface in: the one already
+    /// showing its project, otherwise whichever window is in front.
+    ///
+    /// This only raises a window. Switching which project a window shows is
+    /// left to the renderer, which drives it through the same `open_project`
+    /// command a click on the sidebar uses — doing it from here deadlocks,
+    /// because the switch re-attaches every session in the window while the
+    /// desktop lock is held.
+    /// Records the handoff to bring forward, for a renderer that is not
+    /// listening yet. Overwrites any older entry: the newest console the
+    /// user launched is the one they are waiting to look at.
+    fn set_pending_focus(&self, label: Option<&str>, project_id: &str, session_id: &str) {
+        *self.pending_focus.lock().expect("pending focus poisoned") = Some(PendingFocus {
+            label: label.map(str::to_owned),
+            project_id: project_id.to_owned(),
+            session_id: session_id.to_owned(),
+            at: Instant::now(),
+        });
+    }
+
+    /// Claims the pending handoff focus for `label`, if it is for this
+    /// window and still fresh. Claiming clears it, so only one window acts.
+    pub fn take_pending_focus(&self, label: &str) -> Option<FocusSessionEvent> {
+        claim_pending_focus(
+            &mut self.pending_focus.lock().expect("pending focus poisoned"),
+            label,
+        )
+    }
+
+    fn handoff_window(self: &Arc<Self>, project_id: &str) -> Option<String> {
+        let inner = self.inner.lock().expect("desktop state poisoned");
+        inner
+            .windows
+            .window_for_project(project_id)
+            .map(str::to_owned)
+            .or_else(|| inner.windows.last_or_any())
     }
 
     fn ensure_project_window_with_focus(
@@ -1715,7 +1927,7 @@ impl Core {
             .slave
             .spawn_command(command_for(&shell, &project.path))?;
         let killer = child.clone_killer();
-        let mut reader = pair.master.try_clone_reader()?;
+        let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
         let id = Uuid::new_v4().to_string();
         let metadata = TerminalSession {
@@ -1736,7 +1948,7 @@ impl Core {
                 ManagedSession {
                     metadata: metadata.clone(),
                     master: pair.master,
-                    writer,
+                    writer: SessionWriter::spawn(&id, writer),
                     killer,
                     grid: (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS),
                     viewports: HashMap::new(),
@@ -1755,6 +1967,8 @@ impl Core {
             control_tail: String::new(),
             cursor_query_tail: String::new(),
             pending_cursor_reports: 0,
+            device_attributes_tail: String::new(),
+            pending_device_attributes: 0,
             has_run_command: false,
                 },
             );
@@ -1765,7 +1979,33 @@ impl Core {
         // delivers a repainting TUI as a burst of tiny writes - often one per
         // escape sequence - and each of those would otherwise become its own
         // journal append, Tauri event and WebSocket frame.
+        self.spawn_session_reader(&id, reader);
+        let waiter_core = Arc::clone(self);
+        let waiter_id = id.clone();
+        thread::spawn(move || {
+            if let Ok(status) = child.wait() {
+                waiter_core.on_terminal_exit(&waiter_id, status.exit_code());
+            }
+        });
 
+        if let Err(error) = self.ensure_project_window_quietly(&project.id) {
+            self.close_session(&id);
+            return Err(error);
+        }
+        sync_log!(
+            "session",
+            "created id={id} project={} shell={} grid={SESSION_DEFAULT_COLS}x{SESSION_DEFAULT_ROWS}",
+            project.id,
+            shell.id
+        );
+        self.broadcast();
+        Ok(metadata)
+    }
+
+    /// The session output pipeline, shared by spawned and ConPTY-handoff
+    /// sessions: a raw PTY reader feeding a merge thread that coalesces
+    /// ConPTY's burst of tiny writes before they are journaled.
+    fn spawn_session_reader(self: &Arc<Self>, session_id: &str, mut reader: Box<dyn std::io::Read + Send>) {
         // Bounded, so a session whose output nobody can keep up with pushes
         // back on the PTY exactly as it did when the reader appended inline,
         // instead of growing a queue.
@@ -1784,12 +2024,11 @@ impl Core {
             }
         });
         let reader_core = Arc::clone(self);
-        let reader_id = id.clone();
+        let reader_id = session_id.to_owned();
         thread::spawn(move || {
             let mut compactor = StreamCompactor::new();
             let mut buffered: Vec<u8> = Vec::new();
-            loop {
-                let Ok(chunk) = raw_rx.recv() else { break };
+            while let Ok(chunk) = raw_rx.recv() {
                 buffered.extend_from_slice(&chunk);
                 // Merge whatever else arrives over the next couple of
                 // milliseconds into the same chunk. Bounded by both a total
@@ -1825,25 +2064,171 @@ impl Core {
                 reader_core.on_terminal_data(&reader_id, tail);
             }
         });
+    }
+
+    /// Opens a session from a ConPTY handoff: the console that hosts the new
+    /// process (cmd, pwsh, …) asked us to take over its terminal UI, so the
+    /// "child" of this session is an existing process and the data path is
+    /// the pipe we handed back plus the packed ConPTY control handle.
+    #[cfg(windows)]
+    pub fn create_handoff_session(
+        self: &Arc<Self>,
+        handoff: crate::default_terminal::HandoffSession,
+    ) -> Result<TerminalSession> {
+        let (project, shell) = {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            // A handed-off console belongs with the project it was launched
+            // inside; only fall back to the startup project when the
+            // directory matches nothing the user has open.
+            let project = match handoff.cwd.as_deref() {
+                Some(cwd) => match project_for_directory(&inner, cwd) {
+                    Some(project) => project,
+                    // A console started from the Start menu, the Run box or
+                    // the taskbar inherits Explorer's working directory,
+                    // which is the system directory - not somewhere the user
+                    // is working. Opening a "System32" project for it is
+                    // noise. Home is where such a shell effectively belongs
+                    // (and where one launched from the user's own folder
+                    // lands), so it shares that project rather than dropping
+                    // into whichever project happens to be first.
+                    None if is_system_directory(cwd) => ensure_home_project(&mut inner)?,
+                    // Nothing the user has open owns this directory, so give
+                    // the console a project of its own rather than filing it
+                    // under an unrelated one.
+                    None => ensure_directory_project(&mut inner, Path::new(cwd))?,
+                },
+                None => startup_project(&mut inner)?,
+            };
+            let wanted = inner.store.settings().default_shell_id.as_str();
+            let shell = inner
+                .shells
+                .iter()
+                .find(|shell| shell.id == wanted)
+                .or_else(|| inner.shells.first())
+                .cloned()
+                .ok_or_else(|| anyhow!("No supported shell was found."))?;
+            (project, shell)
+        };
+        let id = Uuid::new_v4().to_string();
+        let metadata = TerminalSession {
+            id: id.clone(),
+            project_id: project.id.clone(),
+            title: handoff.title.clone(),
+            // Where the console was actually launched, when the client
+            // process would tell us; the project path is the fallback.
+            cwd: handoff.cwd.clone().unwrap_or_else(|| project.path.clone()),
+            shell_id: shell.id.clone(),
+            status: "running".into(),
+            created_at: Utc::now().to_rfc3339(),
+            exit_code: None,
+            tui_mode: TuiMode::Canonical,
+        };
+        let master = crate::default_terminal::build_handoff_master(
+            handoff.reader,
+            handoff.writer,
+            handoff.hpc,
+            PtySize {
+                rows: SESSION_DEFAULT_ROWS,
+                cols: SESSION_DEFAULT_COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        );
+        let reader = master.try_clone_reader()?;
+        let writer = master.take_writer()?;
+        let killer = crate::default_terminal::HandoffKiller::new(handoff.client, handoff.hpc);
+        {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            inner.sessions.insert(
+                id.clone(),
+                ManagedSession {
+                    metadata: metadata.clone(),
+                    master: Box::new(master),
+                    writer: SessionWriter::spawn(&id, writer),
+                    killer: Box::new(killer),
+                    grid: (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS),
+                    viewports: HashMap::new(),
+                    owner: None,
+                    grid_epochs: vec![GridEpoch {
+                        offset: 0,
+                        cols: SESSION_DEFAULT_COLS,
+                        rows: SESSION_DEFAULT_ROWS,
+                    }],
+                    buffer: String::new(),
+                    journal_len: 0,
+                    tui: TuiClassifier::new(SESSION_DEFAULT_ROWS),
+                    synthetic_alt: false,
+                    deferred_tui_resize: false,
+                    requested_viewport: None,
+                    control_tail: String::new(),
+                    cursor_query_tail: String::new(),
+                    pending_cursor_reports: 0,
+                    device_attributes_tail: String::new(),
+                    pending_device_attributes: 0,
+                    has_run_command: false,
+                },
+            );
+            inner.session_order.push(id.clone());
+        }
+        self.spawn_session_reader(&id, reader);
+        // The console exits when its client does, which ends the ConPTY and
+        // this session; report the client's exit code so a non-zero end
+        // keeps the tab for inspection, exactly like a spawned shell.
         let waiter_core = Arc::clone(self);
         let waiter_id = id.clone();
+        let client_wait = handoff.client_wait as isize;
         thread::spawn(move || {
-            if let Ok(status) = child.wait() {
-                waiter_core.on_terminal_exit(&waiter_id, status.exit_code());
-            }
+            let status = crate::default_terminal::wait_client_exit(client_wait);
+            waiter_core.on_terminal_exit(&waiter_id, status);
         });
-
-        if let Err(error) = self.ensure_project_window_quietly(&project.id) {
-            self.close_session(&id);
-            return Err(error);
-        }
         sync_log!(
             "session",
-            "created id={id} project={} shell={} grid={SESSION_DEFAULT_COLS}x{SESSION_DEFAULT_ROWS}",
+            "created handoff id={id} project={} path={} title={} cwd={} from_client={}",
             project.id,
-            shell.id
+            project.path,
+            handoff.title,
+            metadata.cwd,
+            handoff.cwd.is_some()
         );
         self.broadcast();
+        // A handoff is the user launching a console, so it has to end up in
+        // front: raise a window, then tell the renderer to open the console's
+        // project and select its tab.
+        //
+        // The renderer owns the project switch deliberately — it drives it
+        // through the same `open_project` command a sidebar click uses.
+        // Switching a window's project from here deadlocks: the switch
+        // re-attaches every session in the window while the desktop lock is
+        // held. This side only ever raises a window, and does it on a worker
+        // because the RPC thread has to return to the console promptly.
+        let window_core = Arc::clone(self);
+        let window_project = project.id.clone();
+        let window_session = id.clone();
+        std::thread::spawn(move || {
+            // Record before raising anything. On a cold start no window is
+            // registered yet, and a window that exists may still be loading
+            // its webview - either way the emit below goes nowhere, and the
+            // renderer claims this instead when it mounts.
+            let target = window_core.handoff_window(&window_project);
+            window_core.set_pending_focus(target.as_deref(), &window_project, &window_session);
+            let Some(label) = target else {
+                return;
+            };
+            if let Some(window) = window_core.app.get_webview_window(&label) {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+                window_core.mark_window_focused(&label);
+            }
+            let _ = window_core.app.emit_to(
+                EventTarget::webview_window(label),
+                "desktop-focus-session",
+                FocusSessionEvent {
+                    project_id: window_project,
+                    session_id: window_session,
+                },
+            );
+        });
         Ok(metadata)
     }
 
@@ -1925,6 +2310,18 @@ impl Core {
                     return;
                 }
                 session.pending_cursor_reports -= 1;
+            } else if is_device_attributes_report(data) {
+                // Same rule as a CPR: valid only as the answer to a query the
+                // shell actually issued. A replay re-answers the query that
+                // is still sitting in the journal.
+                if session.pending_device_attributes == 0 {
+                    sync_log!(
+                        "input",
+                        "dropped stale device-attributes reply session={session_id}"
+                    );
+                    return;
+                }
+                session.pending_device_attributes -= 1;
             } else {
             // The size hint refreshes the writer's viewport entry (the
             // pane's announced W_i x H_i). Typing is always an interaction:
@@ -1945,8 +2342,7 @@ impl Core {
             if data.contains('\r') || data.contains('\n') {
                 session.has_run_command = true;
             }
-            let _ = session.writer.write_all(data.as_bytes());
-            let _ = session.writer.flush();
+            session.writer.write(session_id, data);
 
             applied_grid
         };
@@ -2102,6 +2498,7 @@ impl Core {
             self.broadcast_grid_change(session_id, epoch);
         }
     }
+
 
     pub fn attach_window_session(
         &self,
@@ -3172,6 +3569,12 @@ impl Core {
                         &mut session.cursor_query_tail,
                         &data,
                     ));
+            session.pending_device_attributes = session
+                .pending_device_attributes
+                .saturating_add(record_device_attribute_requests(
+                    &mut session.device_attributes_tail,
+                    &data,
+                ));
             // TUI mode transition (canonical / inline / fullscreen): a
             // program taking or releasing grid ownership changes how
             // clients may treat the data block (strict grid, no reflow
@@ -3608,11 +4011,16 @@ fn project_by_id(inner: &Inner, project_id: &str) -> Option<Project> {
 /// project when none exists. Guarantees the app always has a default project
 /// to fall back on, even after every unsaved project has been closed.
 fn ensure_home_project(inner: &mut Inner) -> Result<Project> {
-    let start_folder = canonical_directory(
-        std::env::var("USERPROFILE")
-            .map(PathBuf::from)
-            .unwrap_or(std::env::current_dir()?),
-    )?;
+    let home = std::env::var("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+    ensure_directory_project(inner, &home)
+}
+
+/// The project for `directory`: an existing saved or temporary one at that
+/// exact path, or a new temporary project standing for it.
+fn ensure_directory_project(inner: &mut Inner, directory: &Path) -> Result<Project> {
+    let start_folder = canonical_directory(directory)?;
     if let Some(project) = inner
         .store
         .projects()
@@ -3651,6 +4059,38 @@ fn ensure_home_project(inner: &mut Inner) -> Result<Project> {
 /// still has live sessions or an open window, because a fresh start means
 /// none of those exist yet. No session is created, so a fresh app opens
 /// with zero terminal tabs.
+/// The project a directory belongs to: the one whose path is the directory
+/// itself or its closest ancestor. Nested projects therefore resolve to the
+/// innermost one, and a directory outside every project matches nothing.
+fn project_for_directory(inner: &Inner, directory: &str) -> Option<Project> {
+    let wanted = normalized_path(Path::new(directory));
+    public_projects(inner)
+        .into_iter()
+        .filter(|project| {
+            let root = normalized_path(Path::new(&project.path));
+            wanted == root || wanted.starts_with(&format!("{root}\\"))
+        })
+        // Deepest match wins; a saved project beats a temporary one sharing
+        // the same path, so the console lands on the sidebar entry the user
+        // actually keeps.
+        .max_by_key(|project| {
+            (
+                normalized_path(Path::new(&project.path)).len(),
+                project.persistent,
+            )
+        })
+}
+
+/// Whether a directory lives under the Windows directory: where a console
+/// launched from Explorer's own shell surfaces starts, and never a place the
+/// user keeps a project.
+fn is_system_directory(directory: &str) -> bool {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let root = normalized_path(Path::new(&root));
+    let wanted = normalized_path(Path::new(directory));
+    wanted == root || wanted.starts_with(&format!("{root}\\"))
+}
+
 fn startup_project(inner: &mut Inner) -> Result<Project> {
     if let Some(project) = public_projects(inner).into_iter().find(|project| {
         inner
@@ -4629,12 +5069,16 @@ mod tests {
     use super::{
         CdOutcome, CdPlan, ConnectivityAction, ConnectivityTracker,
         EmbeddedNodeStatus, Inner, ManagedSession, PRESENCE_WINDOW_MS, PairingGrant,
-        RetireOutcome, SESSION_MAX_COLS, SESSION_MAX_ROWS, VIEWPORT_WATCHDOG_TIMEOUT_MS, apply_grid_if_tui,
+        PENDING_FOCUS_TTL, PendingFocus, RetireOutcome, SESSION_MAX_COLS, SESSION_MAX_ROWS,
+        SessionWriter, claim_pending_focus,
+        VIEWPORT_WATCHDOG_TIMEOUT_MS, apply_grid_if_tui,
         apply_session_grid, ensure_home_project, evict_stale_viewports, folder_name,
-        is_cursor_position_report, is_dropped_node_status, is_within_project, log_escape,
+        is_cursor_position_report, is_device_attributes_report, is_dropped_node_status,
+        is_system_directory, is_within_project, log_escape,
         newest_running_session_project_id, parse_terminal_titles,
         parse_working_directories, preferred_project, presence_alive, project_is_usable,
-        project_name_or_folder, record_cursor_position_requests, reselect_owner_on_departure,
+        project_for_directory, project_name_or_folder, record_cursor_position_requests,
+        record_device_attribute_requests, reselect_owner_on_departure,
         registration_status_for_display, resolve_working_directory, retire_empty_temporary_project,
         apply_owner_grid, apply_owner_grid_for, attach_owner_grid_for, drain_journal_front_at, release_viewport, set_client_viewport, should_open_quiet_window, snapshot_from_inner,
         collapse_superseded_repaints, contains_csi_final, snapshot_of, split_journal_by_epochs, starts_with_screen_repaint, startup_project, take_valid_pairing_grant, truncate_journal_front,
@@ -6185,6 +6629,191 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_focus_is_claimed_once_by_the_window_it_names() {
+        let mut pending = Some(PendingFocus {
+            label: Some("main".into()),
+            project_id: "p1".into(),
+            session_id: "s1".into(),
+            at: Instant::now(),
+        });
+
+        let claimed = claim_pending_focus(&mut pending, "main").expect("claimed");
+        assert_eq!(claimed.project_id, "p1");
+        assert_eq!(claimed.session_id, "s1");
+        assert!(
+            pending.is_none(),
+            "claiming clears the entry so a second window cannot act on it too"
+        );
+        assert!(claim_pending_focus(&mut pending, "main").is_none());
+    }
+
+    #[test]
+    fn a_pending_focus_for_another_window_is_left_for_its_owner() {
+        let mut pending = Some(PendingFocus {
+            label: Some("main".into()),
+            project_id: "p1".into(),
+            session_id: "s1".into(),
+            at: Instant::now(),
+        });
+
+        assert!(claim_pending_focus(&mut pending, "second").is_none());
+        assert!(
+            pending.is_some(),
+            "the entry survives so the window it names can still claim it"
+        );
+        assert!(claim_pending_focus(&mut pending, "main").is_some());
+    }
+
+    #[test]
+    fn a_cold_start_focus_names_no_window_and_the_first_one_up_takes_it() {
+        // Nothing was registered when the console handed over, so the focus
+        // carries no label: whichever window finishes loading first shows it.
+        let mut pending = Some(PendingFocus {
+            label: None,
+            project_id: "p1".into(),
+            session_id: "s1".into(),
+            at: Instant::now(),
+        });
+
+        let claimed = claim_pending_focus(&mut pending, "whichever-window").expect("claimed");
+        assert_eq!(claimed.session_id, "s1");
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn an_expired_pending_focus_is_dropped_rather_than_shown_late() {
+        let mut pending = Some(PendingFocus {
+            label: None,
+            project_id: "p1".into(),
+            session_id: "s1".into(),
+            at: Instant::now() - PENDING_FOCUS_TTL - std::time::Duration::from_secs(1),
+        });
+
+        assert!(claim_pending_focus(&mut pending, "main").is_none());
+        assert!(
+            pending.is_none(),
+            "an expired focus is cleared so a much later window is not yanked onto a stale tab"
+        );
+    }
+
+    #[test]
+    fn no_pending_focus_claims_nothing() {
+        let mut pending = None;
+        assert!(claim_pending_focus(&mut pending, "main").is_none());
+    }
+
+    /// A writer whose consumer never reads: the shape of a handed-off console
+    /// that has stopped draining its input pipe.
+    struct StalledWriter;
+
+    impl std::io::Write for StalledWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            unreachable!("the test finishes long before this returns");
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn writing_to_a_console_that_stopped_reading_never_blocks_the_caller() {
+        // The regression this guards: the write ran inline, on the UI thread,
+        // holding the desktop lock, so one wedged console froze every window.
+        let writer = SessionWriter::spawn("stalled", Box::new(StalledWriter));
+        let started = Instant::now();
+        // Far past the queue depth, so the bounded channel is full for most
+        // of these and the drop path is exercised too.
+        for _ in 0..1_000 {
+            writer.write("stalled", "ls\r");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "queued writes must not wait on the console; took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_project_rooted_in_the_system_directory_still_claims_its_consoles() {
+        // `is_system_directory` only decides the *fallback*: a user who
+        // really does keep a project there still gets their console filed
+        // under it.
+        let (store, state_path) = store_with_cleanup();
+        let mut inner = test_inner(store, Vec::new());
+        test_project(&mut inner, "saved-system", "C:\\Windows\\System32", true);
+
+        let matched = project_for_directory(&inner, "C:\\Windows\\System32")
+            .expect("a project rooted at the system directory matches");
+        assert_eq!(matched.id, "saved-system");
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn recognizes_only_complete_device_attributes_reports() {
+        assert!(is_device_attributes_report("\x1b[?1;2c"));
+        assert!(is_device_attributes_report("\x1b[?62;22c"));
+        assert!(is_device_attributes_report("\x1b[>0;10;1c"));
+        // A primary DA query, not a reply.
+        assert!(!is_device_attributes_report("\x1b[c"));
+        assert!(!is_device_attributes_report("\x1b[?1;2ctail"));
+        assert!(!is_device_attributes_report("\x1b[1;2c"));
+        assert!(!is_device_attributes_report("\x1b[?12;34R"));
+    }
+
+    #[test]
+    fn records_live_device_attribute_queries_even_when_split_across_output_chunks() {
+        let mut tail = String::new();
+        assert_eq!(record_device_attribute_requests(&mut tail, "\x1b[c"), 1);
+        assert_eq!(record_device_attribute_requests(&mut tail, "\x1b[>"), 0);
+        assert_eq!(record_device_attribute_requests(&mut tail, "c"), 1);
+        assert_eq!(
+            record_device_attribute_requests(&mut tail, "\x1b[0c\x1b[=c"),
+            2
+        );
+        // A DA reply in the stream is not a query.
+        assert_eq!(record_device_attribute_requests(&mut tail, "\x1b[?1;2c"), 0);
+    }
+
+    #[test]
+    fn counts_a_device_attributes_query_split_at_every_offset() {
+        // The longest query is five bytes, so it can be cut four ways; each
+        // has to survive the chunk boundary or a live reply gets dropped.
+        let query = "\x1b[>0c";
+        for split in 1..query.len() {
+            let mut tail = String::new();
+            assert_eq!(
+                record_device_attribute_requests(&mut tail, &query[..split]),
+                0,
+                "the leading half is not a query on its own"
+            );
+            assert_eq!(
+                record_device_attribute_requests(&mut tail, &query[split..]),
+                1,
+                "a query split at byte {split} is still counted once"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_position_and_device_attributes_replies_are_told_apart() {
+        // Both are CSI sequences answering a query; each guard must ignore
+        // the other's replies or one counter drains the wrong pending count.
+        assert!(!is_device_attributes_report("\x1b[12;34R"));
+        assert!(!is_cursor_position_report("\x1b[?1;2c"));
+        assert!(!is_cursor_position_report("\x1b[>0;10;1c"));
+    }
+
+    #[test]
+    fn treats_the_windows_directory_as_no_project_location() {
+        assert!(is_system_directory("C:\\Windows\\System32"));
+        assert!(is_system_directory("c:\\windows"));
+        assert!(!is_system_directory("C:\\Users\\edzch"));
+        assert!(!is_system_directory("C:\\WindowsProjects"));
+    }
+
+    #[test]
     fn recognizes_only_complete_cursor_position_reports() {
         assert!(is_cursor_position_report("\x1b[12;34R"));
         assert!(is_cursor_position_report("\x1b[?12;34R"));
@@ -7457,7 +8086,7 @@ mod tests {
                 tui_mode: TuiMode::Canonical,
             },
             master: Box::new(InertMaster),
-            writer: Box::new(std::io::sink()),
+            writer: SessionWriter::spawn(session_id, Box::new(std::io::sink())),
             killer,
             grid: (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS),
             viewports: HashMap::new(),
@@ -7476,6 +8105,8 @@ mod tests {
             control_tail: String::new(),
             cursor_query_tail: String::new(),
             pending_cursor_reports: 0,
+            device_attributes_tail: String::new(),
+            pending_device_attributes: 0,
             has_run_command: false,
         }
     }

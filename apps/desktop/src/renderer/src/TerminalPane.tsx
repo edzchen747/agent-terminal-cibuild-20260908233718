@@ -19,6 +19,13 @@ const MAX_ZOOM_PASSES = 4;
 
 const isCursorPositionReport = (data: string) => /^\x1b\[\??\d+;\d+R$/.test(data);
 
+// A Device Attributes reply (`ESC [ ? ... c` / `ESC [ > ... c`). Like a CPR
+// it answers a query the shell issued, so it is forwarded whether or not this
+// pane is the active tab and validated against the shell's outstanding
+// queries by the tray - a replayed journal still carries the original query,
+// and an unsolicited reply reaches the shell as typed input.
+const isDeviceAttributesReport = (data: string) => /^\x1b\[[?>][\d;]*c$/.test(data);
+
 // Terminal sync diagnostics: mirrored to the host's sync log file (and the
 // WebView2 console) so desktop decisions are captured in the same run as the
 // journal and remote merges.
@@ -473,10 +480,10 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
     const inputDims = () => proposeGrid() ?? { cols: terminal.cols, rows: terminal.rows };
     const dataSubscription = terminal.onData((data) => {
       const dims = inputDims();
-      if (isCursorPositionReport(data)) {
+      if (isCursorPositionReport(data) || isDeviceAttributesReport(data)) {
         // A newly created pane is attached before it becomes the active tab.
-        // Forward terminal-generated CPR replies even while hidden; the tray
-        // validates them against the shell's outstanding queries.
+        // Forward terminal-generated query replies even while hidden; the
+        // tray validates them against the shell's outstanding queries.
         window.agentTerminal.write(sessionId, data, dims.cols, dims.rows);
         return;
       }

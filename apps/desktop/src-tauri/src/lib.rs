@@ -1,4 +1,11 @@
 mod core;
+mod default_terminal;
+
+/// Registers the handoff class object on the calling (main) thread.
+pub fn register_handoff_on_main_thread() {
+    default_terminal::register_handoff_on_calling_thread();
+}
+
 mod models;
 mod network;
 mod path_utils;
@@ -14,7 +21,9 @@ use std::sync::Arc;
 
 use arboard::Clipboard;
 use core::Core;
-use models::{DesktopState, PairingPayload, Project, SessionSnapshot, TerminalSession};
+use models::{
+    DesktopState, FocusSessionEvent, PairingPayload, Project, SessionSnapshot, TerminalSession,
+};
 use store::DesktopStore;
 use tauri::{
     Manager, State, WebviewWindow,
@@ -217,6 +226,33 @@ fn set_default_shell(state: State<'_, Arc<Core>>, shell_id: String) -> Result<()
 }
 
 #[tauri::command]
+fn set_default_terminal(state: State<'_, Arc<Core>>) -> Result<(), String> {
+    // Per-user registry write; the state broadcast below recomputes
+    // `is_default_terminal`, so the settings row flips to Undo on success.
+    crate::default_terminal::set_as_default_terminal()?;
+    state.broadcast();
+    Ok(())
+}
+
+#[tauri::command]
+fn unset_default_terminal(state: State<'_, Arc<Core>>) -> Result<(), String> {
+    crate::default_terminal::clear_as_default_terminal()?;
+    state.broadcast();
+    Ok(())
+}
+
+/// The handoff a console asked us to bring forward, claimed once by the
+/// window that asks first. The matching event is emitted too, but a window
+/// created *by* the handoff is not listening yet when it goes out.
+#[tauri::command]
+fn take_focus_session(
+    window: WebviewWindow,
+    state: State<'_, Arc<Core>>,
+) -> Option<FocusSessionEvent> {
+    state.take_pending_focus(window.label())
+}
+
+#[tauri::command]
 fn set_terminal_theme(
     state: State<'_, Arc<Core>>,
     dark_scheme_id: String,
@@ -270,12 +306,20 @@ async fn select_shell(
 }
 
 pub fn run() {
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    // COM starts us with `-Embedding` to serve a console handoff. That
+    // instance has to keep running and register the handoff class itself,
+    // so it must not hand its command line to an existing instance and
+    // exit the way a second user-launched window would.
+    let com_embedding = std::env::args().any(|arg| arg.eq_ignore_ascii_case("-Embedding"));
+    let mut builder = tauri::Builder::default();
+    if !com_embedding {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(core) = app.try_state::<Arc<Core>>() {
                 show_terminal_window_from_worker(Arc::clone(core.inner()));
             }
-        }))
+        }));
+    }
+    let app = builder
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let data_path = std::env::var_os("AGENT_TERMINAL_DATA_DIR")
@@ -287,6 +331,7 @@ pub fn run() {
             app.manage(Arc::clone(&core));
             build_tray(app)?;
             core.initialize()?;
+            default_terminal::start(Arc::clone(&core));
             remote::start(Arc::clone(&core));
             core.start_connectivity_monitor();
             Ok(())
@@ -331,6 +376,9 @@ pub fn run() {
             set_confirm_external_links,
             set_follow_working_directory,
             select_shell,
+            set_default_terminal,
+            unset_default_terminal,
+            take_focus_session,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Agent Terminal");

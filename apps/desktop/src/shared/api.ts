@@ -9,6 +9,10 @@ export interface DesktopState extends HostSnapshot {
     status: "unregistered" | "pending" | "enrolled" | "failed" | "offline" | "unpaired";
     error?: string;
   };
+  /** Whether this app is registered as the user's default terminal app
+   * (Windows); the settings UI shows a one-shot "set as default" option
+   * while this is false. */
+  isDefaultTerminal: boolean;
 }
 
 /** Per-grid PTY journal snapshot returned by `attachSession`: history split at
@@ -18,6 +22,12 @@ export interface SessionSnapshot {
   segments: SessionSegment[];
   /** Absolute stream byte offset just past the journal; live chunks below it are already contained in the replay. */
   endOffset: number;
+}
+
+/** A console Windows handed to us: open its project and select its tab. */
+export interface FocusSessionEvent {
+  projectId: string;
+  sessionId: string;
 }
 
 export interface DesktopApi {
@@ -46,12 +56,19 @@ export interface DesktopApi {
   retryRemoteRegistration(): Promise<void>;
   revokeDevice(deviceId: string): Promise<void>;
   setDefaultShell(shellId: string): Promise<void>;
+  /** Register this app as the user's default terminal app (Windows, per-user
+   * registry; no elevation). Resolves once the choice is stored. */
+  setDefaultTerminal(): Promise<void>;
+  unsetDefaultTerminal(): Promise<void>;
+  takeFocusSession(): Promise<FocusSessionEvent | null>;
   setTerminalTheme(darkSchemeId: string, lightSchemeId: string): Promise<void>;
   setOpenProjectsInNewWindows(enabled: boolean): Promise<void>;
   setConfirmExternalLinks(enabled: boolean): Promise<void>;
   setFollowWorkingDirectory(enabled: boolean): Promise<void>;
   selectShell(sessionId: string | null, shellId: string): Promise<TerminalSession | null>;
   onPairingSucceeded(callback: () => void): () => void;
+  /** A session the OS handed to us: the window should bring it to the front. */
+  onFocusSession(callback: (event: FocusSessionEvent) => void): () => void;
   onState(callback: (state: DesktopState) => void): () => void;
   onData(callback: (sessionId: string, data: string, offset: number) => void): () => void;
   onGrid(callback: (sessionId: string, cols: number, rows: number, offset: number) => void): () => void;

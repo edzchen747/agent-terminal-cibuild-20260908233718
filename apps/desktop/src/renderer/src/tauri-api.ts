@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { TuiMode } from "@agentterminal/protocol";
-import type { DesktopApi, DesktopState } from "../../shared/api";
+import type { DesktopApi, DesktopState, FocusSessionEvent } from "../../shared/api";
 
 interface TerminalDataEvent {
   sessionId: string;
@@ -29,6 +29,7 @@ const dataListeners = new Set<(sessionId: string, data: string, offset: number) 
 const gridListeners = new Set<(sessionId: string, cols: number, rows: number, offset: number) => void>();
 const modeListeners = new Set<(sessionId: string, mode: TuiMode, offset: number) => void>();
 const pairingListeners = new Set<() => void>();
+const focusSessionListeners = new Set<(event: FocusSessionEvent) => void>();
 const currentWindowTarget = getCurrentWebviewWindow().label;
 
 const stateBridgeReady = listen<DesktopState>("desktop-state", ({ payload }) => {
@@ -47,11 +48,16 @@ const modeBridgeReady = listen<TerminalTuiModeEvent>("desktop-mode", ({ payload 
   for (const listener of modeListeners) listener(payload.sessionId, payload.mode, payload.offset);
 }, { target: currentWindowTarget });
 
+const focusSessionBridgeReady = listen<FocusSessionEvent>("desktop-focus-session", ({ payload }) => {
+  for (const listener of focusSessionListeners) listener(payload);
+}, { target: currentWindowTarget });
+
 const pairingBridgeReady = listen<string>("pairing-succeeded", () => {
   for (const listener of pairingListeners) listener();
 });
 
 void stateBridgeReady;
+void focusSessionBridgeReady;
 void pairingBridgeReady;
 
 const api: DesktopApi = {
@@ -80,11 +86,18 @@ const api: DesktopApi = {
   retryRemoteRegistration: () => invoke("retry_remote_registration"),
   revokeDevice: (deviceId) => invoke("revoke_device", { deviceId }),
   setDefaultShell: (shellId) => invoke("set_default_shell", { shellId }),
+  setDefaultTerminal: () => invoke("set_default_terminal"),
+  unsetDefaultTerminal: () => invoke("unset_default_terminal"),
+  takeFocusSession: () => invoke("take_focus_session"),
   setTerminalTheme: (darkSchemeId, lightSchemeId) => invoke("set_terminal_theme", { darkSchemeId, lightSchemeId }),
   setOpenProjectsInNewWindows: (enabled) => invoke("set_open_projects_in_new_windows", { enabled }),
   setConfirmExternalLinks: (enabled) => invoke("set_confirm_external_links", { enabled }),
   setFollowWorkingDirectory: (enabled) => invoke("set_follow_working_directory", { enabled }),
   selectShell: (sessionId, shellId) => invoke("select_shell", { sessionId, shellId }),
+  onFocusSession: (callback) => {
+    focusSessionListeners.add(callback);
+    return () => focusSessionListeners.delete(callback);
+  },
   onPairingSucceeded: (callback) => {
     pairingListeners.add(callback);
     return () => pairingListeners.delete(callback);
