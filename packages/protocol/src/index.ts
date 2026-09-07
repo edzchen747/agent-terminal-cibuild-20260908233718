@@ -1,4 +1,5 @@
 import type { TerminalThemeSettings } from "./terminal-themes.js";
+import type { TaskbarProgress } from "./taskbar.js";
 
 export * from "./terminal-themes.js";
 export * from "./terminal-layout.js";
@@ -6,6 +7,7 @@ export * from "./terminal-grid.js";
 export * from "./terminal-zoom.js";
 export * from "./terminal-find.js";
 export * from "./session-activity.js";
+export * from "./taskbar.js";
 
 export const PROTOCOL_VERSION = 1 as const;
 
@@ -307,6 +309,13 @@ export interface TerminalSession {
   activity?: SessionActivity;
   /** When the session entered `activity`, RFC3339. */
   activitySince?: string;
+  /**
+   * The ConEmu `OSC 9;4` taskbar progress of the session's last command
+   * (default clear). A window's taskbar button shows the combined state
+   * of its project's sessions, highest priority first: error, paused,
+   * value, indeterminate, clear.
+   */
+  taskbar?: TaskbarProgress;
 }
 
 export interface ShellProfile {
@@ -426,6 +435,12 @@ export type ServerMessage =
    * there is no position to anchor it to.
    */
   | { type: "session.activity"; sessionId: string; activity: SessionActivity; since: string }
+  /**
+   * The session's taskbar progress changed (a ConEmu `OSC 9;4` report,
+   * the shell's command lifecycle, or the process exiting), like the
+   * activity event: no stream offset, the state is host-side.
+   */
+  | { type: "session.taskbar"; sessionId: string; taskbar: TaskbarProgress }
   | { type: "ok"; requestId: string }
   | { type: "error"; requestId?: string; code: string; message: string };
 

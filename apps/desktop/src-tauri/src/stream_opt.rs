@@ -48,7 +48,9 @@ const MAX_HELD_SEQUENCE_BYTES: usize = 64;
 /// excluded: the alternate screen (1047/1048/1049 also save/restore the
 /// cursor and swap buffers) and cursor visibility (25), which the TUI
 /// classifier reads as paint evidence.
-const IDEMPOTENT_MODES: &[u32] = &[9, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 2004];
+const IDEMPOTENT_MODES: &[u32] = &[
+    9, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 2004,
+];
 
 /// Per-session compactor. Owned by the session's output thread, so it sees the
 /// stream in order and can carry state (the current title, the modes set in
@@ -159,10 +161,7 @@ impl StreamCompactor {
                     self.run_modes.clear();
                     return false;
                 }
-                if params
-                    .iter()
-                    .all(|p| self.run_modes.get(p) == Some(enable))
-                {
+                if params.iter().all(|p| self.run_modes.get(p) == Some(enable)) {
                     return true;
                 }
                 for param in params {
@@ -178,9 +177,15 @@ impl StreamCompactor {
 #[derive(Debug, PartialEq, Eq)]
 enum SequenceKind {
     /// `OSC 0/1/2 ; text` - icon name and/or window title.
-    Title { ps: u32, value: String },
+    Title {
+        ps: u32,
+        value: String,
+    },
     /// `CSI ? params h|l`.
-    PrivateMode { params: Vec<u32>, enable: bool },
+    PrivateMode {
+        params: Vec<u32>,
+        enable: bool,
+    },
     Other,
 }
 
@@ -393,7 +398,10 @@ mod tests {
     #[test]
     fn a_multi_parameter_mode_set_is_stripped_only_when_every_mode_repeats() {
         let mut compactor = StreamCompactor::new();
-        assert_eq!(compact(&mut compactor, "\x1b[?1002;1006h"), "\x1b[?1002;1006h");
+        assert_eq!(
+            compact(&mut compactor, "\x1b[?1002;1006h"),
+            "\x1b[?1002;1006h"
+        );
         assert_eq!(compact(&mut compactor, "\x1b[?1002;1006h"), "");
         // 1003 is new, so the whole sequence has to survive.
         assert_eq!(
@@ -411,7 +419,10 @@ mod tests {
         );
         // Still a no-op across intervening output: a title has no side effect
         // beyond the title itself.
-        assert_eq!(compact(&mut compactor, "\x1b]0;agent\x07done\r\n"), "done\r\n");
+        assert_eq!(
+            compact(&mut compactor, "\x1b]0;agent\x07done\r\n"),
+            "done\r\n"
+        );
         assert_eq!(compact(&mut compactor, "\x1b]2;agent\x1b\\"), "");
         assert_eq!(
             compact(&mut compactor, "\x1b]0;other\x07"),
@@ -422,9 +433,15 @@ mod tests {
     #[test]
     fn an_icon_only_title_does_not_mask_a_window_title_change() {
         let mut compactor = StreamCompactor::new();
-        assert_eq!(compact(&mut compactor, "\x1b]1;name\x07"), "\x1b]1;name\x07");
+        assert_eq!(
+            compact(&mut compactor, "\x1b]1;name\x07"),
+            "\x1b]1;name\x07"
+        );
         // OSC 2 sets the window title, which is still unset.
-        assert_eq!(compact(&mut compactor, "\x1b]2;name\x07"), "\x1b]2;name\x07");
+        assert_eq!(
+            compact(&mut compactor, "\x1b]2;name\x07"),
+            "\x1b]2;name\x07"
+        );
         // OSC 0 now matches both.
         assert_eq!(compact(&mut compactor, "\x1b]0;name\x07"), "");
     }
@@ -440,7 +457,10 @@ mod tests {
     #[test]
     fn a_sequence_split_across_chunks_is_classified_whole() {
         let mut compactor = StreamCompactor::new();
-        assert_eq!(compact(&mut compactor, "\x1b[?1002h\x1b[?10"), "\x1b[?1002h");
+        assert_eq!(
+            compact(&mut compactor, "\x1b[?1002h\x1b[?10"),
+            "\x1b[?1002h"
+        );
         assert_eq!(compact(&mut compactor, "02h"), "");
         let mut split_title = StreamCompactor::new();
         assert_eq!(compact(&mut split_title, "\x1b]0;ag"), "");

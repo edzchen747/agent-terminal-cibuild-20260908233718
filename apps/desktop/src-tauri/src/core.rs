@@ -31,12 +31,11 @@ use uuid::Uuid;
 use crate::{
     models::{
         AuthorizedDevice, ClientMessage, DesktopState, DirectoryEntry, DirectoryListing,
-        FocusSessionEvent, HostInfo,
-        HostSnapshot, PROTOCOL_VERSION, PairingPayload, Project, RemoteRegistration, ServerMessage,
-        SessionActivity, SessionSegment, SessionSnapshot, ShellProfile,
-        TerminalActivityEvent, TerminalDataEvent, TerminalGridEvent, TerminalSession,
-        TerminalThemeSettings, TerminalTuiModeEvent, TuiMode,
-        normalize_terminal_scheme_id,
+        FocusSessionEvent, HostInfo, HostSnapshot, PROTOCOL_VERSION, PairingPayload, Project,
+        RemoteRegistration, ServerMessage, SessionActivity, SessionSegment, SessionSnapshot,
+        ShellProfile, TaskbarProgress, TerminalActivityEvent, TerminalDataEvent, TerminalGridEvent,
+        TerminalSession, TerminalTaskbarEvent, TerminalThemeSettings, TerminalTuiModeEvent,
+        TuiMode, normalize_terminal_scheme_id,
     },
     network,
     path_utils::user_visible_path,
@@ -47,7 +46,9 @@ use crate::{
         MAX_MERGED_OUTPUT_BYTES, OUTPUT_MERGE_MAX_SPAN, OUTPUT_MERGE_WINDOW, StreamCompactor,
         take_decodable,
     },
-    tui::TuiClassifier,
+    taskbar::SessionTaskbar,
+    taskbar_engine::TaskbarEngine,
+    tui::{ShellMarker, TuiClassifier},
     window_clients::WindowClients,
 };
 
@@ -409,6 +410,11 @@ struct ManagedSession {
     /// Active/idle detection for this session, fed from the same
     /// classifier pass as the TUI mode.
     activity: ActivityDetector,
+    /// The session's ConEmu `OSC 9;4` taskbar progress state machine
+    /// (explicit program reports plus the shell's command lifecycle);
+    /// see `crate::taskbar`. Fed in the same stream pass as the activity
+    /// detector.
+    taskbar: SessionTaskbar,
     control_tail: String,
     cursor_query_tail: String,
     pending_cursor_reports: usize,
@@ -543,6 +549,9 @@ pub struct Core {
     /// exists may still be loading it - in both cases the event emitted at
     /// handoff time goes nowhere, so the renderer claims this instead.
     pending_focus: Mutex<Option<PendingFocus>>,
+    /// The COM thread that applies ConEmu `OSC 9;4` taskbar progress to
+    /// the app's windows (see `taskbar_engine`).
+    taskbar_engine: TaskbarEngine,
 }
 
 /// Claims `pending` for the window `label`, if it holds a focus meant for
@@ -563,9 +572,7 @@ fn claim_pending_focus(
     // The focus names the window it was recorded for; only that window may
     // act on it, so a later-unrelated window cannot be yanked onto a
     // stale tab.
-    let claimable = pending
-        .as_ref()
-        .is_some_and(|focus| focus.label == label);
+    let claimable = pending.as_ref().is_some_and(|focus| focus.label == label);
     if !claimable {
         return None;
     }
@@ -666,7 +673,10 @@ impl Core {
     pub fn new(app: AppHandle, store: DesktopStore) -> Arc<Self> {
         if sync_debug_enabled() {
             let _ = fs::File::create(sync_log_path());
-            sync_log_line("boot", format_args!("sync debug log started for the host session"));
+            sync_log_line(
+                "boot",
+                format_args!("sync debug log started for the host session"),
+            );
         }
         let remote_port = store.settings().port;
         let project_order = store
@@ -697,6 +707,7 @@ impl Core {
             viewing_cache: Mutex::new(None),
             network_online: AtomicBool::new(true),
             pending_focus: Mutex::new(None),
+            taskbar_engine: TaskbarEngine::start(),
         });
         core.spawn_presence_refresh();
         core.spawn_viewport_watchdog();
@@ -749,6 +760,9 @@ impl Core {
             let ClientSink::Direct { close, .. } = client.sink;
             let _ = close.send(());
         }
+        // Clear every taskbar progress state the engine touched, and stop
+        // the COM thread, so no spinner or bar survives the app exit.
+        self.taskbar_engine.shutdown();
     }
 
     pub fn configured_port(&self) -> u16 {
@@ -1097,10 +1111,7 @@ impl Core {
     /// reset to pending and re-confirm the registration with the control
     /// server before the badge may show "enrolled" again.
     pub fn reverify_remote_registration(self: &Arc<Self>) -> Result<()> {
-        if self
-            .desktop_enrollment_running
-            .load(Ordering::Acquire)
-        {
+        if self.desktop_enrollment_running.load(Ordering::Acquire) {
             // An enrollment run already resolves the registration against the
             // server; restarting the node now would only race its result.
             return Ok(());
@@ -1133,8 +1144,7 @@ impl Core {
         // Never trust the last stored verdict: the node may have been revoked
         // or expired since. Default to pending and let the control server
         // confirm the registration before showing it again.
-        if let Err(error) = self.set_remote_registration("pending", None, network.enrolled, None)
-        {
+        if let Err(error) = self.set_remote_registration("pending", None, network.enrolled, None) {
             eprintln!("Agent Terminal could not mark remote access as pending: {error:#}");
             return false;
         }
@@ -1143,7 +1153,8 @@ impl Core {
     }
 
     fn verify_remote_node(self: &Arc<Self>, force_restart: bool, retry_on_transient_failure: bool) {
-        self.remote_verification_running.store(true, Ordering::Release);
+        self.remote_verification_running
+            .store(true, Ordering::Release);
         let core = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
             // The flag makes the badge show "Registering" while this run is
@@ -1163,11 +1174,15 @@ impl Core {
                     eprintln!("Agent Terminal embedded network node is unavailable: {error:#}");
                     let _ = core.set_remote_registration(
                         "failed",
-                        Some("Remote connection registration failed. LAN access is still available.".into()),
+                        Some(
+                            "Remote connection registration failed. LAN access is still available."
+                                .into(),
+                        ),
                         true,
                         None,
                     );
-                    core.remote_verification_running.store(false, Ordering::Release);
+                    core.remote_verification_running
+                        .store(false, Ordering::Release);
                     core.broadcast();
                     return;
                 }
@@ -1179,7 +1194,8 @@ impl Core {
                     true,
                     None,
                 );
-                core.remote_verification_running.store(false, Ordering::Release);
+                core.remote_verification_running
+                    .store(false, Ordering::Release);
                 core.broadcast();
                 return;
             }
@@ -1187,7 +1203,8 @@ impl Core {
             match core.wait_for_embedded_node().await {
                 Ok(node) => {
                     let _ = core.set_remote_registration("enrolled", None, true, Some(&node));
-                    core.remote_verification_running.store(false, Ordering::Release);
+                    core.remote_verification_running
+                        .store(false, Ordering::Release);
                     core.broadcast();
                 }
                 Err(error) => {
@@ -1201,8 +1218,7 @@ impl Core {
                             "Agent Terminal desktop node is no longer registered; requesting a replacement enrollment: {error:#}"
                         );
                         if let Some(device_id) = core.paired_device_id() {
-                            if let Err(retry_error) =
-                                core.start_desktop_enrollment(device_id, true)
+                            if let Err(retry_error) = core.start_desktop_enrollment(device_id, true)
                             {
                                 eprintln!(
                                     "Agent Terminal could not restart desktop enrollment: {retry_error:#}"
@@ -1239,9 +1255,7 @@ impl Core {
                             retry_core.verify_remote_node(true, false);
                         });
                     } else {
-                        eprintln!(
-                            "Agent Terminal embedded network node did not resume: {error:#}"
-                        );
+                        eprintln!("Agent Terminal embedded network node did not resume: {error:#}");
                         let _ = core.set_remote_registration(
                             "failed",
                             Some("Remote connection registration failed. LAN access is still available.".into()),
@@ -1249,7 +1263,8 @@ impl Core {
                             None,
                         );
                     }
-                    core.remote_verification_running.store(false, Ordering::Release);
+                    core.remote_verification_running
+                        .store(false, Ordering::Release);
                     core.broadcast();
                 }
             }
@@ -1309,20 +1324,19 @@ impl Core {
 
     fn spawn_presence_refresh(self: &Arc<Self>) {
         let core = Arc::clone(self);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(
-                PRESENCE_REFRESH_INTERVAL_MS,
-            ));
-            core.refresh_online_presence();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    PRESENCE_REFRESH_INTERVAL_MS,
+                ));
+                core.refresh_online_presence();
+            }
         });
     }
 
     fn refresh_online_presence(self: &Arc<Self>) {
         let online = self.online_device_ids();
-        let mut cache = self
-            .presence_cache
-            .lock()
-            .expect("presence cache poisoned");
+        let mut cache = self.presence_cache.lock().expect("presence cache poisoned");
         if cache.as_ref() != Some(&online) {
             *cache = Some(online);
             drop(cache);
@@ -1338,11 +1352,11 @@ impl Core {
     /// concern, the green connectivity dot a 2-minute one.
     fn spawn_viewport_watchdog(self: &Arc<Self>) {
         let core = Arc::clone(self);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(
-                VIEWPORT_WATCHDOG_TICK_MS,
-            ));
-            core.sweep_stale_viewports();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(VIEWPORT_WATCHDOG_TICK_MS));
+                core.sweep_stale_viewports();
+            }
         });
     }
 
@@ -1350,9 +1364,7 @@ impl Core {
         let core = Arc::clone(self);
         std::thread::spawn(move || {
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    ACTIVITY_WATCHDOG_TICK_MS,
-                ));
+                std::thread::sleep(std::time::Duration::from_millis(ACTIVITY_WATCHDOG_TICK_MS));
                 core.sweep_session_activity();
             }
         });
@@ -1380,13 +1392,28 @@ impl Core {
                 // lit (see activity.rs for the Windows Terminal
                 // reference).
                 let tui_quiet = session.tui.spontaneous_quiet_ms(now) >= TUI_QUIET_MS;
-                if let Some((activity, since)) = session
-                    .activity
-                    .observe(&[], mode, quiet_idle, tui_quiet, false, false, now)
+                if let Some((activity, since)) =
+                    session
+                        .activity
+                        .observe(&[], mode, quiet_idle, tui_quiet, false, false, now)
                 {
                     session.metadata.activity = activity;
                     session.metadata.activity_since = Some(since.clone());
-                    changed.push((session.metadata.id.clone(), activity, since));
+                    // The same transition moves the taskbar state machine:
+                    // an idle command's implicit spinner goes clear. The
+                    // project id rides along so the window taskbar can be
+                    // re-pushed after the lock.
+                    let taskbar = session
+                        .taskbar
+                        .on_activity(activity)
+                        .then(|| session.taskbar.effective());
+                    changed.push((
+                        session.metadata.id.clone(),
+                        activity,
+                        since,
+                        session.metadata.project_id.clone(),
+                        taskbar,
+                    ));
                 }
             }
             changed
@@ -1394,8 +1421,12 @@ impl Core {
         if changed.is_empty() {
             return;
         }
-        for (session_id, activity, since) in changed {
+        for (session_id, activity, since, project_id, taskbar) in changed {
             self.broadcast_activity(&session_id, activity, &since);
+            if let Some(taskbar) = taskbar {
+                self.broadcast_taskbar(&session_id, taskbar);
+                self.update_window_taskbar(&project_id);
+            }
         }
         // The snapshot carries `activity` too, so a window that opens (or a
         // phone that reconnects) mid-command starts with the right badge.
@@ -1607,6 +1638,8 @@ impl Core {
         // main thread, where the window's messages are dispatched.
         install_edge_resize(&self.app, &label);
         window.show()?;
+        // The window's taskbar button inherits the project's live state.
+        self.update_window_taskbar(&project.id);
         Ok(())
     }
 
@@ -1692,6 +1725,10 @@ impl Core {
                     window.set_focus()?;
                     self.mark_window_focused(&label);
                 }
+                // A reassigned or newly surfaced window inherits the
+                // project's live taskbar state (a running or failed
+                // command's indicator must not die with the old window).
+                self.update_window_taskbar(&project.id);
                 self.broadcast();
                 return Ok(label);
             }
@@ -1712,6 +1749,9 @@ impl Core {
                 window.set_focus()?;
                 self.mark_window_focused(&label);
             }
+            // The window's taskbar button inherits the project's live
+            // state (it may have been rebuilt after a destroy).
+            self.update_window_taskbar(project_id);
             return Ok(label);
         }
 
@@ -1755,6 +1795,9 @@ impl Core {
         if focus {
             window.set_focus()?;
         }
+        // A fresh window's taskbar button inherits the project's live
+        // state (a running or failed command's indicator).
+        self.update_window_taskbar(&project.id);
         Ok(label)
     }
 
@@ -2073,6 +2116,7 @@ impl Core {
             tui_mode: TuiMode::Canonical,
             activity: SessionActivity::Idle,
             activity_since: None,
+            taskbar: TaskbarProgress::Clear,
         };
         {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
@@ -2091,21 +2135,22 @@ impl Core {
                         cols: SESSION_DEFAULT_COLS,
                         rows: SESSION_DEFAULT_ROWS,
                     }],
-            buffer: String::new(),
-            journal_len: 0,
-            tui: TuiClassifier::new(SESSION_DEFAULT_ROWS),
-            synthetic_alt: false,
-            deferred_tui_resize: false,
-            last_user_input_at: None,
-            last_resize_at: None,
-            requested_viewport: None,
-            activity: ActivityDetector::new(Instant::now()),
-            control_tail: String::new(),
-            cursor_query_tail: String::new(),
-            pending_cursor_reports: 0,
-            device_attributes_tail: String::new(),
-            pending_device_attributes: 0,
-            has_run_command: false,
+                    buffer: String::new(),
+                    journal_len: 0,
+                    tui: TuiClassifier::new(SESSION_DEFAULT_ROWS),
+                    synthetic_alt: false,
+                    deferred_tui_resize: false,
+                    last_user_input_at: None,
+                    last_resize_at: None,
+                    requested_viewport: None,
+                    activity: ActivityDetector::new(Instant::now()),
+                    taskbar: SessionTaskbar::new(),
+                    control_tail: String::new(),
+                    cursor_query_tail: String::new(),
+                    pending_cursor_reports: 0,
+                    device_attributes_tail: String::new(),
+                    pending_device_attributes: 0,
+                    has_run_command: false,
                 },
             );
             inner.session_order.push(id.clone());
@@ -2141,7 +2186,11 @@ impl Core {
     /// The session output pipeline, shared by spawned and ConPTY-handoff
     /// sessions: a raw PTY reader feeding a merge thread that coalesces
     /// ConPTY's burst of tiny writes before they are journaled.
-    fn spawn_session_reader(self: &Arc<Self>, session_id: &str, mut reader: Box<dyn std::io::Read + Send>) {
+    fn spawn_session_reader(
+        self: &Arc<Self>,
+        session_id: &str,
+        mut reader: Box<dyn std::io::Read + Send>,
+    ) {
         // Bounded, so a session whose output nobody can keep up with pushes
         // back on the PTY exactly as it did when the reader appended inline,
         // instead of growing a queue.
@@ -2173,7 +2222,8 @@ impl Core {
                 // epoch ahead of bytes the program drew at the previous grid.
                 let deadline = Instant::now() + OUTPUT_MERGE_MAX_SPAN;
                 while buffered.len() < MAX_MERGED_OUTPUT_BYTES {
-                    let wait = OUTPUT_MERGE_WINDOW.min(deadline.saturating_duration_since(Instant::now()));
+                    let wait =
+                        OUTPUT_MERGE_WINDOW.min(deadline.saturating_duration_since(Instant::now()));
                     if wait.is_zero() {
                         break;
                     }
@@ -2260,6 +2310,7 @@ impl Core {
             tui_mode: TuiMode::Canonical,
             activity: SessionActivity::Idle,
             activity_since: None,
+            taskbar: TaskbarProgress::Clear,
         };
         let master = crate::default_terminal::build_handoff_master(
             handoff.reader,
@@ -2301,6 +2352,7 @@ impl Core {
                     last_resize_at: None,
                     requested_viewport: None,
                     activity: ActivityDetector::new(Instant::now()),
+                    taskbar: SessionTaskbar::new(),
                     control_tail: String::new(),
                     cursor_query_tail: String::new(),
                     pending_cursor_reports: 0,
@@ -2371,7 +2423,9 @@ impl Core {
                     // given the app nothing to show it in, so give it one.
                     sync_log_line(
                         "handoff",
-                        format_args!("no window is open; opening one for the handoff (project {window_project})"),
+                        format_args!(
+                            "no window is open; opening one for the handoff (project {window_project})"
+                        ),
                     );
                     let label = match window_core.ensure_project_window(&window_project) {
                         Ok(label) => {
@@ -2387,9 +2441,7 @@ impl Core {
                             // no error UI - the sync log is the only trace.
                             sync_log_line(
                                 "handoff",
-                                format_args!(
-                                    "could not open a window for the handoff: {error}"
-                                ),
+                                format_args!("could not open a window for the handoff: {error}"),
                             );
                             eprintln!(
                                 "agent-terminal: could not open a window for the handed-off console: {error}"
@@ -2443,6 +2495,9 @@ impl Core {
             }
         };
         self.cleanup_empty_temporary_project(&project_id);
+        // The closed session's taskbar state is gone with it, so re-push
+        // the window's combined state for whatever is left.
+        self.update_window_taskbar(&project_id);
         self.broadcast();
     }
 
@@ -2524,13 +2579,13 @@ impl Core {
                 }
                 session.pending_device_attributes -= 1;
             } else {
-            // The size hint refreshes the writer's viewport entry (the
-            // pane's announced W_i x H_i). Typing is always an interaction:
-            // it claims the PTY grid for the sender, in every mode.
-            if let Some((cols, rows)) = size {
-                set_client_viewport(session, controller.clone(), cols, rows);
-                applied_grid = apply_owner_grid_for(session, &controller, cols, rows, true);
-            }
+                // The size hint refreshes the writer's viewport entry (the
+                // pane's announced W_i x H_i). Typing is always an interaction:
+                // it claims the PTY grid for the sender, in every mode.
+                if let Some((cols, rows)) = size {
+                    set_client_viewport(session, controller.clone(), cols, rows);
+                    applied_grid = apply_owner_grid_for(session, &controller, cols, rows, true);
+                }
             }
             sync_log!(
                 "input",
@@ -2668,7 +2723,14 @@ impl Core {
         self.write_session_from(session_id, data, TerminalController::Remote(key), size);
     }
 
-    fn resize_remote_session(&self, client_id: &str, session_id: &str, cols: u16, rows: u16, claim: bool) {
+    fn resize_remote_session(
+        &self,
+        client_id: &str,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+        claim: bool,
+    ) {
         let key = self.remote_sizing_key(client_id);
         self.resize_session_from(
             session_id,
@@ -2682,7 +2744,14 @@ impl Core {
     /// Viewport registration for a remote client's attach - a claimed attach
     /// only (see `attach_owner_grid_for`); the desktop counterpart is
     /// `attach_window_session`.
-    fn attach_remote_session(&self, client_id: &str, session_id: &str, cols: u16, rows: u16, claim: bool) {
+    fn attach_remote_session(
+        &self,
+        client_id: &str,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+        claim: bool,
+    ) {
         let key = self.remote_sizing_key(client_id);
         let controller = TerminalController::Remote(key);
         let epoch = {
@@ -2717,7 +2786,6 @@ impl Core {
         }
     }
 
-
     pub fn attach_window_session(
         &self,
         label: &str,
@@ -2743,7 +2811,11 @@ impl Core {
             Some(session) => {
                 let controller = TerminalController::Desktop(label.to_string());
                 let epoch = attach_owner_grid_for(session, &controller, cols, rows, claim);
-                (session.metadata.project_id.clone(), snapshot_of(session), epoch)
+                (
+                    session.metadata.project_id.clone(),
+                    snapshot_of(session),
+                    epoch,
+                )
             }
             None => return Err(anyhow!("Terminal session not found.")),
         };
@@ -2885,6 +2957,91 @@ impl Core {
                 "desktop-activity",
                 event.clone(),
             );
+        }
+    }
+
+    /// Broadcasts the session's ConEmu `OSC 9;4` taskbar state to the
+    /// remote clients attached to it and to the desktop windows that
+    /// subscribe to it, like the activity broadcast.
+    fn broadcast_taskbar(&self, session_id: &str, taskbar: TaskbarProgress) {
+        let targets = self
+            .clients
+            .lock()
+            .expect("remote clients poisoned")
+            .iter()
+            .filter(|(_, client)| {
+                client.device_id.is_some() && client.attached_sessions.contains(session_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for client_id in &targets {
+            self.send_to_client(
+                client_id,
+                ServerMessage::SessionTaskbarChanged {
+                    session_id: session_id.to_string(),
+                    taskbar,
+                },
+            );
+        }
+        let event = TerminalTaskbarEvent {
+            session_id: session_id.to_string(),
+            taskbar,
+        };
+        let windows = self
+            .inner
+            .lock()
+            .expect("desktop state poisoned")
+            .windows
+            .subscribers(session_id);
+        sync_log!(
+            "taskbar",
+            "broadcast session={session_id} taskbar={taskbar:?} clients={}",
+            targets.len()
+        );
+        for label in windows {
+            let _ = self.app.emit_to(
+                EventTarget::webview_window(label),
+                "desktop-taskbar",
+                event.clone(),
+            );
+        }
+    }
+
+    /// Recomputes the project's window taskbar state and pushes it to the
+    /// taskbar engine. The window-level state follows Windows Terminal's
+    /// group rule (error, paused, value, indeterminate, clear), so the
+    /// button always shows the state that matters most, whatever its
+    /// sessions are doing.
+    fn update_window_taskbar(&self, project_id: &str) {
+        let _ = project_id; // keep the argument on every platform
+        #[cfg(windows)]
+        {
+            let (hwnd, taskbar) = {
+                let inner = self.inner.lock().expect("desktop state poisoned");
+                let Some(label) = inner.windows.window_for_project(project_id) else {
+                    return;
+                };
+                let Some(window) = self.app.get_webview_window(label) else {
+                    return;
+                };
+                let Ok(hwnd) = window.hwnd() else {
+                    return;
+                };
+                let states = inner
+                    .sessions
+                    .values()
+                    .filter(|session| session.metadata.project_id == project_id)
+                    .map(|session| session.taskbar.effective());
+                ((hwnd.0) as isize, crate::taskbar::combine(states))
+            };
+            if taskbar.is_clear() {
+                // A clear push also forgets the window in the engine's
+                // tracking, so shutdown does not bother clearing it.
+                self.taskbar_engine.clear(hwnd);
+            } else {
+                self.taskbar_engine
+                    .set(hwnd, taskbar.state_code(), taskbar.progress());
+            }
         }
     }
 
@@ -3140,10 +3297,7 @@ impl Core {
             .expect("remote clients poisoned")
             .remove(id)
             .and_then(|client| client.device_id);
-        let key = device_id
-            .as_ref()
-            .map(String::as_str)
-            .unwrap_or(id);
+        let key = device_id.as_ref().map(String::as_str).unwrap_or(id);
         // The device's viewport entries leave set S in every session; any
         // session it owned hands the grid to the next most recently active
         // survivor (`reselect_owner_on_departure`).
@@ -3521,7 +3675,10 @@ impl Core {
                 self.close_session(&session_id);
                 Some(ServerMessage::Ok { request_id })
             }
-            ClientMessage::ShellDefault { request_id, shell_id } => {
+            ClientMessage::ShellDefault {
+                request_id,
+                shell_id,
+            } => {
                 self.set_default_shell(&shell_id)?;
                 Some(ServerMessage::Snapshot {
                     request_id: Some(request_id),
@@ -3714,6 +3871,8 @@ impl Core {
             mode_change,
             tui_entry_grid,
             activity_change,
+            taskbar_change,
+            project_id,
         ) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let Some(session) = inner.sessions.get_mut(session_id) else {
@@ -3783,7 +3942,11 @@ impl Core {
             if let Some(cut_rel) = session.tui.take_chunk_clear() {
                 // Both indices are relative to `data`; the injection only
                 // shifts the clear when it was spliced in ahead of it.
-                let shift = if inject_at <= cut_rel { injected.len() } else { 0 };
+                let shift = if inject_at <= cut_rel {
+                    injected.len()
+                } else {
+                    0
+                };
                 let clear_at = before_trim
                     .saturating_sub(payload.len())
                     .saturating_add(shift)
@@ -3839,12 +4002,13 @@ impl Core {
                         &mut session.cursor_query_tail,
                         &data,
                     ));
-            session.pending_device_attributes = session
-                .pending_device_attributes
-                .saturating_add(record_device_attribute_requests(
-                    &mut session.device_attributes_tail,
-                    &data,
-                ));
+            session.pending_device_attributes =
+                session
+                    .pending_device_attributes
+                    .saturating_add(record_device_attribute_requests(
+                        &mut session.device_attributes_tail,
+                        &data,
+                    ));
             // TUI mode transition (canonical / inline / fullscreen): a
             // program taking or releasing grid ownership changes how
             // clients may treat the data block (strict grid, no reflow
@@ -3886,7 +4050,9 @@ impl Core {
             // paint evidence arrives, so the SIGWINCH never lands mid-
             // shell-state and desyncs PSReadLine's prompt-row tracking.
             let mut tui_entry_grid = if tui_transition.is_some_and(|t| t.to != TuiMode::Canonical) {
-                if tui_transition.is_some_and(|t| t.via_alt_enter) && session.tui.grid_change_suppressed() {
+                if tui_transition.is_some_and(|t| t.via_alt_enter)
+                    && session.tui.grid_change_suppressed()
+                {
                     session.deferred_tui_resize = true;
                     None
                 } else {
@@ -3924,6 +4090,7 @@ impl Core {
             // never reaches this list), the mode it settled on, and its
             // prompt-quiet verdict.
             let markers = session.tui.take_shell_markers();
+            let reports = session.tui.take_progress_reports();
             let quiet_idle = session.tui.quiet_idle(now);
             // Output the user just caused - a keystroke reaction, a
             // resize repaint - must not read as the program working:
@@ -3959,6 +4126,35 @@ impl Core {
                     session.metadata.activity_since = Some(since.clone());
                     (activity, since)
                 });
+            // Taskbar progress runs off the same pass (Windows Terminal's
+            // ConEmu `OSC 9;4` path, microsoft/terminal #8055): explicit
+            // program reports first, then the shell's command lifecycle -
+            // a running command is an indeterminate spinner, and a
+            // non-zero exit leaves an error until the next command
+            // starts.
+            let mut taskbar_changed = false;
+            for report in reports {
+                taskbar_changed |= session.taskbar.apply_report(report);
+            }
+            if let Some((activity, _)) = &activity_change {
+                taskbar_changed |= session.taskbar.on_activity(*activity);
+            }
+            let failed_exit = markers.iter().any(|marker| {
+                matches!(
+                    marker,
+                    ShellMarker::CommandEnd {
+                        exit_code: Some(code)
+                    } if *code != 0
+                )
+            });
+            if failed_exit {
+                taskbar_changed |= session.taskbar.on_failed_exit();
+            }
+            // Both values are computed before the tuple: the tuple's
+            // `subscribers` call takes a shared borrow of `inner`, which
+            // may not overlap the session's mutable borrow.
+            let project_id = session.metadata.project_id.clone();
+            let taskbar_change = taskbar_changed.then_some(session.taskbar.effective());
             (
                 reported,
                 title_changed,
@@ -3968,6 +4164,8 @@ impl Core {
                 mode_change,
                 tui_entry_grid,
                 activity_change,
+                taskbar_change,
+                project_id,
             )
         };
         let event = TerminalDataEvent {
@@ -3992,6 +4190,10 @@ impl Core {
         if let Some((activity, since)) = &activity_change {
             self.broadcast_activity(session_id, *activity, since);
         }
+        if let Some(taskbar) = taskbar_change {
+            self.broadcast_taskbar(session_id, taskbar);
+            self.update_window_taskbar(&project_id);
+        }
         if let Some(cwd) = reported_cwd {
             self.handle_session_working_directory(session_id, &cwd);
         } else if title_changed || activity_change.is_some() {
@@ -4000,27 +4202,59 @@ impl Core {
     }
 
     fn on_terminal_exit(self: &Arc<Self>, session_id: &str, exit_code: u32) {
-        let (project_id, changed) = {
+        let (closed_project, exited_project, taskbar_clear) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            // The taskbar state the process was showing, for the
+            // kept-open exited tab: its indicator has to be dropped
+            // explicitly, since no stream is left to clear it.
+            let previous = inner
+                .sessions
+                .get(session_id)
+                .map(|session| session.taskbar.effective());
             if exit_code == 0 {
                 // The shell finished normally: close the tab instead of
                 // leaving a dead one behind. The process is already gone,
                 // so no kill is attempted. If the user closed the tab
                 // first the session is already removed and this is a
                 // no-op.
-                (close_session_in_inner(&mut inner, session_id, false), false)
+                (
+                    close_session_in_inner(&mut inner, session_id, false),
+                    None,
+                    None,
+                )
             } else {
                 // Non-zero exit: keep the tab so the user can inspect
                 // what failed.
-                (None, mark_session_exited(&mut inner, session_id, exit_code))
+                let found = mark_session_exited(&mut inner, session_id, exit_code);
+                let project = found
+                    .then(|| inner.sessions.get(session_id))
+                    .flatten()
+                    .map(|session| session.metadata.project_id.clone());
+                (
+                    None,
+                    project,
+                    previous.filter(|taskbar| !taskbar.is_clear()),
+                )
             }
         };
-        if let Some(project_id) = &project_id {
+        if let Some(project_id) = &closed_project {
             self.cleanup_empty_temporary_project(project_id);
+            // The closed session's state is gone with it, so re-push the
+            // window's taskbar in case the surviving sessions' priority
+            // changed.
+            self.update_window_taskbar(project_id);
+        }
+        if let Some(project_id) = &exited_project {
+            // An exited tab kept for inspection must not keep an
+            // indicator: the process that owned it is gone.
+            if taskbar_clear.is_some() {
+                self.broadcast_taskbar(session_id, TaskbarProgress::Clear);
+            }
+            self.update_window_taskbar(project_id);
         }
         // The manual-close path already broadcast when it removed the
         // session first, so a no-op close here stays silent.
-        if project_id.is_some() || changed {
+        if closed_project.is_some() || exited_project.is_some() {
             self.broadcast();
         }
     }
@@ -4079,6 +4313,11 @@ impl Core {
                     self.cleanup_empty_temporary_project(&plan.previous_project_id);
                 }
             }
+            // The moved session's taskbar state now belongs to the other
+            // project; make sure both projects' windows carry the states
+            // that result.
+            self.update_window_taskbar(&plan.project.id);
+            self.update_window_taskbar(&plan.previous_project_id);
         }
         self.broadcast();
     }
@@ -4239,8 +4478,7 @@ fn snapshot_from_inner(inner: &Inner, online_device_ids: &HashSet<String>) -> Ho
             .map(|device| {
                 let mut entry = device.device.clone();
                 entry.online = online_device_ids.contains(&entry.id);
-                entry.viewing_session_ids =
-                    viewing.get(&entry.id).cloned().unwrap_or_default();
+                entry.viewing_session_ids = viewing.get(&entry.id).cloned().unwrap_or_default();
                 entry
             })
             .collect(),
@@ -4514,6 +4752,9 @@ fn mark_session_exited(inner: &mut Inner, session_id: &str, exit_code: u32) -> b
     session.activity.on_exit(Instant::now());
     session.metadata.activity = session.activity.state();
     session.metadata.activity_since = Some(session.activity.since().to_string());
+    // Same for the taskbar: whatever progress the process was showing
+    // belongs to a process that no longer exists.
+    session.taskbar.on_exit();
     true
 }
 
@@ -4637,9 +4878,7 @@ fn resolve_working_directory(inner: &mut Inner, session_id: &str, cwd: &Path) ->
         .filter(|project| is_within_project(cwd, Path::new(&project.path)))
         .cloned()
         .collect::<Vec<_>>();
-    saved.sort_by_key(|project| {
-        std::cmp::Reverse(Path::new(&project.path).components().count())
-    });
+    saved.sort_by_key(|project| std::cmp::Reverse(Path::new(&project.path).components().count()));
     let project = saved
         .into_iter()
         .next()
@@ -4834,8 +5073,7 @@ fn evict_stale_viewports(
 ) -> Vec<TerminalController> {
     let mut evicted = Vec::new();
     session.viewports.retain(|controller, viewport| {
-        let keep = !viewport.networked
-            || now.duration_since(viewport.last_seen) < timeout;
+        let keep = !viewport.networked || now.duration_since(viewport.last_seen) < timeout;
         if !keep {
             evicted.push(controller.clone());
         }
@@ -5043,7 +5281,9 @@ fn apply_session_grid(session: &mut ManagedSession, cols: u16, rows: u16) -> Opt
 }
 
 fn snapshot_of(session: &ManagedSession) -> SessionSnapshot {
-    let base = session.journal_len.saturating_sub(session.buffer.len() as u64);
+    let base = session
+        .journal_len
+        .saturating_sub(session.buffer.len() as u64);
     SessionSnapshot {
         segments: collapse_superseded_repaints(split_journal_by_epochs(
             &session.buffer,
@@ -5383,7 +5623,10 @@ fn take_valid_pairing_grant(
 }
 
 fn is_dropped_node_status(status: &EmbeddedNodeStatus) -> bool {
-    matches!(status.error_code.as_str(), "preauth_missing" | "preauth_rejected")
+    matches!(
+        status.error_code.as_str(),
+        "preauth_missing" | "preauth_rejected"
+    )
 }
 
 /// Clears the in-flight verification flag when its task exits on a path that
@@ -5391,7 +5634,9 @@ fn is_dropped_node_status(status: &EmbeddedNodeStatus) -> bool {
 struct RemoteVerificationGuard(Arc<Core>);
 impl Drop for RemoteVerificationGuard {
     fn drop(&mut self) {
-        self.0.remote_verification_running.store(false, Ordering::Release);
+        self.0
+            .remote_verification_running
+            .store(false, Ordering::Release);
     }
 }
 
@@ -5424,25 +5669,27 @@ fn registration_status_for_display(
 mod tests {
     use super::{
         ActivityDetector, CdOutcome, CdPlan, ConnectivityAction, ConnectivityTracker,
-        EmbeddedNodeStatus, Inner, ManagedSession, PRESENCE_WINDOW_MS, PairingGrant,
-        PENDING_FOCUS_TTL, PendingFocus, RetireOutcome, SESSION_MAX_COLS, SESSION_MAX_ROWS,
-        SessionActivity, SessionWriter, TUI_QUIET_MS, TUI_USER_ATTRIBUTION_MS, claim_pending_focus, record_pending_focus,
-        VIEWPORT_WATCHDOG_TIMEOUT_MS, apply_grid_if_tui,
-        apply_session_grid, ensure_home_project, evict_stale_viewports, folder_name,
-        is_cursor_position_report, is_device_attributes_report, is_dropped_node_status,
-        is_system_directory, is_within_project, log_escape,
-        active_session_count, newest_running_session_project_id, open_session_count,
-        output_is_user_driven,
-        parse_terminal_titles,
-        parse_working_directories, preferred_project, presence_alive, project_is_usable,
-        project_for_directory, project_name_or_folder, record_cursor_position_requests,
-        record_device_attribute_requests, reselect_owner_on_departure,
-        registration_status_for_display, resolve_working_directory, retire_empty_temporary_project,
-        apply_owner_grid, apply_owner_grid_for, attach_owner_grid_for, drain_journal_front_at, release_viewport, set_client_viewport, should_open_quiet_window, snapshot_from_inner,
-        collapse_superseded_repaints, contains_csi_final, snapshot_of, split_journal_by_epochs, starts_with_screen_repaint, startup_project, take_valid_pairing_grant, truncate_journal_front,
-        validate_project_name, GridEpoch, SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS,
-        TerminalController, close_session_in_inner, mark_session_exited,
+        EmbeddedNodeStatus, GridEpoch, Inner, ManagedSession, PENDING_FOCUS_TTL,
+        PRESENCE_WINDOW_MS, PairingGrant, PendingFocus, RetireOutcome, SESSION_DEFAULT_COLS,
+        SESSION_DEFAULT_ROWS, SESSION_MAX_COLS, SESSION_MAX_ROWS, SessionActivity, SessionWriter,
+        TUI_QUIET_MS, TUI_USER_ATTRIBUTION_MS, TerminalController, VIEWPORT_WATCHDOG_TIMEOUT_MS,
+        active_session_count, apply_grid_if_tui, apply_owner_grid, apply_owner_grid_for,
+        apply_session_grid, attach_owner_grid_for, claim_pending_focus, close_session_in_inner,
+        collapse_superseded_repaints, contains_csi_final, drain_journal_front_at,
+        ensure_home_project, evict_stale_viewports, folder_name, is_cursor_position_report,
+        is_device_attributes_report, is_dropped_node_status, is_system_directory,
+        is_within_project, log_escape, mark_session_exited, newest_running_session_project_id,
+        open_session_count, output_is_user_driven, parse_terminal_titles,
+        parse_working_directories, preferred_project, presence_alive, project_for_directory,
+        project_is_usable, project_name_or_folder, record_cursor_position_requests,
+        record_device_attribute_requests, record_pending_focus, registration_status_for_display,
+        release_viewport, reselect_owner_on_departure, resolve_working_directory,
+        retire_empty_temporary_project, set_client_viewport, should_open_quiet_window,
+        snapshot_from_inner, snapshot_of, split_journal_by_epochs, starts_with_screen_repaint,
+        startup_project, take_valid_pairing_grant, truncate_journal_front, validate_project_name,
     };
+    use crate::models::TaskbarProgress;
+    use crate::taskbar::SessionTaskbar;
     use crate::{
         models::{AuthorizedDevice, Project, SessionSegment, TerminalSession, TuiMode},
         store::DesktopStore,
@@ -5535,18 +5782,37 @@ mod tests {
 
     #[test]
     fn journal_splits_into_per_grid_segments_without_losing_bytes() {
-        let stream = "PS C:\\repo> dir\r\nfile-one.txt\r\nfile-two.txt\r\nPS C:\\repo> git status\r\n";
+        let stream =
+            "PS C:\\repo> dir\r\nfile-one.txt\r\nfile-two.txt\r\nPS C:\\repo> git status\r\n";
         // Offsets: 18 lands inside "file-one.txt" (a mid-line grid switch is
         // fine - reflow takes over the already-printed row), 45 is exactly
         // the start of the next prompt line.
         let epochs = vec![
-            GridEpoch { offset: 0, cols: 120, rows: 30 },
-            GridEpoch { offset: 18, cols: 45, rows: 35 },
-            GridEpoch { offset: 45, cols: 100, rows: 40 },
+            GridEpoch {
+                offset: 0,
+                cols: 120,
+                rows: 30,
+            },
+            GridEpoch {
+                offset: 18,
+                cols: 45,
+                rows: 35,
+            },
+            GridEpoch {
+                offset: 45,
+                cols: 100,
+                rows: 40,
+            },
         ];
         let segments = split_journal_by_epochs(stream, &epochs, 0);
-        let joined: String = segments.iter().map(|segment| segment.data.as_str()).collect();
-        assert_eq!(joined, stream, "no byte may be lost or duplicated across grid slices");
+        let joined: String = segments
+            .iter()
+            .map(|segment| segment.data.as_str())
+            .collect();
+        assert_eq!(
+            joined, stream,
+            "no byte may be lost or duplicated across grid slices"
+        );
         assert_eq!(segments[0].cols, 120);
         assert_eq!(segments[1].cols, 45);
         assert_eq!(segments[1].data, "ile-one.txt\r\nfile-two.txt\r\n");
@@ -5561,9 +5827,21 @@ mod tests {
         // always ends on the current grid.
         let stream = "abc";
         let epochs = vec![
-            GridEpoch { offset: 0, cols: 120, rows: 30 },
-            GridEpoch { offset: 3, cols: 45, rows: 35 },
-            GridEpoch { offset: 3, cols: 100, rows: 40 },
+            GridEpoch {
+                offset: 0,
+                cols: 120,
+                rows: 30,
+            },
+            GridEpoch {
+                offset: 3,
+                cols: 45,
+                rows: 35,
+            },
+            GridEpoch {
+                offset: 3,
+                cols: 100,
+                rows: 40,
+            },
         ];
         let segments = split_journal_by_epochs(stream, &epochs, 0);
         assert_eq!(segments.len(), 3);
@@ -5573,7 +5851,10 @@ mod tests {
         assert_eq!(segments[1].data, "");
         assert_eq!((segments[2].cols, segments[2].rows), (100, 40));
         assert_eq!(segments[2].data, "");
-        let joined: String = segments.iter().map(|segment| segment.data.as_str()).collect();
+        let joined: String = segments
+            .iter()
+            .map(|segment| segment.data.as_str())
+            .collect();
         assert_eq!(joined, "abc");
     }
 
@@ -5581,13 +5862,27 @@ mod tests {
     fn journal_split_after_front_trimming_starts_at_the_trimmed_base() {
         let journal = &"A".repeat(500)[200..];
         let epochs = vec![
-            GridEpoch { offset: 0, cols: 120, rows: 30 },
-            GridEpoch { offset: 480, cols: 60, rows: 40 },
+            GridEpoch {
+                offset: 0,
+                cols: 120,
+                rows: 30,
+            },
+            GridEpoch {
+                offset: 480,
+                cols: 60,
+                rows: 40,
+            },
         ];
         let base = 200_u64;
         let segments = split_journal_by_epochs(journal, &epochs, base);
-        assert_eq!(segments[0].cols, 120, "the last epoch at or before the base still applies");
-        let joined: String = segments.iter().map(|segment| segment.data.as_str()).collect();
+        assert_eq!(
+            segments[0].cols, 120,
+            "the last epoch at or before the base still applies"
+        );
+        let joined: String = segments
+            .iter()
+            .map(|segment| segment.data.as_str())
+            .collect();
         assert_eq!(joined, journal);
     }
 
@@ -5595,11 +5890,22 @@ mod tests {
     fn journal_split_survives_multibyte_characters_at_epoch_boundaries() {
         let stream = "PS> 日本語ファイル.txt\r\n日本語列もそのまま\r\n";
         let epochs = vec![
-            GridEpoch { offset: 0, cols: 120, rows: 30 },
-            GridEpoch { offset: (stream.len() - "日本語列もそのまま\r\n".len()) as u64, cols: 80, rows: 24 },
+            GridEpoch {
+                offset: 0,
+                cols: 120,
+                rows: 30,
+            },
+            GridEpoch {
+                offset: (stream.len() - "日本語列もそのまま\r\n".len()) as u64,
+                cols: 80,
+                rows: 24,
+            },
         ];
         let segments = split_journal_by_epochs(stream, &epochs, 0);
-        let joined: String = segments.iter().map(|segment| segment.data.as_str()).collect();
+        let joined: String = segments
+            .iter()
+            .map(|segment| segment.data.as_str())
+            .collect();
         assert_eq!(joined, stream);
         assert_eq!(segments[1].cols, 80);
     }
@@ -5610,11 +5916,22 @@ mod tests {
         // whole trimmed journal, with no bytes ascribed to the stale grid.
         let journal = "PS> dir\r\nfile.txt\r\n";
         let epochs = vec![
-            GridEpoch { offset: 0, cols: 120, rows: 30 },
-            GridEpoch { offset: 200, cols: 45, rows: 35 },
+            GridEpoch {
+                offset: 0,
+                cols: 120,
+                rows: 30,
+            },
+            GridEpoch {
+                offset: 200,
+                cols: 45,
+                rows: 35,
+            },
         ];
         let segments = split_journal_by_epochs(journal, &epochs, 200);
-        let joined: String = segments.iter().map(|segment| segment.data.as_str()).collect();
+        let joined: String = segments
+            .iter()
+            .map(|segment| segment.data.as_str())
+            .collect();
         assert_eq!(joined, journal);
         assert_eq!(segments.last().unwrap().cols, 45);
     }
@@ -5626,19 +5943,38 @@ mod tests {
         // unreachable segments, and the retained grid stays the latest one.
         let journal = "tail-content\r\n";
         let epochs = vec![
-            GridEpoch { offset: 0, cols: 120, rows: 30 },
-            GridEpoch { offset: 10, cols: 72, rows: 26 },
-            GridEpoch { offset: 5000, cols: 113, rows: 39 },
+            GridEpoch {
+                offset: 0,
+                cols: 120,
+                rows: 30,
+            },
+            GridEpoch {
+                offset: 10,
+                cols: 72,
+                rows: 26,
+            },
+            GridEpoch {
+                offset: 5000,
+                cols: 113,
+                rows: 39,
+            },
         ];
         let segments = split_journal_by_epochs(journal, &epochs, 200);
-        let joined: String = segments.iter().map(|segment| segment.data.as_str()).collect();
+        let joined: String = segments
+            .iter()
+            .map(|segment| segment.data.as_str())
+            .collect();
         assert_eq!(joined, journal);
         assert_eq!(segments.last().unwrap().cols, 72);
     }
 
     #[test]
     fn journal_split_of_an_empty_journal_yields_no_segments() {
-        let epochs = vec![GridEpoch { offset: 0, cols: 120, rows: 30 }];
+        let epochs = vec![GridEpoch {
+            offset: 0,
+            cols: 120,
+            rows: 30,
+        }];
         assert!(split_journal_by_epochs("", &epochs, 0).is_empty());
     }
 
@@ -5649,14 +5985,21 @@ mod tests {
         // the spawn default.
         let journal = "abc";
         let epochs = vec![
-            GridEpoch { offset: 0, cols: 120, rows: 30 },
-            GridEpoch { offset: 3, cols: 45, rows: 35 },
+            GridEpoch {
+                offset: 0,
+                cols: 120,
+                rows: 30,
+            },
+            GridEpoch {
+                offset: 3,
+                cols: 45,
+                rows: 35,
+            },
         ];
         let segments = split_journal_by_epochs(journal, &epochs, 0);
         assert_eq!(segments.last().unwrap().cols, 45);
         assert_eq!(
-            segments[0].cols,
-            120,
+            segments[0].cols, 120,
             "the bytes before the epoch still carry the previous grid"
         );
     }
@@ -5665,19 +6008,41 @@ mod tests {
     fn applying_the_same_grid_is_a_no_op_and_changing_it_records_an_epoch() {
         let mut session = test_session("s1", "p1", "C:\repo");
         let first = apply_session_grid(&mut session, 113, 39);
-        assert_eq!(first, Some(GridEpoch { offset: 0, cols: 113, rows: 39 }));
+        assert_eq!(
+            first,
+            Some(GridEpoch {
+                offset: 0,
+                cols: 113,
+                rows: 39
+            })
+        );
         assert_eq!(session.grid, (113, 39));
-        assert_eq!(session.grid_epochs.len(), 1, "the spawn epoch had no output under it");
+        assert_eq!(
+            session.grid_epochs.len(),
+            1,
+            "the spawn epoch had no output under it"
+        );
 
         let noop = apply_session_grid(&mut session, 113, 39);
         assert_eq!(noop, None);
-        assert_eq!(session.grid_epochs.len(), 1, "a no-op must not add an epoch");
+        assert_eq!(
+            session.grid_epochs.len(),
+            1,
+            "a no-op must not add an epoch"
+        );
 
         // Output at 113x39 pins that grid: the next resize is a new epoch
         // rather than a correction of the last one.
         session.journal_len = 40;
         let second = apply_session_grid(&mut session, 72, 26);
-        assert_eq!(second, Some(GridEpoch { offset: 40, cols: 72, rows: 26 }));
+        assert_eq!(
+            second,
+            Some(GridEpoch {
+                offset: 40,
+                cols: 72,
+                rows: 26
+            })
+        );
         assert_eq!(session.grid, (72, 26));
         assert_eq!(session.grid_epochs.len(), 2);
     }
@@ -5703,17 +6068,29 @@ mod tests {
         // ConPTY redraw the screen, so each intermediate grid gets an epoch
         // with a full repaint under it. The replay only needs the last.
         let segments = vec![
-            SessionSegment { cols: 112, rows: 38, data: "$ ls\r\nfile.txt\r\n".into() },
+            SessionSegment {
+                cols: 112,
+                rows: 38,
+                data: "$ ls\r\nfile.txt\r\n".into(),
+            },
             conpty_repaint(209, 65, "$ "),
             conpty_repaint(209, 28, "$ "),
             conpty_repaint(72, 51, "$ "),
             conpty_repaint(118, 65, "$ "),
-            SessionSegment { cols: 118, rows: 65, data: String::new() },
+            SessionSegment {
+                cols: 118,
+                rows: 65,
+                data: String::new(),
+            },
         ];
         let collapsed = collapse_superseded_repaints(segments.clone());
         assert_eq!(
             collapsed,
-            vec![segments[0].clone(), segments[4].clone(), segments[5].clone()],
+            vec![
+                segments[0].clone(),
+                segments[4].clone(),
+                segments[5].clone()
+            ],
             "only the repaint that survived on screen is replayed"
         );
     }
@@ -5723,7 +6100,9 @@ mod tests {
         // ConPTY homes the cursor either straight away or after restoring the
         // attributes it was drawing with; both are the same repaint.
         assert!(starts_with_screen_repaint("\x1b[?25l\x1b[H\x1b[Ktext"));
-        assert!(starts_with_screen_repaint("\x1b[?25l\x1b[34m\x1b[1m\x1b[1;1Htext"));
+        assert!(starts_with_screen_repaint(
+            "\x1b[?25l\x1b[34m\x1b[1m\x1b[1;1Htext"
+        ));
         // Anything that draws before homing is not a full-screen repaint.
         assert!(!starts_with_screen_repaint("\x1b[?25l\x1b[5;1Htext"));
         assert!(!starts_with_screen_repaint("\x1b[?25ltext\x1b[H"));
@@ -5772,7 +6151,11 @@ mod tests {
         // repaint that preceded it.
         let segments = vec![
             conpty_repaint(80, 24, "$ "),
-            SessionSegment { cols: 80, rows: 24, data: "$ ls\r\nfile.txt\r\n".into() },
+            SessionSegment {
+                cols: 80,
+                rows: 24,
+                data: "$ ls\r\nfile.txt\r\n".into(),
+            },
             conpty_repaint(90, 24, "$ "),
         ];
         assert_eq!(collapse_superseded_repaints(segments.clone()), segments);
@@ -5790,7 +6173,11 @@ mod tests {
     fn each_run_of_repaints_collapses_to_its_own_last() {
         // Two separate resize bursts with a command between them: each burst
         // loses its intermediate repaints, and the output between survives.
-        let output = SessionSegment { cols: 90, rows: 24, data: "$ ls\r\nfile.txt\r\n".into() };
+        let output = SessionSegment {
+            cols: 90,
+            rows: 24,
+            data: "$ ls\r\nfile.txt\r\n".into(),
+        };
         let segments = vec![
             conpty_repaint(80, 24, "a"),
             conpty_repaint(85, 24, "b"),
@@ -5809,8 +6196,16 @@ mod tests {
     fn an_empty_segment_between_two_repaints_does_not_break_the_run() {
         // A zero-length segment is a bare grid swap - it draws nothing, so
         // the repaint before it is still superseded by the one after.
-        let empty = SessionSegment { cols: 85, rows: 24, data: String::new() };
-        let segments = vec![conpty_repaint(80, 24, "a"), empty, conpty_repaint(90, 24, "b")];
+        let empty = SessionSegment {
+            cols: 85,
+            rows: 24,
+            data: String::new(),
+        };
+        let segments = vec![
+            conpty_repaint(80, 24, "a"),
+            empty,
+            conpty_repaint(90, 24, "b"),
+        ];
         let collapsed = collapse_superseded_repaints(segments.clone());
         assert_eq!(collapsed, vec![segments[2].clone()]);
     }
@@ -5853,8 +6248,16 @@ mod tests {
     #[test]
     fn a_journal_with_no_repaints_is_returned_untouched() {
         let segments = vec![
-            SessionSegment { cols: 80, rows: 24, data: "$ ls\r\n".into() },
-            SessionSegment { cols: 90, rows: 24, data: "file.txt\r\n".into() },
+            SessionSegment {
+                cols: 80,
+                rows: 24,
+                data: "$ ls\r\n".into(),
+            },
+            SessionSegment {
+                cols: 90,
+                rows: 24,
+                data: "file.txt\r\n".into(),
+            },
         ];
         assert_eq!(collapse_superseded_repaints(segments.clone()), segments);
     }
@@ -5870,14 +6273,26 @@ mod tests {
         for (cols, rows) in [(80, 24), (82, 24), (85, 25)] {
             assert_eq!(
                 apply_session_grid(&mut session, cols, rows),
-                Some(GridEpoch { offset: 512, cols, rows })
+                Some(GridEpoch {
+                    offset: 512,
+                    cols,
+                    rows
+                })
             );
         }
         assert_eq!(
             session.grid_epochs,
             vec![
-                GridEpoch { offset: 0, cols: SESSION_DEFAULT_COLS, rows: SESSION_DEFAULT_ROWS },
-                GridEpoch { offset: 512, cols: 85, rows: 25 },
+                GridEpoch {
+                    offset: 0,
+                    cols: SESSION_DEFAULT_COLS,
+                    rows: SESSION_DEFAULT_ROWS
+                },
+                GridEpoch {
+                    offset: 512,
+                    cols: 85,
+                    rows: 25
+                },
             ]
         );
     }
@@ -5900,7 +6315,11 @@ mod tests {
         );
         assert_eq!(
             session.grid_epochs,
-            vec![GridEpoch { offset: 0, cols: SESSION_DEFAULT_COLS, rows: SESSION_DEFAULT_ROWS }]
+            vec![GridEpoch {
+                offset: 0,
+                cols: SESSION_DEFAULT_COLS,
+                rows: SESSION_DEFAULT_ROWS
+            }]
         );
         assert_eq!(session.grid, (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS));
     }
@@ -5918,8 +6337,16 @@ mod tests {
         assert_eq!(
             session.grid_epochs,
             vec![
-                GridEpoch { offset: 0, cols: SESSION_DEFAULT_COLS, rows: SESSION_DEFAULT_ROWS },
-                GridEpoch { offset: 64, cols: SESSION_MAX_COLS, rows: SESSION_MAX_ROWS },
+                GridEpoch {
+                    offset: 0,
+                    cols: SESSION_DEFAULT_COLS,
+                    rows: SESSION_DEFAULT_ROWS
+                },
+                GridEpoch {
+                    offset: 64,
+                    cols: SESSION_MAX_COLS,
+                    rows: SESSION_MAX_ROWS
+                },
             ]
         );
     }
@@ -5981,7 +6408,14 @@ mod tests {
         session.buffer.push_str("existing history");
         session.journal_len = 19;
         let epoch = apply_session_grid(&mut session, 100, 34);
-        assert_eq!(epoch, Some(GridEpoch { offset: 19, cols: 100, rows: 34 }));
+        assert_eq!(
+            epoch,
+            Some(GridEpoch {
+                offset: 19,
+                cols: 100,
+                rows: 34
+            })
+        );
     }
 
     /// Feed one chunk to the session's TUI classifier, advancing the test
@@ -6010,7 +6444,10 @@ mod tests {
         assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?104").is_none());
         let enter = feed_session(&mut session, &mut clock, 5, "9h").expect("alt enter");
         assert_eq!(enter.to, TuiMode::Fullscreen);
-        assert!(enter.via_alt_enter, "the program's own alt enter is reported");
+        assert!(
+            enter.via_alt_enter,
+            "the program's own alt enter is reported"
+        );
         assert_eq!(session.metadata.tui_mode, TuiMode::Fullscreen);
         // TUI frames do not re-trigger a transition.
         assert!(feed_session(&mut session, &mut clock, 10, "top - 0.3 up\r\n").is_none());
@@ -6073,17 +6510,32 @@ mod tests {
         let first = apply_grid_if_tui(&mut session, 113, 39);
         assert_eq!(
             first,
-            Some(GridEpoch { offset: 0, cols: 113, rows: 39 }),
+            Some(GridEpoch {
+                offset: 0,
+                cols: 113,
+                rows: 39
+            }),
             "a viewport announcement resizes the PTY"
         );
         assert_eq!(session.grid, (113, 39));
         assert_eq!(session.requested_viewport, Some((113, 39)));
         let repeat = apply_grid_if_tui(&mut session, 113, 39);
         assert_eq!(repeat, None, "an unaltered viewport must not re-resize");
-        assert_eq!(session.grid_epochs.len(), 1, "the resize replaced the spawn epoch it sat on");
+        assert_eq!(
+            session.grid_epochs.len(),
+            1,
+            "the resize replaced the spawn epoch it sat on"
+        );
         // A changed viewport resizes again.
         let second = apply_grid_if_tui(&mut session, 72, 26);
-        assert_eq!(second, Some(GridEpoch { offset: 0, cols: 72, rows: 26 }));
+        assert_eq!(
+            second,
+            Some(GridEpoch {
+                offset: 0,
+                cols: 72,
+                rows: 26
+            })
+        );
         assert_eq!(session.grid, (72, 26));
     }
 
@@ -6099,7 +6551,11 @@ mod tests {
         set_client_viewport(&mut session, window.clone(), 113, 39);
         assert_eq!(
             apply_owner_grid_for(&mut session, &window, 113, 39, false),
-            Some(GridEpoch { offset: 0, cols: 113, rows: 39 }),
+            Some(GridEpoch {
+                offset: 0,
+                cols: 113,
+                rows: 39
+            }),
             "the lone client becomes owner and its grid applies"
         );
         assert_eq!(session.owner, Some(window.clone()));
@@ -6109,7 +6565,11 @@ mod tests {
         // claim needed - it is already the owner.
         assert_eq!(
             apply_owner_grid_for(&mut session, &window, 90, 30, false),
-            Some(GridEpoch { offset: 0, cols: 90, rows: 30 })
+            Some(GridEpoch {
+                offset: 0,
+                cols: 90,
+                rows: 30
+            })
         );
         assert_eq!(session.grid, (90, 30));
         assert_eq!(session.requested_viewport, Some((90, 30)));
@@ -6118,7 +6578,11 @@ mod tests {
         let exit = feed_session(&mut session, &mut clock, 350, "\r\n").expect("quiet exit");
         assert_eq!(exit.to, TuiMode::Canonical);
         assert_eq!(session.owner, Some(window));
-        assert_eq!(session.grid, (90, 30), "no background resize on a mode transition");
+        assert_eq!(
+            session.grid,
+            (90, 30),
+            "no background resize on a mode transition"
+        );
     }
 
     #[test]
@@ -6131,9 +6595,19 @@ mod tests {
         // bare-shell-cycle suppression is up: the program redraws at the
         // new size.
         let epoch = apply_owner_grid(&mut session, 72, 26);
-        assert_eq!(epoch, Some(GridEpoch { offset: 0, cols: 72, rows: 26 }));
+        assert_eq!(
+            epoch,
+            Some(GridEpoch {
+                offset: 0,
+                cols: 72,
+                rows: 26
+            })
+        );
         assert_eq!(session.grid, (72, 26));
-        assert!(session.tui.grid_change_suppressed(), "the hold itself is untouched");
+        assert!(
+            session.tui.grid_change_suppressed(),
+            "the hold itself is untouched"
+        );
     }
 
     #[test]
@@ -6142,13 +6616,28 @@ mod tests {
         let mut clock = Instant::now();
         assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
         let first = apply_owner_grid(&mut session, 90, 30);
-        assert_eq!(first, Some(GridEpoch { offset: 0, cols: 90, rows: 30 }));
-        assert_eq!(session.grid_epochs.len(), 1, "the resize replaced the spawn epoch it sat on");
+        assert_eq!(
+            first,
+            Some(GridEpoch {
+                offset: 0,
+                cols: 90,
+                rows: 30
+            })
+        );
+        assert_eq!(
+            session.grid_epochs.len(),
+            1,
+            "the resize replaced the spawn epoch it sat on"
+        );
         // Re-asserting the SAME size is a no-op: no extra epoch, no
         // spurious SIGWINCH for the running program.
         let repeat = apply_owner_grid(&mut session, 90, 30);
         assert_eq!(repeat, None);
-        assert_eq!(session.grid_epochs.len(), 1, "the resize replaced the spawn epoch it sat on");
+        assert_eq!(
+            session.grid_epochs.len(),
+            1,
+            "the resize replaced the spawn epoch it sat on"
+        );
         assert_eq!(session.requested_viewport, Some((90, 30)));
     }
 
@@ -6160,7 +6649,14 @@ mod tests {
         // A degenerate announce (0 rows, sub-2-column viewport) must not
         // panic or produce an unusable PTY grid.
         let epoch = apply_owner_grid(&mut session, 1, 0);
-        assert_eq!(epoch, Some(GridEpoch { offset: 0, cols: 2, rows: 1 }));
+        assert_eq!(
+            epoch,
+            Some(GridEpoch {
+                offset: 0,
+                cols: 2,
+                rows: 1
+            })
+        );
         assert_eq!(session.grid, (2, 1));
     }
 
@@ -6175,20 +6671,35 @@ mod tests {
         // viewport announcement land a SIGWINCH mid-shell-state.
         assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
         let held = apply_grid_if_tui(&mut session, 90, 30);
-        assert_eq!(held, None, "the grid is held through the bare alt cycle");        assert_eq!(session.requested_viewport, Some((90, 30)));
+        assert_eq!(held, None, "the grid is held through the bare alt cycle");
+        assert_eq!(session.requested_viewport, Some((90, 30)));
         assert_eq!(session.grid, (113, 39));
         // A real TUI frame (DECSTBM) releases the hold: the recorded
         // viewport applies.
         assert!(feed_session(&mut session, &mut clock, 5, "\x1b[1;39r").is_none());
         let epoch = apply_grid_if_tui(&mut session, 90, 30);
-        assert_eq!(epoch, Some(GridEpoch { offset: 0, cols: 90, rows: 30 }));
+        assert_eq!(
+            epoch,
+            Some(GridEpoch {
+                offset: 0,
+                cols: 90,
+                rows: 30
+            })
+        );
         assert_eq!(session.grid, (90, 30));
         // Exit to canonical: the next client viewport applies again -
         // the grid is NOT frozen after a TUI period.
         assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049l").is_none());
         assert!(feed_session(&mut session, &mut clock, 350, "\r\n").is_some());
         let resumed = apply_grid_if_tui(&mut session, 113, 39);
-        assert_eq!(resumed, Some(GridEpoch { offset: 0, cols: 113, rows: 39 }));
+        assert_eq!(
+            resumed,
+            Some(GridEpoch {
+                offset: 0,
+                cols: 113,
+                rows: 39
+            })
+        );
         assert_eq!(session.grid, (113, 39));
     }
 
@@ -6248,16 +6759,21 @@ mod tests {
         // CUP) releases the suppression: the recorded viewport fires as
         // a journal epoch at the current offset.
         let frame = feed_session(&mut session, &mut clock, 5, "\x1b[?25l\x1b[1;39r\x1b[5;10H");
-        assert_eq!(on_chunk_tui_grid(&mut session, frame), Some(GridEpoch { offset: 100, cols: 113, rows: 39 }));
+        assert_eq!(
+            on_chunk_tui_grid(&mut session, frame),
+            Some(GridEpoch {
+                offset: 100,
+                cols: 113,
+                rows: 39
+            })
+        );
         assert!(!session.deferred_tui_resize);
         assert_eq!(session.grid, (113, 39));
         assert_eq!(session.grid_epochs.len(), 2);
         // Exit: the TUI re-shows its cursor, leaves the alt screen, and
         // goes quiet: the grid freezes at the TUI size, nothing is
         // restored.
-        assert!(
-            feed_session(&mut session, &mut clock, 10, "\x1b[?25h\x1b[?1049l").is_none()
-        );
+        assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?25h\x1b[?1049l").is_none());
         let exit = feed_session(&mut session, &mut clock, 350, "\r\n").expect("quiet exit");
         assert_eq!(on_chunk_tui_grid(&mut session, Some(exit)), None);
         assert_eq!(session.grid, (113, 39));
@@ -6277,13 +6793,20 @@ mod tests {
         let entry = feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").expect("alt-enter");
         assert_eq!(on_chunk_tui_grid(&mut session, Some(entry)), None);
         assert!(session.deferred_tui_resize);
-        let alt_content =
-            feed_session(&mut session, &mut clock, 5, "\x1b[?25l\x1b[HPS C:\\> \x1b[?25h");
+        let alt_content = feed_session(
+            &mut session,
+            &mut clock,
+            5,
+            "\x1b[?25l\x1b[HPS C:\\> \x1b[?25h",
+        );
         assert_eq!(on_chunk_tui_grid(&mut session, alt_content), None);
         assert!(session.deferred_tui_resize, "still held mid-alt-cycle");
         let alt_out = feed_session(&mut session, &mut clock, 10, "\x1b[?1049l");
         assert_eq!(on_chunk_tui_grid(&mut session, alt_out), None);
-        assert!(session.deferred_tui_resize, "pending until the period exits");
+        assert!(
+            session.deferred_tui_resize,
+            "pending until the period exits"
+        );
         let redraw = feed_session(
             &mut session,
             &mut clock,
@@ -6293,13 +6816,23 @@ mod tests {
         assert_eq!(on_chunk_tui_grid(&mut session, redraw), None);
         let exit = feed_session(&mut session, &mut clock, 350, "\r\n").expect("quiet exit");
         assert_eq!(on_chunk_tui_grid(&mut session, Some(exit)), None);
-        assert!(!session.deferred_tui_resize, "deferral cleared on canonical exit");
+        assert!(
+            !session.deferred_tui_resize,
+            "deferral cleared on canonical exit"
+        );
         assert_eq!(session.grid, (SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS));
         assert_eq!(session.grid_epochs.len(), 1, "no epoch was ever emitted");
         // After the cycle the shell is idle at the prompt: a client
         // resize applies normally again (no desync risk at the prompt).
         let resumed = apply_grid_if_tui(&mut session, 79, 26);
-        assert_eq!(resumed, Some(GridEpoch { offset: 0, cols: 79, rows: 26 }));
+        assert_eq!(
+            resumed,
+            Some(GridEpoch {
+                offset: 0,
+                cols: 79,
+                rows: 26
+            })
+        );
         assert_eq!(session.grid, (79, 26));
     }
 
@@ -6311,15 +6844,26 @@ mod tests {
         set_client_viewport(&mut session, window.clone(), 113, 39);
         assert_eq!(
             apply_owner_grid_for(&mut session, &window, 113, 39, false),
-            Some(GridEpoch { offset: 0, cols: 113, rows: 39 }),
+            Some(GridEpoch {
+                offset: 0,
+                cols: 113,
+                rows: 39
+            }),
             "an ownerless session claims itself onto the first client to announce"
         );
         assert_eq!(session.owner, Some(window.clone()));
         assert_eq!(session.grid, (113, 39));
         // The owner re-asserting the same size emits no second epoch (no
         // spurious SIGWINCH).
-        assert_eq!(apply_owner_grid_for(&mut session, &window, 113, 39, false), None);
-        assert_eq!(session.grid_epochs.len(), 1, "the resize replaced the spawn epoch it sat on");
+        assert_eq!(
+            apply_owner_grid_for(&mut session, &window, 113, 39, false),
+            None
+        );
+        assert_eq!(
+            session.grid_epochs.len(),
+            1,
+            "the resize replaced the spawn epoch it sat on"
+        );
     }
 
     #[test]
@@ -6333,7 +6877,10 @@ mod tests {
         // neither claimed: the owner's grid is untouched either way, but
         // both are recorded (candidates for reselect_owner_on_departure).
         set_client_viewport(&mut session, phone.clone(), 45, 20);
-        assert_eq!(apply_owner_grid_for(&mut session, &phone, 45, 20, false), None);
+        assert_eq!(
+            apply_owner_grid_for(&mut session, &phone, 45, 20, false),
+            None
+        );
         assert_eq!(session.grid, (113, 39));
         set_client_viewport(&mut session, phone.clone(), 250, 80);
         assert_eq!(
@@ -6342,7 +6889,10 @@ mod tests {
             "a non-owner can never resize the pty, larger or smaller"
         );
         assert_eq!(session.grid, (113, 39));
-        assert_eq!(session.viewports.get(&phone).map(|v| (v.cols, v.rows)), Some((250, 80)));
+        assert_eq!(
+            session.viewports.get(&phone).map(|v| (v.cols, v.rows)),
+            Some((250, 80))
+        );
         assert_eq!(session.owner, Some(window));
     }
 
@@ -6358,7 +6908,11 @@ mod tests {
         set_client_viewport(&mut session, phone.clone(), 45, 20);
         assert_eq!(
             apply_owner_grid_for(&mut session, &phone, 45, 20, true),
-            Some(GridEpoch { offset: 0, cols: 45, rows: 20 })
+            Some(GridEpoch {
+                offset: 0,
+                cols: 45,
+                rows: 20
+            })
         );
         assert_eq!(session.grid, (45, 20));
         assert_eq!(session.owner, Some(phone));
@@ -6375,7 +6929,11 @@ mod tests {
         set_client_viewport(&mut session, window.clone(), 160, 45);
         assert_eq!(
             apply_owner_grid_for(&mut session, &window, 160, 45, false),
-            Some(GridEpoch { offset: 0, cols: 160, rows: 45 })
+            Some(GridEpoch {
+                offset: 0,
+                cols: 160,
+                rows: 45
+            })
         );
         assert_eq!(session.grid, (160, 45));
     }
@@ -6392,7 +6950,10 @@ mod tests {
         // viewport must not resize the PTY even without a claim (it is
         // already the owner).
         set_client_viewport(&mut session, phone.clone(), 45, 36);
-        assert_eq!(apply_owner_grid_for(&mut session, &phone, 45, 36, false), None);
+        assert_eq!(
+            apply_owner_grid_for(&mut session, &phone, 45, 36, false),
+            None
+        );
         assert_eq!(session.grid_epochs.len(), epochs);
         assert_eq!(session.viewports.len(), 1);
     }
@@ -6421,7 +6982,11 @@ mod tests {
         assert_eq!(session.viewports.get(&window).unwrap().networked, false);
         assert_eq!(
             reselect_owner_on_departure(&mut session, &evicted),
-            Some(GridEpoch { offset: 0, cols: 113, rows: 39 }),
+            Some(GridEpoch {
+                offset: 0,
+                cols: 113,
+                rows: 39
+            }),
             "the departed phone owner hands the grid to the surviving desktop pane"
         );
         assert_eq!(session.owner, Some(window));
@@ -6451,14 +7016,24 @@ mod tests {
         let timeout = std::time::Duration::from_millis(VIEWPORT_WATCHDOG_TIMEOUT_MS);
         let evicted = evict_stale_viewports(&mut session, now, timeout);
         assert_eq!(evicted, vec![phone_a.clone()]);
-        assert!(session.viewports.contains_key(&phone_b), "the still-live networked entry survives");
-        assert!(session.viewports.contains_key(&window), "the desktop entry survives even a stale clock");
+        assert!(
+            session.viewports.contains_key(&phone_b),
+            "the still-live networked entry survives"
+        );
+        assert!(
+            session.viewports.contains_key(&window),
+            "the desktop entry survives even a stale clock"
+        );
         // phone-a owned the grid; its eviction hands ownership to whichever
         // survivor was most recently active - phone-b, announced after the
         // window.
         assert_eq!(
             reselect_owner_on_departure(&mut session, &evicted),
-            Some(GridEpoch { offset: 0, cols: 100, rows: 20 })
+            Some(GridEpoch {
+                offset: 0,
+                cols: 100,
+                rows: 20
+            })
         );
         assert_eq!(session.owner, Some(phone_b));
     }
@@ -6474,7 +7049,11 @@ mod tests {
         set_client_viewport(&mut session, phone.clone(), 150, 60);
         assert_eq!(
             apply_owner_grid_for(&mut session, &window, 113, 39, false),
-            Some(GridEpoch { offset: 0, cols: 113, rows: 39 })
+            Some(GridEpoch {
+                offset: 0,
+                cols: 113,
+                rows: 39
+            })
         );
         let epochs = session.grid_epochs.len();
         // The phone never claimed ownership: its eviction must not resize
@@ -6502,7 +7081,11 @@ mod tests {
         set_client_viewport(&mut session, phone.clone(), 45, 36);
         assert_eq!(
             apply_owner_grid_for(&mut session, &window, 113, 39, true),
-            Some(GridEpoch { offset: 0, cols: 113, rows: 39 })
+            Some(GridEpoch {
+                offset: 0,
+                cols: 113,
+                rows: 39
+            })
         );
         assert!(feed_session(&mut session, &mut clock, 10, "\x1b[?1049h").is_some());
         assert!(feed_session(&mut session, &mut clock, 5, "\x1b[1;39r").is_none());
@@ -6510,13 +7093,19 @@ mod tests {
         // The phone is not the owner: its departure must not resize the
         // running program out from under its owner.
         session.viewports.remove(&phone);
-        assert_eq!(reselect_owner_on_departure(&mut session, std::slice::from_ref(&phone)), None);
+        assert_eq!(
+            reselect_owner_on_departure(&mut session, std::slice::from_ref(&phone)),
+            None
+        );
         assert_eq!(session.grid, (113, 39));
         assert_eq!(session.grid_epochs.len(), epochs);
         // A controller with no entry in set S (and that never owned
         // anything) departing is also a no-op.
         let ghost = TerminalController::Remote("ghost".into());
-        assert_eq!(reselect_owner_on_departure(&mut session, std::slice::from_ref(&ghost)), None);
+        assert_eq!(
+            reselect_owner_on_departure(&mut session, std::slice::from_ref(&ghost)),
+            None
+        );
         assert_eq!(session.grid, (113, 39));
     }
 
@@ -6541,7 +7130,11 @@ mod tests {
         session.viewports.remove(&window);
         assert_eq!(
             reselect_owner_on_departure(&mut session, std::slice::from_ref(&window)),
-            Some(GridEpoch { offset: 0, cols: 100, rows: 20 }),
+            Some(GridEpoch {
+                offset: 0,
+                cols: 100,
+                rows: 20
+            }),
             "the most recently active survivor takes over, even though phone-b's dimensions are smaller"
         );
         assert_eq!(session.grid, (100, 20));
@@ -6571,7 +7164,11 @@ mod tests {
         set_client_viewport(&mut session, phone.clone(), 45, 36);
         assert_eq!(
             apply_owner_grid_for(&mut session, &phone, 45, 36, false),
-            Some(GridEpoch { offset: 0, cols: 45, rows: 36 })
+            Some(GridEpoch {
+                offset: 0,
+                cols: 45,
+                rows: 36
+            })
         );
         assert_eq!(session.owner, Some(phone));
     }
@@ -6589,12 +7186,19 @@ mod tests {
         assert!(apply_owner_grid_for(&mut session, &window, 113, 39, true).is_some());
         assert_eq!(
             release_viewport(&mut session, &window),
-            Some(GridEpoch { offset: 0, cols: 45, rows: 36 }),
+            Some(GridEpoch {
+                offset: 0,
+                cols: 45,
+                rows: 36
+            }),
             "the sole survivor takes over"
         );
         assert_eq!(session.grid, (45, 36));
         assert_eq!(session.owner, Some(phone));
-        assert!(!session.viewports.contains_key(&window), "the releasing client leaves set S");
+        assert!(
+            !session.viewports.contains_key(&window),
+            "the releasing client leaves set S"
+        );
     }
 
     #[test]
@@ -6605,7 +7209,11 @@ mod tests {
         set_client_viewport(&mut session, window.clone(), 113, 39);
         set_client_viewport(&mut session, phone.clone(), 45, 36);
         assert!(apply_owner_grid_for(&mut session, &window, 113, 39, true).is_some());
-        assert_eq!(release_viewport(&mut session, &phone), None, "a non-owner's departure is a no-op");
+        assert_eq!(
+            release_viewport(&mut session, &phone),
+            None,
+            "a non-owner's departure is a no-op"
+        );
         assert_eq!(session.grid, (113, 39));
         assert_eq!(session.owner, Some(window));
         assert!(!session.viewports.contains_key(&phone));
@@ -6617,7 +7225,11 @@ mod tests {
         let window = TerminalController::Desktop("window".into());
         set_client_viewport(&mut session, window.clone(), 113, 39);
         assert!(apply_owner_grid_for(&mut session, &window, 113, 39, true).is_some());
-        assert_eq!(release_viewport(&mut session, &window), None, "no survivor to take over");
+        assert_eq!(
+            release_viewport(&mut session, &window),
+            None,
+            "no survivor to take over"
+        );
         assert_eq!(session.grid, (113, 39));
         assert_eq!(session.owner, None);
     }
@@ -6631,7 +7243,10 @@ mod tests {
         let window = TerminalController::Desktop("window".into());
         let background = TerminalController::Desktop("background-window".into());
         assert!(apply_owner_grid_for(&mut session, &window, 113, 39, true).is_some());
-        assert_eq!(attach_owner_grid_for(&mut session, &background, 210, 66, false), None);
+        assert_eq!(
+            attach_owner_grid_for(&mut session, &background, 210, 66, false),
+            None
+        );
         assert_eq!(session.grid, (113, 39));
         assert_eq!(session.owner, Some(window.clone()));
         assert!(
@@ -6654,12 +7269,19 @@ mod tests {
         assert!(apply_owner_grid_for(&mut session, &window, 113, 39, true).is_some());
         assert_eq!(
             attach_owner_grid_for(&mut session, &phone, 45, 36, true),
-            Some(GridEpoch { offset: 0, cols: 45, rows: 36 }),
+            Some(GridEpoch {
+                offset: 0,
+                cols: 45,
+                rows: 36
+            }),
             "opening a terminal claims the grid back from whoever held it"
         );
         assert_eq!(session.grid, (45, 36));
         assert_eq!(session.owner, Some(phone.clone()));
-        assert_eq!(session.viewports.get(&phone).map(|v| (v.cols, v.rows)), Some((45, 36)));
+        assert_eq!(
+            session.viewports.get(&phone).map(|v| (v.cols, v.rows)),
+            Some((45, 36))
+        );
     }
 
     #[test]
@@ -6678,8 +7300,16 @@ mod tests {
             assert!(apply_owner_grid_for(&mut session, &window, 113, 39, true).is_some());
             set_client_viewport(&mut session, first.clone(), 45, 36);
             set_client_viewport(&mut session, second.clone(), 100, 20);
-            let tied = session.viewports.get(first).expect("first entry").last_active;
-            session.viewports.get_mut(second).expect("second entry").last_active = tied;
+            let tied = session
+                .viewports
+                .get(first)
+                .expect("first entry")
+                .last_active;
+            session
+                .viewports
+                .get_mut(second)
+                .expect("second entry")
+                .last_active = tied;
             session.viewports.remove(&window);
             reselect_owner_on_departure(&mut session, std::slice::from_ref(&window))
                 .map(|_| session.owner.clone())
@@ -6714,7 +7344,11 @@ mod tests {
         assert_eq!(evicted, vec![phone_a]);
         assert_eq!(
             reselect_owner_on_departure(&mut session, &evicted),
-            Some(GridEpoch { offset: 0, cols: 100, rows: 20 }),
+            Some(GridEpoch {
+                offset: 0,
+                cols: 100,
+                rows: 20
+            }),
             "the surviving client's announced size takes over the grid"
         );
         assert_eq!(session.grid, (100, 20));
@@ -6753,9 +7387,24 @@ mod tests {
         let mut session = test_session("s1", "p1", "C:\\repo");
         let now = Instant::now();
         let timeout = std::time::Duration::from_millis(VIEWPORT_WATCHDOG_TIMEOUT_MS);
-        set_client_viewport(&mut session, TerminalController::Desktop("window".into()), 113, 39);
-        set_client_viewport(&mut session, TerminalController::Remote("exact".into()), 45, 36);
-        set_client_viewport(&mut session, TerminalController::Remote("fresh".into()), 50, 30);
+        set_client_viewport(
+            &mut session,
+            TerminalController::Desktop("window".into()),
+            113,
+            39,
+        );
+        set_client_viewport(
+            &mut session,
+            TerminalController::Remote("exact".into()),
+            45,
+            36,
+        );
+        set_client_viewport(
+            &mut session,
+            TerminalController::Remote("fresh".into()),
+            50,
+            30,
+        );
         // An entry exactly the timeout old is stale: the sweep keeps only
         // entries strictly younger than the timeout. The desktop pane is
         // ancient but never expires.
@@ -6771,11 +7420,21 @@ mod tests {
             .last_seen = now - timeout + Duration::from_millis(1);
         let evicted = evict_stale_viewports(&mut session, now, timeout);
         assert_eq!(evicted.len(), 1, "only the exactly-stale entry is evicted");
-        assert!(!session.viewports.contains_key(&TerminalController::Remote("exact".into())));
-        assert!(session.viewports.contains_key(&TerminalController::Remote("fresh".into())));
-        assert!(session
-            .viewports
-            .contains_key(&TerminalController::Desktop("window".into())));
+        assert!(
+            !session
+                .viewports
+                .contains_key(&TerminalController::Remote("exact".into()))
+        );
+        assert!(
+            session
+                .viewports
+                .contains_key(&TerminalController::Remote("fresh".into()))
+        );
+        assert!(
+            session
+                .viewports
+                .contains_key(&TerminalController::Desktop("window".into()))
+        );
     }
 
     #[test]
@@ -6788,7 +7447,10 @@ mod tests {
         // A controller that never announced into this session at all
         // departs: it cannot have been the owner, so nothing changes.
         let ghost = TerminalController::Remote("ghost".into());
-        assert_eq!(reselect_owner_on_departure(&mut session, std::slice::from_ref(&ghost)), None);
+        assert_eq!(
+            reselect_owner_on_departure(&mut session, std::slice::from_ref(&ghost)),
+            None
+        );
         assert_eq!(session.grid, (113, 39));
         assert_eq!(session.grid_epochs.len(), epochs);
     }
@@ -6825,7 +7487,11 @@ mod tests {
         let frame = feed_session(&mut session, &mut clock, 5, "\x1b[?25l\x1b[1;39r\x1b[5;10H");
         assert_eq!(
             on_chunk_tui_grid(&mut session, frame),
-            Some(GridEpoch { offset: 0, cols: 113, rows: 39 })
+            Some(GridEpoch {
+                offset: 0,
+                cols: 113,
+                rows: 39
+            })
         );
         assert_eq!(session.grid, (113, 39));
     }
@@ -6942,7 +7608,12 @@ mod tests {
         let second = inner.sessions.get_mut("s2").expect("session");
         set_client_viewport(second, TerminalController::Remote("phone-b".into()), 45, 36);
         let first = inner.sessions.get_mut("s1").expect("session");
-        set_client_viewport(first, TerminalController::Desktop("window-a".into()), 120, 40);
+        set_client_viewport(
+            first,
+            TerminalController::Desktop("window-a".into()),
+            120,
+            40,
+        );
 
         let online = HashSet::from(["phone-a".to_string(), "phone-b".to_string()]);
         let snapshot = snapshot_from_inner(&inner, &online);
@@ -7333,7 +8004,10 @@ mod tests {
                 "offline",
                 "offline must hide a stored {stored} status"
             );
-            assert_eq!(registration_status_for_display(true, true, stored, false), stored);
+            assert_eq!(
+                registration_status_for_display(true, true, stored, false),
+                stored
+            );
         }
     }
 
@@ -7375,10 +8049,22 @@ mod tests {
     fn a_stored_pending_verdict_survives_a_finished_run_when_no_device_was_ever_registered() {
         // The gate only reports pending while a run is in flight; a finished
         // run with no verification shows the stored verdict as-is.
-        assert_eq!(registration_status_for_display(true, true, "pending", false), "pending");
-        assert_eq!(registration_status_for_display(true, true, "enrolled", false), "enrolled");
-        assert_eq!(registration_status_for_display(true, true, "failed", false), "failed");
-        assert_eq!(registration_status_for_display(true, true, "unregistered", false), "unregistered");
+        assert_eq!(
+            registration_status_for_display(true, true, "pending", false),
+            "pending"
+        );
+        assert_eq!(
+            registration_status_for_display(true, true, "enrolled", false),
+            "enrolled"
+        );
+        assert_eq!(
+            registration_status_for_display(true, true, "failed", false),
+            "failed"
+        );
+        assert_eq!(
+            registration_status_for_display(true, true, "unregistered", false),
+            "unregistered"
+        );
     }
 
     #[test]
@@ -7537,7 +8223,10 @@ mod tests {
 
         // A shell profile that later disappears must not leak into snapshots:
         // the first available shell becomes the honest default instead.
-        inner.store.set_default_shell("removed-profile".into()).expect("stale value");
+        inner
+            .store
+            .set_default_shell("removed-profile".into())
+            .expect("stale value");
         assert_eq!(
             snapshot_from_inner(&inner, &HashSet::new()).default_shell_id,
             "powershell",
@@ -7804,12 +8493,7 @@ mod tests {
         let (store, state_path) = store_with_cleanup();
         let mut inner = test_inner(store, Vec::new());
         let home = home_path().to_string_lossy().into_owned();
-        let temporary = test_project(
-            &mut inner,
-            "temp-home",
-            home.to_lowercase().as_str(),
-            false,
-        );
+        let temporary = test_project(&mut inner, "temp-home", home.to_lowercase().as_str(), false);
 
         let result = ensure_home_project(&mut inner).expect("home project");
         assert_eq!(
@@ -7948,8 +8632,15 @@ mod tests {
         );
 
         let picked = startup_project(&mut inner).expect("startup project");
-        assert_eq!(picked.id, existing.id, "the existing temporary home project is reused");
-        assert_eq!(inner.temporary_projects.len(), 1, "no second home project appears");
+        assert_eq!(
+            picked.id, existing.id,
+            "the existing temporary home project is reused"
+        );
+        assert_eq!(
+            inner.temporary_projects.len(),
+            1,
+            "no second home project appears"
+        );
 
         fs::remove_file(state_path).expect("remove test state");
     }
@@ -8211,7 +8902,9 @@ mod tests {
             "s1",
             "p",
             r"C:\Work\P",
-            Box::new(KillingProbe { killed: killed.clone() }),
+            Box::new(KillingProbe {
+                killed: killed.clone(),
+            }),
         );
         inner.sessions.insert("s1".into(), session);
         inner.session_order.push("s1".into());
@@ -8223,7 +8916,10 @@ mod tests {
             "the owning project is reported so an empty temporary project can be retired"
         );
         assert!(!inner.sessions.contains_key("s1"), "the tab must be gone");
-        assert!(!inner.session_order.contains(&"s1".to_string()), "the tab must leave the order");
+        assert!(
+            !inner.session_order.contains(&"s1".to_string()),
+            "the tab must leave the order"
+        );
         assert!(
             !killed.load(Ordering::SeqCst),
             "the process already exited; no kill may be attempted"
@@ -8241,13 +8937,15 @@ mod tests {
             "s1",
             "p",
             r"C:\Work\P",
-            Box::new(KillingProbe { killed: killed.clone() }),
+            Box::new(KillingProbe {
+                killed: killed.clone(),
+            }),
         );
         inner.sessions.insert("s1".into(), session);
         inner.session_order.push("s1".into());
 
-        let _ = close_session_in_inner(&mut inner, "s1", true)
-            .expect("the session must be removed");
+        let _ =
+            close_session_in_inner(&mut inner, "s1", true).expect("the session must be removed");
         assert!(
             killed.load(Ordering::SeqCst),
             "a manual close must kill the live process"
@@ -8262,8 +8960,12 @@ mod tests {
         // report must not touch the surviving state.
         let (mut inner, state_path) = inner_with_settings(false, false);
         test_project(&mut inner, "p", r"C:\Work\P", true);
-        inner.sessions.insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
-        inner.sessions.insert("s2".into(), test_session("s2", "p", r"C:\Work\P"));
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        inner
+            .sessions
+            .insert("s2".into(), test_session("s2", "p", r"C:\Work\P"));
         inner.session_order.push("s1".into());
         inner.session_order.push("s2".into());
 
@@ -8273,7 +8975,10 @@ mod tests {
             close_session_in_inner(&mut inner, "s2", false).is_none(),
             "the late exit report for a removed session is a no-op"
         );
-        assert!(inner.sessions.contains_key("s1"), "the sibling session must survive");
+        assert!(
+            inner.sessions.contains_key("s1"),
+            "the sibling session must survive"
+        );
         assert_eq!(
             inner.session_order,
             vec!["s1".to_string()],
@@ -8291,9 +8996,17 @@ mod tests {
         // session.
         let (mut inner, state_path) = inner_with_settings(false, false);
         test_project(&mut inner, "p", r"C:\Work\P", true);
-        inner.sessions.insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
-        inner.sessions.insert("s2".into(), test_session("s2", "p", r"C:\Work\P"));
-        assert_eq!(active_session_count(&inner), 0, "a fresh tab sits at its prompt");
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        inner
+            .sessions
+            .insert("s2".into(), test_session("s2", "p", r"C:\Work\P"));
+        assert_eq!(
+            active_session_count(&inner),
+            0,
+            "a fresh tab sits at its prompt"
+        );
 
         for id in ["s1", "s2"] {
             inner
@@ -8303,10 +9016,18 @@ mod tests {
                 .metadata
                 .activity = SessionActivity::Active;
         }
-        assert_eq!(active_session_count(&inner), 2, "both tabs are running something");
+        assert_eq!(
+            active_session_count(&inner),
+            2,
+            "both tabs are running something"
+        );
 
         assert!(mark_session_exited(&mut inner, "s1", 1));
-        assert_eq!(open_session_count(&inner), 2, "the exited tab is still open");
+        assert_eq!(
+            open_session_count(&inner),
+            2,
+            "the exited tab is still open"
+        );
         assert_eq!(
             active_session_count(&inner),
             1,
@@ -8378,7 +9099,8 @@ mod tests {
     /// ago and nothing has produced output since.
     fn session_with_tui_history_in_journal() -> ManagedSession {
         let mut session = test_session("s1", "p", r"C:\Work\P");
-        let history = "\x1b[?1049h\x1b[2;1H\x1b[?25lframe 1\r\n\x1b[3;1Hframe 2\r\n\x1b[?1049lPS C:\\> ";
+        let history =
+            "\x1b[?1049h\x1b[2;1H\x1b[?25lframe 1\r\n\x1b[3;1Hframe 2\r\n\x1b[?1049lPS C:\\> ";
         session.buffer.push_str(history);
         session.journal_len = history.len() as u64;
         session
@@ -8386,7 +9108,7 @@ mod tests {
 
     #[test]
     fn a_replay_snapshot_is_a_pure_read_of_the_journal() {
-        let mut session = session_with_tui_history_in_journal();
+        let session = session_with_tui_history_in_journal();
         let journal_len = session.journal_len;
         let buffer_len = session.buffer.len();
         let mode = session.metadata.tui_mode;
@@ -8409,7 +9131,8 @@ mod tests {
             "serving the snapshot must not append to the journal"
         );
         assert_eq!(
-            session.buffer.len(), buffer_len,
+            session.buffer.len(),
+            buffer_len,
             "serving the snapshot must not mutate the buffer"
         );
         assert_eq!(
@@ -8429,11 +9152,10 @@ mod tests {
         // its prompt and the clients hold `Idle`. A client attaching now
         // is served the full journal - alt enter, frames, alt exit,
         // prompt - and serving it must not re-run any of it.
-        let mut session = session_with_tui_history_in_journal();
+        let session = session_with_tui_history_in_journal();
         assert_eq!(session.metadata.activity, SessionActivity::Idle);
 
         let _ = snapshot_of(&session);
-
         assert_eq!(
             session.metadata.activity,
             SessionActivity::Idle,
@@ -8499,7 +9221,9 @@ mod tests {
         session.buffer.push_str(open_period);
         session.journal_len = open_period.len() as u64;
         let now = Instant::now();
-        session.tui.mark_spontaneous_output(now - Duration::from_secs(10));
+        session
+            .tui
+            .mark_spontaneous_output(now - Duration::from_secs(10));
 
         let _ = snapshot_of(&session);
 
@@ -8512,9 +9236,15 @@ mod tests {
         let tui_quiet = session.tui.spontaneous_quiet_ms(now) >= TUI_QUIET_MS;
         assert!(tui_quiet, "the last spontaneous frame was ten seconds ago");
         assert_eq!(
-            session
-                .activity
-                .observe(&[], TuiMode::Fullscreen, false, tui_quiet, false, false, now),
+            session.activity.observe(
+                &[],
+                TuiMode::Fullscreen,
+                false,
+                tui_quiet,
+                false,
+                false,
+                now
+            ),
             None,
             "the quiet sweep reasserts the idle clients already hold"
         );
@@ -8527,22 +9257,42 @@ mod tests {
         // after a non-zero exit still counts, and only a close removes it.
         let (mut inner, state_path) = inner_with_settings(false, false);
         test_project(&mut inner, "p", r"C:\Work\P", true);
-        assert_eq!(open_session_count(&inner), 0, "no tabs before a session opens");
+        assert_eq!(
+            open_session_count(&inner),
+            0,
+            "no tabs before a session opens"
+        );
 
-        inner.sessions.insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
-        inner.sessions.insert("s2".into(), test_session("s2", "p", r"C:\Work\P"));
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        inner
+            .sessions
+            .insert("s2".into(), test_session("s2", "p", r"C:\Work\P"));
         assert_eq!(open_session_count(&inner), 2, "every open tab counts");
 
         // A non-zero exit marks the tab exited but keeps it open for
         // inspection, so the count must not drop.
         assert!(mark_session_exited(&mut inner, "s1", 1));
-        assert_eq!(open_session_count(&inner), 2, "a kept-for-inspection tab still counts");
+        assert_eq!(
+            open_session_count(&inner),
+            2,
+            "a kept-for-inspection tab still counts"
+        );
 
         close_session_in_inner(&mut inner, "s2", true).expect("the close removes the session");
-        assert_eq!(open_session_count(&inner), 1, "closing a tab removes it from the count");
+        assert_eq!(
+            open_session_count(&inner),
+            1,
+            "closing a tab removes it from the count"
+        );
 
         close_session_in_inner(&mut inner, "s1", false).expect("the close removes the session");
-        assert_eq!(open_session_count(&inner), 0, "closing the last tab empties the count");
+        assert_eq!(
+            open_session_count(&inner),
+            0,
+            "closing the last tab empties the count"
+        );
 
         fs::remove_file(state_path).expect("remove test state");
     }
@@ -8560,10 +9310,12 @@ mod tests {
         inner
             .sessions
             .insert("s3".into(), test_session("s3", "p", r"C:\Work\P"));
-        inner.session_order.extend(["s1".into(), "s2".into(), "s3".into()]);
+        inner
+            .session_order
+            .extend(["s1".into(), "s2".into(), "s3".into()]);
 
-        let _ = close_session_in_inner(&mut inner, "s2", false)
-            .expect("the middle tab must be closed");
+        let _ =
+            close_session_in_inner(&mut inner, "s2", false).expect("the middle tab must be closed");
         assert!(inner.sessions.contains_key("s1") && inner.sessions.contains_key("s3"));
         assert_eq!(
             inner.session_order,
@@ -8583,8 +9335,8 @@ mod tests {
             .insert("s1".into(), test_session("s1", "temp", r"C:\Work\Temp"));
         inner.session_order.push("s1".into());
 
-        let project_id = close_session_in_inner(&mut inner, "s1", false)
-            .expect("the tab must be closed");
+        let project_id =
+            close_session_in_inner(&mut inner, "s1", false).expect("the tab must be closed");
         assert!(
             matches!(
                 retire_empty_temporary_project(&mut inner, &project_id),
@@ -8606,8 +9358,8 @@ mod tests {
             .insert("s1".into(), test_session("s1", "saved", r"C:\Work\Saved"));
         inner.session_order.push("s1".into());
 
-        let project_id = close_session_in_inner(&mut inner, "s1", false)
-            .expect("the tab must be closed");
+        let project_id =
+            close_session_in_inner(&mut inner, "s1", false).expect("the tab must be closed");
         assert!(
             matches!(
                 retire_empty_temporary_project(&mut inner, &project_id),
@@ -8682,6 +9434,7 @@ mod tests {
             tui_mode: TuiMode::Canonical,
             activity: SessionActivity::Idle,
             activity_since: None,
+            taskbar: TaskbarProgress::Clear,
         }
     }
 
@@ -8778,6 +9531,7 @@ mod tests {
                 tui_mode: TuiMode::Canonical,
                 activity: SessionActivity::Idle,
                 activity_since: None,
+                taskbar: TaskbarProgress::Clear,
             },
             master: Box::new(InertMaster),
             writer: SessionWriter::spawn(session_id, Box::new(std::io::sink())),
@@ -8799,6 +9553,7 @@ mod tests {
             last_resize_at: None,
             requested_viewport: None,
             activity: ActivityDetector::new(Instant::now()),
+            taskbar: SessionTaskbar::new(),
             control_tail: String::new(),
             cursor_query_tail: String::new(),
             pending_cursor_reports: 0,
@@ -8836,7 +9591,9 @@ mod tests {
         let (mut inner, state_path) = inner_with_settings(false, false);
         test_project(&mut inner, "a", r"C:\Work\A", true);
         test_project(&mut inner, "b", r"C:\Work\B", true);
-        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
         inner.windows.assign("window-a", "a");
         inner.windows.attach("window-a", "s1");
 
@@ -8868,12 +9625,13 @@ mod tests {
     fn follow_off_creates_no_temporary_project_for_an_unmatched_folder() {
         let (mut inner, state_path) = inner_with_settings(false, false);
         test_project(&mut inner, "a", r"C:\Work\A", true);
-        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
         inner.windows.assign("window-a", "a");
 
         // A folder that matches no saved or temporary project.
-        let outcome =
-            resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Somewhere\Else"));
+        let outcome = resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Somewhere\Else"));
         assert!(matches!(outcome, CdOutcome::Recorded));
         assert_eq!(inner.sessions["s1"].metadata.project_id, "a");
         assert!(
@@ -8888,7 +9646,9 @@ mod tests {
     fn follow_off_keeps_a_session_inside_a_temporary_project() {
         let (mut inner, state_path) = inner_with_settings(false, false);
         test_project(&mut inner, "temp-a", r"C:\Work\TempA", false);
-        inner.sessions.insert("s1".into(), test_session("s1", "temp-a", r"C:\Work\TempA"));
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "temp-a", r"C:\Work\TempA"));
         inner.windows.assign("window-t", "temp-a");
         inner.windows.attach("window-t", "s1");
 
@@ -8910,7 +9670,8 @@ mod tests {
             resolve_working_directory(&mut inner, "ghost", Path::new(r"C:\Work\A")),
             CdOutcome::Missing
         ));
-        inner.store
+        inner
+            .store
             .set_follow_working_directory(true)
             .expect("turn follow on");
         assert!(matches!(
@@ -8926,12 +9687,16 @@ mod tests {
         let (mut inner, state_path) = inner_with_settings(true, false);
         test_project(&mut inner, "a", r"C:\Work\A", true);
         test_project(&mut inner, "b", r"C:\Work\B", true);
-        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
         inner.windows.assign("window-a", "a");
         inner.windows.attach("window-a", "s1");
 
         let plan = expect_reassigned(resolve_working_directory(
-            &mut inner, "s1", Path::new(r"C:\Work\B\deep"),
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Work\B\deep"),
         ));
         assert_eq!(inner.sessions["s1"].metadata.project_id, "b");
         assert_eq!(plan.previous_project_id, "a");
@@ -8948,10 +9713,15 @@ mod tests {
         let (mut inner, state_path) = inner_with_settings(true, false);
         test_project(&mut inner, "outer", r"C:\Work", true);
         test_project(&mut inner, "inner", r"C:\Work\Deep", true);
-        inner.sessions.insert("s1".into(), test_session("s1", "outer", r"C:\Work"));
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "outer", r"C:\Work"));
 
-        let plan =
-            expect_reassigned(resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\Deep\x")));
+        let plan = expect_reassigned(resolve_working_directory(
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Work\Deep\x"),
+        ));
         assert_eq!(plan.project.id, "inner", "the more specific project wins");
         assert_eq!(inner.sessions["s1"].metadata.project_id, "inner");
         fs::remove_file(state_path).expect("remove test state");
@@ -8962,12 +9732,20 @@ mod tests {
         let (mut inner, state_path) = inner_with_settings(true, false);
         test_project(&mut inner, "a", r"C:\Work\A", true);
         let temp = test_project(&mut inner, "temp-c", r"C:\Work\C", false);
-        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
         let temp_count = inner.temporary_projects.len();
 
-        let plan =
-            expect_reassigned(resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\C")));
-        assert_eq!(plan.project.id, temp.id, "the existing temporary project is reused");
+        let plan = expect_reassigned(resolve_working_directory(
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Work\C"),
+        ));
+        assert_eq!(
+            plan.project.id, temp.id,
+            "the existing temporary project is reused"
+        );
         assert_eq!(inner.sessions["s1"].metadata.project_id, "temp-c");
         assert_eq!(
             inner.temporary_projects.len(),
@@ -8981,13 +9759,20 @@ mod tests {
     fn follow_on_creates_a_temporary_project_when_nothing_matches() {
         let (mut inner, state_path) = inner_with_settings(true, false);
         test_project(&mut inner, "a", r"C:\Work\A", true);
-        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
         let order_len = inner.project_order.len();
 
         let plan = expect_reassigned(resolve_working_directory(
-            &mut inner, "s1", Path::new(r"C:\Fresh\Folder"),
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Fresh\Folder"),
         ));
-        assert!(!plan.project.persistent, "a freshly matched folder becomes a temporary project");
+        assert!(
+            !plan.project.persistent,
+            "a freshly matched folder becomes a temporary project"
+        );
         assert_eq!(plan.project.path, r"C:\Fresh\Folder");
         assert!(inner.temporary_projects.contains_key(&plan.project.id));
         assert_eq!(inner.sessions["s1"].metadata.project_id, plan.project.id);
@@ -9000,12 +9785,20 @@ mod tests {
     fn follow_on_same_project_makes_no_window_changes() {
         let (mut inner, state_path) = inner_with_settings(true, false);
         test_project(&mut inner, "a", r"C:\Work\A", true);
-        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
         inner.windows.assign("window-a", "a");
 
-        let plan =
-            expect_reassigned(resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\A\sub")));
-        assert!(!plan.project_changed, "staying inside the same project is not a change");
+        let plan = expect_reassigned(resolve_working_directory(
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Work\A\sub"),
+        ));
+        assert!(
+            !plan.project_changed,
+            "staying inside the same project is not a change"
+        );
         assert_eq!(plan.active_window, None);
         assert_eq!(plan.displaced_window, None);
         assert_eq!(inner.sessions["s1"].metadata.cwd, r"C:\Work\A\sub");
@@ -9042,13 +9835,18 @@ mod tests {
         let (mut inner, state_path) = inner_with_settings(true, false);
         test_project(&mut inner, "a", r"C:\Work\A", true);
         test_project(&mut inner, "b", r"C:\Work\B", true);
-        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
         inner.windows.assign("window-a", "a");
         inner.windows.assign("window-b", "b");
         inner.windows.attach("window-a", "s1");
 
-        let plan =
-            expect_reassigned(resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\B")));
+        let plan = expect_reassigned(resolve_working_directory(
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Work\B"),
+        ));
         assert!(plan.project_changed);
         assert_eq!(plan.active_window.as_deref(), Some("window-a"));
         assert_eq!(
@@ -9067,18 +9865,28 @@ mod tests {
         let (mut inner, state_path) = inner_with_settings(true, true);
         test_project(&mut inner, "a", r"C:\Work\A", true);
         test_project(&mut inner, "b", r"C:\Work\B", true);
-        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
-        inner.sessions.insert("s2".into(), test_session("s2", "a", r"C:\Work\A"));
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner
+            .sessions
+            .insert("s2".into(), test_session("s2", "a", r"C:\Work\A"));
         inner.windows.assign("window-a", "a");
 
-        let plan =
-            expect_reassigned(resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\B")));
+        let plan = expect_reassigned(resolve_working_directory(
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Work\B"),
+        ));
         assert!(
             plan.old_has_sessions,
             "another session still lives in the old project"
         );
         assert!(plan.open_projects_in_new_windows);
-        assert_eq!(inner.sessions["s2"].metadata.project_id, "a", "the sibling session is untouched");
+        assert_eq!(
+            inner.sessions["s2"].metadata.project_id, "a",
+            "the sibling session is untouched"
+        );
         fs::remove_file(state_path).expect("remove test state");
     }
 
@@ -9087,11 +9895,16 @@ mod tests {
         let (mut inner, state_path) = inner_with_settings(true, false);
         test_project(&mut inner, "a", r"C:\Work\A", true);
         test_project(&mut inner, "b", r"C:\Work\B", true);
-        inner.sessions.insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
         inner.windows.assign("window-a", "a");
 
-        let plan =
-            expect_reassigned(resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\B")));
+        let plan = expect_reassigned(resolve_working_directory(
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Work\B"),
+        ));
         assert!(
             !plan.old_has_sessions,
             "the moved session was the last one in the old project"

@@ -246,14 +246,44 @@ button { color: inherit; }
 .terminal-tab:hover .tab-close, .terminal-tab.active .tab-close, .terminal-tab.is-split-selected .tab-close { opacity: 1; }
 .tab-close:hover { background: var(--surface-hover); }
 .tab-close svg { width: 12px; }
-.exit-dot { width: 6px; height: 6px; flex: none; background: var(--warn); border-radius: 50%; }
-/* The tab is running something: the host says the shell is blocked on a
-   foreground program (a build, a TUI, anything waiting). It sits before
-   the exit dot, and the two never show together - an exited tab is never
-   also busy. */
-.activity-dot { width: 6px; height: 6px; flex: none; background: var(--accent); border-radius: 50%; animation: activity-pulse 1.6s ease-in-out infinite; }
+/* The dot beside the tab label: a blinking green dot while a command
+   runs, an empty circle on an idle tab, a red dot after a failure.
+   A tab with an explicit progress percentage draws no dot - the bar
+   along the bottom edge carries the number. */
+.tab-status-dot { width: 6px; height: 6px; flex: none; border-radius: 50%; box-sizing: border-box; }
+.tab-status-dot.is-running { background: var(--ok); animation: activity-pulse 1.6s ease-in-out infinite; }
+.tab-status-dot.is-completed { background: var(--ok); }
+.tab-status-dot.is-idle { border: 1.5px solid var(--text-muted); }
+.tab-status-dot.is-error { background: var(--danger); }
 @keyframes activity-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
-@media (prefers-reduced-motion: reduce) { .activity-dot { animation: none; } }
+/* The progress bar along the tab's bottom edge: the same 2px thickness
+   as the active tab's indicator bar, coloured like the tab's title text
+   (the bar inherits the tab's colour, so it matches in every state),
+   with an even darker track. It is inset a few pixels so the bars of
+   neighbouring tabs keep a gap between them and never connect. The
+   active tab always shows its own indicator bar, never a progress bar. */
+.tab-progress {
+  position: absolute; left: 4px; right: 4px; bottom: 0; height: 2px;
+  overflow: hidden;
+  background: color-mix(in srgb, currentColor 30%, black);
+}
+.tab-progress::before {
+  content: ""; position: absolute; top: 0; bottom: 0; left: 0;
+  width: var(--tab-fill, 100%);
+  background: currentColor;
+  transition: width .25s ease;
+}
+/* A running command without a percentage: a band of the fill colour
+   sweeping across the track, like the taskbar's indeterminate bar. */
+.tab-progress.is-pulse::before {
+  width: 35%;
+  animation: tab-progress-sweep 1.4s linear infinite;
+}
+@keyframes tab-progress-sweep { from { left: -35%; } to { left: 100%; } }
+@media (prefers-reduced-motion: reduce) {
+  .tab-status-dot.is-running { animation: none; }
+  .tab-progress.is-pulse::before { animation: none; left: 0; }
+}
 .add-tab { width: 40px; height: 36px; flex: none; border: 0; background: transparent; color: var(--text-muted); display: grid; place-items: center; cursor: pointer; }
 .add-tab:hover { color: var(--text); background: var(--surface-hover); }
 .add-tab svg { width: 15px; }

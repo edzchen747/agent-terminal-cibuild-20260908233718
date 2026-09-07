@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import QRCode from "qrcode";
 import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemesFor } from "@agentterminal/protocol";
-import type { Project, SessionActivity, TerminalSession } from "@agentterminal/protocol";
+import type { Project, SessionActivity, TaskbarProgress, TerminalSession } from "@agentterminal/protocol";
 import type { DesktopState, FocusSessionEvent } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { projectPersistenceAction, projectRowOpensOnKey } from "./persistence";
@@ -10,6 +10,7 @@ import { projectDragTransform, reorderBlock, shouldCommitProjectReorder } from "
 import { departedProjects, PROJECT_LEAVE_MS, projectListEntries, type LeavingProject } from "./project-leave";
 import { pruneRememberedActiveSessions, rememberProjectActiveSession, resolveProjectActiveSession } from "./active-tab";
 import { applyActivityEvent, mergeActivity, projectActivitySummary } from "./session-activity";
+import { applyTaskbarEvent, mergeTaskbar, tabProgressModel, taskbarJustCompleted, taskbarOf } from "./session-taskbar";
 import { shellSwitchSessionOrder, shellSwitchSplitGroups } from "./shell-switch";
 import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
 import type { SplitGroup, SplitLayout } from "./split-tabs";
@@ -85,6 +86,9 @@ export function App() {
   const [tabDrag, setTabDrag] = useState<TabDragState | null>(null);
   const [closingSessionIds, setClosingSessionIds] = useState<Set<string>>(() => new Set());
   const [activityBySession, setActivityBySession] = useState<ReadonlyMap<string, SessionActivity>>(() => new Map());
+  const [taskbarBySession, setTaskbarBySession] = useState<ReadonlyMap<string, TaskbarProgress>>(() => new Map());
+  const [completedHold, setCompletedHold] = useState<ReadonlySet<string>>(() => new Set());
+  const previousTaskbarRef = useRef(new Map<string, TaskbarProgress>());
   const [projectDrag, setProjectDrag] = useState<ProjectDragState | null>(null);
   const [projectReordering, setProjectReordering] = useState(false);
   const [leavingProjects, setLeavingProjects] = useState<LeavingProject[]>([]);
@@ -135,10 +139,74 @@ export function App() {
     });
   }, []);
 
+  // The session's taskbar progress, for the same reason: the host owns
+  // the state (an explicit ConEmu report or the command lifecycle), the
+  // window only draws it.
+  useEffect(() => {
+    return window.agentTerminal.onTaskbar((sessionId, taskbar) => {
+      setTaskbarBySession((current) => applyTaskbarEvent(current, sessionId, taskbar));
+    });
+  }, []);
+
+  // A command that finished on a tab the user is not looking at holds
+  // its bar at 100% - the "come look" marker - until the tab is opened.
+  // The host's machine emits the running -> clear edge; comparing each
+  // session's effective state against the last render's catches it.
+  useEffect(() => {
+    const sessions = state?.sessions;
+    if (!sessions) return;
+    const previous = previousTaskbarRef.current;
+    const now = new Map<string, TaskbarProgress>();
+    for (const session of sessions) {
+      now.set(session.id, taskbarBySession.get(session.id) ?? taskbarOf(session));
+    }
+    for (const id of previous.keys()) {
+      if (!now.has(id)) previous.delete(id);
+    }
+    previousTaskbarRef.current = now;
+    setCompletedHold((current) => {
+      const holds = new Set(current);
+      let changed = false;
+      for (const session of sessions) {
+        const effective = now.get(session.id);
+        if (!effective) continue;
+        const last = previous.get(session.id);
+        // The running -> clear edge on a tab the user is not on: hold
+        // the 100% bar until the tab is opened.
+        if (last && taskbarJustCompleted(last, effective) && session.status === "running" && session.id !== activeSessionId && !holds.has(session.id)) {
+          holds.add(session.id);
+          changed = true;
+        }
+        // A new command on the tab: the bar shows progress again, so
+        // the hold is stale.
+        if (effective.state !== "clear" && holds.delete(session.id)) changed = true;
+      }
+      // A held tab that left the project: drop its marker with it.
+      for (const id of [...holds]) {
+        if (!now.has(id) && holds.delete(id)) changed = true;
+      }
+      return changed ? holds : current;
+    });
+  }, [state, taskbarBySession, activeSessionId]);
+
+  // Opening a held tab resets its bar to the idle colour: the marker
+  // is only for tabs the user has not looked at yet. Covers every
+  // entry point (a tab click, a console handoff, a phone focus).
+  useEffect(() => {
+    if (!activeSessionId) return;
+    setCompletedHold((current) => {
+      if (!current.has(activeSessionId)) return current;
+      const next = new Set(current);
+      next.delete(activeSessionId);
+      return next;
+    });
+  }, [activeSessionId]);
+
   useEffect(() => {
     const sessions = state?.sessions;
     if (!sessions) return;
     setActivityBySession((current) => mergeActivity(current, sessions));
+    setTaskbarBySession((current) => mergeTaskbar(current, sessions));
   }, [state?.sessions]);
 
   // When a project disappears from the host list (e.g. it was removed), keep
@@ -1021,8 +1089,20 @@ export function App() {
                 const selectedSplit = activeSplit?.id === sessionSplit?.id;
                 const draggedSplit = findSplitGroup(splitGroups, tabDrag?.sessionId);
                 const isDragging = tabDrag?.sessionId === session.id || draggedSplit?.sessionIds.includes(session.id);
+                // The tab's progress state: the newest event the window
+                // heard, the snapshot's state until one arrives. The
+                // active tab keeps its own indicator bar; the others
+                // draw a dot and/or a progress bar from the model.
+                const taskbar = taskbarBySession.get(session.id) ?? taskbarOf(session);
+                const progressModel = tabProgressModel({
+                  isActive: session.id === activeSessionId,
+                  session,
+                  taskbar,
+                  activity: activityBySession.get(session.id),
+                  justCompleted: completedHold.has(session.id)
+                });
                 return <button key={session.id} ref={(element) => { if (element) tabElementsRef.current.set(session.id, element); else tabElementsRef.current.delete(session.id); }} role="tab" aria-selected={session.id === activeSessionId} className={`terminal-tab ${session.id === activeSessionId ? "active" : ""} ${selectedSplit ? "is-split-selected" : ""} ${sessionSplit ? "is-split" : ""} ${splitIndex === 0 ? "split-first" : splitIndex === 1 ? "split-second" : ""} ${isDragging ? "is-dragging" : ""} ${closingSessionIds.has(session.id) ? "is-closing" : ""}`} style={{ transform: tabDragTransform(session.id, index) }} onClick={() => { if (!suppressTabClickRef.current) setActiveSessionId(session.id); }} onContextMenu={(event) => { event.preventDefault(); setSplitMenu({ kind: "tab", sessionId: session.id, x: event.clientX, y: event.clientY }); }} onPointerDown={(event) => beginTabDrag(event, session.id, index)} onPointerMove={moveTabDrag} onPointerUp={(event) => finishTabDrag(event, true)} onPointerCancel={(event) => finishTabDrag(event, false)}>
-                  <TerminalIcon /><span className="terminal-tab-label display-name" title={session.title}>{session.title}</span>{activityBySession.get(session.id) === "active" && <i className="activity-dot" title="Running" />}{session.status === "exited" && <i className="exit-dot" title={`Exited (${session.exitCode ?? "unknown"})`} />}
+                  <TerminalIcon /><span className="terminal-tab-label display-name" title={session.title}>{session.title}</span>{progressModel.dot === "running" && <i className="tab-status-dot is-running" title="Running" />}{progressModel.dot === "completed" && <i className="tab-status-dot is-completed" title="Just finished" />}{progressModel.dot === "idle" && <i className="tab-status-dot is-idle" title="Idle" />}{progressModel.dot === "error" && <i className="tab-status-dot is-error" title={`Exited (${session.exitCode ?? "unknown"})`} />}{progressModel.bar !== null && <i className={`tab-progress${progressModel.bar === "pulse" ? " is-pulse" : ""}`} style={progressModel.fill !== null ? ({ "--tab-fill": `${progressModel.fill}%` } as CSSProperties) : undefined} aria-hidden="true" />}
                   <span className="tab-close" role="button" aria-label={`Close ${session.title}`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void closeTab(session.id); }}><CloseIcon /></span>
                 </button>;
               })}

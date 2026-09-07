@@ -14,7 +14,7 @@ tauri-build = { version = "2", features = [] }
 
 [target.'cfg(windows)'.dependencies]
 filedescriptor = "0.8"
-winapi = { version = "0.3", features = ["combaseapi", "fileapi", "guiddef", "handleapi", "heapapi", "minwinbase", "namedpipeapi", "processthreadsapi", "synchapi", "winbase", "wincon", "winnt"] }
+winapi = { version = "0.3", features = ["combaseapi", "fileapi", "guiddef", "handleapi", "heapapi", "libloaderapi", "minwinbase", "minwindef", "namedpipeapi", "objbase", "processthreadsapi", "shobjidl_core", "synchapi", "winbase", "wincon", "windef", "winnt", "winuser"] }
 winreg = "0.52"
 
 [dependencies]

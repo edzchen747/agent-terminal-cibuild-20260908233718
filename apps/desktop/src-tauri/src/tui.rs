@@ -67,7 +67,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::models::TuiMode;
+use crate::models::{TaskbarProgress, TuiMode};
 
 /// Alt-anchored exit requires the stream to have been quiet this long
 /// with a visible cursor.
@@ -180,6 +180,9 @@ pub struct TuiClassifier {
     /// them, in stream order. Only markers seen outside a
     /// synchronized-output bracket land here.
     shell_markers: Vec<ShellMarker>,
+    /// ConEmu `OSC 9;4` taskbar progress reports the foreground program
+    /// emitted since the host last drained them, in stream order.
+    progress_reports: Vec<TaskbarProgress>,
 }
 
 impl TuiClassifier {
@@ -202,6 +205,7 @@ impl TuiClassifier {
             row_stamps: VecDeque::new(),
             clear_marker: None,
             shell_markers: Vec::new(),
+            progress_reports: Vec::new(),
         }
     }
 
@@ -227,6 +231,14 @@ impl TuiClassifier {
     /// painting its own composer and never reach this list.
     pub fn take_shell_markers(&mut self) -> Vec<ShellMarker> {
         std::mem::take(&mut self.shell_markers)
+    }
+
+    /// Drain the ConEmu `OSC 9;4` taskbar progress reports the
+    /// foreground program emitted since the last call, in stream order.
+    /// Unlike the OSC 133 markers a report is the program's own signal,
+    /// so it is accepted even inside a synchronized-output bracket.
+    pub fn take_progress_reports(&mut self) -> Vec<TaskbarProgress> {
+        std::mem::take(&mut self.progress_reports)
     }
 
     /// Milliseconds since the last output chunk reached the classifier,
@@ -325,9 +337,7 @@ impl TuiClassifier {
     /// put; a real alt-screen TUI releases the suppression on its
     /// first painted frame.
     pub fn grid_change_suppressed(&self) -> bool {
-        self.mode == TuiMode::Fullscreen
-            && self.alt_anchored
-            && !self.has_paint_evidence()
+        self.mode == TuiMode::Fullscreen && self.alt_anchored && !self.has_paint_evidence()
     }
 
     /// Feed one PTY output chunk. Returns a mode transition, if this
@@ -633,6 +643,17 @@ impl TuiClassifier {
     }
 
     fn on_osc(&mut self, payload: &str, at: usize) -> Option<TuiTransition> {
+        // ConEmu's progress reports, the taskbar path Windows Terminal
+        // takes (microsoft/terminal #8055): the foreground program
+        // reports `OSC 9 ; 4 ; state ; progress ST`. Unlike the shell's
+        // OSC 133 markers, a report is the program's own signal, so it
+        // is accepted regardless of the synchronized-output depth.
+        if payload == "9;4" || payload.starts_with("9;4;") {
+            if let Some(report) = parse_progress_report(payload) {
+                self.progress_reports.push(report);
+            }
+            return None;
+        }
         // OSC 133 shell-integration markers are ground truth that the
         // shell owns the foreground again - but only when the shell is
         // what emitted them. Inside a synchronized-output bracket the
@@ -708,7 +729,10 @@ impl TuiClassifier {
 
     fn distinct_extent(&self, rows: u16) -> usize {
         let end = (rows as usize + 1).min(self.extent_rows.len());
-        self.extent_rows[1..end].iter().filter(|&&written| written).count()
+        self.extent_rows[1..end]
+            .iter()
+            .filter(|&&written| written)
+            .count()
     }
 
     /// Parse one CSI sequence: `*i` points at the intro byte (`[`, `=`,
@@ -846,7 +870,11 @@ impl TuiClassifier {
                     CursorPosition { row }
                 }
                 b'd' => CursorPosition {
-                    row: if groups.is_empty() { 1 } else { value.max(1).min(u16::MAX as u32) as u16 },
+                    row: if groups.is_empty() {
+                        1
+                    } else {
+                        value.max(1).min(u16::MAX as u32) as u16
+                    },
                 },
                 b'G' => NoSignal, // column movement only
                 b'r' => Decstbm,
@@ -936,6 +964,40 @@ fn exit_code_of(code: &str) -> Option<i32> {
     code.split(';').nth(1)?.trim().parse().ok()
 }
 
+/// Parses the `state ; progress` tail of a ConEmu `OSC 9;4` report the
+/// way Windows Terminal's `DoConEmuAction` does: a `state` above 4 is
+/// ignored, a `progress` above 100 clamps to 100, and a malformed
+/// progress field (including an empty one) invalidates the whole report.
+/// A bare `OSC 9;4` with no state is a clear: state and progress both
+/// default to zero.
+fn parse_progress_report(payload: &str) -> Option<TaskbarProgress> {
+    // A bare `9;4` (no state field) is a clear, like Windows Terminal.
+    let tail = match payload.strip_prefix("9;4;") {
+        Some(rest) => rest,
+        None if payload == "9;4" => return Some(TaskbarProgress::Clear),
+        None => return None,
+    };
+    let (state_text, progress_text) = match tail.split_once(';') {
+        Some((state, progress)) => (state, Some(progress)),
+        None => (tail, None),
+    };
+    let state: u32 = state_text.parse().ok()?;
+    if state > 4 {
+        return None;
+    }
+    let progress: u32 = match progress_text {
+        Some(text) => text.parse().ok()?,
+        None => 0,
+    };
+    Some(match state {
+        0 => TaskbarProgress::Clear,
+        1 => TaskbarProgress::Value(progress.min(100)),
+        2 => TaskbarProgress::Error(progress.min(100)),
+        3 => TaskbarProgress::Indeterminate,
+        _ => TaskbarProgress::Paused(progress.min(100)),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -952,10 +1014,7 @@ mod tests {
         );
         clf.feed("\x1b[?1049h", at, 30);
         assert_eq!(clf.quiet_ms(at), 0, "a just-fed chunk is not quiet");
-        assert_eq!(
-            clf.quiet_ms(at + Duration::from_millis(1_500)),
-            1_500
-        );
+        assert_eq!(clf.quiet_ms(at + Duration::from_millis(1_500)), 1_500);
     }
 
     #[test]
@@ -970,7 +1029,11 @@ mod tests {
         clf.feed("frame\x1b[?25l", at + Duration::from_millis(500), 30);
         assert_eq!(clf.quiet_ms(at + Duration::from_millis(1_500)), 1_000);
         // The TUI leaves the alt screen and the shell prompt lands.
-        clf.feed("\x1b[?1049l\x1b[?25l", at + Duration::from_millis(3_000), 30);
+        clf.feed(
+            "\x1b[?1049l\x1b[?25l",
+            at + Duration::from_millis(3_000),
+            30,
+        );
         assert_eq!(
             clf.quiet_ms(at + Duration::from_millis(3_500)),
             500,
@@ -1002,7 +1065,10 @@ mod tests {
         );
         // The program's next own frame restarts the clock.
         clf.mark_spontaneous_output(later);
-        assert_eq!(clf.spontaneous_quiet_ms(later + Duration::from_millis(3_000)), 3_000);
+        assert_eq!(
+            clf.spontaneous_quiet_ms(later + Duration::from_millis(3_000)),
+            3_000
+        );
     }
 
     /// Feed chunks 5ms apart, starting 5ms after `at`.
@@ -1131,12 +1197,10 @@ mod tests {
         // (cursor hidden, CUP to the prompt row, erase + text), shows
         // the cursor, then streams the listing with the cursor
         // visible across half the grid. None of it is TUI evidence.
-        let mut steps: Vec<(u64, String)> = vec![
-            (
-                10,
-                "\x1b[?25l\x1b[35;1H\x1b[16X\x1b[44mPS C:\\Users> \x1b[?25h".into(),
-            ),
-        ];
+        let mut steps: Vec<(u64, String)> = vec![(
+            10,
+            "\x1b[?25l\x1b[35;1H\x1b[16X\x1b[44mPS C:\\Users> \x1b[?25h".into(),
+        )];
         for row in 1..=34 {
             steps.push((5, format!("-rw- 1 file{row}\r\n")));
         }
@@ -1182,9 +1246,10 @@ mod tests {
         // whole grid. Only the few CUP-targeted rows stamp; the
         // scrolled listing rows do not - far below the distinct-row
         // threshold.
-        let mut steps: Vec<(u64, String)> = vec![
-            (10, "\x1b[?25l\x1b[5;1H\x1b[16XDirectory: C:\\Users\x1b[?25h".into()),
-        ];
+        let mut steps: Vec<(u64, String)> = vec![(
+            10,
+            "\x1b[?25l\x1b[5;1H\x1b[16XDirectory: C:\\Users\x1b[?25h".into(),
+        )];
         for i in 1..=38u16 {
             steps.push((2, format!("-rw- 1 file{i}\r\n")));
         }
@@ -1245,7 +1310,10 @@ mod tests {
         let mut clf = TuiClassifier::new(30);
         let mut at = Instant::now();
         at += Duration::from_millis(10);
-        assert!(clf.feed("echo on\r\n\x1b[2J\x1b[HPS C:\\> ", at, 30).is_none());
+        assert!(
+            clf.feed("echo on\r\n\x1b[2J\x1b[HPS C:\\> ", at, 30)
+                .is_none()
+        );
         assert_eq!(clf.take_chunk_clear(), Some(9));
         assert_eq!(clf.take_chunk_clear(), None, "the marker is consumed once");
         // ED3 (scrollback wipe) is a clear boundary too.
@@ -1413,11 +1481,7 @@ mod tests {
         // misread a prompt redraw as a TUI repaint).
         let out = feed_timed(
             30,
-            &[
-                (10, "\x1b[2J\x1b[1;1H"),
-                (5, "\x1b[2;1Hline two"),
-                (60, ""),
-            ],
+            &[(10, "\x1b[2J\x1b[1;1H"), (5, "\x1b[2;1Hline two"), (60, "")],
         );
         assert!(out.is_empty());
     }
@@ -1438,10 +1502,16 @@ mod tests {
         let out = feed_timed(
             39,
             &[
-                (10, "\x1b[H\x1b[?25h\x1b[3J\x1b]9;9;C:\\repo\x07\x1b[?25lPS C:\\repo> "),
+                (
+                    10,
+                    "\x1b[H\x1b[?25h\x1b[3J\x1b]9;9;C:\\repo\x07\x1b[?25lPS C:\\repo> ",
+                ),
                 (5, sweep),
                 (5, "\x1b[1;31H\x1b[?25h"),
-                (5, "\x1b[?25l\x1b[93ml\x1b[97m\x1b[2m\x1b[3ms\x08\x1b[1;33H\x1b[?25h"),
+                (
+                    5,
+                    "\x1b[?25l\x1b[93ml\x1b[97m\x1b[2m\x1b[3ms\x08\x1b[1;33H\x1b[?25h",
+                ),
                 (5, "\x1b[?25l\x1b[93m\x1b[3;1Hrow\x1b[4;1Hrow"),
                 (60, ""),
             ],
@@ -1504,12 +1574,7 @@ mod tests {
         // some of them too.
         let out = feed_timed(
             30,
-            &[
-                (10, "\x1b[?c"),
-                (5, "\x1b[?6n"),
-                (5, "\x1b[18t"),
-                (60, ""),
-            ],
+            &[(10, "\x1b[?c"), (5, "\x1b[?6n"), (5, "\x1b[18t"), (60, "")],
         );
         assert!(out.is_empty(), "{out:?}");
     }
@@ -1675,7 +1740,10 @@ mod tests {
         let mut at = Instant::now();
         at += Duration::from_millis(10);
         clf.feed("\x1b]133", at, 30);
-        assert!(clf.take_shell_markers().is_empty(), "nothing has completed yet");
+        assert!(
+            clf.take_shell_markers().is_empty(),
+            "nothing has completed yet"
+        );
 
         at += Duration::from_millis(10);
         clf.feed(";D;7\x07", at, 30);
@@ -1787,10 +1855,7 @@ mod tests {
 
     #[test]
     fn a_split_sequence_bridges_chunks() {
-        let out = feed_timed(
-            30,
-            &[(10, "\x1b[?104"), (5, "9h"), (5, "x")],
-        );
+        let out = feed_timed(30, &[(10, "\x1b[?104"), (5, "9h"), (5, "x")]);
         assert_eq!(out.len(), 1);
         assert_eq!(mode(&out[0]), TuiMode::Fullscreen);
     }
@@ -1819,13 +1884,24 @@ mod tests {
         // whole time.
         let mut clf = TuiClassifier::new(30);
         let mut at = Instant::now();
-        let entry =
-            step(&mut clf, &mut at, 30, "\x1b[?1049h\x1b[?25l\x1b[HPS C:\\> ", 10)
-                .expect("alt-enter commits");
+        let entry = step(
+            &mut clf,
+            &mut at,
+            30,
+            "\x1b[?1049h\x1b[?25l\x1b[HPS C:\\> ",
+            10,
+        )
+        .expect("alt-enter commits");
         assert!(entry.via_alt_enter);
         // Row-1 hidden writes produce no paint evidence; the grid is
         // suppressed from the moment of entry.
-        step(&mut clf, &mut at, 30, "\x1b[K\r\n\x1b[K\r\n\x1b[1;32H\x1b[?25h", 10);
+        step(
+            &mut clf,
+            &mut at,
+            30,
+            "\x1b[K\r\n\x1b[K\r\n\x1b[1;32H\x1b[?25h",
+            10,
+        );
         assert!(!clf.has_paint_evidence());
         assert!(clf.grid_change_suppressed());
         // Alt-exit, then the main-screen prompt redraw: PSReadLine CUPs
@@ -1833,8 +1909,17 @@ mod tests {
         // shell activity on the MAIN screen after the program left the
         // alt screen - it must NOT count as TUI paint evidence, so the
         // grid stays held.
-        step(&mut clf, &mut at, 30, "\x1b[?1049l\x1b[?25l\x1b[4;31Hl\x1b[?25h", 10);
-        assert!(!clf.has_paint_evidence(), "post-alt main-screen CUP is not TUI paint");
+        step(
+            &mut clf,
+            &mut at,
+            30,
+            "\x1b[?1049l\x1b[?25l\x1b[4;31Hl\x1b[?25h",
+            10,
+        );
+        assert!(
+            !clf.has_paint_evidence(),
+            "post-alt main-screen CUP is not TUI paint"
+        );
         assert!(clf.grid_change_suppressed());
         // Quiet + visible cursor exits to canonical; the suppression
         // disappears with the TUI period.
@@ -1847,8 +1932,8 @@ mod tests {
     fn alt_tui_stbm_releases_grid_suppression() {
         let mut clf = TuiClassifier::new(26);
         let mut at = Instant::now();
-        let entry = step(&mut clf, &mut at, 26, "\x1b[?1049h\x1b[?25l", 10)
-            .expect("alt-enter commits");
+        let entry =
+            step(&mut clf, &mut at, 26, "\x1b[?1049h\x1b[?25l", 10).expect("alt-enter commits");
         assert!(entry.via_alt_enter);
         assert!(clf.grid_change_suppressed());
         // DECSTBM: definitive paint evidence on the first frame.
@@ -1861,8 +1946,8 @@ mod tests {
     fn hidden_multirow_paint_releases_grid_suppression() {
         let mut clf = TuiClassifier::new(26);
         let mut at = Instant::now();
-        let _entry = step(&mut clf, &mut at, 26, "\x1b[?1049h\x1b[?25l", 10)
-            .expect("alt-enter commits");
+        let _entry =
+            step(&mut clf, &mut at, 26, "\x1b[?1049h\x1b[?25l", 10).expect("alt-enter commits");
         // Hidden-cursor absolute writes past row 1: paint evidence
         // without DECSTBM.
         step(&mut clf, &mut at, 26, "\x1b[5;10Hx\x1b[7;10Hy", 10);
@@ -1892,8 +1977,8 @@ mod tests {
         step(&mut clf, &mut at, 30, "\x1b[?1049l\x1b[?25h", 10);
         step(&mut clf, &mut at, 30, "\r", 350);
         assert_eq!(clf.mode(), TuiMode::Canonical);
-        let entry = step(&mut clf, &mut at, 30, "\x1b[?1049h\x1b[?25l", 10)
-            .expect("second alt-enter");
+        let entry =
+            step(&mut clf, &mut at, 30, "\x1b[?1049h\x1b[?25l", 10).expect("second alt-enter");
         assert!(entry.via_alt_enter);
         assert!(clf.grid_change_suppressed());
         step(&mut clf, &mut at, 30, "\x1b[1;30r\x1b[2;1Ht", 10);
@@ -1986,7 +2071,10 @@ mod tests {
         // marker is read as the shell's again.
         step(&mut clf, &mut at, 30, "\x1b[?2026h", 10).expect("second entry");
         let second = step(&mut clf, &mut at, 30, "\x1b[?2026l\x1b]133;A\x07", 5);
-        assert_eq!(mode(&second.expect("marker after the bracket closed")), TuiMode::Canonical);
+        assert_eq!(
+            mode(&second.expect("marker after the bracket closed")),
+            TuiMode::Canonical
+        );
     }
 
     #[test]
@@ -1997,7 +2085,13 @@ mod tests {
         let mut clf = TuiClassifier::new(30);
         let mut at = Instant::now();
         assert_eq!(
-            step(&mut clf, &mut at, 30, "\x1b[?2026h\x1b[?2026l\x1b]133;A\x07", 10),
+            step(
+                &mut clf,
+                &mut at,
+                30,
+                "\x1b[?2026h\x1b[?2026l\x1b]133;A\x07",
+                10
+            ),
             None,
             "the chunk both entered and left: nothing net changed"
         );
@@ -2079,7 +2173,11 @@ mod tests {
         let mut at = Instant::now();
         step(&mut clf, &mut at, 30, "\x1b[?2026h", 10).expect("inline entry");
         assert_eq!(step(&mut clf, &mut at, 30, "\x1b]133", 5), None);
-        assert_eq!(step(&mut clf, &mut at, 30, ";A\x07", 5), None, "still inside the frame");
+        assert_eq!(
+            step(&mut clf, &mut at, 30, ";A\x07", 5),
+            None,
+            "still inside the frame"
+        );
         assert_eq!(clf.mode(), TuiMode::Inline);
     }
 
@@ -2130,7 +2228,13 @@ mod tests {
         let enter = step(&mut clf, &mut at, 30, "\x1b[?1049h\x1b[?25l", 10).expect("alt enter");
         assert_eq!(mode(&enter), TuiMode::Fullscreen);
         assert_eq!(
-            step(&mut clf, &mut at, 30, "\x1b[?2026h\x1b]133;C\x07frame\x1b[?2026l", 5),
+            step(
+                &mut clf,
+                &mut at,
+                30,
+                "\x1b[?2026h\x1b]133;C\x07frame\x1b[?2026l",
+                5
+            ),
             None
         );
         assert_eq!(clf.mode(), TuiMode::Fullscreen);
@@ -2215,7 +2319,12 @@ mod tests {
         // that actually end a TUI period are events.
         let mut clf = TuiClassifier::new(30);
         let mut at = Instant::now();
-        for marker in ["\x1b]133;A\x07", "\x1b]133;B\x07", "\x1b]133;C\x07", "\x1b]133;D\x07"] {
+        for marker in [
+            "\x1b]133;A\x07",
+            "\x1b]133;B\x07",
+            "\x1b]133;C\x07",
+            "\x1b]133;D\x07",
+        ] {
             assert_eq!(step(&mut clf, &mut at, 30, marker, 10), None, "{marker}");
         }
         assert_eq!(clf.mode(), TuiMode::Canonical);
@@ -2251,7 +2360,66 @@ mod tests {
         let mut at = Instant::now();
         let chunk = "\x1b[?2026h\x1b[2J\x1b[3J\x1b[?2026l";
         step(&mut clf, &mut at, 30, chunk, 10).expect("inline entry");
-        assert_eq!(clf.take_chunk_clear(), Some(chunk.find("\x1b[3J").expect("ed3")));
+        assert_eq!(
+            clf.take_chunk_clear(),
+            Some(chunk.find("\x1b[3J").expect("ed3"))
+        );
         assert_eq!(clf.mode(), TuiMode::Inline);
+    }
+
+    #[test]
+    fn conemu_progress_reports_are_parsed_like_windows_terminal() {
+        let cases = [
+            ("9;4", TaskbarProgress::Clear),
+            ("9;4;0", TaskbarProgress::Clear),
+            ("9;4;1;50", TaskbarProgress::Value(50)),
+            ("9;4;1", TaskbarProgress::Value(0)),
+            ("9;4;2;80", TaskbarProgress::Error(80)),
+            ("9;4;3", TaskbarProgress::Indeterminate),
+            ("9;4;3;40", TaskbarProgress::Indeterminate),
+            ("9;4;4;25", TaskbarProgress::Paused(25)),
+            // Progress clamps to 100.
+            ("9;4;1;150", TaskbarProgress::Value(100)),
+        ];
+        for (payload, want) in cases {
+            assert_eq!(
+                parse_progress_report(payload),
+                Some(want),
+                "parse {payload:?}"
+            );
+        }
+        // Malformed fields invalidate the whole report, and unknown
+        // states are ignored, exactly like DoConEmuAction.
+        for payload in ["9;4;1;", "9;4;1;x", "9;4;5;50", "9;4;99;50", "9;4;;50"] {
+            assert_eq!(parse_progress_report(payload), None, "parse {payload:?}");
+        }
+    }
+
+    #[test]
+    fn progress_reports_land_in_the_drain_in_stream_order() {
+        let mut clf = TuiClassifier::new(30);
+        let at = Instant::now();
+        // A split report bridges the chunk boundary, like any OSC.
+        clf.feed("\x1b]9;4;", at, 30);
+        assert!(clf.take_progress_reports().is_empty());
+        clf.feed("1;50\x07\x1b]9;4;2;80\x07", at, 30);
+        assert_eq!(
+            clf.take_progress_reports(),
+            vec![TaskbarProgress::Value(50), TaskbarProgress::Error(80)]
+        );
+        assert!(clf.take_progress_reports().is_empty(), "drained once");
+    }
+
+    #[test]
+    fn a_progress_report_is_accepted_inside_a_sync_bracket() {
+        // A report is the program's own signal, unlike an OSC 133 marker a
+        // program may paint into its own composer.
+        let mut clf = TuiClassifier::new(30);
+        let at = Instant::now();
+        clf.feed("\x1b[?2026h\x1b]9;4;1;30\x07\x1b[?2026l", at, 30);
+        assert_eq!(
+            clf.take_progress_reports(),
+            vec![TaskbarProgress::Value(30)]
+        );
     }
 }

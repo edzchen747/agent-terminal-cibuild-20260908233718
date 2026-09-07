@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, TERMINAL_SESSION_ACTIVITIES, isSessionActive, sessionActivityLabel, sessionActivityOf, sessionActivitySummary, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, MAX_ZOOM_FONT_SIZE, MIN_ZOOM_FONT_SIZE, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, findDecorationsFor, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, BASELINE_TERMINAL_ZOOM, MAX_TERMINAL_ZOOM, MIN_TERMINAL_ZOOM, TERMINAL_ZOOM_STEPS, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, terminalZoomFontSize, CLOSED_FIND, applyFindResults, closeFind, findCommandForKey, findStatusLabel, openFind, setFindQuery, type ClientMessage, type HostSnapshot, type SessionActivity, type TerminalSession } from "./index.js";
+import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, TERMINAL_SESSION_ACTIVITIES, isSessionActive, sessionActivityLabel, sessionActivityOf, sessionActivitySummary, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, combineTaskbarProgress, CLEAR_TASKBAR_PROGRESS, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, MAX_ZOOM_FONT_SIZE, MIN_ZOOM_FONT_SIZE, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TASKBAR_PROGRESS_STATES, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, findDecorationsFor, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, BASELINE_TERMINAL_ZOOM, MAX_TERMINAL_ZOOM, MIN_TERMINAL_ZOOM, TERMINAL_ZOOM_STEPS, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, terminalZoomFontSize, CLOSED_FIND, applyFindResults, closeFind, findCommandForKey, findStatusLabel, openFind, setFindQuery, type ClientMessage, type HostSnapshot, type SessionActivity, type TerminalSession, type TaskbarProgress } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -282,6 +282,75 @@ test("TerminalSession.activity is optional so a host without it still parses", (
   if (decoded.type !== "snapshot") assert.fail("expected snapshot");
   assert.equal(decoded.snapshot.sessions[0]?.activity, undefined);
   assert.equal(decoded.snapshot.sessions[0]?.activitySince, undefined);
+});
+
+test("session.taskbar round-trips all five ConEmu states", () => {
+  const taskbars: TaskbarProgress[] = [
+    { state: "clear" },
+    { state: "value", progress: 50 },
+    { state: "error", progress: 80 },
+    { state: "indeterminate" },
+    { state: "paused", progress: 25 }
+  ];
+  for (const taskbar of taskbars) {
+    const message = decodeServerMessage(JSON.stringify({ type: "session.taskbar", sessionId: "s1", taskbar }));
+    assert.equal(message.type, "session.taskbar");
+    if (message.type !== "session.taskbar") assert.fail("expected session.taskbar");
+    assert.equal(message.sessionId, "s1");
+    assert.deepEqual(message.taskbar, taskbar);
+  }
+});
+
+test("TerminalSession.taskbar is optional so a host without it still parses", () => {
+  const decoded = decodeServerMessage(JSON.stringify({
+    type: "snapshot",
+    snapshot: { host: { id: "h1", name: "Desktop One", version: "0.3.5" }, projects: [], sessions: [{ id: "s1", projectId: "p1", title: "pwsh", cwd: "C:\\repo", shellId: "powershell", status: "running", createdAt: "now" }], devices: [], shells: [], defaultShellId: "" }
+  }));
+  if (decoded.type !== "snapshot") assert.fail("expected snapshot");
+  assert.equal(decoded.snapshot.sessions[0]?.taskbar, undefined);
+});
+
+test("a session's taskbar state rides the snapshot wire shape", () => {
+  // The Rust side serializes `{state, progress}` with an internal tag;
+  // this is the exact JSON a desktop host puts on the wire.
+  const decoded = decodeServerMessage(JSON.stringify({
+    type: "snapshot",
+    snapshot: { host: { id: "h1", name: "Desktop One", version: "0.3.5" }, projects: [], sessions: [{ id: "s1", projectId: "p1", title: "pwsh", cwd: "C:\\repo", shellId: "powershell", status: "running", createdAt: "now", taskbar: { state: "value", progress: 42 } }], devices: [], shells: [], defaultShellId: "" }
+  }));
+  if (decoded.type !== "snapshot") assert.fail("expected snapshot");
+  assert.deepEqual(decoded.snapshot.sessions[0]?.taskbar, { state: "value", progress: 42 });
+});
+
+test("the taskbar group rule ranks error, paused, value, indeterminate, clear", () => {
+  // A window's taskbar button shows the highest-priority state of its
+  // project's sessions, Windows Terminal's rule: whatever matters most
+  // wins, so a failure is never hidden behind a spinner.
+  assert.deepEqual(TASKBAR_PROGRESS_STATES, ["clear", "value", "error", "indeterminate", "paused"]);
+  const states: TaskbarProgress[] = [
+    { state: "indeterminate" },
+    { state: "value", progress: 50 },
+    { state: "paused", progress: 25 },
+    { state: "error", progress: 70 },
+    CLEAR_TASKBAR_PROGRESS
+  ];
+  const wants: TaskbarProgress[] = [
+    { state: "indeterminate" },
+    { state: "value", progress: 50 },
+    { state: "paused", progress: 25 },
+    { state: "error", progress: 70 },
+    // Clear is the lowest priority of all: adding it to a list that
+    // already holds an error changes nothing.
+    { state: "error", progress: 70 }
+  ];
+  for (let count = 1; count <= states.length; count++) {
+    assert.deepEqual(
+      combineTaskbarProgress(states.slice(0, count)),
+      wants[count - 1],
+      `the best of the first ${count} states`
+    );
+  }
+  assert.deepEqual(combineTaskbarProgress([CLEAR_TASKBAR_PROGRESS]), CLEAR_TASKBAR_PROGRESS);
+  assert.deepEqual(combineTaskbarProgress([]), CLEAR_TASKBAR_PROGRESS);
 });
 
 test("an active session carries the state and the time it started", () => {

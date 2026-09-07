@@ -94,11 +94,7 @@ pub fn command_for(shell: &ShellProfile, cwd: &str) -> CommandBuilder {
 
     match shell.id.as_str() {
         "powershell" | "pwsh" => {
-            args.extend([
-                "-NoExit".into(),
-                "-Command".into(),
-                POWERSHELL_HOOK.into(),
-            ]);
+            args.extend(["-NoExit".into(), "-Command".into(), POWERSHELL_HOOK.into()]);
         }
         "cmd" => {
             // cmd has no way to report an exit code from PROMPT, so the
@@ -107,9 +103,7 @@ pub fn command_for(shell: &ShellProfile, cwd: &str) -> CommandBuilder {
             let original = env::var("PROMPT").unwrap_or_else(|_| "$P$G".into());
             extra_environment.insert(
                 "PROMPT".into(),
-                format!(
-                    "$e]133;D$e\\$e]133;A$e\\$e]9;9;$P$e\\{original}$e]133;B$e\\"
-                ),
+                format!("$e]133;D$e\\$e]133;A$e\\$e]9;9;$P$e\\{original}$e]133;B$e\\"),
             );
         }
         "git-bash" => {
@@ -173,13 +167,7 @@ fn executable_on_path(command: &str, path: Option<&OsStr>) -> bool {
         vec![command.to_string()]
     };
     path.map(std::env::split_paths)
-        .map(|mut dirs| {
-            dirs.any(|dir| {
-                names
-                    .iter()
-                    .any(|name| dir.join(name).is_file())
-            })
-        })
+        .map(|mut dirs| dirs.any(|dir| names.iter().any(|name| dir.join(name).is_file())))
         .unwrap_or(false)
 }
 

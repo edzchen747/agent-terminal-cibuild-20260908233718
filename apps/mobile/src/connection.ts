@@ -1,6 +1,6 @@
 import { Preferences } from "@capacitor/preferences";
 import { Capacitor } from "@capacitor/core";
-import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage, SessionActivity, TuiMode } from "@agentterminal/protocol";
+import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage, SessionActivity, TaskbarProgress, TuiMode } from "@agentterminal/protocol";
 import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, VIEWPORT_KEEPALIVE_INTERVAL_MS } from "@agentterminal/protocol";
 import { deviceName } from "./device";
 import { canAttemptConnection, heartbeatActive, heartbeatCatchUpNeeded, heartbeatIntervalMs, nextReconnectDelay, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS } from "./connectionPolicy";
@@ -966,6 +966,7 @@ export class HostConnection {
     if (message.type === "session.grid") { this.emit("grid", { sessionId: message.sessionId, cols: message.cols, rows: message.rows, offset: message.offset }); return; }
     if (message.type === "session.mode") { this.emit("mode", { sessionId: message.sessionId, mode: message.mode, offset: message.offset }); return; }
     if (message.type === "session.activity") { this.applyActivity(message.sessionId, message.activity, message.since); return; }
+    if (message.type === "session.taskbar") { this.applyTaskbar(message.sessionId, message.taskbar); return; }
     if (message.type === "snapshot") { this.snapshot = message.snapshot; this.emit("snapshot", message.snapshot); }
     if ((message.type === "auth.accepted" || message.type === "pair.accepted") && message.snapshot) this.snapshot = message.snapshot;
     const requestId = "requestId" in message ? message.requestId : undefined;
@@ -990,6 +991,22 @@ export class HostConnection {
     if (!snapshot?.sessions.some((session) => session.id === sessionId)) return;
     const sessions = snapshot.sessions.map((session) =>
       session.id === sessionId ? { ...session, activity, activitySince: since } : session
+    );
+    this.snapshot = { ...snapshot, sessions };
+    this.emit("snapshot", this.snapshot);
+  }
+
+  /**
+   * The host's taskbar progress for a session. The mobile UI does not
+   * draw it yet, but the held snapshot keeps the state so a future
+   * indicator - or a desktop window that pairs in later - reads the
+   * truth instead of a stale copy.
+   */
+  private applyTaskbar(sessionId: string, taskbar: TaskbarProgress): void {
+    const snapshot = this.snapshot;
+    if (!snapshot?.sessions.some((session) => session.id === sessionId)) return;
+    const sessions = snapshot.sessions.map((session) =>
+      session.id === sessionId ? { ...session, taskbar } : session
     );
     this.snapshot = { ...snapshot, sessions };
     this.emit("snapshot", this.snapshot);

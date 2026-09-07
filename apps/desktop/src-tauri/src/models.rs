@@ -28,6 +28,60 @@ pub enum SessionActivity {
     Active,
 }
 
+/// ConEmu's `OSC 9;4` taskbar progress state, the same states Windows
+/// Terminal applies to its taskbar button through `ITaskbarList3`
+/// (microsoft/terminal #8055, #10755): the foreground program reports
+/// `OSC 9 ; 4 ; state ; progress ST`, and the host additionally derives
+/// `indeterminate` and `error` from the shell's command lifecycle. A
+/// window's taskbar button shows the highest-priority state of its
+/// project's sessions: error, paused, value, indeterminate, clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "progress", rename_all = "lowercase")]
+pub enum TaskbarProgress {
+    /// No progress indicator.
+    Clear,
+    /// Deterministic progress, a 0-100 percentage.
+    Value(u32),
+    /// The command failed; the percentage marks where it stopped.
+    Error(u32),
+    /// Running, duration unknown (the taskbar shows an animated spinner).
+    Indeterminate,
+    /// Waiting on input or a user action.
+    Paused(u32),
+}
+
+impl Default for TaskbarProgress {
+    fn default() -> Self {
+        TaskbarProgress::Clear
+    }
+}
+
+impl TaskbarProgress {
+    pub fn is_clear(&self) -> bool {
+        matches!(self, TaskbarProgress::Clear)
+    }
+
+    /// The `st` code of a ConEmu `OSC 9;4` report in this state.
+    pub fn state_code(self) -> u8 {
+        match self {
+            TaskbarProgress::Clear => 0,
+            TaskbarProgress::Value(_) => 1,
+            TaskbarProgress::Error(_) => 2,
+            TaskbarProgress::Indeterminate => 3,
+            TaskbarProgress::Paused(_) => 4,
+        }
+    }
+
+    /// The 0-100 value carried by the value, error, and paused states
+    /// (zero otherwise).
+    pub fn progress(self) -> u32 {
+        match self {
+            TaskbarProgress::Value(p) | TaskbarProgress::Error(p) | TaskbarProgress::Paused(p) => p,
+            TaskbarProgress::Clear | TaskbarProgress::Indeterminate => 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceIdentity {
@@ -105,6 +159,14 @@ pub struct TerminalSession {
     /// how long the current command has been running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity_since: Option<String>,
+    /// The session's ConEmu `OSC 9;4` taskbar progress for its last
+    /// command: an explicit program report, or derived from the shell's
+    /// command lifecycle (indeterminate while it runs, error after a
+    /// non-zero exit). A window's taskbar button combines these across
+    /// the project's sessions, highest priority first. Skipped while
+    /// clear, like `activity_since`.
+    #[serde(default, skip_serializing_if = "TaskbarProgress::is_clear")]
+    pub taskbar: TaskbarProgress,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,7 +213,10 @@ pub fn normalize_terminal_scheme_id(id: &str, dark: bool) -> String {
     allowed
         .iter()
         .find(|candidate| **candidate == id)
-        .map_or_else(|| fallback.to_string(), |candidate| (*candidate).to_string())
+        .map_or_else(
+            || fallback.to_string(),
+            |candidate| (*candidate).to_string(),
+        )
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -265,6 +330,17 @@ pub struct TerminalActivityEvent {
     pub session_id: String,
     pub activity: SessionActivity,
     pub since: String,
+}
+
+/// The session's ConEmu `OSC 9;4` taskbar progress changed, whether by
+/// an explicit program report or derived from the shell's command
+/// lifecycle. Like the activity event it carries no stream offset: the
+/// state is host-side and is also refreshed by the host's idle sweeper.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalTaskbarEvent {
+    pub session_id: String,
+    pub taskbar: TaskbarProgress,
 }
 
 /// One contiguous slice of the session's PTY stream recorded under a single
@@ -451,9 +527,10 @@ impl ClientMessage {
             | Self::SessionViewportRelease { request_id, .. }
             | Self::ShellDefault { request_id, .. }
             | Self::TerminalTheme { request_id, .. } => Some(request_id),
-            Self::SessionInput { .. } | Self::SessionResize { .. } | Self::DebugDiagnostics { .. } | Self::Ping => {
-                None
-            }
+            Self::SessionInput { .. }
+            | Self::SessionResize { .. }
+            | Self::DebugDiagnostics { .. }
+            | Self::Ping => None,
         }
     }
 }
@@ -521,6 +598,15 @@ pub enum ServerMessage {
         activity: SessionActivity,
         since: String,
     },
+    /// The session's taskbar progress changed (a program `OSC 9;4`
+    /// report, the shell's command lifecycle, or the process exiting).
+    /// Like the activity event it carries no stream offset: the state is
+    /// host-side, not a position in the stream.
+    #[serde(rename = "session.taskbar")]
+    SessionTaskbarChanged {
+        session_id: String,
+        taskbar: TaskbarProgress,
+    },
     #[serde(rename = "ok")]
     Ok { request_id: String },
     #[serde(rename = "error")]
@@ -536,8 +622,9 @@ pub enum ServerMessage {
 mod tests {
     use super::{
         ClientMessage, DARK_TERMINAL_SCHEME_IDS, DEFAULT_DARK_TERMINAL_SCHEME_ID,
-        DEFAULT_LIGHT_TERMINAL_SCHEME_ID, LIGHT_TERMINAL_SCHEME_IDS, ServerMessage, SessionActivity, SessionSegment,
-        TerminalSession, TerminalTuiModeEvent, TuiMode, normalize_terminal_scheme_id,
+        DEFAULT_LIGHT_TERMINAL_SCHEME_ID, LIGHT_TERMINAL_SCHEME_IDS, ServerMessage,
+        SessionActivity, SessionSegment, TaskbarProgress, TerminalSession, TerminalTuiModeEvent,
+        TuiMode, normalize_terminal_scheme_id,
     };
 
     #[test]
@@ -548,7 +635,11 @@ mod tests {
         .expect("client message");
         assert!(matches!(
             client,
-            ClientMessage::SessionResize { cols: 120, rows: 40, .. }
+            ClientMessage::SessionResize {
+                cols: 120,
+                rows: 40,
+                ..
+            }
         ));
 
         let ping: ClientMessage = serde_json::from_str(r#"{"type":"ping"}"#).expect("ping");
@@ -648,6 +739,7 @@ mod tests {
             tui_mode: TuiMode::Inline,
             activity: SessionActivity::Active,
             activity_since: Some("2026-09-06T00:00:00Z".into()),
+            taskbar: TaskbarProgress::Clear,
         };
         let json = serde_json::to_value(&session).expect("TerminalSession");
         assert_eq!(json["tuiMode"], "inline", "the TUI mode must be camelCased");
@@ -665,6 +757,70 @@ mod tests {
     }
 
     #[test]
+    fn taskbar_progress_uses_the_protocol_wire_shape() {
+        // The desktop and the renderer must agree on this JSON: a
+        // lowercase state tag plus an optional progress, matching
+        // packages/protocol's TaskbarProgress.
+        let json = serde_json::to_value(TaskbarProgress::Value(42)).expect("value");
+        assert_eq!(
+            json,
+            serde_json::json!({ "state": "value", "progress": 42 })
+        );
+        let json = serde_json::to_value(TaskbarProgress::Clear).expect("clear");
+        assert_eq!(json, serde_json::json!({ "state": "clear" }));
+        let json = serde_json::to_value(TaskbarProgress::Error(70)).expect("error");
+        assert_eq!(
+            json,
+            serde_json::json!({ "state": "error", "progress": 70 })
+        );
+        let json = serde_json::to_value(TaskbarProgress::Indeterminate).expect("indeterminate");
+        assert_eq!(json, serde_json::json!({ "state": "indeterminate" }));
+        let json = serde_json::to_value(TaskbarProgress::Paused(7)).expect("paused");
+        assert_eq!(
+            json,
+            serde_json::json!({ "state": "paused", "progress": 7 })
+        );
+
+        // The inverse direction: what a client could report back, or a
+        // persisted journal, must round-trip.
+        let progress: TaskbarProgress =
+            serde_json::from_value(serde_json::json!({ "state": "value", "progress": 3 }))
+                .expect("round-trip");
+        assert!(matches!(progress, TaskbarProgress::Value(3)));
+    }
+
+    #[test]
+    fn a_clear_taskbar_is_omitted_from_the_session_json() {
+        let session = TerminalSession {
+            id: "s1".into(),
+            project_id: "p1".into(),
+            title: "pwsh".into(),
+            cwd: "C:\\repo".into(),
+            shell_id: "powershell".into(),
+            status: "running".into(),
+            created_at: "now".into(),
+            exit_code: None,
+            tui_mode: TuiMode::Canonical,
+            activity: SessionActivity::Idle,
+            activity_since: None,
+            taskbar: TaskbarProgress::Clear,
+        };
+        let json = serde_json::to_value(&session).expect("TerminalSession");
+        assert!(
+            json.get("taskbar").is_none(),
+            "a clear indicator is the default and must not ship on the wire"
+        );
+
+        let mut busy = session.clone();
+        busy.taskbar = TaskbarProgress::Indeterminate;
+        let json = serde_json::to_value(&busy).expect("TerminalSession");
+        assert_eq!(
+            json["taskbar"],
+            serde_json::json!({ "state": "indeterminate" })
+        );
+    }
+
+    #[test]
     fn shell_default_carries_the_chosen_terminal_through_the_wire_contract() {
         let message: ClientMessage = serde_json::from_str(
             r#"{"type":"shell.default","requestId":"r5","shellId":"git-bash"}"#,
@@ -678,9 +834,8 @@ mod tests {
 
         // A missing or unknown shell id must never decode as a valid command:
         // the desktop answers with an error instead of touching its store.
-        let invalid: Result<ClientMessage, _> = serde_json::from_str(
-            r#"{"type":"shell.default","requestId":"r6","shellId":""}"#,
-        );
+        let invalid: Result<ClientMessage, _> =
+            serde_json::from_str(r#"{"type":"shell.default","requestId":"r6","shellId":""}"#);
         assert!(invalid.is_ok());
         assert!(matches!(
             invalid.expect("empty value still parses"),
@@ -689,8 +844,9 @@ mod tests {
 
         // The type tag is what routes a command; a lookalike must be rejected
         // so a typo'd or newer type cannot silently fall through to a handler.
-        let lookalike: Result<ClientMessage, _> =
-            serde_json::from_str(r#"{"type":"shell.defaultValue","requestId":"r7","shellId":"cmd"}"#);
+        let lookalike: Result<ClientMessage, _> = serde_json::from_str(
+            r#"{"type":"shell.defaultValue","requestId":"r7","shellId":"cmd"}"#,
+        );
         assert!(lookalike.is_err());
 
         // SessionInput and SessionResize intentionally carry no request id;
@@ -709,19 +865,26 @@ mod tests {
         .expect("input with a viewport size");
         assert!(matches!(
             with_size,
-            ClientMessage::SessionInput { cols: Some(113), rows: Some(39), .. }
+            ClientMessage::SessionInput {
+                cols: Some(113),
+                rows: Some(39),
+                ..
+            }
         ));
         assert_eq!(with_size.request_id(), None);
 
         // Legacy clients send no size: the fields decode as None and the
         // host keeps the previously announced viewport.
-        let legacy: ClientMessage = serde_json::from_str(
-            r#"{"type":"session.input","sessionId":"s1","data":"q"}"#,
-        )
-        .expect("input without a viewport size");
+        let legacy: ClientMessage =
+            serde_json::from_str(r#"{"type":"session.input","sessionId":"s1","data":"q"}"#)
+                .expect("input without a viewport size");
         assert!(matches!(
             legacy,
-            ClientMessage::SessionInput { cols: None, rows: None, .. }
+            ClientMessage::SessionInput {
+                cols: None,
+                rows: None,
+                ..
+            }
         ));
     }
 
@@ -753,10 +916,7 @@ mod tests {
             r#"{"type":"auth","requestId":"r1","deviceId":"d1","deviceToken":"t1"}"#,
         )
         .expect("auth without a display name");
-        assert!(matches!(
-            legacy,
-            ClientMessage::Auth { name: None, .. }
-        ));
+        assert!(matches!(legacy, ClientMessage::Auth { name: None, .. }));
     }
 
     /// The host validates scheme ids against the lists above, but the colors
@@ -792,8 +952,14 @@ mod tests {
         }
 
         assert!(!dark.is_empty() && !light.is_empty(), "parsed no schemes");
-        assert_eq!(dark, DARK_TERMINAL_SCHEME_IDS, "dark scheme ids drifted from terminal-themes.ts");
-        assert_eq!(light, LIGHT_TERMINAL_SCHEME_IDS, "light scheme ids drifted from terminal-themes.ts");
+        assert_eq!(
+            dark, DARK_TERMINAL_SCHEME_IDS,
+            "dark scheme ids drifted from terminal-themes.ts"
+        );
+        assert_eq!(
+            light, LIGHT_TERMINAL_SCHEME_IDS,
+            "light scheme ids drifted from terminal-themes.ts"
+        );
         assert!(dark.contains(&DEFAULT_DARK_TERMINAL_SCHEME_ID.to_string()));
         assert!(light.contains(&DEFAULT_LIGHT_TERMINAL_SCHEME_ID.to_string()));
     }
@@ -804,10 +970,22 @@ mod tests {
         assert_eq!(normalize_terminal_scheme_id("novel", false), "novel");
         // A light id in the dark slot (or the reverse) would paint an
         // unreadable terminal, so it is replaced rather than stored.
-        assert_eq!(normalize_terminal_scheme_id("novel", true), DEFAULT_DARK_TERMINAL_SCHEME_ID);
-        assert_eq!(normalize_terminal_scheme_id("vintage", false), DEFAULT_LIGHT_TERMINAL_SCHEME_ID);
-        assert_eq!(normalize_terminal_scheme_id("", true), DEFAULT_DARK_TERMINAL_SCHEME_ID);
-        assert_eq!(normalize_terminal_scheme_id("nonsense", false), DEFAULT_LIGHT_TERMINAL_SCHEME_ID);
+        assert_eq!(
+            normalize_terminal_scheme_id("novel", true),
+            DEFAULT_DARK_TERMINAL_SCHEME_ID
+        );
+        assert_eq!(
+            normalize_terminal_scheme_id("vintage", false),
+            DEFAULT_LIGHT_TERMINAL_SCHEME_ID
+        );
+        assert_eq!(
+            normalize_terminal_scheme_id("", true),
+            DEFAULT_DARK_TERMINAL_SCHEME_ID
+        );
+        assert_eq!(
+            normalize_terminal_scheme_id("nonsense", false),
+            DEFAULT_LIGHT_TERMINAL_SCHEME_ID
+        );
     }
 
     #[test]

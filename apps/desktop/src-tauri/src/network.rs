@@ -38,11 +38,8 @@ pub fn tailnet_domain() -> String {
 /// literal IPs so the probe has no DNS dependency: a broken resolver alone,
 /// or the overlay control server being down, must not be reported as a lost
 /// network connection.
-pub const INTERNET_PROBE_ENDPOINTS: &[(&str, u16)] = &[
-    ("1.1.1.1", 53),
-    ("8.8.8.8", 53),
-    ("1.1.1.1", 443),
-];
+pub const INTERNET_PROBE_ENDPOINTS: &[(&str, u16)] =
+    &[("1.1.1.1", 53), ("8.8.8.8", 53), ("1.1.1.1", 443)];
 
 /// Returns true when any public probe endpoint accepts a TCP connection
 /// within a short timeout.

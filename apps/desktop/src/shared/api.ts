@@ -1,4 +1,4 @@
-import type { HostSnapshot, PairingPayload, Project, SessionActivity, SessionSegment, TerminalSession, TuiMode } from "@agentterminal/protocol";
+import type { HostSnapshot, PairingPayload, Project, SessionActivity, SessionSegment, TaskbarProgress, TerminalSession, TuiMode } from "@agentterminal/protocol";
 
 export interface DesktopState extends HostSnapshot {
   currentProjectId: string;
@@ -82,4 +82,10 @@ export interface DesktopApi {
    * the host, not by a byte in the stream.
    */
   onActivity(callback: (sessionId: string, activity: SessionActivity, since: string) => void): () => void;
+  /**
+   * The session's taskbar progress changed, like the activity event: an
+   * explicit ConEmu `OSC 9;4` report or the shell's command lifecycle,
+   * both host-side, so there is no stream offset either.
+   */
+  onTaskbar(callback: (sessionId: string, taskbar: TaskbarProgress) => void): () => void;
 }

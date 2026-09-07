@@ -323,7 +323,11 @@ impl DesktopStore {
         self.write()
     }
 
-    pub fn set_terminal_theme(&mut self, dark_scheme_id: String, light_scheme_id: String) -> Result<()> {
+    pub fn set_terminal_theme(
+        &mut self,
+        dark_scheme_id: String,
+        light_scheme_id: String,
+    ) -> Result<()> {
         self.state.settings.terminal_dark_scheme_id = dark_scheme_id;
         self.state.settings.terminal_light_scheme_id = light_scheme_id;
         self.write()
@@ -565,7 +569,11 @@ mod tests {
             "settings": { "defaultShellId": "powershell", "port": 47831 }
         });
         let legacy_path = test_root.join(format!("legacy-{}.json", Uuid::new_v4()));
-        fs::write(&legacy_path, serde_json::to_vec(&legacy).expect("serialize legacy")).expect("write legacy");
+        fs::write(
+            &legacy_path,
+            serde_json::to_vec(&legacy).expect("serialize legacy"),
+        )
+        .expect("write legacy");
         let legacy_store = DesktopStore::load(legacy_path.clone()).expect("load legacy state");
         assert!(legacy_store.settings().follow_working_directory);
 
@@ -577,13 +585,20 @@ mod tests {
             "settings": { "defaultShellId": "powershell", "port": 47831, "followWorkingDirectory": false }
         });
         let explicit_path = test_root.join(format!("off-{}.json", Uuid::new_v4()));
-        fs::write(&explicit_path, serde_json::to_vec(&explicit_off).expect("serialize")).expect("write");
-        let explicit_store = DesktopStore::load(explicit_path.clone()).expect("load explicit-off state");
+        fs::write(
+            &explicit_path,
+            serde_json::to_vec(&explicit_off).expect("serialize"),
+        )
+        .expect("write");
+        let explicit_store =
+            DesktopStore::load(explicit_path.clone()).expect("load explicit-off state");
         assert!(!explicit_store.settings().follow_working_directory);
 
         // Re-enabling persists just like disabling does.
         let mut store = DesktopStore::load(state_path.clone()).expect("reloaded store");
-        store.set_follow_working_directory(true).expect("re-enable follow");
+        store
+            .set_follow_working_directory(true)
+            .expect("re-enable follow");
         drop(store);
         let reenabled = DesktopStore::load(state_path.clone()).expect("final reload");
         assert!(reenabled.settings().follow_working_directory);
@@ -651,9 +666,11 @@ mod tests {
     fn update_device_name_changes_and_persists_across_reloads() {
         let (state_path, mut store) = store_with_device("Android phone");
 
-        assert!(store
-            .update_device_name("phone-1", "Pixel 9 Pro")
-            .expect("rename device"));
+        assert!(
+            store
+                .update_device_name("phone-1", "Pixel 9 Pro")
+                .expect("rename device")
+        );
         assert_eq!(store.devices()[0].device.name, "Pixel 9 Pro");
         assert_eq!(store.devices().len(), 1);
 
@@ -667,22 +684,30 @@ mod tests {
     fn update_device_name_trims_blanks_and_ignores_unknown_or_unchanged() {
         let (_state_path, mut store) = store_with_device("Android phone");
 
-        assert!(store
-            .update_device_name("phone-1", "  Pixel 9 Pro  ")
-            .expect("trimmed rename"));
+        assert!(
+            store
+                .update_device_name("phone-1", "  Pixel 9 Pro  ")
+                .expect("trimmed rename")
+        );
         assert_eq!(store.devices()[0].device.name, "Pixel 9 Pro");
         // A repeated rename is a no-op rather than a write.
-        assert!(!store
-            .update_device_name("phone-1", "Pixel 9 Pro")
-            .expect("unchanged rename"));
+        assert!(
+            !store
+                .update_device_name("phone-1", "Pixel 9 Pro")
+                .expect("unchanged rename")
+        );
         // Blank names are rejected, keeping the previous name in place.
-        assert!(!store
-            .update_device_name("phone-1", "   ")
-            .expect("blank rename"));
+        assert!(
+            !store
+                .update_device_name("phone-1", "   ")
+                .expect("blank rename")
+        );
         assert_eq!(store.devices()[0].device.name, "Pixel 9 Pro");
         // Unknown device ids are ignored instead of failing the auth flow.
-        assert!(!store
-            .update_device_name("phone-missing", "Other phone")
-            .expect("unknown device rename"));
+        assert!(
+            !store
+                .update_device_name("phone-missing", "Other phone")
+                .expect("unknown device rename")
+        );
     }
 }

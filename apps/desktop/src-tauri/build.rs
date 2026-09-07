@@ -19,7 +19,9 @@ fn copy_handoff_proxy() {
     let source = manifest.join("handoff-proxy").join(PROXY_DLL);
     println!("cargo:rerun-if-changed={}", source.display());
     if !source.exists() {
-        println!("cargo:warning={PROXY_DLL} is missing; the default terminal handoff will not marshal");
+        println!(
+            "cargo:warning={PROXY_DLL} is missing; the default terminal handoff will not marshal"
+        );
         return;
     }
     // OUT_DIR is target/<profile>/build/<pkg>-<hash>/out; the executable

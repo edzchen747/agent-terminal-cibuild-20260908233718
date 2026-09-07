@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import type { SessionActivity, TuiMode } from "@agentterminal/protocol";
+import type { SessionActivity, TaskbarProgress, TuiMode } from "@agentterminal/protocol";
 import type { DesktopApi, DesktopState, FocusSessionEvent } from "../../shared/api";
 
 interface TerminalDataEvent {
@@ -30,11 +30,17 @@ interface TerminalActivityEvent {
   since: string;
 }
 
+interface TerminalTaskbarEvent {
+  sessionId: string;
+  taskbar: TaskbarProgress;
+}
+
 const stateListeners = new Set<(state: DesktopState) => void>();
 const dataListeners = new Set<(sessionId: string, data: string, offset: number) => void>();
 const gridListeners = new Set<(sessionId: string, cols: number, rows: number, offset: number) => void>();
 const modeListeners = new Set<(sessionId: string, mode: TuiMode, offset: number) => void>();
 const activityListeners = new Set<(sessionId: string, activity: SessionActivity, since: string) => void>();
+const taskbarListeners = new Set<(sessionId: string, taskbar: TaskbarProgress) => void>();
 const pairingListeners = new Set<() => void>();
 const focusSessionListeners = new Set<(event: FocusSessionEvent) => void>();
 const currentWindowTarget = getCurrentWebviewWindow().label;
@@ -59,6 +65,10 @@ const activityBridgeReady = listen<TerminalActivityEvent>("desktop-activity", ({
   for (const listener of activityListeners) listener(payload.sessionId, payload.activity, payload.since);
 }, { target: currentWindowTarget });
 
+const taskbarBridgeReady = listen<TerminalTaskbarEvent>("desktop-taskbar", ({ payload }) => {
+  for (const listener of taskbarListeners) listener(payload.sessionId, payload.taskbar);
+}, { target: currentWindowTarget });
+
 const focusSessionBridgeReady = listen<FocusSessionEvent>("desktop-focus-session", ({ payload }) => {
   for (const listener of focusSessionListeners) listener(payload);
 }, { target: currentWindowTarget });
@@ -69,6 +79,7 @@ const pairingBridgeReady = listen<string>("pairing-succeeded", () => {
 
 void stateBridgeReady;
 void activityBridgeReady;
+void taskbarBridgeReady;
 void focusSessionBridgeReady;
 void pairingBridgeReady;
 
@@ -134,6 +145,10 @@ const api: DesktopApi = {
   onActivity: (callback) => {
     activityListeners.add(callback);
     return () => activityListeners.delete(callback);
+  },
+  onTaskbar: (callback) => {
+    taskbarListeners.add(callback);
+    return () => taskbarListeners.delete(callback);
   }
 };
 

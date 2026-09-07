@@ -48,8 +48,7 @@ impl WindowClients {
     /// window for the project, shown and focused, so the console the user
     /// launched lands on screen.
     pub fn handoff_target(&self, project_id: &str) -> Option<String> {
-        self
-            .window_for_project(project_id)
+        self.window_for_project(project_id)
             .map(str::to_owned)
             .or_else(|| self.last_or_any())
     }
@@ -243,7 +242,11 @@ mod tests {
         assert_eq!(assignment.displaced_window, None);
         assert_eq!(clients.window_for_project("project-a"), Some("window-a"));
         assert_eq!(clients.window_for_project("project-b"), Some("window-b"));
-        assert_eq!(clients.subscribers("session-a"), vec!["window-a"], "the old window keeps its terminal attachment");
+        assert_eq!(
+            clients.subscribers("session-a"),
+            vec!["window-a"],
+            "the old window keeps its terminal attachment"
+        );
     }
 
     #[test]
@@ -258,7 +261,10 @@ mod tests {
             Some("window-1".to_string()),
             "the project's own window wins over whichever is in front"
         );
-        assert_eq!(clients.handoff_target("project-2"), Some("window-2".to_string()));
+        assert_eq!(
+            clients.handoff_target("project-2"),
+            Some("window-2".to_string())
+        );
     }
 
     #[test]
@@ -270,7 +276,10 @@ mod tests {
 
         // The console's project has no window of its own, so the handoff
         // raises the front-most one and records a pending focus for it.
-        assert_eq!(clients.handoff_target("project-3"), Some("window-1".to_string()));
+        assert_eq!(
+            clients.handoff_target("project-3"),
+            Some("window-1".to_string())
+        );
     }
 
     #[test]
@@ -304,6 +313,9 @@ mod tests {
         let mut clients = WindowClients::default();
         clients.assign("window-1", "project-1");
 
-        assert_eq!(clients.handoff_target("project-2"), Some("window-1".to_string()));
+        assert_eq!(
+            clients.handoff_target("project-2"),
+            Some("window-1".to_string())
+        );
     }
 }

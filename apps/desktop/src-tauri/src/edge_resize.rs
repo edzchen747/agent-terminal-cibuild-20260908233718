@@ -114,8 +114,7 @@ mod sys {
 
     /// The SUBCLASSPROC signature: (HWND, UINT, WPARAM, LPARAM, DWORD,
     /// DWORD_PTR) -> LRESULT.
-    type SubclassProc =
-        unsafe extern "system" fn(Hwnd, u32, usize, isize, u32, usize) -> isize;
+    type SubclassProc = unsafe extern "system" fn(Hwnd, u32, usize, isize, u32, usize) -> isize;
 
     #[link(name = "user32")]
     unsafe extern "system" {
@@ -165,7 +164,12 @@ mod sys {
                 let width = rect.right - rect.left;
                 let height = rect.bottom - rect.top;
                 if width > 0 && height > 0 {
-                    return super::edge_hit_code(point.x as _, point.y as _, width as _, height as _);
+                    return super::edge_hit_code(
+                        point.x as _,
+                        point.y as _,
+                        width as _,
+                        height as _,
+                    );
                 }
             }
         }
@@ -181,7 +185,10 @@ mod sys {
 
 #[cfg(test)]
 mod tests {
-    use super::{edge_hit_code, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT};
+    use super::{
+        HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT,
+        HTTOPRIGHT, edge_hit_code,
+    };
 
     /// A 100x100 client area with the 8px margin: the bands are
     /// x in [0..8) left, x in [92..100) right, and y likewise.

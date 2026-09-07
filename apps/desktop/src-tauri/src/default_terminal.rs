@@ -86,8 +86,8 @@ pub fn is_default_terminal() -> bool {
 /// whatever console host the user already chose keeps starting the session.
 #[cfg(windows)]
 pub fn set_as_default_terminal() -> Result<(), String> {
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
     use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
 
     // The console marshals the handoff call into us, so the proxy/stub
     // must be registered for the interfaces before the delegation is
@@ -124,9 +124,12 @@ pub fn set_as_default_terminal() -> Result<(), String> {
 const PREVIOUS_DELEGATION_KEY: &str = "Software\\AgentTerminal\\PreviousDelegation";
 
 #[cfg(windows)]
-fn save_previous_delegation(console: Option<String>, terminal: Option<String>) -> Result<(), String> {
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
+fn save_previous_delegation(
+    console: Option<String>,
+    terminal: Option<String>,
+) -> Result<(), String> {
     use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
 
     let root = RegKey::predef(HKEY_CURRENT_USER);
     let (key, _disposition) = root
@@ -163,8 +166,8 @@ fn save_previous_delegation(console: Option<String>, terminal: Option<String>) -
 /// re-applying instant.
 #[cfg(windows)]
 pub fn clear_as_default_terminal() -> Result<(), String> {
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
     use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 
     let root = RegKey::predef(HKEY_CURRENT_USER);
     let previous = root
@@ -218,8 +221,14 @@ const HANDOFF_PROXY_DLL: &str = "agent-terminal-proxy.dll";
 #[cfg(windows)]
 const HANDOFF_INTERFACES: [(&str, &str); 3] = [
     ("{59D55CCE-FC8A-48B4-ACE8-0A9286C6557F}", "ITerminalHandoff"),
-    ("{AA6B364F-4A50-4176-9002-0AE755E7B5EF}", "ITerminalHandoff2"),
-    ("{6F23DA90-15C5-4203-9DB0-64E73F1B1B00}", "ITerminalHandoff3"),
+    (
+        "{AA6B364F-4A50-4176-9002-0AE755E7B5EF}",
+        "ITerminalHandoff2",
+    ),
+    (
+        "{6F23DA90-15C5-4203-9DB0-64E73F1B1B00}",
+        "ITerminalHandoff3",
+    ),
 ];
 
 /// Locates the proxy/stub DLL: next to the running executable in a normal
@@ -253,8 +262,8 @@ fn handoff_proxy_path() -> Option<std::path::PathBuf> {
 /// users. Writing is idempotent: an up-to-date registration is left alone.
 #[cfg(windows)]
 pub fn register_handoff_proxy() -> Result<(), String> {
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
     use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 
     let dll = handoff_proxy_path()
         .ok_or_else(|| format!("{HANDOFF_PROXY_DLL} is missing from the application directory"))?;
@@ -361,7 +370,7 @@ pub fn register_handoff_on_calling_thread() -> i32 {
 }
 
 #[cfg(windows)]
-pub use win::{build_handoff_master, wait_client_exit, HandoffKiller, HandoffSession};
+pub use win::{HandoffKiller, HandoffSession, build_handoff_master, wait_client_exit};
 
 /// Reads the per-user `%%Startup` delegation key read-only.
 #[cfg(windows)]
@@ -389,20 +398,17 @@ mod win {
     use winapi::um::heapapi::{GetProcessHeap, HeapAlloc, HeapFree};
     use winapi::um::minwinbase::STILL_ACTIVE;
     use winapi::um::namedpipeapi::CreateNamedPipeW;
-    use winapi::um::processthreadsapi::{
-        GetExitCodeProcess, GetCurrentProcess, TerminateProcess,
-    };
+    use winapi::um::processthreadsapi::{GetCurrentProcess, GetExitCodeProcess, TerminateProcess};
     use winapi::um::synchapi::WaitForSingleObject;
     use winapi::um::winbase::{
         FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, INFINITE, PIPE_ACCESS_INBOUND,
-        PIPE_ACCESS_OUTBOUND,
-        PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
-        QueryFullProcessImageNameW,
+        PIPE_ACCESS_OUTBOUND, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+        PIPE_WAIT, QueryFullProcessImageNameW,
     };
     use winapi::um::wincon::COORD;
     use winapi::um::winnt::{
         DUPLICATE_SAME_ACCESS, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE,
-        PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ, SYNCHRONIZE, HANDLE,
+        HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ, SYNCHRONIZE,
     };
 
     use crate::core::{Core, SESSION_DEFAULT_COLS, SESSION_DEFAULT_ROWS};
@@ -511,11 +517,10 @@ mod win {
         // is already initialized (e.g. STA by the webview); register from
         // whatever apartment the thread has.
         let _ = ensure_com_init();
-        let factory =
-            Box::into_raw(Box::new(FactoryObject {
-                vtable: &FACTORY_VTABLE,
-                refs: AtomicUsize::new(1),
-            }));
+        let factory = Box::into_raw(Box::new(FactoryObject {
+            vtable: &FACTORY_VTABLE,
+            refs: AtomicUsize::new(1),
+        }));
         let mut cookie: u32 = 0;
         let hr = unsafe {
             CoRegisterClassObject(
@@ -948,15 +953,18 @@ mod win {
         // PROCESS_VM_READ is what lets `client_working_directory` reach the
         // process parameters; the fallbacks below keep the handoff working
         // when it is refused.
-        let wanted =
-            PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE;
+        let wanted = PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE;
         let owned_client = duplicate_handle(client, wanted)
-            .or_else(|_| duplicate_handle(client, PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | SYNCHRONIZE))
+            .or_else(|_| {
+                duplicate_handle(
+                    client,
+                    PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | SYNCHRONIZE,
+                )
+            })
             .or_else(|_| duplicate_handle(client, 0))
             .map_err(|error| format!("duplicate client handle: {error}"))?;
-        let wait_client =
-            duplicate_handle(owned_client, SYNCHRONIZE | PROCESS_QUERY_INFORMATION)
-                .unwrap_or(INVALID_HANDLE_VALUE);
+        let wait_client = duplicate_handle(owned_client, SYNCHRONIZE | PROCESS_QUERY_INFORMATION)
+            .unwrap_or(INVALID_HANDLE_VALUE);
         // The `[in]` handles belong to the RPC stub, which closes them once
         // this call returns — exactly what `CTerminalHandoff` relies on.
         // Closing them here as well is a double close: the values get
@@ -1029,7 +1037,15 @@ mod win {
             let writer = duplicate_handle(out_handle, 0)
                 .map_err(|error| format!("duplicate the console output handle: {error}"))?;
             unsafe {
-                host_handoff(reader, writer, signal, reference, server, client, std::ptr::null())
+                host_handoff(
+                    reader,
+                    writer,
+                    signal,
+                    reference,
+                    server,
+                    client,
+                    std::ptr::null(),
+                )
             }
         })();
         match result {
@@ -1061,9 +1077,7 @@ mod win {
                 .map_err(|error| format!("duplicate the console input handle: {error}"))?;
             let writer = duplicate_handle(out_handle, 0)
                 .map_err(|error| format!("duplicate the console output handle: {error}"))?;
-            unsafe {
-                host_handoff(reader, writer, signal, reference, server, client, info)
-            }
+            unsafe { host_handoff(reader, writer, signal, reference, server, client, info) }
         })();
         match result {
             Ok(()) => S_OK,
@@ -1102,17 +1116,7 @@ mod win {
             // single duplex pipe wedges the input side).
             let (reader, writer, console_writer, console_reader) =
                 create_handoff_pipe().map_err(|error| format!("create the data pipe: {error}"))?;
-            unsafe {
-                host_handoff(
-                    reader,
-                    writer,
-                    signal,
-                    reference,
-                    server,
-                    client,
-                    info,
-                )
-            }?;
+            unsafe { host_handoff(reader, writer, signal, reference, server, client, info) }?;
             // Hand the console its ends. Ownership transfers through the
             // out-parameter marshaling (the RPC layer duplicates them into
             // the console's process when this call returns), so the local
@@ -1178,8 +1182,11 @@ mod win {
 
     #[repr(C)]
     struct FactoryVTable {
-        query_interface:
-            unsafe extern "system" fn(*const FactoryObject, *const GUID, *mut *mut c_void) -> HResult,
+        query_interface: unsafe extern "system" fn(
+            *const FactoryObject,
+            *const GUID,
+            *mut *mut c_void,
+        ) -> HResult,
         add_ref: unsafe extern "system" fn(*const FactoryObject) -> u32,
         release: unsafe extern "system" fn(*const FactoryObject) -> u32,
         /// `IClassFactory::CreateInstance(pUnkOuter, riid, ppvObject)` —
@@ -1208,10 +1215,7 @@ mod win {
         // IUnknown and IClassFactory; rejecting either makes every
         // cross-process activation of the CLSID fail with E_NOINTERFACE
         // before `CreateInstance` is ever reached.
-        if !riid.is_null()
-            && !guid_eq(riid, &ICLASSFACTORY_IID)
-            && !guid_eq(riid, &IUNKNOWN_IID)
-        {
+        if !riid.is_null() && !guid_eq(riid, &ICLASSFACTORY_IID) && !guid_eq(riid, &IUNKNOWN_IID) {
             return E_NOINTERFACE;
         }
         unsafe {
@@ -1404,7 +1408,8 @@ mod win {
     /// `PseudoConsole` (the same layout and allocator the OS winconpty
     /// library uses in `ConptyPackPseudoConsole`).
     fn pack_pseudo_console(server: HANDLE, reference: HANDLE, signal: HANDLE) -> HANDLE {
-        let memory = unsafe { HeapAlloc(GetProcessHeap(), 0, std::mem::size_of::<PseudoConsole>()) };
+        let memory =
+            unsafe { HeapAlloc(GetProcessHeap(), 0, std::mem::size_of::<PseudoConsole>()) };
         if memory.is_null() {
             return std::ptr::null_mut();
         }
@@ -1499,11 +1504,9 @@ mod win {
                 }
                 let pointer = unsafe { GetProcAddress(module, name.as_ptr() as *const u8) };
                 if !pointer.is_null() {
-                    return Some(
-                        unsafe {
-                            std::mem::transmute::<*mut c_void, ResizePseudoConsoleFn>(pointer)
-                        },
-                    );
+                    return Some(unsafe {
+                        std::mem::transmute::<*mut c_void, ResizePseudoConsoleFn>(pointer)
+                    });
                 }
             }
             None
@@ -1550,8 +1553,10 @@ mod win {
         if status < 0 || info.peb_base_address.is_null() {
             return None;
         }
-        let parameters: usize =
-            read_process_value(client, (info.peb_base_address as usize) + PEB_PROCESS_PARAMETERS)?;
+        let parameters: usize = read_process_value(
+            client,
+            (info.peb_base_address as usize) + PEB_PROCESS_PARAMETERS,
+        )?;
         if parameters == 0 {
             return None;
         }
@@ -1723,10 +1728,7 @@ mod win {
             // Record the target first so `get_size` stays truthful, then let
             // the worker push it to the ConPTY. A closed channel just means
             // the session is going away.
-            self.inner
-                .lock()
-                .expect("handoff master poisoned")
-                .size = size;
+            self.inner.lock().expect("handoff master poisoned").size = size;
             let _ = self.resizes.send(size);
             Ok(())
         }

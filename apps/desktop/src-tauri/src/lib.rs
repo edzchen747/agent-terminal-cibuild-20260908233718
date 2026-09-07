@@ -16,6 +16,8 @@ mod remote;
 mod shells;
 mod store;
 mod stream_opt;
+mod taskbar;
+mod taskbar_engine;
 mod tui;
 mod window_clients;
 
@@ -190,7 +192,11 @@ fn detach_session(window: WebviewWindow, state: State<'_, Arc<Core>>, session_id
 }
 
 #[tauri::command]
-fn release_session_viewport(window: WebviewWindow, state: State<'_, Arc<Core>>, session_id: String) {
+fn release_session_viewport(
+    window: WebviewWindow,
+    state: State<'_, Arc<Core>>,
+    session_id: String,
+) {
     state.release_window_viewport(window.label(), &session_id);
 }
 
@@ -288,20 +294,14 @@ fn set_open_projects_in_new_windows(
 }
 
 #[tauri::command]
-fn set_confirm_external_links(
-    state: State<'_, Arc<Core>>,
-    enabled: bool,
-) -> Result<(), String> {
+fn set_confirm_external_links(state: State<'_, Arc<Core>>, enabled: bool) -> Result<(), String> {
     state
         .set_confirm_external_links(enabled)
         .map_err(error_string)
 }
 
 #[tauri::command]
-fn set_follow_working_directory(
-    state: State<'_, Arc<Core>>,
-    enabled: bool,
-) -> Result<(), String> {
+fn set_follow_working_directory(state: State<'_, Arc<Core>>, enabled: bool) -> Result<(), String> {
     state
         .set_follow_working_directory(enabled)
         .map_err(error_string)
@@ -424,7 +424,10 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     // Reuse the icon embedded into the app binary (the same one the window
     // and taskbar show) so the tray always matches the desktop icon; the
     // procedural glyph only stands in if no icon was embedded.
-    let tray_icon = app.default_window_icon().cloned().unwrap_or_else(|| tray_icon());
+    let tray_icon = app
+        .default_window_icon()
+        .cloned()
+        .unwrap_or_else(|| tray_icon());
     TrayIconBuilder::with_id("agent-terminal")
         .icon(tray_icon)
         .tooltip("Agent Terminal")
@@ -461,12 +464,14 @@ const TRAY_SESSION_COUNT_TICK_MS: u64 = 500;
 
 fn spawn_tray_session_count_refresher(core: Arc<Core>, label: MenuItem<Wry>) {
     let mut last = session_count_label(core.session_counts());
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_millis(TRAY_SESSION_COUNT_TICK_MS));
-        let text = session_count_label(core.session_counts());
-        if text != last {
-            last = text.clone();
-            let _ = label.set_text(&text);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(TRAY_SESSION_COUNT_TICK_MS));
+            let text = session_count_label(core.session_counts());
+            if text != last {
+                last = text.clone();
+                let _ = label.set_text(&text);
+            }
         }
     });
 }
