@@ -313,6 +313,46 @@ export function normalizeTerminalThemeSettings(value: Partial<TerminalThemeSetti
 }
 
 /** The scheme's colors in the shape xterm's theme option expects. */
+/**
+ * The alpha a non-active find match is tinted at, as an 8-bit hex suffix.
+ * Translucent so the glyph under it stays readable and so the active match,
+ * painted in the same hue at full strength, separates from the rest at a
+ * glance.
+ */
+const FIND_MATCH_ALPHA = "66";
+
+/** `color` at FIND_MATCH_ALPHA, when it is a plain #RRGGBB the suffix can extend. */
+function translucent(color: string): string {
+  return /^#[0-9a-fA-F]{6}$/.test(color) ? `${color}${FIND_MATCH_ALPHA}` : color;
+}
+
+/**
+ * The colors a find highlights its matches in, drawn from the session's own
+ * scheme so they read on every one of them rather than assuming a dark
+ * surface. Yellow is the terminal's own "attention" hue in all 16-color
+ * palettes, and taking it from the palette means a light scheme gets its
+ * darker yellow and a dark one its brighter.
+ *
+ * Active and inactive matches are the SAME hue at different strengths rather
+ * than yellow and bright yellow: several palettes here (Solarized above all)
+ * put a grey in the bright slots, which would leave the active match
+ * indistinguishable from the surface. Opacity is a property of the color the
+ * scheme actually declares, so it separates the two on every scheme.
+ *
+ * Both are painted behind the glyphs by xterm. The overview ruler marks reuse
+ * the same colors, so the scrollbar ticks match what the buffer shows.
+ */
+export function findDecorationsFor(scheme: TerminalScheme) {
+  const hue = scheme.ansi.yellow;
+  return {
+    matchBackground: translucent(hue),
+    matchOverviewRuler: hue,
+    activeMatchBackground: hue,
+    activeMatchBorder: scheme.foreground,
+    activeMatchColorOverviewRuler: scheme.foreground
+  };
+}
+
 export function xtermThemeFor(scheme: TerminalScheme) {
   return {
     background: scheme.background,

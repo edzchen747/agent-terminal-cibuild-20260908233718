@@ -311,6 +311,19 @@ button { color: inherit; }
    active scheme rather than the app theme, so its accent is a fixed
    translucent blue that reads on both light and dark schemes. */
 .mobile-terminal .xterm-scrollable-element > .scrollbar.vertical > .slider.active::after { width: 7px; background: #3f9be0cc; }
+/* The find bar floats over the top of the terminal, where it covers the
+   least of what a search is usually looking for (the recent output at the
+   bottom). It is a child of the SHELL, never of .mobile-terminal: that div
+   carries the scaleX squish, which would stretch the bar's text and
+   controls along with the cells. Absolute, so it also stays out of the
+   shell's grid rows and never steals height from the terminal. */
+.terminal-find-bar { position: absolute; z-index: 12; top: 8px; left: 8px; right: 8px; height: 44px; display: flex; align-items: center; gap: 6px; padding: 0 6px 0 10px; border: 1px solid var(--border-strong); border-radius: 999px; background: var(--surface); box-shadow: 0 10px 30px var(--shadow-deep); }
+.terminal-find-input { min-width: 0; flex: 1; height: 32px; padding: 0 10px; border: 1px solid var(--border-input); border-radius: 999px; outline: 0; background: var(--surface-input); color: var(--text); font-family: "Roboto Mono", monospace; font-size: 12px; }
+.terminal-find-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-wash); }
+.terminal-find-count { flex: none; color: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; -webkit-user-select: none; user-select: none; }
+.terminal-find-bar button { width: 34px; height: 34px; flex: none; padding: 0; display: grid; place-items: center; border: 0; border-radius: 50%; background: transparent; color: var(--text-muted); font-size: 13px; }
+.terminal-find-bar button:active:not(:disabled) { background: var(--accent-tint-strong); color: var(--accent-ink); }
+.terminal-find-bar button:disabled { opacity: .35; }
 .extra-keys { padding: 6px 5px calc(7px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: 5px; border-top: 1px solid var(--border); background: var(--surface); overflow: hidden; }
 .key-row { display: flex; gap: 5px; overflow-x: auto; scrollbar-width: none; }
 .key-row button { min-width: 38px; height: 36px; flex: 1 1 auto; position: relative; overflow: hidden; padding: 0 6px; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--surface-raised); color: var(--text-muted); font-family: "Roboto Mono", monospace; font-size: 10px; box-shadow: 0 2px 0 var(--shadow-soft); touch-action: pan-x; }

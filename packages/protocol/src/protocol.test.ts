@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, MAX_ZOOM_FONT_SIZE, MIN_ZOOM_FONT_SIZE, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, BASELINE_TERMINAL_ZOOM, MAX_TERMINAL_ZOOM, MIN_TERMINAL_ZOOM, TERMINAL_ZOOM_STEPS, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, terminalZoomFontSize, type ClientMessage, type HostSnapshot } from "./index.js";
+import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, MAX_ZOOM_FONT_SIZE, MIN_ZOOM_FONT_SIZE, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, findDecorationsFor, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, BASELINE_TERMINAL_ZOOM, MAX_TERMINAL_ZOOM, MIN_TERMINAL_ZOOM, TERMINAL_ZOOM_STEPS, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, terminalZoomFontSize, CLOSED_FIND, applyFindResults, closeFind, findCommandForKey, findStatusLabel, openFind, setFindQuery, type ClientMessage, type HostSnapshot } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -1174,4 +1174,156 @@ test("no zoom stop on any display can announce a grid the host would rewrite", (
       assert.ok(grid.rows <= MAX_TERMINAL_ROWS, `${where}: ${grid.rows} rows exceeds the host ceiling`);
     }
   }
+});
+
+test("opening and closing the find bar keeps the query but not the tally", () => {
+  const searching = applyFindResults(setFindQuery(openFind(CLOSED_FIND), "error"), { resultIndex: 2, resultCount: 9 });
+  assert.deepEqual(searching, { open: true, query: "error", index: 2, count: 9 });
+  const closed = closeFind(searching);
+  assert.equal(closed.open, false);
+  assert.equal(closed.query, "error", "reopening should offer the last thing searched for");
+  assert.equal(closed.count, 0);
+  assert.equal(closed.index, -1);
+  assert.deepEqual(openFind(closed), { open: true, query: "error", index: -1, count: 0 });
+});
+
+test("find seeds from a usable selection only", () => {
+  assert.equal(openFind(CLOSED_FIND, "  npm run build  ").query, "npm run build");
+  const typed = setFindQuery(openFind(CLOSED_FIND), "typed");
+  // A multi-line selection is not a search term, and blank ones say nothing:
+  // neither may wipe a query the user already typed.
+  assert.equal(openFind(closeFind(typed), "first\nsecond").query, "typed");
+  assert.equal(openFind(closeFind(typed), "   ").query, "typed");
+  assert.equal(openFind(closeFind(typed), undefined).query, "typed");
+  // Re-seeding with the same term must not throw away a live tally.
+  const live = applyFindResults(typed, { resultIndex: 1, resultCount: 4 });
+  assert.deepEqual(openFind(live, "typed"), live);
+});
+
+test("changing the find query clears the previous term's tally", () => {
+  const found = applyFindResults(setFindQuery(openFind(CLOSED_FIND), "alpha"), { resultIndex: 3, resultCount: 12 });
+  const retyped = setFindQuery(found, "beta");
+  assert.deepEqual(retyped, { open: true, query: "beta", index: -1, count: 0 });
+  // An identical query is not a change, so the tally survives a re-render.
+  assert.equal(setFindQuery(found, "alpha"), found);
+});
+
+test("find results keep the count when the addon stops tracking the active match", () => {
+  const searching = setFindQuery(openFind(CLOSED_FIND), "e");
+  // resultIndex -1 means the addon's match threshold was exceeded: the count
+  // still stands, so only the position is dropped.
+  const untracked = applyFindResults(searching, { resultIndex: -1, resultCount: 5_000 });
+  assert.deepEqual(untracked, { open: true, query: "e", index: -1, count: 5_000 });
+  assert.equal(findStatusLabel(untracked), "5000");
+  // An index the count cannot support is treated the same way.
+  assert.equal(applyFindResults(searching, { resultIndex: 9, resultCount: 4 }).index, -1);
+  assert.equal(applyFindResults(searching, { resultIndex: 0, resultCount: 0 }).count, 0);
+});
+
+test("find status reports position, bare count, emptiness and no results", () => {
+  assert.equal(findStatusLabel(CLOSED_FIND), "", "an empty query has nothing to report yet");
+  assert.equal(findStatusLabel(setFindQuery(openFind(CLOSED_FIND), "nope")), "No results");
+  assert.equal(findStatusLabel(applyFindResults(setFindQuery(openFind(CLOSED_FIND), "x"), { resultIndex: 0, resultCount: 17 })), "1/17");
+  assert.equal(findStatusLabel(applyFindResults(setFindQuery(openFind(CLOSED_FIND), "x"), { resultIndex: 16, resultCount: 17 })), "17/17");
+});
+
+test("find keys step forward, back, and close", () => {
+  assert.equal(findCommandForKey({ key: "Enter", shiftKey: false }), "next");
+  assert.equal(findCommandForKey({ key: "Enter", shiftKey: true }), "previous");
+  assert.equal(findCommandForKey({ key: "Escape", shiftKey: false }), "close");
+  assert.equal(findCommandForKey({ key: "Escape", shiftKey: true }), "close");
+  for (const key of ["a", "F3", "Backspace", "ArrowDown", " "]) {
+    assert.equal(findCommandForKey({ key, shiftKey: false }), "none", `${key} is ordinary typing`);
+  }
+});
+
+test("find highlights stay visible on every scheme", () => {
+  for (const scheme of TERMINAL_SCHEMES) {
+    const decorations = findDecorationsFor(scheme);
+    // Active and inactive matches must differ, or stepping through results
+    // tells the user nothing. Several palettes put a grey in the bright
+    // slots, so the two are the same hue at different strengths instead.
+    assert.notEqual(decorations.matchBackground, decorations.activeMatchBackground, scheme.id);
+    assert.equal(decorations.activeMatchBackground, scheme.ansi.yellow, scheme.id);
+    assert.equal(decorations.matchBackground, `${scheme.ansi.yellow}66`, scheme.id);
+    // Nothing may be painted in the surface color, on any scheme.
+    for (const color of Object.values(decorations)) {
+      assert.notEqual(color.toLowerCase(), scheme.background.toLowerCase(), `${scheme.id}: highlight matches the background`);
+    }
+  }
+});
+
+test("find reducers never mutate the state handed to them", () => {
+  // The clients hold FindState in React state and pass it straight back in.
+  // A reducer that mutated in place would leave a render reading a value it
+  // never rendered - and setState would skip the re-render entirely.
+  const frozen = Object.freeze({ open: true, query: "term", index: 1, count: 4 });
+  assert.doesNotThrow(() => setFindQuery(frozen, "other"));
+  assert.doesNotThrow(() => applyFindResults(frozen, { resultIndex: 0, resultCount: 2 }));
+  assert.doesNotThrow(() => closeFind(frozen));
+  assert.doesNotThrow(() => openFind(frozen, "seed"));
+  assert.deepEqual(frozen, { open: true, query: "term", index: 1, count: 4 });
+});
+
+test("clearing the find query reports nothing rather than no results", () => {
+  // Emptying the field is not a failed search: the bar must fall silent, or
+  // deleting the last character flashes "No results" at the user.
+  const found = applyFindResults(setFindQuery(openFind(CLOSED_FIND), "x"), { resultIndex: 0, resultCount: 3 });
+  const cleared = setFindQuery(found, "");
+  assert.deepEqual(cleared, { open: true, query: "", index: -1, count: 0 });
+  assert.equal(findStatusLabel(cleared), "");
+});
+
+test("a whitespace query is a real search, not an empty one", () => {
+  // Spaces are perfectly good terminal search terms (column alignment,
+  // trailing whitespace), so a query of spaces must report like any other.
+  const spaces = setFindQuery(openFind(CLOSED_FIND), "   ");
+  assert.equal(spaces.query, "   ");
+  assert.equal(findStatusLabel(spaces), "No results");
+  assert.equal(findStatusLabel(applyFindResults(spaces, { resultIndex: 0, resultCount: 2 })), "1/2");
+});
+
+test("reopening an already-open find bar re-seeds it in place", () => {
+  // Ctrl+F pressed again while the bar is open (with a new selection) is a
+  // fresh search, not a no-op - but it must not close the bar or lose it.
+  const live = applyFindResults(setFindQuery(openFind(CLOSED_FIND), "old"), { resultIndex: 2, resultCount: 6 });
+  const reseeded = openFind(live, "new");
+  assert.deepEqual(reseeded, { open: true, query: "new", index: -1, count: 0 });
+});
+
+test("a multi-line seed is rejected whatever its line endings", () => {
+  // A terminal selection spanning rows is never a search term. It must not
+  // silently replace a query the user typed, on either newline convention.
+  const typed = closeFind(setFindQuery(openFind(CLOSED_FIND), "kept"));
+  for (const seed of ["a\nb", "a\r\nb", "one\ntwo\nthree", "\n", "\r\n"]) {
+    assert.equal(openFind(typed, seed).query, "kept", JSON.stringify(seed));
+  }
+  // Selecting one whole row hands over that line plus its trailing newline;
+  // that is still a single-line selection, and trimming makes it usable.
+  assert.equal(openFind(typed, "trailing\n").query, "trailing");
+  assert.equal(openFind(typed, "\n  leading").query, "leading");
+  // A single line that merely contains spaces is still usable.
+  assert.equal(openFind(typed, "npm run build").query, "npm run build");
+});
+
+test("find tallies survive nonsense from the addon", () => {
+  // resultCount is reported by the addon, not computed here. Nothing it can
+  // send may produce a negative count or an index the label cannot render.
+  const searching = setFindQuery(openFind(CLOSED_FIND), "q");
+  for (const event of [
+    { resultIndex: -5, resultCount: -3 },
+    { resultIndex: 0, resultCount: -1 },
+    { resultIndex: -1, resultCount: 0 },
+    { resultIndex: 3, resultCount: 3 }
+  ]) {
+    const state = applyFindResults(searching, event);
+    assert.ok(state.count >= 0, JSON.stringify(event));
+    assert.ok(state.index === -1 || (state.index >= 0 && state.index < state.count), JSON.stringify(event));
+    assert.equal(findStatusLabel(state).includes("-"), false, `${JSON.stringify(event)} produced ${findStatusLabel(state)}`);
+  }
+});
+
+test("closing a find bar that was never opened changes nothing", () => {
+  assert.deepEqual(closeFind(CLOSED_FIND), CLOSED_FIND);
+  assert.equal(findStatusLabel(CLOSED_FIND), "");
 });

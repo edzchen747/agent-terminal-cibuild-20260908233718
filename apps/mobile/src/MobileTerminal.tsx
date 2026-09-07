@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
-import { applyTerminalModifiers, ConsoleFrame, createRequestId, findHttpLinks, gridForContent, squishScaleToFill, streamByteLength, TERMINAL_SCROLLBACK_LINES, writeHostChunk, xtermThemeFor, zoomedFontSize } from "@agentterminal/protocol";
-import type { Size, TerminalModifier, TerminalScheme, TerminalSession } from "@agentterminal/protocol";
+import { SearchAddon } from "@xterm/addon-search";
+import { applyTerminalModifiers, CLOSED_FIND, ConsoleFrame, applyFindResults, closeFind, createRequestId, findCommandForKey, findDecorationsFor, findHttpLinks, findStatusLabel, openFind, setFindQuery, gridForContent, squishScaleToFill, streamByteLength, TERMINAL_SCROLLBACK_LINES, writeHostChunk, xtermThemeFor, zoomedFontSize } from "@agentterminal/protocol";
+import type { FindState, Size, TerminalModifier, TerminalScheme, TerminalSession } from "@agentterminal/protocol";
 import type { HostConnection } from "./connection";
 import { classifyGestureAxis, commitTapOnGestureEnd, type GestureAxis } from "./gesture";
 import { claimNativeInput, isCursorPositionReport, mobileTerminalKeydownInput, nativeTerminalInput } from "./terminalInput";
@@ -59,7 +60,9 @@ const ACCESSIBILITY_KEY_ROWS: UtilityKey[][] = [
     { id: "shift", label: "Shift", modifier: "shift" },
     { id: "tab", label: "Tab", value: "\t" },
     { id: "pipe", label: "|", value: "|" },
-    { id: "tilde", label: "~", value: "~" }
+    // No `value`: the pad returns no data for it (see utilityKeys.ts), so it
+    // toggles the find bar instead of typing anything into the shell.
+    { id: "find", label: "🔍 Find" }
   ],
   [
     { id: "page-up", label: "PgUp", value: "\x1b[5~" },
@@ -89,6 +92,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
   const hostRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
+  // Find runs entirely on this phone's own buffer: nothing about it is sent
+  // to the host, so searching here never disturbs the desktop's view.
+  const searchRef = useRef<SearchAddon | null>(null);
+  const findInputRef = useRef<HTMLInputElement>(null);
+  const [findState, setFindState] = useState<FindState>(CLOSED_FIND);
   const activeRef = useRef(active);
   activeRef.current = active;
   const fontWidthScaleRef = useRef(fontWidthScale);
@@ -177,6 +185,41 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     if (result.data) sendKeyData(result.data);
   };
 
+  // Runs the query against this phone's buffer. `incremental` holds the
+  // active match still while the user is typing, so the view does not lurch
+  // under the soft keyboard on every keystroke; the arrows pass it off.
+  const runSearch = (query: string, direction: "next" | "previous", incremental = false) => {
+    const search = searchRef.current;
+    if (!search) return;
+    if (!query) {
+      search.clearDecorations();
+      return;
+    }
+    const options = { incremental, decorations: findDecorationsFor(schemeRef.current) };
+    if (direction === "previous") search.findPrevious(query, options);
+    else search.findNext(query, options);
+  };
+
+  // Leaves find. The soft keyboard belongs to the find field while the bar is
+  // open, so closing deliberately falls back to the cursor-only focus state
+  // rather than the IME field: dismissing a search must not leave the
+  // terminal keyboard popped up over the output the user came back to read.
+  const dismissFind = () => {
+    searchRef.current?.clearDecorations();
+    setFindState(closeFind);
+    findInputRef.current?.blur();
+    applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: false }));
+  };
+
+  const toggleFind = () => {
+    vibrate();
+    if (findState.open) {
+      dismissFind();
+      return;
+    }
+    setFindState((state) => openFind(state, terminalRef.current?.getSelection()));
+  };
+
   useLayoutEffect(() => {
     const hostElement = hostRef.current;
     const inputElement = inputRef.current;
@@ -206,6 +249,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       // desktop takes control, the host announces the new grid (session.grid)
       // and this emulator reflows its history in place, so nothing is lost.
       const terminal = new Terminal({
+      // Find highlights every match with a decoration, and xterm gates
+      // registerDecoration (and therefore the addon's result counts) behind
+      // this flag. Without it the first search throws.
+      allowProposedApi: true,
       cursorBlink: true,
       cursorStyle: "bar",
       fontFamily: TERMINAL_FONT_FAMILY,
@@ -225,6 +272,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     // lines this emulator's frame up with the console's (see ConsoleFrame).
     const frame = new ConsoleFrame();
     terminal.open(hostElement);
+    const search = new SearchAddon();
+    terminal.loadAddon(search);
+    searchRef.current = search;
+    const searchResults = search.onDidChangeResults((event) => setFindState((state) => applyFindResults(state, event)));
     const httpLinkProvider = terminal.registerLinkProvider({
       provideLinks: (y, callback) => {
         const line = terminal.buffer.active.getLine(y - 1);
@@ -1104,7 +1155,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       hostElement.removeEventListener("touchcancel", handleTouchCancel);
       clearLongPressTimer();
       if (statsTimer !== undefined) window.clearInterval(statsTimer);
-      connected(); gridChange(); modeChange(); input.dispose(); output(); httpLinkProvider.dispose(); terminal.dispose(); terminalRef.current = null;
+      connected(); gridChange(); modeChange(); input.dispose(); output(); httpLinkProvider.dispose(); searchResults.dispose(); search.dispose(); searchRef.current = null; terminal.dispose(); terminalRef.current = null;
       resizeRef.current = () => undefined;
       focusInputRef.current = () => undefined;
       activateCursorRef.current = () => undefined;
@@ -1209,6 +1260,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       if (selection && hostElement && !selection.isCollapsed && (selection.anchorNode === hostElement || hostElement.contains(selection.anchorNode))) {
         selection.removeAllRanges();
       }
+      // A backgrounded terminal must not keep find highlights on a buffer
+      // nobody is looking at, nor its input holding the soft keyboard.
+      searchRef.current?.clearDecorations();
+      setFindState(closeFind);
+      findInputRef.current?.blur();
       deactivateTerminalCursor(terminalRef.current?.textarea ?? null);
       terminalRef.current?.blur();
       inputRef.current?.blur();
@@ -1229,6 +1285,13 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
 
   function pressAccessibilityKey(key: UtilityKey) {
     if (!activeRef.current) return;
+    // Find is an action, not input: it never reaches the key pad (so it
+    // cannot consume a latched modifier) and never focuses the IME field,
+    // because the soft keyboard it opens belongs to the find query.
+    if (key.id === "find") {
+      toggleFind();
+      return;
+    }
     // Tapping a non-modifier key fires a chord, so give a quick buzz;
     // modifiers only arm and wait, so they stay silent.
     if (!key.modifier) vibrate();
@@ -1237,13 +1300,13 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
   }
 
   function releaseAccessibilityKey(key: UtilityKey) {
-    if (!activeRef.current) return;
+    if (!activeRef.current || key.id === "find") return;
     applyKeyPadResult(keyPadRef.current!.release(key.id));
     applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: true }));
   }
 
   function cancelAccessibilityKey(key: UtilityKey) {
-    if (!activeRef.current) return;
+    if (!activeRef.current || key.id === "find") return;
     // The platform took the gesture away (the finger slid off the key and
     // started scrolling or a system gesture): no pointerup will ever
     // arrive for that pointer. The key must not outlive the finger, so a
@@ -1251,6 +1314,16 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     applyKeyPadResult(keyPadRef.current!.cancel(key.id));
     applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: true }));
   }
+
+  // Opening the bar hands it the soft keyboard and selects the seeded query,
+  // so typing replaces it rather than appending to it.
+  useEffect(() => {
+    if (!findState.open) return;
+    const input = findInputRef.current;
+    if (!input) return;
+    input.focus({ preventScroll: true });
+    input.select();
+  }, [findState.open]);
 
   // Every squished value paints from the live scale (the slider relaxed to
   // whatever fills the screen - see squishScaleToFill), not from the slider
@@ -1264,6 +1337,36 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
   return <div className="mobile-terminal-shell">
     <input ref={inputRef} className="mobile-terminal-input" type="text" inputMode="text" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} aria-label="Terminal input" />
     <div ref={hostRef} className="mobile-terminal" style={{ width: squishWidthPercent(renderScale), transform: `scaleX(${renderScale})`, transformOrigin: "left center", "--terminal-bg": scheme.background, "--terminal-squish-font-size": squishFontSize, "--terminal-squish-line-height": squishLineHeight, "--terminal-squish-inverse": `${squishInverse}` } as CSSProperties} />
+    {findState.open && <div className="terminal-find-bar" data-no-swipe role="search">
+      <input
+        ref={findInputRef}
+        type="text"
+        className="terminal-find-input"
+        placeholder="Find"
+        aria-label="Find in terminal"
+        inputMode="text"
+        autoComplete="off"
+        autoCorrect="off"
+        autoCapitalize="none"
+        spellCheck={false}
+        value={findState.query}
+        onChange={(event) => {
+          setFindState((state) => setFindQuery(state, event.target.value));
+          runSearch(event.target.value, "next", true);
+        }}
+        onKeyDown={(event) => {
+          const command = findCommandForKey(event);
+          if (command === "none") return;
+          event.preventDefault();
+          if (command === "close") dismissFind();
+          else runSearch(findState.query, command);
+        }}
+      />
+      <span className="terminal-find-count" role="status" aria-live="polite">{findStatusLabel(findState)}</span>
+      <button type="button" aria-label="Previous match" disabled={findState.count === 0} onPointerDown={(event) => event.preventDefault()} onClick={() => runSearch(findState.query, "previous")}>↑</button>
+      <button type="button" aria-label="Next match" disabled={findState.count === 0} onPointerDown={(event) => event.preventDefault()} onClick={() => runSearch(findState.query, "next")}>↓</button>
+      <button type="button" aria-label="Close find" onPointerDown={(event) => event.preventDefault()} onClick={dismissFind}>✕</button>
+    </div>}
     <div className="extra-keys" data-no-swipe aria-label="Terminal function keys" ref={(element) => guardUtilityKeySelection(element)}>
       {ACCESSIBILITY_KEY_ROWS.map((row, rowIndex) => <div className="key-row" key={rowIndex}>{row.map((key) => {
         const latched = latchedKeyIds.has(key.id);
@@ -1285,6 +1388,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
             // a keyboard click has detail 0 and no pointer hold, so press and
             // release in one activation.
             if (event.detail === 0) {
+              if (key.id === "find") {
+                toggleFind();
+                return;
+              }
               if (!key.modifier) vibrate();
               applyKeyPadResult(keyPadRef.current!.press(key));
               applyKeyPadResult(keyPadRef.current!.release(key.id));
