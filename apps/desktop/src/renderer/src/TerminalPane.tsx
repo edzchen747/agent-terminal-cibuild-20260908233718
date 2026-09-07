@@ -509,9 +509,24 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       dbg(`out session=${sessionId} off=${offset} len=${streamByteLength(data)} upTo=${merge.appliedUpTo}`);
       writeHostChunk(frame, terminal, data);
     });
+    // The latest live grid that arrived while the replay/drain was still
+    // running. `merge.attached` turns true only when the drain completes, so
+    // a grid broadcast that lands mid-replay must not be applied in place:
+    // the replay plan's own segment resizes execute interleaved with it
+    // (xterm writes are async), and a plan resize that lands LATER would
+    // stomp the live grid, leaving the pane at the last replayed segment's
+    // grid - e.g. the phone's 73x24 - while the PTY is back at the
+    // desktop's. Record it instead and settle it when the replay/drain ends
+    // (runPlanOp's tail, before the live drain writes, and
+    // finishAttachment, for grids that land mid-drain).
+    let lastLiveGrid: { cols: number; rows: number } | null = null;
+    const settleLiveGrid = () => {
+      if (lastLiveGrid !== null) applyGridInPlace(lastLiveGrid.cols, lastLiveGrid.rows);
+    };
     const offGrid = window.agentTerminal.onGrid((id, cols, rows) => {
       if (id !== sessionId) return;
-      applyGridInPlace(cols, rows);
+      lastLiveGrid = { cols, rows };
+      if (merge.attached) applyGridInPlace(cols, rows);
       dbg(`grid session=${sessionId} cols=${cols} rows=${rows}`);
     });
     // TUI mode is classification only: it no longer switches the sizing or
@@ -525,6 +540,10 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       if (disposed) return;
       if (activeRef.current) terminal.focus();
       setReplaying(false);
+      // Settle any live grid that arrived after the plan settled (mid-drain):
+      // the pane must end at the host's current grid, not the last replayed
+      // segment's (see offGrid).
+      settleLiveGrid();
       // The replay's announce gate has lifted: resync the container grid in
       // case it changed while the replay ran (its ResizeObserver fired but
       // announceViewport was suppressed). Opening the active tab is an
@@ -598,6 +617,13 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
         if (disposed) return;
         const op = plan[index];
         if (op === undefined) {
+          // Settle a live grid that arrived while the plan ran BEFORE the
+          // drain: the queued chunks are live host output produced at the
+          // host's CURRENT grid, so they must be written at that grid, not
+          // the last replayed segment's (which the plan just left the
+          // emulator at). finishAttachment settles it again for grids that
+          // land mid-drain.
+          settleLiveGrid();
           applyZoom();
           replayPending();
           return;

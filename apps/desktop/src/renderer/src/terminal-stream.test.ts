@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { JournalMerge, planSegmentReplay, type StreamChunk } from "./terminal-stream.ts";
+import { JournalMerge, planSegmentReplay, type ReplayOp, type StreamChunk } from "./terminal-stream.ts";
 
 /** Drain the queue the way replayPending does, collecting what gets written. */
 function drain(merge: JournalMerge): string[] {
@@ -12,6 +12,13 @@ function drain(merge: JournalMerge): string[] {
 /** Feed a live chunk and report whether the pane would write it. */
 function live(merge: JournalMerge, chunk: StreamChunk): boolean {
   return merge.receive(chunk) === "write";
+}
+
+/** The grid the emulator is left at after executing a plan from `initial`. */
+function finalGrid(plan: ReplayOp[], initial: { cols: number; rows: number }): { cols: number; rows: number } {
+  let grid = initial;
+  for (const op of plan) if (op.kind === "resize") grid = { cols: op.cols, rows: op.rows };
+  return grid;
 }
 
 describe("JournalMerge", () => {
@@ -427,5 +434,40 @@ describe("planSegmentReplay", () => {
         { kind: "write", data: "b" }
       ]
     );
+  });
+
+  it("ends at a foreign tail grid when the desktop's detach handed the session away", () => {
+    // The desktop tab left while the phone owned the session, so a re-attach's
+    // snapshot tail is the phone's grid (73x24). The plan faithfully ends
+    // there: it cannot know that a live broadcast (the desktop's 209x65,
+    // re-claimed on focus-in) superseded the tail mid-replay. That supersede
+    // is the pane's post-drain settle - this edge pins the precondition:
+    // after executing the plan the emulator sits on the FOREIGN grid, so
+    // without a settle step the pane would stay at the phone's dimensions
+    // while the PTY is back at the desktop's.
+    const plan = planSegmentReplay([seg(209, 65, "host output"), seg(73, 24, "phone reflow")], { cols: 209, rows: 65 });
+    assert.deepEqual(plan, [
+      { kind: "write", data: "host output" },
+      { kind: "resize", cols: 73, rows: 24 },
+      { kind: "write", data: "phone reflow" }
+    ]);
+    assert.deepEqual(finalGrid(plan, { cols: 209, rows: 65 }), { cols: 73, rows: 24 });
+  });
+
+  it("still ends at a zero-length foreign tail grid (a bare zoom swap)", () => {
+    // A zoom storm left the session's last epoch a bare swap: the grid moved
+    // (back to the desktop's 209x65) with no bytes written at the new size
+    // before the tab left. The tail segment is zero-length, but the swap is
+    // the content - the plan must end on that grid, so the same settle
+    // precondition holds even though the final op is a bare resize.
+    const plan = planSegmentReplay([seg(73, 24, "phone"), seg(209, 65, ""), seg(73, 24, ""), seg(209, 65, "")], { cols: 209, rows: 65 });
+    assert.deepEqual(plan, [
+      { kind: "resize", cols: 73, rows: 24 },
+      { kind: "write", data: "phone" },
+      { kind: "resize", cols: 209, rows: 65 },
+      { kind: "resize", cols: 73, rows: 24 },
+      { kind: "resize", cols: 209, rows: 65 }
+    ]);
+    assert.deepEqual(finalGrid(plan, { cols: 209, rows: 65 }), { cols: 209, rows: 65 });
   });
 });

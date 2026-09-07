@@ -73,6 +73,69 @@ test("finishAttachment re-measures and claims for the active tab after the repla
     terminalPaneSource.indexOf("const finishAttachment = () => {"),
     terminalPaneSource.indexOf("const replayPending = () => {")
   );
+  assert.ok(finish.includes("settleLiveGrid();"),
+    "a live grid that landed mid-drain must be settled before the post-replay resync");
   assert.ok(finish.includes("resizeRef.current(activeRef.current);"),
     "the post-replay resync must claim when this pane is the active tab");
+});
+
+test("a live grid broadcast that lands mid-replay is deferred, not stomped by the replay's last resize", () => {
+  // The replay plan's segment resizes execute interleaved with live grid
+  // broadcasts (xterm writes are async): when the host hands the grid back
+  // to the returning desktop mid-replay, applying that broadcast in place
+  // lets a plan resize that lands LATER stomp it, leaving the pane at the
+  // last replayed segment's grid (the phone's 73x24) while the PTY is at
+  // the desktop's. The broadcast is therefore recorded while the replay/
+  // drain is in flight (merge.attached is false) and settled when the
+  // replay/drain ends - once before the live drain writes (so the drained
+  // chunks land at the grid the host produced them at) and once in
+  // finishAttachment (for grids that land mid-drain).
+  const offGrid = terminalPaneSource.slice(
+    terminalPaneSource.indexOf("const offGrid = "),
+    terminalPaneSource.indexOf("const offMode = ")
+  );
+  assert.ok(offGrid.includes("lastLiveGrid = { cols, rows };"),
+    "every live grid must be recorded so a mid-replay one cannot be lost");
+  assert.ok(offGrid.includes("if (merge.attached) applyGridInPlace(cols, rows);"),
+    "a live grid must only be applied in place after the drain; mid-replay it must wait");
+  const planTail = terminalPaneSource.slice(
+    terminalPaneSource.indexOf("if (op === undefined) {"),
+    terminalPaneSource.indexOf("replayPending();")
+  );
+  assert.ok(planTail.includes("settleLiveGrid();"),
+    "the recorded live grid must be settled before the pending drain writes its chunks");
+});
+
+test("the settle is a no-op when nothing was recorded, goes through the frame, and never touches a disposed terminal", () => {
+  // Edge cases of the settle itself: (a) a fresh session's replay sees no
+  // live grid, so a settle with nothing recorded must resize nothing -
+  // the pane stays exactly where the plan left it; (b) the settle must go
+  // through applyGridInPlace (ConsoleFrame alignment + zoom follow), never
+  // a raw terminal.resize that would skip the scrollback protection;
+  // (c) a pane that unmounted mid-replay must not have its disposed
+  // terminal resized - the disposed guard must run before the settle.
+  const settle = terminalPaneSource.slice(
+    terminalPaneSource.indexOf("const settleLiveGrid = () => {"),
+    terminalPaneSource.indexOf("const offGrid = ")
+  );
+  assert.ok(settle.includes("if (lastLiveGrid !== null)"),
+    "a settle with no recorded grid must be a no-op, not a stale resize");
+  assert.ok(settle.includes("applyGridInPlace(lastLiveGrid.cols, lastLiveGrid.rows)"),
+    "the settle must reuse the live-apply path so frame alignment and zoom follow");
+  assert.ok(!settle.includes("terminal.resize"),
+    "the settle must not bypass the ConsoleFrame with a raw resize");
+
+  const planFn = terminalPaneSource.slice(
+    terminalPaneSource.indexOf("const runPlanOp = (index = 0) => {"),
+    terminalPaneSource.indexOf("runPlanOp();")
+  );
+  assert.ok(planFn.indexOf("if (disposed) return;") < planFn.indexOf("settleLiveGrid();"),
+    "the disposed guard must run before the settle, so an unmounted pane never resizes a disposed terminal");
+
+  const finish = terminalPaneSource.slice(
+    terminalPaneSource.indexOf("const finishAttachment = () => {"),
+    terminalPaneSource.indexOf("const replayPending = () => {")
+  );
+  assert.ok(finish.indexOf("settleLiveGrid();") < finish.indexOf("resizeRef.current(activeRef.current);"),
+    "the buffer must settle at the host's grid before the post-replay resync announces it");
 });
