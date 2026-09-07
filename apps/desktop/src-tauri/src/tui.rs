@@ -136,6 +136,15 @@ pub struct TuiClassifier {
     /// ended with a newline: line editing, not a TUI repaint.
     last_newline_chunk_at: Option<Instant>,
     last_chunk_at: Option<Instant>,
+    /// The most recent PROGRAM-INITIATED chunk: user-driven chunks (a
+    /// repaint that answers a keystroke or a terminal resize) do not
+    /// advance this clock, because the screen reacting to the user is
+    /// not the program working. The activity detector reads this gap,
+    /// not `last_chunk_at`, so an idle TUI that the user keeps poking
+    /// or resizing never keeps a busy badge - Windows Terminal shows no
+    /// indicator for such a screen either, its progress path being
+    /// app-signalled (ConEmu) and a reactive screen signalling nothing.
+    last_spontaneous_at: Option<Instant>,
     /// The program entered the alt screen itself (not a synthetic
     /// injection): the exit is anchored to the matching alt-exit
     /// sequence, not to stream quiet.
@@ -183,6 +192,7 @@ impl TuiClassifier {
             cup_entered_row: false,
             last_newline_chunk_at: None,
             last_chunk_at: None,
+            last_spontaneous_at: None,
             alt_anchored: false,
             saw_alt_exit: false,
             alt_open: false,
@@ -220,17 +230,42 @@ impl TuiClassifier {
     }
 
     /// Milliseconds since the last output chunk reached the classifier,
-    /// or [`u64::MAX`] if no chunk has ever arrived. The activity
-    /// detector times out a TUI period whose screen has stopped
-    /// changing with this: a frozen TUI (a paused htop, a waiting
-    /// pager, a stopped agent harness) must not keep a busy badge the
-    /// way Windows Terminal never keeps a progress indicator for a
-    /// terminal whose screen has stopped changing. Unlike
-    /// [`quiet_idle`](Self::quiet_idle) it measures *any* output -
-    /// TUI frames are absolute-addressed repaints, not line-terminated
-    /// shell output, so the prompt heuristic never applies to them.
+    /// or [`u64::MAX`] if no chunk has ever arrived. It measures *any*
+    /// output - TUI frames are absolute-addressed repaints, not
+    /// line-terminated shell output, so the prompt heuristic
+    /// ([`quiet_idle`](Self::quiet_idle)) never applies to them. The
+    /// activity detector instead reads the program-initiated clock
+    /// ([`spontaneous_quiet_ms`]), because user reactions must not
+    /// count as the program working.
+    ///
+    /// Kept as the generic gap query (the raw primitive that
+    /// [`spontaneous_quiet_ms`] specializes): nothing consumes it in the
+    /// hot path today.
+    #[allow(dead_code)]
     pub fn quiet_ms(&self, now: Instant) -> u64 {
         self.last_chunk_at
+            .map(|at| now.duration_since(at).as_millis() as u64)
+            .unwrap_or(u64::MAX)
+    }
+
+    /// A chunk just fed is the program's own output, not a reaction to
+    /// the user: advance the clock the activity detector reads
+    /// ([`spontaneous_quiet_ms`]). The host calls this for every chunk
+    /// that is not within [`crate::activity::TUI_USER_ATTRIBUTION_MS`]
+    /// of a keystroke or a resize.
+    pub fn mark_spontaneous_output(&mut self, now: Instant) {
+        self.last_spontaneous_at = Some(now);
+    }
+
+    /// How long the program has been working on its own: milliseconds
+    /// since the last program-initiated chunk ([`u64::MAX`] if there
+    /// has been none). User-driven chunks - a menu repaint after a
+    /// keystroke, a full-grid redraw after a resize - are the screen
+    /// echoing the user and never count, so a TUI the user is merely
+    /// interacting with (or that just repainted for a new grid) reads
+    /// as idle once the program's own output has gone quiet.
+    pub fn spontaneous_quiet_ms(&self, now: Instant) -> u64 {
+        self.last_spontaneous_at
             .map(|at| now.duration_since(at).as_millis() as u64)
             .unwrap_or(u64::MAX)
     }
@@ -941,6 +976,33 @@ mod tests {
             500,
             "the prompt chunk restarted the gap"
         );
+    }
+
+    #[test]
+    fn the_spontaneous_clock_ignores_user_reactions() {
+        let mut clf = TuiClassifier::new(30);
+        let at = Instant::now();
+        assert_eq!(
+            clf.spontaneous_quiet_ms(at),
+            u64::MAX,
+            "no program output ever"
+        );
+        // A program-initiated frame (alt-enter) advances the clock.
+        clf.feed("\x1b[?1049h", at, 30);
+        clf.mark_spontaneous_output(at);
+        assert_eq!(clf.spontaneous_quiet_ms(at), 0);
+        // A user-driven repaint (keystroke or resize answer) feeds the
+        // stream but does NOT advance the clock.
+        let later = at + Duration::from_millis(1_000);
+        clf.feed("repaint\x1b[?25l", later, 30);
+        assert_eq!(
+            clf.spontaneous_quiet_ms(later),
+            1_000,
+            "the reaction is not the program working"
+        );
+        // The program's next own frame restarts the clock.
+        clf.mark_spontaneous_output(later);
+        assert_eq!(clf.spontaneous_quiet_ms(later + Duration::from_millis(3_000)), 3_000);
     }
 
     /// Feed chunks 5ms apart, starting 5ms after `at`.

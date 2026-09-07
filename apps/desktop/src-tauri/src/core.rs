@@ -20,7 +20,7 @@ use chrono::{Duration, Utc};
 use percent_encoding::percent_decode_str;
 use portable_pty::{ChildKiller, MasterPty, PtySize, native_pty_system};
 
-use crate::activity::{ActivityDetector, TUI_QUIET_MS};
+use crate::activity::{ActivityDetector, TUI_QUIET_MS, TUI_USER_ATTRIBUTION_MS};
 use regex::Regex;
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, EventTarget, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -392,6 +392,14 @@ struct ManagedSession {
     /// receive a SIGWINCH mid-shell-state. Cleared when paint evidence
     /// fires the deferred resize, or when the mode exits to canonical.
     deferred_tui_resize: bool,
+    /// When the user's last keystroke was written to the PTY master. Output
+    /// arriving within `TUI_USER_ATTRIBUTION_MS` of it is the screen
+    /// *reacting* to the user, not the program working (see
+    /// `output_is_user_driven`).
+    last_user_input_at: Option<Instant>,
+    /// When the PTY grid was last resized: a resize forces a redraw of the
+    /// whole screen, and that redraw must not read as activity either.
+    last_resize_at: Option<Instant>,
     /// The most recent grid target: the owning client's announced viewport,
     /// verbatim, in every mode - viewports are never combined across clients
     /// (see `apply_owner_grid_for`). Recorded even while the PTY is frozen,
@@ -1365,13 +1373,16 @@ impl Core {
                 }
                 let mode = session.metadata.tui_mode;
                 let quiet_idle = session.tui.quiet_idle(now);
-                // A TUI screen that has been quiet for TUI_QUIET_MS no
-                // longer reads as active (see activity.rs for the
-                // Windows Terminal reference).
-                let tui_quiet = session.tui.quiet_ms(now) >= TUI_QUIET_MS;
+                // A TUI screen that has had no *spontaneous* output for
+                // TUI_QUIET_MS no longer reads as active: user-driven
+                // repaints (keystroke reactions, resize redraws) never
+                // advanced the quiet clock, so they cannot keep the badge
+                // lit (see activity.rs for the Windows Terminal
+                // reference).
+                let tui_quiet = session.tui.spontaneous_quiet_ms(now) >= TUI_QUIET_MS;
                 if let Some((activity, since)) = session
                     .activity
-                    .observe(&[], mode, quiet_idle, tui_quiet, false, now)
+                    .observe(&[], mode, quiet_idle, tui_quiet, false, false, now)
                 {
                     session.metadata.activity = activity;
                     session.metadata.activity_since = Some(since.clone());
@@ -2085,6 +2096,8 @@ impl Core {
             tui: TuiClassifier::new(SESSION_DEFAULT_ROWS),
             synthetic_alt: false,
             deferred_tui_resize: false,
+            last_user_input_at: None,
+            last_resize_at: None,
             requested_viewport: None,
             activity: ActivityDetector::new(Instant::now()),
             control_tail: String::new(),
@@ -2284,6 +2297,8 @@ impl Core {
                     tui: TuiClassifier::new(SESSION_DEFAULT_ROWS),
                     synthetic_alt: false,
                     deferred_tui_resize: false,
+                    last_user_input_at: None,
+                    last_resize_at: None,
                     requested_viewport: None,
                     activity: ActivityDetector::new(Instant::now()),
                     control_tail: String::new(),
@@ -2527,16 +2542,20 @@ impl Core {
 
             if data.contains('\r') || data.contains('\n') {
                 session.has_run_command = true;
-                // A submitted line is the command start. It is the only
-                // such signal in the shells whose prompt hooks report
-                // `A`/`B`/`D` but no `C`, and the only one at all in a
-                // shell we could not hook.
+                // A submitted line is a command start in a canonical
+                // shell. The detector suppresses it inside a TUI period,
+                // where the line belongs to the foreground program (a
+                // menu selection, a composer submit), not to a shell.
                 if let Some((activity, since)) = session.activity.on_input_line(Instant::now()) {
                     session.metadata.activity = activity;
                     session.metadata.activity_since = Some(since.clone());
                     activity_change = Some((activity, since));
                 }
             }
+            // Every byte the user types arms the user-attribution window:
+            // output the screen produces within TUI_USER_ATTRIBUTION_MS of
+            // it is a reaction to the user, not the program working.
+            session.last_user_input_at = Some(Instant::now());
             session.writer.write(session_id, data);
 
             (applied_grid, activity_change)
@@ -3906,15 +3925,35 @@ impl Core {
             // prompt-quiet verdict.
             let markers = session.tui.take_shell_markers();
             let quiet_idle = session.tui.quiet_idle(now);
-            // A chunk was just fed above, so its quiet gap is zero; this
-            // stays false here and only the sweeper can see a TUI screen
-            // go quiet (see activity.rs for the Windows Terminal
-            // reference).
-            let tui_quiet = session.tui.quiet_ms(now) >= TUI_QUIET_MS;
+            // Output the user just caused - a keystroke reaction, a
+            // resize repaint - must not read as the program working:
+            // it neither earns nor extends the busy badge. Only
+            // program-spontaneous chunks advance the quiet clock, so a
+            // quiet screen stays quiet no matter how the user interacts
+            // with it.
+            let user_driven = output_is_user_driven(session, now);
+            if !user_driven {
+                session.tui.mark_spontaneous_output(now);
+            }
+            // The quiet verdict comes from the spontaneous clock, not the
+            // last-chunk gap: user-driven repaints cannot keep a TUI
+            // screen reading active (a Windows Terminal whose screen
+            // stopped changing shows no busy indicator, whatever caused
+            // the last repaint).
+            let tui_quiet = session.tui.spontaneous_quiet_ms(now) >= TUI_QUIET_MS;
+            let tui_spontaneous = !user_driven;
             let mode_now = session.metadata.tui_mode;
             let activity_change = session
                 .activity
-                .observe(&markers, mode_now, quiet_idle, tui_quiet, true, now)
+                .observe(
+                    &markers,
+                    mode_now,
+                    quiet_idle,
+                    tui_quiet,
+                    true,
+                    tui_spontaneous,
+                    now,
+                )
                 .map(|(activity, since)| {
                     session.metadata.activity = activity;
                     session.metadata.activity_since = Some(since.clone());
@@ -4941,6 +4980,17 @@ fn release_viewport(
 /// nothing if the grid did not actually change. `apply_session_grid` runs
 /// under the session lock, so the recorded epoch offset is always aligned to
 /// a journal chunk boundary.
+fn output_is_user_driven(session: &ManagedSession, now: Instant) -> bool {
+    [session.last_user_input_at, session.last_resize_at]
+        .into_iter()
+        .flatten()
+        .max()
+        .is_some_and(|at| {
+            now.checked_duration_since(at)
+                .is_some_and(|gap| gap.as_millis() as u64 <= TUI_USER_ATTRIBUTION_MS)
+        })
+}
+
 fn apply_session_grid(session: &mut ManagedSession, cols: u16, rows: u16) -> Option<GridEpoch> {
     let cols = cols.clamp(2, SESSION_MAX_COLS);
     let rows = rows.clamp(1, SESSION_MAX_ROWS);
@@ -4956,6 +5006,9 @@ fn apply_session_grid(session: &mut ManagedSession, cols: u16, rows: u16) -> Opt
         pixel_width: 0,
         pixel_height: 0,
     });
+    // A resize repaints the whole screen; attribute that repaint to the
+    // user, not to the program.
+    session.last_resize_at = Some(Instant::now());
     session.grid = (cols, rows);
     let epoch = GridEpoch {
         offset: session.journal_len,
@@ -5373,12 +5426,13 @@ mod tests {
         ActivityDetector, CdOutcome, CdPlan, ConnectivityAction, ConnectivityTracker,
         EmbeddedNodeStatus, Inner, ManagedSession, PRESENCE_WINDOW_MS, PairingGrant,
         PENDING_FOCUS_TTL, PendingFocus, RetireOutcome, SESSION_MAX_COLS, SESSION_MAX_ROWS,
-        SessionActivity, SessionWriter, claim_pending_focus, record_pending_focus,
+        SessionActivity, SessionWriter, TUI_QUIET_MS, TUI_USER_ATTRIBUTION_MS, claim_pending_focus, record_pending_focus,
         VIEWPORT_WATCHDOG_TIMEOUT_MS, apply_grid_if_tui,
         apply_session_grid, ensure_home_project, evict_stale_viewports, folder_name,
         is_cursor_position_report, is_device_attributes_report, is_dropped_node_status,
         is_system_directory, is_within_project, log_escape,
         active_session_count, newest_running_session_project_id, open_session_count,
+        output_is_user_driven,
         parse_terminal_titles,
         parse_working_directories, preferred_project, presence_alive, project_is_usable,
         project_for_directory, project_name_or_folder, record_cursor_position_requests,
@@ -8263,6 +8317,210 @@ mod tests {
     }
 
     #[test]
+    fn output_user_driven_uses_the_latest_of_input_and_resize() {
+        // Keystrokes and resizes each arm the attribution window, and
+        // the LATEST of the two governs: a resize while the user was
+        // typing re-arms the window from the resize.
+        let mut session = test_session("s1", "p", r"C:\Work\P");
+        let now = Instant::now();
+        assert!(
+            !output_is_user_driven(&session, now),
+            "no input or resize yet: the output is the program's own"
+        );
+
+        session.last_user_input_at = Some(now);
+        assert!(
+            output_is_user_driven(&session, now),
+            "the keystroke's instant is inside its window"
+        );
+        assert!(
+            output_is_user_driven(
+                &session,
+                now + std::time::Duration::from_millis(TUI_USER_ATTRIBUTION_MS)
+            ),
+            "the window is inclusive of its boundary"
+        );
+        assert!(
+            !output_is_user_driven(
+                &session,
+                now + std::time::Duration::from_millis(TUI_USER_ATTRIBUTION_MS + 1)
+            ),
+            "past the window the output is the program's own"
+        );
+
+        // A resize later than the keystroke re-arms the window.
+        let resize_at = now + std::time::Duration::from_millis(400);
+        session.last_resize_at = Some(resize_at);
+        assert!(output_is_user_driven(&session, resize_at));
+        assert!(
+            !output_is_user_driven(
+                &session,
+                resize_at + std::time::Duration::from_millis(TUI_USER_ATTRIBUTION_MS + 1)
+            ),
+            "the window runs from the LATEST of input and resize"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // History replay must never read as activity. The bytes an attaching
+    // client is served from the journal (a new window, a phone
+    // reconnecting, a fresh client's snapshot) are already-delivered
+    // history: running them through the classifier or the activity
+    // detector would light the badge for work the program finished long
+    // ago. The live reader loop (`on_terminal_data`) is the only feed
+    // into the classifier and the detector, and the replay itself is a
+    // pure read of `session.buffer` (see `snapshot_of`).
+    // ---------------------------------------------------------------------
+
+    /// A session whose journal holds a complete past TUI period: alt
+    /// screen enter, a couple of frames, alt screen exit, and the shell
+    /// prompt back. The session itself is idle: the period ended long
+    /// ago and nothing has produced output since.
+    fn session_with_tui_history_in_journal() -> ManagedSession {
+        let mut session = test_session("s1", "p", r"C:\Work\P");
+        let history = "\x1b[?1049h\x1b[2;1H\x1b[?25lframe 1\r\n\x1b[3;1Hframe 2\r\n\x1b[?1049lPS C:\\> ";
+        session.buffer.push_str(history);
+        session.journal_len = history.len() as u64;
+        session
+    }
+
+    #[test]
+    fn a_replay_snapshot_is_a_pure_read_of_the_journal() {
+        let mut session = session_with_tui_history_in_journal();
+        let journal_len = session.journal_len;
+        let buffer_len = session.buffer.len();
+        let mode = session.metadata.tui_mode;
+
+        let snapshot = snapshot_of(&session);
+
+        assert_eq!(
+            snapshot.end_offset, journal_len,
+            "the snapshot covers the whole journal"
+        );
+        assert!(
+            snapshot
+                .segments
+                .iter()
+                .any(|segment| segment.data.contains("\x1b[?1049h")),
+            "the replay carries the alt-screen sequences verbatim"
+        );
+        assert_eq!(
+            session.journal_len, journal_len,
+            "serving the snapshot must not append to the journal"
+        );
+        assert_eq!(
+            session.buffer.len(), buffer_len,
+            "serving the snapshot must not mutate the buffer"
+        );
+        assert_eq!(
+            session.metadata.tui_mode, mode,
+            "the replay bytes are not fed to the classifier, so the mode is untouched"
+        );
+        assert_eq!(
+            session.tui.spontaneous_quiet_ms(Instant::now()),
+            u64::MAX,
+            "the replay bytes are not stamped onto the spontaneous clock either"
+        );
+    }
+
+    #[test]
+    fn replayed_history_does_not_light_the_activity_badge() {
+        // The TUI period in the journal ended long ago; the session is at
+        // its prompt and the clients hold `Idle`. A client attaching now
+        // is served the full journal - alt enter, frames, alt exit,
+        // prompt - and serving it must not re-run any of it.
+        let mut session = session_with_tui_history_in_journal();
+        assert_eq!(session.metadata.activity, SessionActivity::Idle);
+
+        let _ = snapshot_of(&session);
+
+        assert_eq!(
+            session.metadata.activity,
+            SessionActivity::Idle,
+            "a replay is already-delivered history, not new work"
+        );
+        assert_eq!(session.activity.state(), SessionActivity::Idle);
+    }
+
+    #[test]
+    fn a_quiet_session_stays_idle_after_a_client_replays_its_history() {
+        // The exact computation the activity sweeper runs for a session
+        // that produced no new bytes: replaying the journal for a new
+        // client creates no chunk, so the sweep must find nothing to
+        // announce. If the replayed bytes were misread as output, the
+        // sweep would re-earn a badge for a quiet screen.
+        let mut session = session_with_tui_history_in_journal();
+        let now = Instant::now();
+        let mode = session.metadata.tui_mode;
+        let quiet_idle = session.tui.quiet_idle(now);
+        let tui_quiet = session.tui.spontaneous_quiet_ms(now) >= TUI_QUIET_MS;
+        assert!(
+            session
+                .activity
+                .observe(&[], mode, quiet_idle, tui_quiet, false, false, now)
+                .is_none(),
+            "the sweep reasserts the idle clients already hold and announces nothing"
+        );
+    }
+
+    #[test]
+    fn serving_a_snapshot_does_not_extend_the_spontaneous_quiet_window() {
+        // The program last worked 1.5 s ago - inside TUI_QUIET_MS, so
+        // its badge is still up. A client attaching at that same instant
+        // is served the journal, and a naive implementation that fed the
+        // journal through the classifier would stamp the spontaneous
+        // clock to now and hold the badge past its rightful expiry.
+        let mut session = session_with_tui_history_in_journal();
+        let now = Instant::now();
+        session
+            .tui
+            .mark_spontaneous_output(now - Duration::from_millis(1_500));
+
+        let _ = snapshot_of(&session);
+
+        assert_eq!(
+            session.tui.spontaneous_quiet_ms(now),
+            1_500,
+            "the replay must not read as program work: the quiet window still runs from the last spontaneous chunk"
+        );
+    }
+
+    #[test]
+    fn replaying_an_open_tui_period_does_not_reclassify_or_rebadge() {
+        // The journal ends INSIDE an alt screen: a paused htop. The live
+        // stream already classified the session Fullscreen, and the
+        // screen has been quiet for far longer than TUI_QUIET_MS, so
+        // the badge is idle. A client that replays the journal must not
+        // re-run the alt sequences: the mode is the live stream's
+        // verdict, and the replay carries no new chunk.
+        let mut session = test_session("s1", "p", r"C:\Work\P");
+        session.metadata.tui_mode = TuiMode::Fullscreen;
+        let open_period = "\x1b[?1049h\x1b[H\x1b[?25lpaused";
+        session.buffer.push_str(open_period);
+        session.journal_len = open_period.len() as u64;
+        let now = Instant::now();
+        session.tui.mark_spontaneous_output(now - Duration::from_secs(10));
+
+        let _ = snapshot_of(&session);
+
+        assert_eq!(
+            session.metadata.tui_mode,
+            TuiMode::Fullscreen,
+            "the mode is the live stream's verdict, untouched by the replay"
+        );
+        assert_eq!(session.activity.state(), SessionActivity::Idle);
+        let tui_quiet = session.tui.spontaneous_quiet_ms(now) >= TUI_QUIET_MS;
+        assert!(tui_quiet, "the last spontaneous frame was ten seconds ago");
+        assert_eq!(
+            session
+                .activity
+                .observe(&[], TuiMode::Fullscreen, false, tui_quiet, false, false, now),
+            None,
+            "the quiet sweep reasserts the idle clients already hold"
+        );
+    }
+
+    #[test]
     fn open_session_count_tracks_tabs_through_exit_and_close() {
         // The tray's session label reports this count, so its edge cases
         // must hold: an empty tray reads zero, a tab kept for inspection
@@ -8537,6 +8795,8 @@ mod tests {
             tui: TuiClassifier::new(SESSION_DEFAULT_ROWS),
             synthetic_alt: false,
             deferred_tui_resize: false,
+            last_user_input_at: None,
+            last_resize_at: None,
             requested_viewport: None,
             activity: ActivityDetector::new(Instant::now()),
             control_tail: String::new(),

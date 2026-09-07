@@ -22,16 +22,18 @@
 //! 2. **TUI mode.** A non-`Canonical` period *is* a blocked shell, so
 //!    `vim`, `htop`, `lazygit` and agent harnesses read as active in
 //!    every shell, integrated or not. But a blocked shell is only
-//!    *busy* while its program is actually doing something: while the
-//!    screen is still changing (a fresh output chunk, i.e. not
-//!    `tui_quiet`) the period reads active, and once the screen has
-//!    been quiet for [`TUI_QUIET_MS`] the program is waiting - on
-//!    keys, on a timer, on the user - and the badge drops to idle.
-//!    That matches Windows Terminal, where a terminal whose screen has
-//!    stopped changing shows no busy indicator. This matters even with
-//!    integration: our PowerShell and cmd hooks emit `A`/`B`/`D` but no
-//!    `C`, so between the prompt and the command's end the markers say
-//!    nothing at all.
+//!    *busy* while its program is actually doing something on its own:
+//!    a program-initiated output chunk reads active, and once the
+//!    program's own output has been quiet for [`TUI_QUIET_MS`] the
+//!    badge drops to idle. Chunks that merely react to the user - a
+//!    menu repaint after a keystroke, a full-grid redraw after a
+//!    resize, within [`TUI_USER_ATTRIBUTION_MS`] of the user action -
+//!    never count: the screen echoing the user is not work, the way
+//!    Windows Terminal's app-signalled progress path (ConEmu
+//!    `OSC 9;4`) stays dark for a terminal that is merely being poked
+//!    or resized. This matters even with integration: our PowerShell
+//!    and cmd hooks emit `A`/`B`/`D` but no `C`, so between the prompt
+//!    and the command's end the markers say nothing at all.
 //!
 //! 3. **Input and stream quiet**, the fallback for a shell we could not
 //!    hook. A submitted line (input containing CR/LF) starts a command;
@@ -65,14 +67,30 @@ pub const ACTIVE_MIN_MS: u64 = 250;
 
 /// A TUI period whose screen has been quiet this long is no longer doing
 /// something visible: its `Active` badge drops to `Idle` until a new
-/// output chunk lands (which re-earns `Active` through the ordinary
-/// [`ACTIVE_MIN_MS`] delay). TUIs that are actively redrawing - htop's
-/// 1 Hz refresh, an agent harness repainting its composer band - land
-/// their next frame well inside this window and stay active, while an
-/// idle one (a paused htop, a waiting pager, a stopped harness) goes
-/// quiet and reports `Idle`, the way Windows Terminal shows no busy
-/// indicator for a terminal whose screen has stopped changing.
+/// PROGRAM-INITIATED output chunk lands (user reactions never count;
+/// see [`TUI_USER_ATTRIBUTION_MS`]), which re-earns `Active` through
+/// the ordinary [`ACTIVE_MIN_MS`] delay. TUIs that are actively
+/// redrawing - htop's 1 Hz refresh, an agent harness repainting its
+/// composer band while it works - land their next own frame well
+/// inside this window and stay active, while an idle one (a paused
+/// htop, a waiting pager, a stopped harness) goes quiet and reports
+/// `Idle`, the way Windows Terminal shows no busy indicator for a
+/// terminal whose screen has stopped changing.
 pub const TUI_QUIET_MS: u64 = 2000;
+
+/// Output that lands this close to a user keystroke or a terminal
+/// resize is the program's REACTION to the user, not the program
+/// working: a TUI that repaints its menu after a keystroke, or its
+/// whole grid after a resize, must not earn or keep a busy badge.
+/// Windows Terminal stays dark in exactly these cases because its
+/// progress path is app-signalled (ConEmu `OSC 9;4`) and a screen that
+/// merely reacts to the user signals nothing; the output-based
+/// detector reaches the same result by attributing these chunks to the
+/// user. Long enough to catch every TUI repaint that answers a key or
+/// a resize (tens of milliseconds), short enough that a model's
+/// time-to-first-token (usually well over a second) is never masked,
+/// so the badge still comes on when the work actually starts.
+pub const TUI_USER_ATTRIBUTION_MS: u64 = 500;
 
 pub struct ActivityDetector {
     /// The last state announced to clients.
@@ -90,6 +108,11 @@ pub struct ActivityDetector {
     /// does, quiet is the gap before the command's first byte, not a
     /// prompt.
     awaiting_output: bool,
+    /// The mode the last `observe` saw. An input line only earns a badge
+    /// while the shell owns the prompt: inside a TUI period the line
+    /// belongs to the foreground program (a menu selection, a composer
+    /// submit), and interaction with the TUI is not the program working.
+    last_mode: TuiMode,
 }
 
 impl ActivityDetector {
@@ -101,6 +124,7 @@ impl ActivityDetector {
             observed_at: now,
             integrated: false,
             awaiting_output: false,
+            last_mode: TuiMode::Canonical,
         }
     }
 
@@ -120,11 +144,12 @@ impl ActivityDetector {
 
     /// Apply the signals available after a classifier `feed`, or - with
     /// `saw_output` false and no markers - a sweeper tick. `quiet_idle`
-    /// is the classifier's shell-prompt verdict (canonical mode only) and
-    /// `tui_quiet` says the TUI screen has been quiet for
-    /// [`TUI_QUIET_MS`] (TUI modes only). Returns the new
-    /// state and its timestamp only when what clients have been told
-    /// changes.
+    /// is the classifier's shell-prompt verdict (canonical mode only);
+    /// `tui_quiet` says the program's own output has been quiet for
+    /// [`TUI_QUIET_MS`] and `tui_spontaneous` says the chunk just fed
+    /// was the program's own work rather than a reaction to the user
+    /// (both TUI modes only). Returns the new state and its timestamp
+    /// only when what clients have been told changes.
     pub fn observe(
         &mut self,
         markers: &[ShellMarker],
@@ -132,11 +157,13 @@ impl ActivityDetector {
         quiet_idle: bool,
         tui_quiet: bool,
         saw_output: bool,
+        tui_spontaneous: bool,
         now: Instant,
     ) -> Option<(SessionActivity, String)> {
         if saw_output {
             self.awaiting_output = false;
         }
+        self.last_mode = mode;
 
         let mut next = self.observed;
         match mode {
@@ -145,17 +172,20 @@ impl ActivityDetector {
                     next = SessionActivity::Idle;
                 }
             }
-            // A TUI period is a blocked shell, but only a redrawing one is
-            // busy: while the program's screen is still changing (not
-            // `tui_quiet`) it reads active, and a screen that has been
-            // quiet for `TUI_QUIET_MS` reads idle (see the module docs
-            // for the Windows Terminal reference).
+            // A TUI period is a blocked shell, but only the program's
+            // OWN work is busy: a program-initiated chunk reads
+            // active, and a program that has been quiet on its own for
+            // `TUI_QUIET_MS` reads idle. A user-driven chunk (a
+            // keystroke or resize repaint) changes nothing: the screen
+            // echoing the user is not work, the way Windows Terminal's
+            // app-signalled progress path stays dark for a screen that
+            // merely reacts (see the module docs).
             TuiMode::Inline | TuiMode::Fullscreen => {
-                next = if tui_quiet {
-                    SessionActivity::Idle
-                } else {
-                    SessionActivity::Active
-                };
+                if tui_spontaneous {
+                    next = SessionActivity::Active;
+                } else if tui_quiet {
+                    next = SessionActivity::Idle;
+                }
             }
         }
         // Markers land last: they are the strongest evidence, and a `D`
@@ -177,8 +207,16 @@ impl ActivityDetector {
 
     /// The user submitted a line, so a command is starting. This stands in
     /// for `OSC 133 ; C` in the shells whose prompt hooks can only report
-    /// the prompt itself.
+    /// the prompt itself. Inside a TUI period the line belongs to the
+    /// foreground program - a paused htop earning the badge back every
+    /// time the user presses a key is exactly the false positive this
+    /// exists to avoid - so it earns nothing and must not arm the quiet
+    /// fallback either: the prompt the shell prints when the TUI exits
+    /// has to stay allowed to read idle.
     pub fn on_input_line(&mut self, now: Instant) -> Option<(SessionActivity, String)> {
+        if self.last_mode != TuiMode::Canonical {
+            return self.settle(now);
+        }
         self.awaiting_output = true;
         self.set_observed(SessionActivity::Active, now);
         self.settle(now)
@@ -244,7 +282,7 @@ mod tests {
         at: &mut Instant,
     ) -> Option<(SessionActivity, String)> {
         let now = advance(at, ACTIVE_MIN_MS);
-        detector.observe(NONE, TuiMode::Canonical, false, false, false, now)
+        detector.observe(NONE, TuiMode::Canonical, false, false, false, false, now)
     }
 
     #[test]
@@ -263,6 +301,7 @@ mod tests {
                 false,
                 false,
                 true,
+                true,
                 at
             ),
             None,
@@ -279,6 +318,7 @@ mod tests {
             TuiMode::Canonical,
             false,
             false,
+            true,
             true,
             now,
         );
@@ -299,6 +339,7 @@ mod tests {
             false,
             false,
             true,
+            true,
             now,
         );
         assert_eq!(out.map(|(state, _)| state), Some(SessionActivity::Idle));
@@ -316,6 +357,7 @@ mod tests {
             false,
             false,
             true,
+            true,
             at,
         );
         settle_active(&mut detector, &mut at);
@@ -324,7 +366,7 @@ mod tests {
         for _ in 0..40 {
             let now = advance(&mut at, 250);
             assert_eq!(
-                detector.observe(NONE, TuiMode::Canonical, true, false, false, now),
+                detector.observe(NONE, TuiMode::Canonical, true, false, false, false, now),
                 None,
                 "quiet must not contradict an outstanding command-start"
             );
@@ -339,7 +381,7 @@ mod tests {
         // mode is the only thing holding the tab active - but only while
         // the program is still redrawing its screen.
         let (mut detector, mut at) = detector();
-        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, at);
+        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, true, at);
         settle_active(&mut detector, &mut at);
         assert_eq!(detector.state(), SessionActivity::Active);
 
@@ -348,7 +390,7 @@ mod tests {
         for _ in 0..20 {
             let now = advance(&mut at, 250);
             assert_eq!(
-                detector.observe(NONE, TuiMode::Fullscreen, false, false, true, now),
+                detector.observe(NONE, TuiMode::Fullscreen, false, false, true, true, now),
                 None,
                 "a redrawing TUI keeps the badge"
             );
@@ -360,6 +402,7 @@ mod tests {
             TuiMode::Canonical,
             false,
             false,
+            true,
             true,
             now,
         );
@@ -374,21 +417,21 @@ mod tests {
         // shows no busy indicator for a terminal whose screen has
         // stopped changing.
         let (mut detector, mut at) = detector();
-        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, at);
+        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, true, at);
         settle_active(&mut detector, &mut at);
         assert_eq!(detector.state(), SessionActivity::Active);
 
         for _ in 0..(TUI_QUIET_MS / 250 - 1) {
             let now = advance(&mut at, 250);
             assert_eq!(
-                detector.observe(NONE, TuiMode::Fullscreen, true, false, false, now),
+                detector.observe(NONE, TuiMode::Fullscreen, true, false, false, false, now),
                 None,
                 "the quiet gap has not reached TUI_QUIET_MS yet"
             );
             assert_eq!(detector.state(), SessionActivity::Active);
         }
         let now = advance(&mut at, 250); // the quiet gap now reaches TUI_QUIET_MS
-        let idle = detector.observe(NONE, TuiMode::Fullscreen, true, true, false, now);
+        let idle = detector.observe(NONE, TuiMode::Fullscreen, true, true, false, false, now);
         assert_eq!(idle.map(|(state, _)| state), Some(SessionActivity::Idle));
     }
 
@@ -397,13 +440,13 @@ mod tests {
         // The TUI redraws after going quiet: the badge must come back,
         // earning its own publication delay like any other Active.
         let (mut detector, mut at) = detector();
-        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, at);
+        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, true, at);
         settle_active(&mut detector, &mut at);
 
         let now = advance(&mut at, TUI_QUIET_MS);
         assert_eq!(
             detector
-                .observe(NONE, TuiMode::Fullscreen, true, true, false, now)
+                .observe(NONE, TuiMode::Fullscreen, true, true, false, false, now)
                 .map(|(state, _)| state),
             Some(SessionActivity::Idle),
             "a frozen screen is idle"
@@ -411,12 +454,12 @@ mod tests {
 
         let now = advance(&mut at, 50);
         assert_eq!(
-            detector.observe(NONE, TuiMode::Fullscreen, false, false, true, now),
+            detector.observe(NONE, TuiMode::Fullscreen, false, false, true, true, now),
             None,
             "the fresh frame restarts the quiet window, but Active is held back"
         );
         let now = advance(&mut at, ACTIVE_MIN_MS);
-        let out = detector.observe(NONE, TuiMode::Fullscreen, false, false, true, now);
+        let out = detector.observe(NONE, TuiMode::Fullscreen, false, false, true, true, now);
         assert_eq!(out.map(|(state, _)| state), Some(SessionActivity::Active));
     }
 
@@ -427,13 +470,13 @@ mod tests {
         // then off for clients.
         let (mut detector, mut at) = detector();
         assert_eq!(
-            detector.observe(NONE, TuiMode::Fullscreen, false, false, true, at),
+            detector.observe(NONE, TuiMode::Fullscreen, false, false, true, true, at),
             None,
             "the Active is held back by the publication delay"
         );
         let now = advance(&mut at, TUI_QUIET_MS);
         assert_eq!(
-            detector.observe(NONE, TuiMode::Fullscreen, true, true, false, now),
+            detector.observe(NONE, TuiMode::Fullscreen, true, true, false, false, now),
             None,
             "the quiet flip landed on a state clients never saw"
         );
@@ -447,14 +490,14 @@ mod tests {
         // the quiet rule, or a paused htop would earn the badge back
         // every time the user presses a key.
         let (mut detector, mut at) = detector();
-        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, at);
+        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, true, at);
         settle_active(&mut detector, &mut at);
         assert_eq!(detector.state(), SessionActivity::Active);
 
         let now = advance(&mut at, TUI_QUIET_MS);
         assert_eq!(
             detector
-                .observe(NONE, TuiMode::Fullscreen, true, true, false, now)
+                .observe(NONE, TuiMode::Fullscreen, true, true, false, false, now)
                 .map(|(state, _)| state),
             Some(SessionActivity::Idle),
             "the frozen screen drops the badge"
@@ -467,7 +510,7 @@ mod tests {
         // line's Active never got published, so nothing is announced.
         let now = advance(&mut at, 250);
         assert_eq!(
-            detector.observe(NONE, TuiMode::Fullscreen, true, true, false, now),
+            detector.observe(NONE, TuiMode::Fullscreen, true, true, false, false, now),
             None,
             "the quiet rule reasserts the idle the badge already dropped"
         );
@@ -480,13 +523,13 @@ mod tests {
         // shell back its prompt must not re-announce an idle the badge
         // already dropped.
         let (mut detector, mut at) = detector();
-        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, at);
+        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, true, at);
         settle_active(&mut detector, &mut at);
 
         let now = advance(&mut at, TUI_QUIET_MS);
         assert_eq!(
             detector
-                .observe(NONE, TuiMode::Fullscreen, true, true, false, now)
+                .observe(NONE, TuiMode::Fullscreen, true, true, false, false, now)
                 .map(|(state, _)| state),
             Some(SessionActivity::Idle)
         );
@@ -498,6 +541,7 @@ mod tests {
                 TuiMode::Canonical,
                 false,
                 false,
+                true,
                 true,
                 now,
             ),
@@ -511,13 +555,13 @@ mod tests {
         // The quiet drop and the exit both land on Idle: only the first
         // may announce.
         let (mut detector, mut at) = detector();
-        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, at);
+        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, true, at);
         settle_active(&mut detector, &mut at);
 
         let now = advance(&mut at, TUI_QUIET_MS);
         assert_eq!(
             detector
-                .observe(NONE, TuiMode::Fullscreen, true, true, false, now)
+                .observe(NONE, TuiMode::Fullscreen, true, true, false, false, now)
                 .map(|(state, _)| state),
             Some(SessionActivity::Idle)
         );
@@ -531,23 +575,24 @@ mod tests {
 
     #[test]
     fn the_tui_quiet_boundary_is_exactly_tui_quiet_ms() {
-        // The host computes `quiet_ms(now) >= TUI_QUIET_MS`, so one
+        // The host computes `spontaneous_quiet_ms(now) >= TUI_QUIET_MS`,
+        // so one
         // millisecond short of the window the screen still reads busy
         // and the window's last millisecond flips it to idle.
         let (mut detector, mut at) = detector();
-        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, at);
+        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, true, at);
         settle_active(&mut detector, &mut at);
 
         let now = advance(&mut at, TUI_QUIET_MS - 1);
         assert_eq!(
-            detector.observe(NONE, TuiMode::Fullscreen, true, false, false, now),
+            detector.observe(NONE, TuiMode::Fullscreen, true, false, false, false, now),
             None,
             "one millisecond short of the window the screen still reads busy"
         );
         let now = advance(&mut at, 1); // the quiet gap now reaches TUI_QUIET_MS
         assert_eq!(
             detector
-                .observe(NONE, TuiMode::Fullscreen, true, true, false, now)
+                .observe(NONE, TuiMode::Fullscreen, true, true, false, false, now)
                 .map(|(state, _)| state),
             Some(SessionActivity::Idle)
         );
@@ -558,14 +603,14 @@ mod tests {
         // Inline TUIs (composer bands) share the quiet rule: the badge
         // follows the band's redraws, not the period's duration.
         let (mut detector, mut at) = detector();
-        detector.observe(NONE, TuiMode::Inline, false, false, true, at);
+        detector.observe(NONE, TuiMode::Inline, false, false, true, true, at);
         settle_active(&mut detector, &mut at);
         assert_eq!(detector.state(), SessionActivity::Active);
 
         let now = advance(&mut at, TUI_QUIET_MS);
         assert_eq!(
             detector
-                .observe(NONE, TuiMode::Inline, true, true, false, now)
+                .observe(NONE, TuiMode::Inline, true, true, false, false, now)
                 .map(|(state, _)| state),
             Some(SessionActivity::Idle)
         );
@@ -574,7 +619,7 @@ mod tests {
     #[test]
     fn an_inline_tui_is_active_without_any_shell_integration() {
         let (mut detector, mut at) = detector();
-        detector.observe(NONE, TuiMode::Inline, false, false, true, at);
+        detector.observe(NONE, TuiMode::Inline, false, false, true, true, at);
         settle_active(&mut detector, &mut at);
         assert_eq!(detector.state(), SessionActivity::Active);
         assert!(!detector.integrated());
@@ -590,11 +635,11 @@ mod tests {
         // Output flows for a while, then the prompt comes back.
         let now = advance(&mut at, 300);
         assert_eq!(
-            detector.observe(NONE, TuiMode::Canonical, false, false, true, now),
+            detector.observe(NONE, TuiMode::Canonical, false, false, true, true, now),
             None
         );
         let now = advance(&mut at, 600);
-        let idle = detector.observe(NONE, TuiMode::Canonical, true, false, false, now);
+        let idle = detector.observe(NONE, TuiMode::Canonical, true, false, false, false, now);
         assert_eq!(idle.map(|(state, _)| state), Some(SessionActivity::Idle));
     }
 
@@ -608,7 +653,7 @@ mod tests {
 
         let now = advance(&mut at, 900);
         assert_eq!(
-            detector.observe(NONE, TuiMode::Canonical, true, false, false, now),
+            detector.observe(NONE, TuiMode::Canonical, true, false, false, false, now),
             None,
             "no output has arrived since the line was submitted"
         );
@@ -621,12 +666,12 @@ mod tests {
         assert_eq!(detector.on_input_line(at), None);
         let now = advance(&mut at, 40);
         assert_eq!(
-            detector.observe(NONE, TuiMode::Canonical, false, false, true, now),
+            detector.observe(NONE, TuiMode::Canonical, false, false, true, true, now),
             None
         );
         let now = advance(&mut at, 600);
         assert_eq!(
-            detector.observe(NONE, TuiMode::Canonical, true, false, false, now),
+            detector.observe(NONE, TuiMode::Canonical, true, false, false, false, now),
             None,
             "the tab was never announced active, so there is nothing to clear"
         );
@@ -643,6 +688,7 @@ mod tests {
             false,
             false,
             true,
+            true,
             at,
         );
         assert!(detector.integrated());
@@ -654,7 +700,7 @@ mod tests {
 
         let now = advance(&mut at, 5_000);
         assert_eq!(
-            detector.observe(NONE, TuiMode::Canonical, true, false, false, now),
+            detector.observe(NONE, TuiMode::Canonical, true, false, false, false, now),
             None
         );
         assert_eq!(
@@ -672,6 +718,7 @@ mod tests {
             TuiMode::Canonical,
             false,
             false,
+            true,
             true,
             at,
         );
@@ -704,6 +751,7 @@ mod tests {
             false,
             false,
             true,
+            true,
             now,
         );
         assert_eq!(out.map(|(state, _)| state), Some(SessionActivity::Idle));
@@ -720,6 +768,7 @@ mod tests {
             false,
             false,
             true,
+            true,
             at,
         );
         assert_eq!(
@@ -733,7 +782,7 @@ mod tests {
         // The classifier exits to canonical on the same marker, but the
         // detector must not depend on the order those two land in.
         let (mut detector, mut at) = detector();
-        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, at);
+        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, true, at);
         settle_active(&mut detector, &mut at);
 
         let now = advance(&mut at, 100);
@@ -742,6 +791,7 @@ mod tests {
             TuiMode::Fullscreen,
             false,
             false,
+            true,
             true,
             now,
         );
@@ -754,20 +804,20 @@ mod tests {
         // shell has not printed its prompt yet. Going idle on the mode
         // change alone would blink the badge off and on between the two.
         let (mut detector, mut at) = detector();
-        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, at);
+        detector.observe(NONE, TuiMode::Fullscreen, false, false, true, true, at);
         settle_active(&mut detector, &mut at);
         assert_eq!(detector.state(), SessionActivity::Active);
 
         let now = advance(&mut at, 10);
         assert_eq!(
-            detector.observe(NONE, TuiMode::Canonical, false, false, true, now),
+            detector.observe(NONE, TuiMode::Canonical, false, false, true, true, now),
             None,
             "the mode dropped but nothing says the shell has the prompt"
         );
         assert_eq!(detector.state(), SessionActivity::Active);
 
         let now = advance(&mut at, 600);
-        let idle = detector.observe(NONE, TuiMode::Canonical, true, false, false, now);
+        let idle = detector.observe(NONE, TuiMode::Canonical, true, false, false, false, now);
         assert_eq!(idle.map(|(state, _)| state), Some(SessionActivity::Idle));
     }
 
@@ -777,13 +827,13 @@ mod tests {
         // there. None of that may announce a state clients already hold.
         let (mut detector, mut at) = detector();
         assert_eq!(
-            detector.observe(NONE, TuiMode::Canonical, false, false, true, at),
+            detector.observe(NONE, TuiMode::Canonical, false, false, true, true, at),
             None
         );
         for _ in 0..10 {
             let now = advance(&mut at, 250);
             assert_eq!(
-                detector.observe(NONE, TuiMode::Canonical, true, false, false, now),
+                detector.observe(NONE, TuiMode::Canonical, true, false, false, false, now),
                 None,
                 "idle was never left, so there is nothing to announce"
             );
@@ -820,15 +870,15 @@ mod tests {
         let (mut detector, mut at) = detector();
         detector.on_input_line(at);
         let now = advance(&mut at, 40);
-        detector.observe(NONE, TuiMode::Canonical, false, false, true, now);
+        detector.observe(NONE, TuiMode::Canonical, false, false, true, true, now);
         let now = advance(&mut at, 600);
-        detector.observe(NONE, TuiMode::Canonical, true, false, false, now);
+        detector.observe(NONE, TuiMode::Canonical, true, false, false, false, now);
         assert_eq!(detector.state(), SessionActivity::Idle, "too brief to show");
 
         detector.on_input_line(advance(&mut at, 10));
         let now = advance(&mut at, ACTIVE_MIN_MS - 1);
         assert_eq!(
-            detector.observe(NONE, TuiMode::Canonical, false, false, true, now),
+            detector.observe(NONE, TuiMode::Canonical, false, false, true, true, now),
             None,
             "the second command is still inside its own delay"
         );
@@ -847,10 +897,10 @@ mod tests {
         assert_ne!(active_since, opened, "the badge carries its own start time");
 
         let now = advance(&mut at, 100);
-        detector.observe(NONE, TuiMode::Canonical, false, false, true, now);
+        detector.observe(NONE, TuiMode::Canonical, false, false, true, true, now);
         let now = advance(&mut at, 700);
         let (_, idle_since) = detector
-            .observe(NONE, TuiMode::Canonical, true, false, false, now)
+            .observe(NONE, TuiMode::Canonical, true, false, false, false, now)
             .expect("idle");
         assert_eq!(idle_since, detector.since());
     }
@@ -861,7 +911,7 @@ mod tests {
         detector.on_input_line(at);
         let now = advance(&mut at, ACTIVE_MIN_MS);
         let (state, since) = detector
-            .observe(NONE, TuiMode::Canonical, false, false, false, now)
+            .observe(NONE, TuiMode::Canonical, false, false, false, false, now)
             .expect("active is published");
         assert_eq!(state, SessionActivity::Active);
         assert_eq!(since, detector.since());
