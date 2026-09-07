@@ -78,6 +78,33 @@ function hostsPageBackAction(state: BackNavigationState): BackAction {
   return state.hostsEmpty ? "pairFromHosts" : "navToHome";
 }
 
+/**
+ * Whether the pairing screen shows its back control (the header button and
+ * the back-swipe gesture):
+ *  - reached from the home bottom nav, back always lands somewhere useful
+ *    (the home view or the try-again screen) - show it;
+ *  - reached from the hosts page, back restores that page - show it, unless
+ *    the hosts list is loaded and empty: there, back would just open the
+ *    pairing screen again (a loop), so the screen behaves like a first
+ *    launch and hides its back control.
+ * The Android back key is deliberately decoupled from this: it still acts
+ * (backFromPairing) in every pairing state, because it is the only exit a
+ * first-launch-style screen offers.
+ */
+export interface PairBackControlInput {
+  /** The user reached the pairing screen from the hosts page. */
+  pairFromHosts: boolean;
+  /** The user reached the pairing screen from the home view's bottom nav. */
+  pairFromHome: boolean;
+  /** The hosts page finished loading and has no paired desktops. */
+  hostsEmpty: boolean;
+}
+
+export function pairScreenShowsBack(input: PairBackControlInput): boolean {
+  if (input.pairFromHome) return true;
+  return input.pairFromHosts && !input.hostsEmpty;
+}
+
 // ---- Back from the pairing screen: restoring the originating state --------
 
 export interface PairingRestoreInput {

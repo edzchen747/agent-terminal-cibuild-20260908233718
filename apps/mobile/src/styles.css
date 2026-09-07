@@ -319,8 +319,17 @@ button { color: inherit; }
 .key-row button:active, .key-row button.latched, .key-row button.held { color: var(--accent-ink); border-color: var(--accent-line-strong); background: var(--accent-tint-strong); transform: translateY(1px); box-shadow: none; }
 .key-row button.chord-pending { animation: key-armed-pulse .7s ease-in-out infinite alternate; }
 @keyframes key-armed-pulse { from { border-color: var(--accent-line-strong); } to { border-color: var(--accent); box-shadow: inset 0 0 10px var(--accent-wash); } }
-.sheet-backdrop { position: fixed; inset: 0; z-index: 20; display: flex; align-items: flex-end; background: var(--scrim); backdrop-filter: blur(3px); touch-action: pan-x; }
-.sheet-backdrop .bottom-sheet { transform: translateY(var(--sheet-drag-y, 0px)); transition: transform .25s cubic-bezier(.2,.8,.2,1); }
+/* Bottom sheets: slide up from below on open, slide back down on close
+   (SheetChrome in App.tsx drives is-open/is-closing). The scrim fades in
+   step with the sheet; while is-closing the in-flight drag-down offset
+   (--sheet-drag-y) is added on so a swipe-down dismissal exits from where
+   the finger let go. */
+.sheet-backdrop { position: fixed; inset: 0; z-index: 20; display: flex; align-items: flex-end; background: var(--scrim); backdrop-filter: blur(3px); touch-action: pan-x; opacity: 0; transition: opacity .25s cubic-bezier(.2,.8,.2,1); }
+.sheet-backdrop .bottom-sheet { transform: translateY(calc(100% + var(--sheet-drag-y, 0px))); transition: transform .25s cubic-bezier(.2,.8,.2,1); }
+.sheet-backdrop.is-open { opacity: 1; }
+.sheet-backdrop.is-open .bottom-sheet { transform: translateY(var(--sheet-drag-y, 0px)); }
+.sheet-backdrop.is-closing { opacity: 0; }
+.sheet-backdrop.is-closing .bottom-sheet { transform: translateY(calc(100% + var(--sheet-drag-y, 0px))); }
 .mobile-pager.is-sheet-dragging .sheet-backdrop .bottom-sheet { transition: none; }
 .bottom-sheet { width: 100%; padding: 11px 20px calc(18px + env(safe-area-inset-bottom)); border: 1px solid var(--border-strong); border-bottom: 0; border-radius: 22px 22px 0 0; background: var(--surface); box-shadow: 0 -20px 60px var(--shadow-deep); }
 .sheet-handle { display: block; width: 38px; height: 4px; margin: 0 auto 21px; border-radius: 2px; background: var(--border-input); }
@@ -413,7 +422,7 @@ button { color: inherit; }
 .error-screen .error-host { margin: 0 0 8px; color: var(--text-dim); font-size: 12px; font-weight: 700; }
 .error-screen .error-host strong { color: var(--text-strong); }
 @media (min-width: 700px) { .mobile-app,.onboarding,.splash,.error-screen { max-width: 520px; margin: auto; border-left: 1px solid var(--border); border-right: 1px solid var(--border); } }
-@media (prefers-reduced-motion: reduce) { .mobile-page-track, .project-card { transition-duration: 1ms; } }
+@media (prefers-reduced-motion: reduce) { .mobile-page-track, .project-card, .sheet-backdrop, .sheet-backdrop .bottom-sheet, .back-swipe-page { transition-duration: 1ms; } }
 /* Hosts page: the list of previously paired desktops */
 .hosts-section { flex: 1; min-height: 0; padding: 17px 15px 10px; overflow-y: auto; touch-action: pan-y; }
 .hosts-loading { min-height: 120px; display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--text-muted); font-size: 10px; }
@@ -450,3 +459,22 @@ button { color: inherit; }
 .host-remove:active { background: var(--danger-surface-hover); transform: scale(.96); }
 .host-remove svg { width: 16px; height: 16px; }
 .hosts-actions { flex: none; padding: 11px 15px calc(14px + env(safe-area-inset-bottom)); border-top: 1px solid var(--border); background: var(--surface); }
+/* Back swipe (hosts page, pairing screen): the view slides right over the
+   page the back gesture actually lands on (BackSwipeZone in App.tsx); a
+   committed release slides it fully off, then the navigation runs. The pane
+   and the page both ease at the pager's 280ms so back reads the same
+   everywhere in the app. */
+.back-swipe-zone { position: relative; height: 100%; overflow: hidden; touch-action: pan-y; background: var(--sunken); }
+.back-swipe-fill { position: absolute; inset: 0; overflow: hidden; background: var(--app-bg); pointer-events: none; isolation: isolate; }
+.back-swipe-fill > * { height: 100%; }
+/* The preview is a live copy of a page, and pages may carry viewport-fixed
+   controls (the home bottom nav, the registration banner). Reparent them to
+   the fill - the same box, but inside the zone - so they cannot float over
+   the page being swiped; the zone's overflow clips them with the rest.
+   isolation keeps the preview's own z-indexes (4, 18) inside the fill's
+   layer, so the page - later in DOM order - always paints over it. */
+.back-swipe-fill .bottom-nav, .back-swipe-fill .mobile-registration-banner { position: absolute; z-index: auto; }
+.back-swipe-page { height: 100%; overflow: hidden; transition: transform .28s cubic-bezier(.22,.78,.2,1); will-change: transform; }
+.back-swipe-page > .mobile-app, .back-swipe-page > .onboarding { height: 100%; }
+.back-swipe-zone.is-dragging > .back-swipe-page { transition: none; }
+.back-swipe-zone.is-exiting > .back-swipe-page { transform: translate3d(101%, 0, 0); }

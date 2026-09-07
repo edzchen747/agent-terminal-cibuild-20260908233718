@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { backButtonAction, pairingReconnectStep, pairingRestoreDecision } from "./navigationPolicy.ts";
+import { backButtonAction, pairScreenShowsBack, pairingReconnectStep, pairingRestoreDecision } from "./navigationPolicy.ts";
 
 const connected = (viewType) => ({
   status: "connected",
@@ -248,6 +248,69 @@ test("the reconnect step stays on the pairing screen when no host is saved", () 
   // A phone with no saved desktop yet (pairing never succeeded) has nothing
   // to retry: back must not strand the user on a try-again screen.
   assert.equal(pairingReconnectStep(false), "stayOnPairing");
+});
+
+// ---- Back controls on the pairing screen (button + back swipe) ------------
+
+test("the pairing screen reached from the home bottom nav always shows back", () => {
+  // The home origin's back target (home view / try-again screen) is useful in
+  // every hosts-list state, so the hosts list cannot hide the control.
+  assert.equal(pairScreenShowsBack({ pairFromHosts: false, pairFromHome: true, hostsEmpty: true }), true);
+  assert.equal(pairScreenShowsBack({ pairFromHosts: false, pairFromHome: true, hostsEmpty: false }), true);
+});
+
+test("the pairing screen reached from the hosts page shows back when desktops are paired", () => {
+  // Back restores a hosts page with rows in it: a useful destination.
+  assert.equal(pairScreenShowsBack({ pairFromHosts: true, pairFromHome: false, hostsEmpty: false }), true);
+});
+
+test("a pairing screen opened from a loaded, empty hosts list hides back", () => {
+  // Back would land on the empty hosts page, whose own back opens the
+  // pairing screen again - a loop. The screen instead behaves like a first
+  // launch: no back button, no back swipe.
+  assert.equal(pairScreenShowsBack({ pairFromHosts: true, pairFromHome: false, hostsEmpty: true }), false);
+});
+
+test("a first-launch pairing screen (no origin flag) hides back", () => {
+  assert.equal(pairScreenShowsBack({ pairFromHosts: false, pairFromHome: false, hostsEmpty: false }), false);
+});
+
+test("a hosts page that is still loading is not 'empty', so back stays visible", () => {
+  // hostsEmpty is only true once the list finished loading; a 'Pair a new
+  // desktop' tap during the load still lands back on a real (loading) hosts
+  // page, so the control must not disappear.
+  assert.equal(pairScreenShowsBack({ pairFromHosts: true, pairFromHome: false, hostsEmpty: false }), true);
+});
+
+test("when both origin flags are set, the home origin wins", () => {
+  // The flags are mutually exclusive in practice (one entry point each);
+  // the policy stays total and prefers the origin whose back target is
+  // always useful, even over an empty hosts list.
+  assert.equal(pairScreenShowsBack({ pairFromHosts: true, pairFromHome: true, hostsEmpty: true }), true);
+});
+
+test("the Android back key still acts while the back control is hidden", () => {
+  // The key is the only exit a first-launch-style pairing screen offers, so
+  // its backFromPairing action is deliberately decoupled from the button and
+  // swipe visibility: hiding the control must never change the key's answer.
+  const state = connected("home");
+  state.status = "pairing";
+  state.pairFromHosts = true;
+  state.hostsEmpty = true;
+  assert.equal(pairScreenShowsBack({ pairFromHosts: state.pairFromHosts, pairFromHome: state.pairFromHome, hostsEmpty: state.hostsEmpty }), false);
+  assert.equal(backButtonAction(state), "backFromPairing");
+});
+
+test("the full origin x empty-list matrix for the pairing screen back control", () => {
+  const spec = (input) => input.pairFromHome || (input.pairFromHosts && !input.hostsEmpty);
+  for (const pairFromHosts of [false, true]) {
+    for (const pairFromHome of [false, true]) {
+      for (const hostsEmpty of [false, true]) {
+        const input = { pairFromHosts, pairFromHome, hostsEmpty };
+        assert.equal(pairScreenShowsBack(input), spec(input), JSON.stringify(input));
+      }
+    }
+  }
 });
 
 // ---- Exhaustive sweep: every status/view/overlay combination ----------------

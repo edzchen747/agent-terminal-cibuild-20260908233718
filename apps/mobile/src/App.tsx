@@ -18,9 +18,10 @@ import { notificationStateFor, type ConnectionNotificationState } from "./connec
 import { isRetryingSavedHost } from "./connectionFlow";
 import { hostRowRegistrationStatus, hostRowStatusLabel, hostsPageCheckPlan, lastConnectedLabel, REGISTRATION_STATUS_LABELS, registrationDisplayStatusFor, type HostCheckState, type RegistrationDisplayStatus, sortHostsByLastConnected } from "./hostSelection";
 import { readRegistrationVerdict, rememberRegistrationVerdict, type RegistrationVerdict } from "./registrationCache";
-import { backButtonAction, pairingReconnectStep, pairingRestoreDecision } from "./navigationPolicy";
+import { backButtonAction, pairScreenShowsBack, pairingReconnectStep, pairingRestoreDecision } from "./navigationPolicy";
 import { deviceIdentity } from "./device";
-import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_SLIDER_HORIZONTAL_BIAS } from "./gesture";
+import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_SLIDER_HORIZONTAL_BIAS, SWIPE_COMMIT_DISTANCE_RATIO, SWIPE_COMMIT_VELOCITY_PX_MS } from "./gesture";
+import { shouldCommitBackSwipe } from "./backSwipe";
 import { effectiveDefaultShell } from "./defaultShell";
 import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, RefreshIcon, ScanIcon, SettingsIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
@@ -30,9 +31,18 @@ import { syncSystemBars } from "./systemBars";
 import { backProjectId, resolveViewGeometry } from "./projectNavigation";
 
 type View = { type: "home" } | { type: "hosts" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
+// The bottom sheets of the connected pager. While one is set, that sheet is
+// playing its slide-down exit and stays mounted until it finishes.
+type SheetKind = "settings" | "terminalSettings" | "createProject" | "rename" | "closeSession";
 const TERMINAL_FONT_WIDTH_KEY = "agent-terminal-font-width-percent";
 const SWALLOW_CLICK_LINGER_MS = 600;
 const SWALLOW_CLICK_DISTANCE_PX = 48;
+// The sheet exit matches the .25s sheet transition in styles.css; the
+// fallback covers the cases where transitions never run (screen off,
+// reduced motion), so the sheet still unmounts.
+const SHEET_EXIT_FALLBACK_MS = 400;
+// The back-swipe exit matches the pager's 280ms track transition.
+const BACK_SWIPE_EXIT_MS = 280;
 
 interface ProjectDragState {
   projectId: string;
@@ -116,6 +126,12 @@ export function App() {
   const [projectReordering, setProjectReordering] = useState(false);
   const [swipe, setSwipe] = useState<SwipeState | null>(null);
   const [sheetDragY, setSheetDragY] = useState(0);
+  // True while a finger actively drags a sheet down. Unlike sheetDragY this
+  // clears at lift-off: a committed drag keeps its offset until the sheet's
+  // exit animation has unmounted it, so the slide-down continues the drag.
+  const [sheetDragging, setSheetDragging] = useState(false);
+  // The sheet whose exit animation is running (see closeSheet).
+  const [closingSheet, setClosingSheet] = useState<SheetKind | null>(null);
   const connectionRef = useRef<HostConnection | null>(null);
   connectionRef.current = connection;
   const screenAwakeRef = useRef(true);
@@ -147,6 +163,9 @@ export function App() {
   const projectDragRef = useRef<ProjectDragState | null>(null);
   const projectElementsRef = useRef(new Map<string, HTMLElement>());
   const swipeRef = useRef<SwipeState | null>(null);
+  // The sheet whose exit is in flight, mirrored for the mount-time back-key
+  // listener (closeSheet) which would otherwise see a stale state closure.
+  const sheetClosingRef = useRef<SheetKind | null>(null);
   const suppressSwipeClickRef = useRef(false);
   const swipeClickPageRef = useRef<number | null>(null);
   const swipeClickTimerRef = useRef<number | undefined>(undefined);
@@ -233,19 +252,19 @@ export function App() {
         hostsEmpty: navigation.hostsEmpty
       })) {
         case "closeTerminalSettings":
-          setShowTerminalSettings(false);
+          closeSheet("terminalSettings");
           return;
         case "closeSettings":
-          setShowSettings(false);
+          closeSheet("settings");
           return;
         case "closeRenameSheet":
-          setProjectToRename(null);
+          closeSheet("rename");
           return;
         case "closeSessionSheet":
-          setSessionToClose(null);
+          closeSheet("closeSession");
           return;
         case "closeCreateProject":
-          setShowCreateProject(false);
+          closeSheet("createProject");
           return;
         case "backFromPairing":
           backFromPairing();
@@ -836,9 +855,60 @@ export function App() {
   async function closeSession(session: TerminalSession) {
     if (!connection) return;
     await connection.request({ type: "session.close", requestId: createRequestId(), sessionId: session.id });
-    setSessionToClose(null);
+    closeSheet("closeSession");
     setView({ type: "project", projectId: session.projectId });
   }
+
+  // The home view, shared by the pager's live first page and the back-swipe
+  // previews below: a preview instance sits in the zone's fill, where
+  // pointer events are disabled, so its controls can never fire. Computed
+  // before the early-return branches so they can hand their previews to the
+  // zone without a use-before-declaration.
+  const remoteStatus = registrationDisplayStatusFor(remoteRegistration.status, online);
+  const remoteStatusLabel = REGISTRATION_STATUS_LABELS[remoteStatus];
+  const homeView = connection && snapshot ? (
+    <HomeScreen
+      snapshot={snapshot}
+      remoteRegistration={remoteRegistration}
+      remoteStatus={remoteStatus}
+      remoteStatusLabel={remoteStatusLabel}
+      orderedProjects={orderedProjects}
+      projectDrag={projectDrag}
+      projectReordering={projectReordering}
+      transformFor={projectDragTransform}
+      cardElement={(projectId, element) => { if (element) projectElementsRef.current.set(projectId, element); else projectElementsRef.current.delete(projectId); }}
+      onDragStart={beginProjectDrag}
+      onDragMove={moveProjectDrag}
+      onDragEnd={finishProjectDrag}
+      onRetryRegistration={() => void connection.retryRemoteRegistration()}
+      onOpenProject={openProject}
+      onOpenSession={openTerminal}
+      onShowSettings={() => setShowSettings(true)}
+      onShowCreateProject={() => setShowCreateProject(true)}
+      onPairNew={enterPairFromHome}
+      onOpenHosts={openHosts}
+    />
+  ) : null;
+
+  // The page a back swipe on the hosts page actually lands on (navigateBack):
+  // the try-again screen when the hosts page was reached from there, the
+  // pairing screen when no desktop is paired (back opens pairing there),
+  // otherwise the home view.
+  const hostsBackPreview = status === "error"
+    ? <ErrorScreen message={error} hostName={hostName || undefined} onRetry={() => window.location.reload()} onConnectDifferent={openHosts} />
+    : hostsLoaded && hostRecords.length === 0
+      ? <PairScreen error={error} manualCode={manualCode} showManual={showManual} onManualCode={setManualCode} onShowManual={() => setShowManual(true)} onScan={() => void scan()} onPair={() => void pair(manualCode)} />
+      : homeView;
+
+  // The page a back swipe on the pairing screen actually lands on
+  // (backFromPairing): the page it was opened from - the hosts page (or the
+  // try-again screen when pairing started after a failed connection), or the
+  // home view when the home bottom nav started it.
+  const pairBackPreview = pairFromHosts
+    ? prePairStatusRef.current === "error"
+      ? <ErrorScreen message={prePairErrorRef.current} hostName={hostName || undefined} onRetry={() => window.location.reload()} onConnectDifferent={openHosts} />
+      : <HostsPage records={hostRecords} loaded={hostsLoaded} connectedId={connection?.host.id ?? null} registration={remoteRegistration} online={online} checks={hostChecks} refreshing={hostsRefreshing} onBack={navigateBack} onSelect={(record) => selectHost(record)} onRemove={(record) => void removeHost(record)} onPairNew={enterPairFromHosts} onRefresh={() => void refreshHosts()} />
+    : connection && snapshot ? homeView : <ErrorScreen message={error} hostName={hostName || undefined} onRetry={() => window.location.reload()} onConnectDifferent={openHosts} />;
 
   if (status === "loading" || status === "connecting") {
     // The cancel control only makes sense while a saved desktop connection is
@@ -847,12 +917,19 @@ export function App() {
     const retryingSavedHost = isRetryingSavedHost(status, connection !== null);
     return <Splash label={status === "loading" ? "Opening Agent Terminal" : error || "Connecting to desktop"} hostName={retryingSavedHost ? hostName : undefined} onCancel={retryingSavedHost ? cancelConnection : undefined} />;
   }
-  if (status === "pairing") return <PairScreen error={error} manualCode={manualCode} showManual={showManual} onManualCode={setManualCode} onShowManual={() => setShowManual(true)} onScan={() => void scan()} onPair={() => void pair(manualCode)} onBack={(pairFromHosts || pairFromHome) ? backFromPairing : undefined} />;
+  if (status === "pairing") {
+    // From an empty hosts list, back has no useful destination (it would just
+    // open the pairing screen again), so that pairing screen behaves like a
+    // first launch: no back button and no back swipe. The branch choices
+    // live in navigationPolicy.pairScreenShowsBack so they stay tested.
+    const pairShowsBack = pairScreenShowsBack({ pairFromHosts, pairFromHome, hostsEmpty: hostsLoaded && hostRecords.length === 0 });
+    return <PairScreen error={error} manualCode={manualCode} showManual={showManual} onManualCode={setManualCode} onShowManual={() => setShowManual(true)} onScan={() => void scan()} onPair={() => void pair(manualCode)} onBack={pairShowsBack ? backFromPairing : undefined} preview={pairShowsBack ? pairBackPreview : undefined} />;
+  }
   if (view.type === "hosts" && (status === "connected" || status === "error")) {
     // Reached from home the live connection stays open and its row carries
     // the "connected" indicator; reached from the try-again screen the error
     // status is retained, so back returns there.
-    return <HostsPage records={hostRecords} loaded={hostsLoaded} connectedId={connection?.host.id ?? null} registration={remoteRegistration} online={online} checks={hostChecks} refreshing={hostsRefreshing} onBack={navigateBack} onSelect={(record) => selectHost(record)} onRemove={(record) => void removeHost(record)} onPairNew={enterPairFromHosts} onRefresh={() => void refreshHosts()} />;
+    return <HostsPage records={hostRecords} loaded={hostsLoaded} connectedId={connection?.host.id ?? null} registration={remoteRegistration} online={online} checks={hostChecks} refreshing={hostsRefreshing} onBack={navigateBack} onSelect={(record) => selectHost(record)} onRemove={(record) => void removeHost(record)} onPairNew={enterPairFromHosts} onRefresh={() => void refreshHosts()} preview={hostsBackPreview} />;
   }
   if (status === "error") return <ErrorScreen message={error} hostName={hostName || undefined} onRetry={() => window.location.reload()} onConnectDifferent={openHosts} />;
   if (!connection || !snapshot) return null;
@@ -869,8 +946,6 @@ export function App() {
     requestedProjectId,
     requestedSessionId
   });
-  const remoteStatus = registrationDisplayStatusFor(remoteRegistration.status, online);
-  const remoteStatusLabel = REGISTRATION_STATUS_LABELS[remoteStatus];
 
   function beginSwipe(event: ReactPointerEvent<HTMLDivElement>) {
     // A new pointer sequence is a fresh interaction. Do not let a delayed
@@ -931,6 +1006,7 @@ export function App() {
         }
         const next = { ...current, sheetDragging: true, deltaY };
         swipeRef.current = next;
+        setSheetDragging(true);
         setSheetDragY(deltaY);
         return;
       }
@@ -969,15 +1045,21 @@ export function App() {
     if (current.overlay) {
       swipeRef.current = null;
       setSwipe(null);
+      setSheetDragging(false);
       if (current.sheetDragging && !cancelled && !current.blocked) {
         const elapsed = Math.max(1, performance.now() - current.startedAt);
         const distancePx = Math.max(0, event.clientY - current.startY);
         if (shouldCommitSheetDismiss({ cancelled, distancePx, velocityPxPerMs: distancePx / elapsed }) && !document.querySelector(".sheet-backdrop[data-busy]")) {
           dismissActiveSheet();
           squashSwipeClick(event);
+          // The exit starts from where the finger let go: the drag offset is
+          // released only when the sheet actually unmounts (finishSheetClose).
+        } else {
+          setSheetDragY(0);
         }
+      } else {
+        setSheetDragY(0);
       }
-      setSheetDragY(0);
       // Taps inside the sheet still need the click bridge: a taut tap on a
       // sheet control is fired directly so it works right after a drag.
       if (!cancelled) bridgeTapClick(event, current);
@@ -986,7 +1068,7 @@ export function App() {
     const elapsed = Math.max(1, performance.now() - current.startedAt);
     const velocity = Math.abs(current.deltaX) / elapsed;
     const canNavigate = current.deltaX > 0 ? currentPage > 0 : currentPage < pageCount - 1;
-    const commit = !cancelled && current.horizontal && canNavigate && (Math.abs(current.deltaX) > window.innerWidth * .22 || velocity > .55);
+    const commit = !cancelled && current.horizontal && canNavigate && (Math.abs(current.deltaX) > window.innerWidth * SWIPE_COMMIT_DISTANCE_RATIO || velocity > SWIPE_COMMIT_VELOCITY_PX_MS);
     const targetPage = commit ? currentPage + (current.deltaX < 0 ? 1 : -1) : currentPage;
     swipeRef.current = null;
     setSwipe(null);
@@ -1082,12 +1164,42 @@ export function App() {
     event.stopPropagation();
   }
 
+  // Close request that plays the sheet's exit animation. Every close path
+  // (a control in the sheet, a backdrop tap, the Android back key, a
+  // swipe-down dismissal, a confirmed session close) goes through here: the
+  // sheet stays mounted while it slides down, and finishSheetClose
+  // unmounts it once the exit has finished.
+  function closeSheet(kind: SheetKind) {
+    // Sheets are mutually exclusive; a close already in flight must not be
+    // restarted (a second request while a sheet is sliding down is a no-op
+    // - the unmount in flight owns the cleanup).
+    if (sheetClosingRef.current !== null) return;
+    sheetClosingRef.current = kind;
+    setClosingSheet(kind);
+  }
+
+  function finishSheetClose(kind: SheetKind) {
+    if (sheetClosingRef.current !== kind) return;
+    sheetClosingRef.current = null;
+    setClosingSheet(null);
+    switch (kind) {
+      case "createProject": setShowCreateProject(false); break;
+      case "rename": setProjectToRename(null); break;
+      case "closeSession": setSessionToClose(null); break;
+      case "terminalSettings": setShowTerminalSettings(false); break;
+      case "settings": setShowSettings(false); break;
+    }
+    // The sheet is gone: release the drag offset a swipe-down dismissal
+    // left behind, so the next sheet opens from its base position.
+    setSheetDragY(0);
+  }
+
   function dismissActiveSheet() {
-    if (showSettings) { setShowSettings(false); return; }
-    if (showTerminalSettings) { setShowTerminalSettings(false); return; }
-    if (projectToRename) { setProjectToRename(null); return; }
-    if (sessionToClose) { setSessionToClose(null); return; }
-    if (showCreateProject) { setShowCreateProject(false); return; }
+    if (showSettings) { closeSheet("settings"); return; }
+    if (showTerminalSettings) { closeSheet("terminalSettings"); return; }
+    if (projectToRename) { closeSheet("rename"); return; }
+    if (sessionToClose) { closeSheet("closeSession"); return; }
+    if (showCreateProject) { closeSheet("createProject"); return; }
   }
 
   function squashSwipeClick(event: ReactPointerEvent<HTMLDivElement>) {
@@ -1103,34 +1215,30 @@ export function App() {
     }, SWALLOW_CLICK_LINGER_MS);
   }
 
-  return <div className={`mobile-pager ${sheetDragY > 0 ? "is-sheet-dragging" : ""}`} style={{ ["--sheet-drag-y" as string]: `${sheetDragY}px` } as React.CSSProperties} onPointerDownCapture={beginSwipe} onTouchStartCapture={() => { suppressSwipeClickRef.current = false; swipeClickPageRef.current = null; if (swipeClickTimerRef.current !== undefined) window.clearTimeout(swipeClickTimerRef.current); swipeClickTimerRef.current = undefined; swallowTapClickRef.current = false; if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current); swallowTapClickTimerRef.current = undefined; }} onPointerMoveCapture={moveSwipe} onPointerUpCapture={(event) => finishSwipe(event)} onPointerCancelCapture={(event) => finishSwipe(event)} onClickCapture={suppressSwipeClick}>
+  return <div className={`mobile-pager ${sheetDragging ? "is-sheet-dragging" : ""}`} style={{ ["--sheet-drag-y" as string]: `${sheetDragY}px` } as React.CSSProperties} onPointerDownCapture={beginSwipe} onTouchStartCapture={() => { suppressSwipeClickRef.current = false; swipeClickPageRef.current = null; if (swipeClickTimerRef.current !== undefined) window.clearTimeout(swipeClickTimerRef.current); swipeClickTimerRef.current = undefined; swallowTapClickRef.current = false; if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current); swallowTapClickTimerRef.current = undefined; }} onPointerMoveCapture={moveSwipe} onPointerUpCapture={(event) => finishSwipe(event)} onPointerCancelCapture={(event) => finishSwipe(event)} onClickCapture={suppressSwipeClick}>
     <div className={`mobile-page-track ${swipe?.horizontal ? "is-dragging" : ""}`} style={{ transform: `translate3d(calc(${-currentPage * 100}% + ${swipe?.deltaX ?? 0}px),0,0)` }}>
-      <div className="mobile-page"><div className="mobile-app home-view">
-        <RemoteRegistrationBanner state={remoteRegistration} onRetry={() => void connection.retryRemoteRegistration()} />
-        <header className="home-header">
-          <div><span className="eyebrow">Connected desktop</span><h1>{snapshot.host.name}</h1><span className="connection-label"><i /> Online · {snapshot.sessions.filter((s) => s.status === "running").length} sessions</span></div>
-          <div className="home-header-actions"><span className={`mobile-remote-status is-${remoteStatus}`} role="status"><i />{remoteStatusLabel}</span><button className="round-button" onClick={() => setShowSettings(true)} title="Settings" aria-label="App settings"><MoreIcon /></button></div>
-        </header>
-        <section className="home-content">
-          <div className="section-title"><span>Projects</span><button onClick={() => setShowCreateProject(true)}><PlusIcon /> New</button></div>
-          <div className="project-cards">
-            {orderedProjects.map((project, index) => <ProjectCard key={project.id} elementRef={(element) => { if (element) projectElementsRef.current.set(project.id, element); else projectElementsRef.current.delete(project.id); }} project={project} sessions={snapshot.sessions.filter((session) => session.projectId === project.id)} dragging={project.id === projectDrag?.projectId} reordering={projectReordering} transform={projectDragTransform(project.id, index)} onDragStart={(event) => beginProjectDrag(event, project.id, index)} onDragMove={moveProjectDrag} onDragEnd={(event, commit) => finishProjectDrag(event, commit)} onClick={() => openProject(project.id)} onSession={openTerminal} />)}
-          </div>
-          {!snapshot.projects.length && <div className="mobile-empty"><FolderIcon /><h2>No projects yet</h2><p>Add a folder from your desktop to begin.</p></div>}
-        </section>
-        <nav className="bottom-nav"><button className="active"><FolderIcon /><span>Projects</span></button><button onClick={enterPairFromHome}><ScanIcon /><span>Pair</span></button><button onClick={openHosts}><WifiIcon /><span>Hosts</span></button></nav>
-      </div></div>
+      <div className="mobile-page">{homeView}</div>
       {activeProject && <div className="mobile-page"><ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={navigateBack} onRename={() => setProjectToRename(activeProject)} onOpen={openTerminal} /></div>}
       {activeProject && activeSession && <div className="mobile-page"><div className="mobile-app terminal-view">
         <MobileHeader title={activeSession.title} subtitle={activeProject.name} onBack={navigateBack} trailing={<div className="session-actions"><span className={`session-state ${activeSession.status}`}>{activeSession.status}</span><button className="terminal-settings-button" onClick={() => setShowTerminalSettings(true)} aria-label="Terminal display settings"><SettingsIcon /></button><button className="close-session-button" onClick={() => setSessionToClose(activeSession)} aria-label="Close terminal session" title="Close terminal session"><CloseIcon /></button></div>} />
         <MobileTerminal key={activeSession.id} active={view.type === "terminal"} fontWidthScale={fontWidthPercent / 100} connection={connection} session={activeSession} scheme={terminalScheme} />
       </div></div>}
     </div>
-    {showCreateProject && <CreateProjectSheet connection={connection} onClose={() => setShowCreateProject(false)} />}
-    {projectToRename && activeProject?.id === projectToRename.id && <RenameProjectSheet project={activeProject} connection={connection} onClose={() => setProjectToRename(null)} />}
-    {sessionToClose && activeSession?.id === sessionToClose.id && <CloseSessionSheet session={activeSession} onClose={() => setSessionToClose(null)} onConfirm={() => closeSession(activeSession)} />}
-    {showTerminalSettings && <TerminalSettingsSheet snapshot={snapshot} connection={connection} value={fontWidthPercent} onChange={(value) => { setFontWidthPercent(value); void Preferences.set({ key: TERMINAL_FONT_WIDTH_KEY, value: String(value) }); }} themePreference={themePreference} onThemeChange={setThemePreference} resolvedTheme={resolvedTheme} onClose={() => setShowTerminalSettings(false)} />}
-    {showSettings && <SettingsSheet snapshot={snapshot} connection={connection} fontWidthPercent={fontWidthPercent} onFontWidthChange={(value) => { setFontWidthPercent(value); void Preferences.set({ key: TERMINAL_FONT_WIDTH_KEY, value: String(value) }); }} themePreference={themePreference} onThemeChange={setThemePreference} resolvedTheme={resolvedTheme} onClose={() => setShowSettings(false)} />}
+    {(showCreateProject || closingSheet === "createProject") && (
+      <CreateProjectSheet connection={connection} closing={closingSheet === "createProject"} onClose={() => closeSheet("createProject")} onClosed={() => finishSheetClose("createProject")} />
+    )}
+    {projectToRename && ((activeProject?.id === projectToRename.id) || closingSheet === "rename") && (
+      <RenameProjectSheet project={projectToRename} connection={connection} closing={closingSheet === "rename"} onClose={() => closeSheet("rename")} onClosed={() => finishSheetClose("rename")} />
+    )}
+    {sessionToClose && ((activeSession?.id === sessionToClose.id) || closingSheet === "closeSession") && (
+      <CloseSessionSheet session={sessionToClose} closing={closingSheet === "closeSession"} onClose={() => closeSheet("closeSession")} onConfirm={() => closeSession(sessionToClose)} onClosed={() => finishSheetClose("closeSession")} />
+    )}
+    {(showTerminalSettings || closingSheet === "terminalSettings") && (
+      <TerminalSettingsSheet snapshot={snapshot} connection={connection} value={fontWidthPercent} onChange={(value) => { setFontWidthPercent(value); void Preferences.set({ key: TERMINAL_FONT_WIDTH_KEY, value: String(value) }); }} themePreference={themePreference} onThemeChange={setThemePreference} resolvedTheme={resolvedTheme} closing={closingSheet === "terminalSettings"} onClose={() => closeSheet("terminalSettings")} onClosed={() => finishSheetClose("terminalSettings")} />
+    )}
+    {(showSettings || closingSheet === "settings") && (
+      <SettingsSheet snapshot={snapshot} connection={connection} fontWidthPercent={fontWidthPercent} onFontWidthChange={(value) => { setFontWidthPercent(value); void Preferences.set({ key: TERMINAL_FONT_WIDTH_KEY, value: String(value) }); }} themePreference={themePreference} onThemeChange={setThemePreference} resolvedTheme={resolvedTheme} closing={closingSheet === "settings"} onClose={() => closeSheet("settings")} onClosed={() => finishSheetClose("settings")} />
+    )}
   </div>;
 }
 
@@ -1219,13 +1327,121 @@ function ProjectCard({ project, sessions, dragging, reordering, transform, eleme
   </article>;
 }
 
-function TerminalSettingsSheet({ snapshot, connection, value, onChange, themePreference, onThemeChange, resolvedTheme, onClose }: { snapshot: HostSnapshot; connection: HostConnection; value: number; onChange: (value: number) => void; themePreference: ThemePreference; onThemeChange: (value: ThemePreference) => void; resolvedTheme: ResolvedTheme; onClose: () => void }) {
+/**
+ * The home view (the pager's first page). One component so the pager's live
+ * page and the back-swipe previews (hosts page, pairing screen) render
+ * exactly the same thing: the preview instance sits in the zone's fill,
+ * where pointer events are disabled, so its controls can never fire.
+ */
+function HomeScreen({ snapshot, remoteRegistration, remoteStatus, remoteStatusLabel, orderedProjects, projectDrag, projectReordering, transformFor, cardElement, onDragStart, onDragMove, onDragEnd, onRetryRegistration, onOpenProject, onOpenSession, onShowSettings, onShowCreateProject, onPairNew, onOpenHosts }: {
+  snapshot: HostSnapshot;
+  remoteRegistration: RemoteRegistrationState;
+  remoteStatus: RegistrationDisplayStatus;
+  remoteStatusLabel: string;
+  orderedProjects: Project[];
+  projectDrag: ProjectDragState | null;
+  projectReordering: boolean;
+  transformFor: (projectId: string, index: number) => string | undefined;
+  cardElement: (projectId: string, element: HTMLElement | null) => void;
+  onDragStart: (event: ReactPointerEvent<HTMLElement>, projectId: string, index: number) => void;
+  onDragMove: (event: ReactPointerEvent<HTMLElement>) => void;
+  onDragEnd: (event: ReactPointerEvent<HTMLElement>, commit: boolean) => void;
+  onRetryRegistration: () => void;
+  onOpenProject: (projectId: string) => void;
+  onOpenSession: (session: TerminalSession) => void;
+  onShowSettings: () => void;
+  onShowCreateProject: () => void;
+  onPairNew: () => void;
+  onOpenHosts: () => void;
+}) {
+  return <div className="mobile-app home-view">
+    <RemoteRegistrationBanner state={remoteRegistration} onRetry={onRetryRegistration} />
+    <header className="home-header">
+      <div><span className="eyebrow">Connected desktop</span><h1>{snapshot.host.name}</h1><span className="connection-label"><i /> Online · {snapshot.sessions.filter((s) => s.status === "running").length} sessions</span></div>
+      <div className="home-header-actions"><span className={`mobile-remote-status is-${remoteStatus}`} role="status"><i />{remoteStatusLabel}</span><button className="round-button" onClick={onShowSettings} title="Settings" aria-label="App settings"><MoreIcon /></button></div>
+    </header>
+    <section className="home-content">
+      <div className="section-title"><span>Projects</span><button onClick={onShowCreateProject}><PlusIcon /> New</button></div>
+      <div className="project-cards">
+        {orderedProjects.map((project, index) => <ProjectCard key={project.id} elementRef={(element) => cardElement(project.id, element)} project={project} sessions={snapshot.sessions.filter((session) => session.projectId === project.id)} dragging={project.id === projectDrag?.projectId} reordering={projectReordering} transform={transformFor(project.id, index)} onDragStart={(event) => onDragStart(event, project.id, index)} onDragMove={onDragMove} onDragEnd={onDragEnd} onClick={() => onOpenProject(project.id)} onSession={onOpenSession} />)}
+      </div>
+      {!snapshot.projects.length && <div className="mobile-empty"><FolderIcon /><h2>No projects yet</h2><p>Add a folder from your desktop to begin.</p></div>}
+    </section>
+    <nav className="bottom-nav"><button className="active"><FolderIcon /><span>Projects</span></button><button onClick={onPairNew}><ScanIcon /><span>Pair</span></button><button onClick={onOpenHosts}><WifiIcon /><span>Hosts</span></button></nav>
+  </div>;
+}
+
+/**
+ * Bottom-sheet chrome with the slide-up/slide-down animation: on mount the
+ * sheet starts off-screen below the transparent scrim and slides up; while
+ * `closing` is true it slides back down and fires `onClosed` once the exit
+ * transition ends (a timer covers the cases where transitions never run)
+ * so the parent can unmount it.
+ */
+function SheetChrome({ closing, busy, sheetClass, onDismiss, onClosed, children }: {
+  closing: boolean;
+  /** A request is in flight; a backdrop tap must not close the sheet. */
+  busy?: boolean;
+  sheetClass?: string;
+  onDismiss: () => void;
+  onClosed: () => void;
+  children: React.ReactNode;
+}) {
+  const [entered, setEntered] = useState(false);
+  const closedRef = useRef(false);
+  useEffect(() => {
+    // Two frames: the first paint holds the off-screen start position, the
+    // second flips to open so the slide-up transition runs.
+    let inner: number | undefined;
+    const outer = window.requestAnimationFrame(() => { inner = window.requestAnimationFrame(() => setEntered(true)); });
+    return () => {
+      window.cancelAnimationFrame(outer);
+      if (inner !== undefined) window.cancelAnimationFrame(inner);
+    };
+  }, []);
+  useEffect(() => {
+    if (!closing) return;
+    const timer = window.setTimeout(() => {
+      if (closedRef.current) return;
+      closedRef.current = true;
+      onClosed();
+    }, SHEET_EXIT_FALLBACK_MS);
+    return () => window.clearTimeout(timer);
+  }, [closing, onClosed]);
+  return (
+    <div
+      className={`sheet-backdrop${entered ? " is-open" : ""}${closing ? " is-closing" : ""}`}
+      data-busy={busy ? "" : undefined}
+      onClick={busy || closing ? undefined : onDismiss}
+    >
+      <section
+        className={`bottom-sheet${sheetClass ? ` ${sheetClass}` : ""}`}
+        data-no-swipe
+        onClick={(event) => event.stopPropagation()}
+        onTransitionEnd={(event) => {
+          // The sheet's own transform transition is the exit signal; the
+          // backdrop's opacity end lands on the backdrop and a child's
+          // transitionend bubbles up, so only the section itself counts.
+          if (closing && !closedRef.current && event.target === event.currentTarget && event.propertyName === "transform") {
+            closedRef.current = true;
+            onClosed();
+          }
+        }}
+      >
+        <i className="sheet-handle" />
+        {children}
+      </section>
+    </div>
+  );
+}
+
+function TerminalSettingsSheet({ snapshot, connection, value, onChange, themePreference, onThemeChange, resolvedTheme, closing, onClose, onClosed }: { snapshot: HostSnapshot; connection: HostConnection; value: number; onChange: (value: number) => void; themePreference: ThemePreference; onThemeChange: (value: ThemePreference) => void; resolvedTheme: ResolvedTheme; closing: boolean; onClose: () => void; onClosed: () => void }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  return <div className="sheet-backdrop" data-busy={saving ? "" : undefined} onClick={saving ? undefined : onClose}><section className="bottom-sheet terminal-settings-sheet" data-no-swipe onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Terminal display</span><h2>Appearance</h2>
+  return <SheetChrome closing={closing} busy={saving} sheetClass="terminal-settings-sheet" onDismiss={onClose} onClosed={onClosed}><span className="eyebrow">Terminal display</span><h2>Appearance</h2>
     <TerminalPreferences snapshot={snapshot} connection={connection} fontWidthPercent={value} onFontWidthChange={onChange} themePreference={themePreference} onThemeChange={onThemeChange} resolvedTheme={resolvedTheme} saving={saving} onSavingChange={setSaving} onError={setError} />
     {error && <div className="form-error">{error}</div>}
-    <button className="mobile-primary full" onClick={onClose}>Done</button></section></div>;
+    <button className="mobile-primary full" onClick={onClose}>Done</button></SheetChrome>;
 }
 
 /** The slider and its live preview, in one box. */
@@ -1266,7 +1482,7 @@ function TerminalPreferences({ snapshot, connection, fontWidthPercent, onFontWid
   </>;
 }
 
-function SettingsSheet({ snapshot, connection, fontWidthPercent, onFontWidthChange, themePreference, onThemeChange, resolvedTheme, onClose }: { snapshot: HostSnapshot; connection: HostConnection; fontWidthPercent: number; onFontWidthChange: (value: number) => void; themePreference: ThemePreference; onThemeChange: (value: ThemePreference) => void; resolvedTheme: ResolvedTheme; onClose: () => void }) {
+function SettingsSheet({ snapshot, connection, fontWidthPercent, onFontWidthChange, themePreference, onThemeChange, resolvedTheme, closing, onClose, onClosed }: { snapshot: HostSnapshot; connection: HostConnection; fontWidthPercent: number; onFontWidthChange: (value: number) => void; themePreference: ThemePreference; onThemeChange: (value: ThemePreference) => void; resolvedTheme: ResolvedTheme; closing: boolean; onClose: () => void; onClosed: () => void }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const selectedShellId = effectiveDefaultShell(snapshot.shells, snapshot.defaultShellId);
@@ -1280,17 +1496,17 @@ function SettingsSheet({ snapshot, connection, fontWidthPercent, onFontWidthChan
       setSaving(false);
     }
   }
-  return <div className="sheet-backdrop" data-busy={saving ? "" : undefined} onClick={saving ? undefined : onClose}><section className="bottom-sheet" data-no-swipe onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Settings</span><h2>Preferences</h2>
+  return <SheetChrome closing={closing} busy={saving} onDismiss={onClose} onClosed={onClosed}><span className="eyebrow">Settings</span><h2>Preferences</h2>
     <TerminalPreferences snapshot={snapshot} connection={connection} fontWidthPercent={fontWidthPercent} onFontWidthChange={onFontWidthChange} themePreference={themePreference} onThemeChange={onThemeChange} resolvedTheme={resolvedTheme} saving={saving} onSavingChange={setSaving} onError={setError} />
     <div className="settings-group">
       <label className="settings-field"><span><strong>Default terminal</strong></span><select value={selectedShellId} disabled={saving || !snapshot.shells.length} onChange={(event) => void syncDefaultShell(event.target.value)}>{snapshot.shells.map((shell) => <option key={shell.id} value={shell.id}>{shell.name}</option>)}</select></label>
     </div>
     {!snapshot.shells.length && <div className="form-error">No terminal profiles are available on the desktop.</div>}
     {error && <div className="form-error">{error}</div>}
-    <button className="mobile-primary full" onClick={onClose}>Done</button></section></div>;
+    <button className="mobile-primary full" onClick={onClose}>Done</button></SheetChrome>;
 }
 
-function CreateProjectSheet({ connection, onClose }: { connection: HostConnection; onClose: () => void }) {
+function CreateProjectSheet({ connection, closing, onClose, onClosed }: { connection: HostConnection; closing: boolean; onClose: () => void; onClosed: () => void }) {
   const [name, setName] = useState("");
   const [listing, setListing] = useState<DirectoryListing | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1313,10 +1529,10 @@ function CreateProjectSheet({ connection, onClose }: { connection: HostConnectio
     try { await connection.request({ type: "project.create", requestId: createRequestId(), name: name.trim() || listing.path.split(/[\\/]/).filter(Boolean).at(-1) || "Project", path: listing.path }); onClose(); }
     catch (cause) { setError(cause instanceof Error ? cause.message : "Could not create the project."); }
   }
-  return <div className="sheet-backdrop" onClick={onClose}><section className="bottom-sheet folder-picker-sheet" onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Desktop project</span><h2>Choose a folder</h2><p>Browse folders on {connection.host.name}, then add the current folder as a project.</p><label>Project name (optional)<input maxLength={MAX_PROJECT_NAME_LENGTH} value={name} onChange={(event) => setName(event.target.value)} placeholder={listing?.path.split(/[\\/]/).filter(Boolean).at(-1) || "Project name"} /></label><div className="folder-location"><button disabled={!listing?.parentPath || loading} onClick={() => void openFolder(listing?.parentPath)} aria-label="Parent folder"><BackIcon /></button><span>{listing?.path ?? "Opening desktop folders…"}</span></div><div className="folder-list" aria-busy={loading}>{loading ? <div className="folder-loading"><i className="loader" />Loading folders…</div> : listing?.directories.length ? listing.directories.map((directory) => <button key={directory.path} onClick={() => void openFolder(directory.path)}><FolderIcon /><span>{directory.name}</span><ChevronIcon /></button>) : <div className="folder-empty">This folder has no subfolders.</div>}</div>{error && <div className="form-error">{error}</div>}<button className="mobile-primary full" disabled={!listing || loading} onClick={() => void submit()}>Add this folder</button><button className="text-button" onClick={onClose}>Cancel</button></section></div>;
+  return <SheetChrome closing={closing} sheetClass="folder-picker-sheet" onDismiss={onClose} onClosed={onClosed}><span className="eyebrow">Desktop project</span><h2>Choose a folder</h2><p>Browse folders on {connection.host.name}, then add the current folder as a project.</p><label>Project name (optional)<input maxLength={MAX_PROJECT_NAME_LENGTH} value={name} onChange={(event) => setName(event.target.value)} placeholder={listing?.path.split(/[\\/]/).filter(Boolean).at(-1) || "Project name"} /></label><div className="folder-location"><button disabled={!listing?.parentPath || loading} onClick={() => void openFolder(listing?.parentPath)} aria-label="Parent folder"><BackIcon /></button><span>{listing?.path ?? "Opening desktop folders…"}</span></div><div className="folder-list" aria-busy={loading}>{loading ? <div className="folder-loading"><i className="loader" />Loading folders…</div> : listing?.directories.length ? listing.directories.map((directory) => <button key={directory.path} onClick={() => void openFolder(directory.path)}><FolderIcon /><span>{directory.name}</span><ChevronIcon /></button>) : <div className="folder-empty">This folder has no subfolders.</div>}</div>{error && <div className="form-error">{error}</div>}<button className="mobile-primary full" disabled={!listing || loading} onClick={() => void submit()}>Add this folder</button><button className="text-button" onClick={onClose}>Cancel</button></SheetChrome>;
 }
 
-function RenameProjectSheet({ project, connection, onClose }: { project: Project; connection: HostConnection; onClose: () => void }) {
+function RenameProjectSheet({ project, connection, closing, onClose, onClosed }: { project: Project; connection: HostConnection; closing: boolean; onClose: () => void; onClosed: () => void }) {
   const [name, setName] = useState(project.name);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -1331,35 +1547,177 @@ function RenameProjectSheet({ project, connection, onClose }: { project: Project
       setSaving(false);
     }
   }
-  return <div className="sheet-backdrop" data-busy={saving ? "" : undefined} onClick={saving ? undefined : onClose}><section className="bottom-sheet" onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Project name</span><h2>Rename project</h2><p>The desktop folder stays at {project.path}. Leave the name blank to use the folder name.</p><label>Name<input autoFocus maxLength={MAX_PROJECT_NAME_LENGTH} value={name} onChange={(event) => setName(event.target.value)} /></label>{error && <div className="form-error">{error}</div>}<button className="mobile-primary full" disabled={saving} onClick={() => void submit()}>{saving ? "Renaming…" : "Save name"}</button><button className="text-button" disabled={saving} onClick={onClose}>Cancel</button></section></div>;
+  return <SheetChrome closing={closing} busy={saving} onDismiss={onClose} onClosed={onClosed}><span className="eyebrow">Project name</span><h2>Rename project</h2><p>The desktop folder stays at {project.path}. Leave the name blank to use the folder name.</p><label>Name<input autoFocus maxLength={MAX_PROJECT_NAME_LENGTH} value={name} onChange={(event) => setName(event.target.value)} /></label>{error && <div className="form-error">{error}</div>}<button className="mobile-primary full" disabled={saving} onClick={() => void submit()}>{saving ? "Renaming…" : "Save name"}</button><button className="text-button" disabled={saving} onClick={onClose}>Cancel</button></SheetChrome>;
 }
 
-function CloseSessionSheet({ session, onClose, onConfirm }: { session: TerminalSession; onClose: () => void; onConfirm: () => Promise<void> }) {
-  const [closing, setClosing] = useState(false);
+function CloseSessionSheet({ session, closing, onClose, onConfirm, onClosed }: { session: TerminalSession; closing: boolean; onClose: () => void; onConfirm: () => Promise<void>; onClosed: () => void }) {
+  // `closing` is the sheet's own exit animation; `busy` is the in-flight
+  // session-close request (its backdrop tap is held back the same way).
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   async function confirm() {
-    setClosing(true); setError("");
+    setBusy(true); setError("");
     try { await onConfirm(); }
-    catch (cause) { setError(cause instanceof Error ? cause.message : "Could not close the terminal session."); setClosing(false); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Could not close the terminal session."); setBusy(false); }
   }
-  return <div className="sheet-backdrop" data-busy={closing ? "" : undefined} onClick={closing ? undefined : onClose}><section className="bottom-sheet confirm-sheet" onClick={(event) => event.stopPropagation()}><i className="sheet-handle" /><span className="eyebrow">Close terminal</span><h2>End this session?</h2><p>This will terminate <strong title={session.title}>{session.title}</strong> and remove its tab from the desktop and phone.</p>{error && <div className="form-error">{error}</div>}<button className="danger-button" disabled={closing} onClick={() => void confirm()}>{closing ? "Closing…" : "Close terminal"}</button><button className="text-button" disabled={closing} onClick={onClose}>Cancel</button></section></div>;
+  return <SheetChrome closing={closing} busy={busy} sheetClass="confirm-sheet" onDismiss={onClose} onClosed={onClosed}><span className="eyebrow">Close terminal</span><h2>End this session?</h2><p>This will terminate <strong title={session.title}>{session.title}</strong> and remove its tab from the desktop and phone.</p>{error && <div className="form-error">{error}</div>}<button className="danger-button" disabled={busy} onClick={() => void confirm()}>{busy ? "Closing…" : "Close terminal"}</button><button className="text-button" disabled={busy} onClick={onClose}>Cancel</button></SheetChrome>;
+}
+
+interface BackSwipeDragState {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  startedAt: number;
+  deltaX: number;
+  horizontal: boolean;
+}
+
+/**
+ * Wraps a full-screen view (the hosts page, the pairing screen) with a
+ * back swipe: a rightward drag slides the view right, revealing `preview`
+ * - the page the back gesture actually lands on - underneath it; a
+ * committed release slides the view fully off and runs `onBack`. The
+ * gesture is armed only while `onBack` is provided - exactly when the view
+ * shows its back button - so a view with no back control (the first-launch
+ * pairing screen) must not accept the gesture either.
+ */
+function BackSwipeZone({ onBack, preview, children }: { onBack: (() => void) | undefined; preview?: React.ReactNode; children: React.ReactNode }) {
+  const [dragX, setDragX] = useState(0);
+  const [dragging, setDragging] = useState(false);
+  const [exiting, setExiting] = useState(false);
+  const dragRef = useRef<BackSwipeDragState | null>(null);
+  const exitingRef = useRef(false);
+  const onBackRef = useRef(onBack);
+  onBackRef.current = onBack;
+  // The committed swipe's trailing compatibility click must not fire a
+  // control on the view the navigation lands on (the pager keeps the same
+  // guard: the WebView can emit the click after the finger is already
+  // gone, on whatever is underneath now).
+  const swallowClickRef = useRef(false);
+  const swallowClickAtRef = useRef({ x: 0, y: 0 });
+  const swallowClickTimerRef = useRef<number | undefined>(undefined);
+  const exitTimerRef = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    const swallow = (event: MouseEvent) => {
+      if (!swallowClickRef.current) return;
+      const nearTap = Math.hypot(event.clientX - swallowClickAtRef.current.x, event.clientY - swallowClickAtRef.current.y) <= SWALLOW_CLICK_DISTANCE_PX;
+      const swallowTrailing = shouldSwallowTrailingClick({ armed: true, nearTap });
+      // One-shot: whether or not this is the click it waited for, it never
+      // outlives this event.
+      swallowClickRef.current = false;
+      swallowClickAtRef.current = { x: 0, y: 0 };
+      if (swallowClickTimerRef.current !== undefined) window.clearTimeout(swallowClickTimerRef.current);
+      swallowClickTimerRef.current = undefined;
+      if (swallowTrailing) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+    document.addEventListener("click", swallow, true);
+    return () => {
+      document.removeEventListener("click", swallow, true);
+      if (swallowClickTimerRef.current !== undefined) window.clearTimeout(swallowClickTimerRef.current);
+      if (exitTimerRef.current !== undefined) window.clearTimeout(exitTimerRef.current);
+    };
+  }, []);
+
+  function begin(event: ReactPointerEvent<HTMLDivElement>) {
+    if (dragRef.current || exitingRef.current || !onBackRef.current) return;
+    if (event.pointerType === "mouse") return;
+    dragRef.current = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startedAt: performance.now(), deltaX: 0, horizontal: false };
+  }
+
+  function move(event: ReactPointerEvent<HTMLDivElement>) {
+    const current = dragRef.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    const rawX = event.clientX - current.startX;
+    if (!current.horizontal) {
+      const axis = classifyGestureAxis(rawX, event.clientY - current.startY);
+      if (axis === "pending") return;
+      if (axis === "vertical") {
+        // The view's own vertical motion (its host list, the pairing copy)
+        // wins; a scroll is not a back swipe.
+        dragRef.current = null;
+        return;
+      }
+      current.horizontal = true;
+      setDragging(true);
+    }
+    // A leftward move has no forward target: resist it, mirroring the
+    // pager's dead-zone feel, so the view never rubber-bands the wrong way.
+    const deltaX = rawX > 0 ? rawX : rawX * 0.14;
+    current.deltaX = deltaX;
+    setDragX(deltaX);
+    event.preventDefault();
+  }
+
+  function end(event: ReactPointerEvent<HTMLDivElement>, cancelled: boolean) {
+    const current = dragRef.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    dragRef.current = null;
+    setDragging(false);
+    if (cancelled) { setDragX(0); return; }
+    const elapsed = Math.max(1, performance.now() - current.startedAt);
+    const velocity = Math.abs(current.deltaX) / elapsed;
+    if (!shouldCommitBackSwipe({ cancelled, deltaX: current.deltaX, widthPx: window.innerWidth, velocityPxPerMs: velocity })) {
+      setDragX(0);
+      return;
+    }
+    // Commit: slide the view fully off to the right and navigate once it
+    // has left. The drag offset drops at the same time, so the exit
+    // transition continues from where the finger let go.
+    exitingRef.current = true;
+    setExiting(true);
+    setDragX(0);
+    swallowClickRef.current = true;
+    swallowClickAtRef.current = { x: event.clientX, y: event.clientY };
+    if (swallowClickTimerRef.current !== undefined) window.clearTimeout(swallowClickTimerRef.current);
+    swallowClickTimerRef.current = window.setTimeout(() => {
+      swallowClickRef.current = false;
+      swallowClickAtRef.current = { x: 0, y: 0 };
+      swallowClickTimerRef.current = undefined;
+    }, SWALLOW_CLICK_LINGER_MS);
+    exitTimerRef.current = window.setTimeout(() => {
+      exitTimerRef.current = undefined;
+      onBackRef.current?.();
+    }, BACK_SWIPE_EXIT_MS);
+  }
+
+  return (
+    <div
+      className={`back-swipe-zone${dragging ? " is-dragging" : ""}${exiting ? " is-exiting" : ""}`}
+      onPointerDownCapture={begin}
+      onPointerMoveCapture={move}
+      onPointerUpCapture={(event) => end(event, false)}
+      onPointerCancelCapture={(event) => end(event, true)}
+    >
+      {/* The page the back swipe lands on, revealed under the sliding view.
+          Inert (pointer-events: none) and decorative: the real navigation
+          still runs from the sliding view's own controls, so the preview's
+          controls can never fire. */}
+      <div className="back-swipe-fill" aria-hidden={preview ? true : undefined}>{preview}</div>
+      <div className="back-swipe-page" style={dragging ? { transform: `translate3d(${dragX}px,0,0)` } : undefined}>{children}</div>
+    </div>
+  );
 }
 
 function MobileHeader({ title, subtitle, onBack, trailing }: { title: string; subtitle: string; onBack: () => void; trailing?: React.ReactNode }) {
   return <header className="mobile-header"><button className="round-button" onClick={onBack}><BackIcon /></button><span><strong className="display-name" title={title}>{title}</strong><small title={subtitle}>{subtitle}</small></span><div className="header-trailing">{trailing}</div></header>;
 }
 
-function PairScreen({ error, manualCode, showManual, onManualCode, onShowManual, onScan, onPair, onBack }: { error: string; manualCode: string; showManual: boolean; onManualCode: (value: string) => void; onShowManual: () => void; onScan: () => void; onPair: () => void; onBack?: () => void }) {
-  return <div className="onboarding"><div className="ambient one"/><div className="ambient two"/><div className="onboarding-top">{onBack && <button className="round-button" onClick={onBack} aria-label="Back to try again"><BackIcon /></button>}<span className="logo"><TerminalIcon /></span><strong>Agent Terminal</strong></div><section className="pair-copy"><span className="eyebrow">Desktop, untethered</span><h1>Your Windows terminal.<br/><em>Now in your pocket.</em></h1><p>Scan once while both devices are on the same network to authorize this phone. Once paired, connect to your desktop from anywhere.</p></section><div className="scan-illustration"><span className="scan-corner tl"/><span className="scan-corner tr"/><span className="scan-corner bl"/><span className="scan-corner br"/><div className="qr-art"><i/><i/><i/><i/><i/><i/><i/><i/><i/></div><div className="scan-line"/></div>{error && <div className="pair-error">{error}</div>}<section className="pair-actions"><button className="scan-button" onClick={onScan}><ScanIcon /> Authorize this phone</button>{showManual ? <div className="manual-pair"><textarea value={manualCode} onChange={(event) => onManualCode(event.target.value)} placeholder="Paste setup QR data"/><button onClick={onPair}>Authorize</button></div> : <button className="manual-link" onClick={onShowManual}>Enter setup data manually</button>}<small>Future connections work automatically from any network.</small></section></div>;
+function PairScreen({ error, manualCode, showManual, onManualCode, onShowManual, onScan, onPair, onBack, preview }: { error: string; manualCode: string; showManual: boolean; onManualCode: (value: string) => void; onShowManual: () => void; onScan: () => void; onPair: () => void; onBack?: () => void; preview?: React.ReactNode }) {
+  // The back swipe mirrors the back button: it is offered only when the
+  // screen shows one (reached from the hosts page or the home bottom nav).
+  return <BackSwipeZone onBack={onBack} preview={preview}><div className="onboarding"><div className="ambient one"/><div className="ambient two"/><div className="onboarding-top">{onBack && <button className="round-button" onClick={onBack} aria-label="Back to try again"><BackIcon /></button>}<span className="logo"><TerminalIcon /></span><strong>Agent Terminal</strong></div><section className="pair-copy"><span className="eyebrow">Desktop, untethered</span><h1>Your Windows terminal.<br/><em>Now in your pocket.</em></h1><p>Scan once while both devices are on the same network to authorize this phone. Once paired, connect to your desktop from anywhere.</p></section><div className="scan-illustration"><span className="scan-corner tl"/><span className="scan-corner tr"/><span className="scan-corner bl"/><span className="scan-corner br"/><div className="qr-art"><i/><i/><i/><i/><i/><i/><i/><i/><i/></div><div className="scan-line"/></div>{error && <div className="pair-error">{error}</div>}<section className="pair-actions"><button className="scan-button" onClick={onScan}><ScanIcon /> Authorize this phone</button>{showManual ? <div className="manual-pair"><textarea value={manualCode} onChange={(event) => onManualCode(event.target.value)} placeholder="Paste setup QR data"/><button onClick={onPair}>Authorize</button></div> : <button className="manual-link" onClick={onShowManual}>Enter setup data manually</button>}<small>Future connections work automatically from any network.</small></section></div></BackSwipeZone>;
 }
 
 function Splash({ label, hostName, onCancel }: { label: string; hostName?: string; onCancel?: () => void }) {
   const status = label.endsWith("…") ? label : `${label}…`;
   return <div className="splash"><span className="logo large"><TerminalIcon /></span><strong>Agent Terminal</strong>{hostName && <span className="splash-host">Connecting to {hostName}</span>}<small>{status}</small><i className="loader" />{onCancel && <button className="text-button" onClick={onCancel}>Cancel</button>}</div>;
 }
-function HostsPage({ records, loaded, connectedId, registration, online, checks, refreshing, onBack, onSelect, onRemove, onPairNew, onRefresh }: { records: SavedHostRecord[]; loaded: boolean; connectedId: string | null; registration: RemoteRegistrationState; online: boolean; checks: ReadonlyMap<string, HostCheckState>; refreshing: boolean; onBack: () => void; onSelect: (record: SavedHostRecord) => void; onRemove: (record: SavedHostRecord) => void; onPairNew: () => void; onRefresh: () => void }) {
+function HostsPage({ records, loaded, connectedId, registration, online, checks, refreshing, onBack, onSelect, onRemove, onPairNew, onRefresh, preview }: { records: SavedHostRecord[]; loaded: boolean; connectedId: string | null; registration: RemoteRegistrationState; online: boolean; checks: ReadonlyMap<string, HostCheckState>; refreshing: boolean; onBack: () => void; onSelect: (record: SavedHostRecord) => void; onRemove: (record: SavedHostRecord) => void; onPairNew: () => void; onRefresh: () => void; preview?: React.ReactNode }) {
   const ordered = sortHostsByLastConnected(records);
-  return <div className="mobile-app hosts-page">
+  return <BackSwipeZone onBack={onBack} preview={preview}><div className="mobile-app hosts-page">
     <MobileHeader title="Hosts" subtitle={loaded ? `${records.length} paired desktop${records.length === 1 ? "" : "s"}` : "Previously paired desktops"} onBack={onBack} trailing={loaded ? <button className="round-button hosts-refresh" onClick={onRefresh} disabled={refreshing} aria-label="Refresh host statuses" title="Refresh host statuses">{refreshing ? <i className="loader" /> : <RefreshIcon />}</button> : undefined} />
     <section className="hosts-section">
       {!loaded ? <div className="hosts-loading"><i className="loader" />Loading paired desktops…</div>
@@ -1398,7 +1756,7 @@ function HostsPage({ records, loaded, connectedId, registration, online, checks,
       </div>}
     </section>
     <footer className="hosts-actions"><button className="mobile-primary full" onClick={onPairNew}><PlusIcon /> Pair a new desktop</button></footer>
-  </div>;
+  </div></BackSwipeZone>;
 }
 
 function ErrorScreen({ message, hostName, onRetry, onConnectDifferent }: { message: string; hostName?: string; onRetry: () => void; onConnectDifferent: () => void }) { return <div className="error-screen"><span className="offline-icon"><WifiIcon /></span><h1>Desktop unavailable</h1>{hostName && <p className="error-host">Trying to connect to <strong>{hostName}</strong></p>}<p>{message}</p><button className="mobile-primary full" onClick={onRetry}>Try again</button><button className="text-button" onClick={onConnectDifferent}>Connect to a different desktop</button></div>; }

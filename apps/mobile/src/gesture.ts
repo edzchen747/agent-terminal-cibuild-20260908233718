@@ -11,6 +11,15 @@ export const SHEET_DISMISS_MIN_FLICK_PX = 24;
 export const SHEET_DISMISS_VELOCITY_PX_MS = 0.55;
 
 /**
+ * The shared commit feel for every horizontal swipe in the app: the pager's
+ * page transitions and the back swipes on the hosts page and the pairing
+ * screen all navigate when a drag clears 22% of the view's width, or when
+ * the release is faster than 0.55 px/ms; anything shorter snaps back.
+ */
+export const SWIPE_COMMIT_DISTANCE_RATIO = 0.22;
+export const SWIPE_COMMIT_VELOCITY_PX_MS = 0.55;
+
+/**
  * Whether a tracked vertical swipe over an overlay has enough distance or
  * speed to commit its dismissal. Short drags snap the sheet back; a quick
  * flick closes it even when the distance is small.
