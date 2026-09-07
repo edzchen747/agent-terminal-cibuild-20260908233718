@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import type { TuiMode } from "@agentterminal/protocol";
+import type { SessionActivity, TuiMode } from "@agentterminal/protocol";
 import type { DesktopApi, DesktopState, FocusSessionEvent } from "../../shared/api";
 
 interface TerminalDataEvent {
@@ -24,10 +24,17 @@ interface TerminalTuiModeEvent {
   offset: number;
 }
 
+interface TerminalActivityEvent {
+  sessionId: string;
+  activity: SessionActivity;
+  since: string;
+}
+
 const stateListeners = new Set<(state: DesktopState) => void>();
 const dataListeners = new Set<(sessionId: string, data: string, offset: number) => void>();
 const gridListeners = new Set<(sessionId: string, cols: number, rows: number, offset: number) => void>();
 const modeListeners = new Set<(sessionId: string, mode: TuiMode, offset: number) => void>();
+const activityListeners = new Set<(sessionId: string, activity: SessionActivity, since: string) => void>();
 const pairingListeners = new Set<() => void>();
 const focusSessionListeners = new Set<(event: FocusSessionEvent) => void>();
 const currentWindowTarget = getCurrentWebviewWindow().label;
@@ -48,6 +55,10 @@ const modeBridgeReady = listen<TerminalTuiModeEvent>("desktop-mode", ({ payload 
   for (const listener of modeListeners) listener(payload.sessionId, payload.mode, payload.offset);
 }, { target: currentWindowTarget });
 
+const activityBridgeReady = listen<TerminalActivityEvent>("desktop-activity", ({ payload }) => {
+  for (const listener of activityListeners) listener(payload.sessionId, payload.activity, payload.since);
+}, { target: currentWindowTarget });
+
 const focusSessionBridgeReady = listen<FocusSessionEvent>("desktop-focus-session", ({ payload }) => {
   for (const listener of focusSessionListeners) listener(payload);
 }, { target: currentWindowTarget });
@@ -57,6 +68,7 @@ const pairingBridgeReady = listen<string>("pairing-succeeded", () => {
 });
 
 void stateBridgeReady;
+void activityBridgeReady;
 void focusSessionBridgeReady;
 void pairingBridgeReady;
 
@@ -117,6 +129,10 @@ const api: DesktopApi = {
   onTuiMode: (callback) => {
     modeListeners.add(callback);
     return () => modeListeners.delete(callback);
+  },
+  onActivity: (callback) => {
+    activityListeners.add(callback);
+    return () => activityListeners.delete(callback);
   }
 };
 

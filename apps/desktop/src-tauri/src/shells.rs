@@ -10,7 +10,32 @@ use uuid::Uuid;
 
 use crate::{models::ShellProfile, path_utils::strip_windows_verbatim_prefix};
 
-const POWERSHELL_CWD_HOOK: &str = "$global:__AgentTerminalOriginalPrompt=$function:prompt; function global:prompt { $loc=$executionContext.SessionState.Path.CurrentLocation; $path=$loc.ProviderPath; if (-not $path) { $path=[string]$loc }; $prefix=[string]([char]27)+']9;9;'+$path+[char]27+'\\'; if ($global:__AgentTerminalOriginalPrompt) { $prefix+(& $global:__AgentTerminalOriginalPrompt) } else { $prefix+'PS '+$path+'> ' } }";
+/// Prompt hook for PowerShell and PowerShell 7.
+///
+/// It reports the working directory (`OSC 9;9`, which the host parses to
+/// follow `cd` between projects) and wraps the prompt in OSC 133 shell
+/// integration: `D` with the previous command's exit code, `A` at the
+/// start of the prompt and `B` where the shell begins reading input.
+/// Between `B` and the next `D` the shell is running something, which is
+/// what `activity.rs` reads as an active tab.
+///
+/// There is deliberately no `C` (command start): emitting one needs a
+/// PSReadLine key handler, and the host already treats a submitted line
+/// as the command start. `$?` and `$LASTEXITCODE` are captured on the
+/// first statement because the user's own prompt function, invoked
+/// below, would otherwise overwrite them.
+const POWERSHELL_HOOK: &str = "$global:__AgentTerminalOriginalPrompt=$function:prompt; function global:prompt { $__atOk=$?; $__atCode=$LASTEXITCODE; if ($null -eq $__atCode -or $__atOk) { $__atCode = if ($__atOk) { 0 } else { 1 } }; $__atE=[string]([char]27); $__atSt=$__atE+'\\'; $loc=$executionContext.SessionState.Path.CurrentLocation; $path=$loc.ProviderPath; if (-not $path) { $path=[string]$loc }; $prefix=$__atE+']133;D;'+$__atCode+$__atSt+$__atE+']133;A'+$__atSt+$__atE+']9;9;'+$path+$__atSt; $body = if ($global:__AgentTerminalOriginalPrompt) { [string](& $global:__AgentTerminalOriginalPrompt) } else { 'PS '+$path+'> ' }; $prefix+$body+$__atE+']133;B'+$__atSt }";
+
+/// `OSC 133 ; C` from bash's `PS0`, which is expanded after a command
+/// line is read and before it runs - exactly the command-start point,
+/// and without the per-pipeline noise a `DEBUG` trap would produce.
+const COMMAND_START_MARKER: &str = "\x1b]133;C\x07";
+
+/// `OSC 133 ; D ; <code>` then `A`, prepended to `PROMPT_COMMAND`. `$?`
+/// is read on the first statement so the rest of the hook cannot clobber
+/// the exit code the user's command actually returned.
+const PROMPT_END_MARKERS: &str =
+    r#"__at_code=$?; printf "\033]133;D;%s\007\033]133;A\007" "$__at_code""#;
 
 pub fn detect_shells() -> Vec<ShellProfile> {
     let mut shells = Vec::new();
@@ -72,22 +97,35 @@ pub fn command_for(shell: &ShellProfile, cwd: &str) -> CommandBuilder {
             args.extend([
                 "-NoExit".into(),
                 "-Command".into(),
-                POWERSHELL_CWD_HOOK.into(),
+                POWERSHELL_HOOK.into(),
             ]);
         }
         "cmd" => {
+            // cmd has no way to report an exit code from PROMPT, so the
+            // `D` marker is bare; the host only needs it to mean "the
+            // prompt is back".
             let original = env::var("PROMPT").unwrap_or_else(|_| "$P$G".into());
-            extra_environment.insert("PROMPT".into(), format!("$e]9;9;$P$e\\{original}"));
+            extra_environment.insert(
+                "PROMPT".into(),
+                format!(
+                    "$e]133;D$e\\$e]133;A$e\\$e]9;9;$P$e\\{original}$e]133;B$e\\"
+                ),
+            );
         }
         "git-bash" => {
             let report = r#"printf "\033]9;9;%s\007" "$(cygpath -w "$PWD" -C ANSI)""#;
+            extra_environment.insert("PS0".into(), COMMAND_START_MARKER.into());
             let prompt = env::var("PROMPT_COMMAND")
                 .map(|value| format!("{value};{report}"))
                 .unwrap_or_else(|_| report.into());
-            extra_environment.insert("PROMPT_COMMAND".into(), prompt);
+            extra_environment.insert(
+                "PROMPT_COMMAND".into(),
+                format!("{PROMPT_END_MARKERS};{prompt}"),
+            );
         }
         "wsl" => {
             let report = r#"printf "\033]9;9;%s\007" "$(wslpath -w "$PWD")""#;
+            extra_environment.insert("PS0".into(), COMMAND_START_MARKER.into());
             let prompt = env::var("PROMPT_COMMAND")
                 .map(|value| format!("{value};{report}"))
                 .unwrap_or_else(|_| report.into());
@@ -98,7 +136,11 @@ pub fn command_for(shell: &ShellProfile, cwd: &str) -> CommandBuilder {
                 .map(str::to_owned)
                 .collect();
             wslenv.insert("PROMPT_COMMAND/w".into());
-            extra_environment.insert("PROMPT_COMMAND".into(), prompt);
+            wslenv.insert("PS0/w".into());
+            extra_environment.insert(
+                "PROMPT_COMMAND".into(),
+                format!("{PROMPT_END_MARKERS};{prompt}"),
+            );
             extra_environment.insert(
                 "WSLENV".into(),
                 wslenv.into_iter().collect::<Vec<_>>().join(":"),

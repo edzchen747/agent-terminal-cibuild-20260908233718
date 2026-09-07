@@ -76,6 +76,23 @@ pub const ALT_EXIT_QUIET_MS: u64 = 300;
 /// means the foreground is back at a shell prompt.
 pub const STREAM_EXIT_QUIET_MS: u64 = 500;
 
+/// An OSC 133 shell-integration marker the classifier accepted as coming
+/// from the shell rather than from a program painting a frame (see
+/// [`TuiClassifier::on_osc`] for the synchronized-output gate). The
+/// activity detector consumes these as ground truth for whether the
+/// shell owns the prompt or is blocked on a foreground program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellMarker {
+    /// `OSC 133 ; A` - the prompt starts here.
+    PromptStart,
+    /// `OSC 133 ; B` - the prompt ends and the shell reads input.
+    PromptEnd,
+    /// `OSC 133 ; C` - the shell handed the foreground to a command.
+    CommandStart,
+    /// `OSC 133 ; D [; exit-code]` - the command finished.
+    CommandEnd { exit_code: Option<i32> },
+}
+
 /// A mode transition the classifier observed, with the evidence the host
 /// needs for its journaling rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +167,10 @@ pub struct TuiClassifier {
     /// (`CSI 2 J` / `CSI 3 J`) started, reported to the host so it can
     /// truncate the replay journal at the boundary.
     clear_marker: Option<usize>,
+    /// Shell-emitted OSC 133 markers accepted since the host last drained
+    /// them, in stream order. Only markers seen outside a
+    /// synchronized-output bracket land here.
+    shell_markers: Vec<ShellMarker>,
 }
 
 impl TuiClassifier {
@@ -170,6 +191,7 @@ impl TuiClassifier {
             extent_rows: vec![false; rows.max(1) as usize + 1],
             row_stamps: VecDeque::new(),
             clear_marker: None,
+            shell_markers: Vec::new(),
         }
     }
 
@@ -188,6 +210,46 @@ impl TuiClassifier {
     /// start sits in an earlier chunk, which cannot anchor a cut.
     pub fn take_chunk_clear(&mut self) -> Option<usize> {
         self.clear_marker.take()
+    }
+
+    /// Drain the OSC 133 markers the shell emitted since the last call.
+    /// Markers seen inside a synchronized-output bracket were a program
+    /// painting its own composer and never reach this list.
+    pub fn take_shell_markers(&mut self) -> Vec<ShellMarker> {
+        std::mem::take(&mut self.shell_markers)
+    }
+
+    /// Whether the stream currently looks like a shell sitting at a
+    /// prompt: line-terminated output, a visible cursor, and quiet for
+    /// at least [`STREAM_EXIT_QUIET_MS`]. This is the same rule the
+    /// `exit-quiet` transition uses, exposed so the activity detector
+    /// can apply it in `Canonical` too - where `feed` never evaluates
+    /// it, because there is no TUI period left to exit.
+    ///
+    /// It is a fallback only. A foreground program that prints nothing
+    /// (`sleep 30`, an installer before its first line, anything
+    /// blocked on stdin) is indistinguishable from a prompt here, which
+    /// is exactly why OSC 133 markers outrank it.
+    pub fn quiet_idle(&self, now: Instant) -> bool {
+        let quiet_ms = self
+            .last_chunk_at
+            .map(|at| now.duration_since(at).as_millis() as u64)
+            .unwrap_or(0);
+        self.prompt_quiet(quiet_ms)
+    }
+
+    /// The `exit-quiet` predicate, given an already-measured quiet gap.
+    /// The gap is preceded by line-terminated output: the last output
+    /// chunk, or one within the quiet window, ended a line the way
+    /// shell output does. A colored prompt still counts because the
+    /// newline chunk is recent.
+    fn prompt_quiet(&self, quiet_ms: u64) -> bool {
+        let newline_recent = self.last_newline_chunk_at.is_some_and(|at| {
+            self.last_chunk_at.is_some_and(|last| {
+                last.duration_since(at) <= Duration::from_millis(STREAM_EXIT_QUIET_MS)
+            })
+        });
+        !self.cursor_hidden && newline_recent && quiet_ms >= STREAM_EXIT_QUIET_MS
     }
 
     /// Whether the program has painted TUI frames while its own alt
@@ -228,16 +290,7 @@ impl TuiClassifier {
             let quiet_ms = gap.map(|g| g.as_millis() as u64).unwrap_or(0);
             let visible = !self.cursor_hidden;
             let alt_exit_ok = self.saw_alt_exit && visible && quiet_ms >= ALT_EXIT_QUIET_MS;
-            // The quiet gap is preceded by line-terminated output: the
-            // last output chunk, or one within the quiet window, ended a
-            // line the way shell output does. A colored prompt ("PS C:\>
-            // " after a "\r\n") still counts because the newline chunk
-            // is recent.
-            let newline_recent = self.last_newline_chunk_at.is_some_and(|at| {
-                self.last_chunk_at
-                    .is_some_and(|last| last.duration_since(at) <= Duration::from_millis(STREAM_EXIT_QUIET_MS))
-            });
-            let stream_exit_ok = visible && newline_recent && quiet_ms >= STREAM_EXIT_QUIET_MS;
+            let stream_exit_ok = self.prompt_quiet(quiet_ms);
             if self.alt_anchored && alt_exit_ok {
                 return self.exit_to_canonical("alt-exit", 0);
             }
@@ -542,7 +595,19 @@ impl TuiClassifier {
                 return None;
             }
             let marker = code.chars().next().unwrap_or('\0');
-            if matches!(marker, 'A' | 'B' | 'C' | 'D') && self.mode != TuiMode::Canonical {
+            // The same gate decides both questions: a marker the shell
+            // emitted is evidence for the mode *and* for the activity
+            // state, and one a program painted is evidence for neither.
+            match marker {
+                'A' => self.shell_markers.push(ShellMarker::PromptStart),
+                'B' => self.shell_markers.push(ShellMarker::PromptEnd),
+                'C' => self.shell_markers.push(ShellMarker::CommandStart),
+                'D' => self.shell_markers.push(ShellMarker::CommandEnd {
+                    exit_code: exit_code_of(code),
+                }),
+                _ => return None,
+            }
+            if self.mode != TuiMode::Canonical {
                 return self.exit_to_canonical("osc133", at);
             }
             return None;
@@ -811,6 +876,13 @@ enum CsiSignal {
     EraseDisplay23,
     CursorUp(u16),
     CursorPosition { row: u16 },
+}
+
+/// The exit code carried by an `OSC 133 ; D ; <code>` payload, given
+/// the payload after the `133;` prefix. A bare `D`, or a code the
+/// shell could not render as a number, reports none.
+fn exit_code_of(code: &str) -> Option<i32> {
+    code.split(';').nth(1)?.trim().parse().ok()
 }
 
 #[cfg(test)]
@@ -1414,6 +1486,188 @@ mod tests {
         let out = clf.feed("\x1b]133;D\x07", at, 30);
         assert!(out.is_some());
         assert_eq!(mode(out.as_ref().unwrap()), TuiMode::Canonical);
+    }
+
+    #[test]
+    fn shell_markers_are_collected_for_the_activity_detector() {
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        at += Duration::from_millis(10);
+        clf.feed("\x1b]133;C\x07", at, 30);
+        assert_eq!(clf.take_shell_markers(), vec![ShellMarker::CommandStart]);
+        assert!(
+            clf.take_shell_markers().is_empty(),
+            "draining is destructive, so the host never re-applies a marker"
+        );
+
+        at += Duration::from_millis(10);
+        clf.feed("\x1b]133;D;130\x07\x1b]133;A\x07\x1b]133;B\x07", at, 30);
+        assert_eq!(
+            clf.take_shell_markers(),
+            vec![
+                ShellMarker::CommandEnd {
+                    exit_code: Some(130)
+                },
+                ShellMarker::PromptStart,
+                ShellMarker::PromptEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_command_end_exit_code_is_read_from_the_payload_or_dropped() {
+        let cases: &[(&str, Option<i32>)] = &[
+            ("133;D;0", Some(0)),
+            ("133;D;130", Some(130)),
+            // `$LASTEXITCODE` can be empty, and a shell that prints
+            // something unparseable must not be taken at its word.
+            ("133;D;", None),
+            ("133;D;n/a", None),
+            ("133;D", None),
+            // A shell that appends its own fields keeps the first one.
+            ("133;D;3;aborted", Some(3)),
+        ];
+        for (payload, expected) in cases {
+            let mut clf = TuiClassifier::new(30);
+            let at = Instant::now() + Duration::from_millis(10);
+            clf.feed(&format!("\x1b]{payload}\x07"), at, 30);
+            assert_eq!(
+                clf.take_shell_markers(),
+                vec![ShellMarker::CommandEnd {
+                    exit_code: *expected
+                }],
+                "payload {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_osc_133_code_is_not_a_marker() {
+        // `OSC 133 ; P ; Cwd=...` and friends are shell-integration
+        // properties, not prompt boundaries; treating one as a marker
+        // would call the tab idle in the middle of a command.
+        let mut clf = TuiClassifier::new(30);
+        let at = Instant::now() + Duration::from_millis(10);
+        clf.feed("\x1b]133;P;Cwd=/home\x07\x1b]133;E;id=7\x07", at, 30);
+        assert!(clf.take_shell_markers().is_empty());
+    }
+
+    #[test]
+    fn a_marker_split_across_chunks_is_collected_once() {
+        // ConPTY hands a repainting program back as a burst of tiny
+        // writes, so a single escape sequence routinely straddles a chunk.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        at += Duration::from_millis(10);
+        clf.feed("\x1b]133", at, 30);
+        assert!(clf.take_shell_markers().is_empty(), "nothing has completed yet");
+
+        at += Duration::from_millis(10);
+        clf.feed(";D;7\x07", at, 30);
+        assert_eq!(
+            clf.take_shell_markers(),
+            vec![ShellMarker::CommandEnd { exit_code: Some(7) }]
+        );
+    }
+
+    #[test]
+    fn markers_survive_a_sync_bracket_that_opened_in_an_earlier_chunk() {
+        // The depth gate has to bridge chunks too, or the first marker of
+        // every frame would leak through as a shell prompt.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        at += Duration::from_millis(10);
+        clf.feed("\x1b[?2026h", at, 30);
+        clf.take_shell_markers();
+
+        at += Duration::from_millis(10);
+        clf.feed("\x1b]133;C\x07frame", at, 30);
+        assert!(
+            clf.take_shell_markers().is_empty(),
+            "the bracket is still open from the previous chunk"
+        );
+
+        at += Duration::from_millis(10);
+        clf.feed("\x1b[?2026l\x1b]133;D\x07", at, 30);
+        assert_eq!(
+            clf.take_shell_markers(),
+            vec![ShellMarker::CommandEnd { exit_code: None }]
+        );
+    }
+
+    #[test]
+    fn quiet_idle_is_false_before_any_output_at_all() {
+        // A session whose shell has not written a byte yet has no prompt
+        // to be sitting at.
+        let clf = TuiClassifier::new(30);
+        assert!(!clf.quiet_idle(Instant::now() + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn quiet_idle_is_false_while_the_cursor_is_hidden() {
+        // A hidden cursor means a program is drawing, however still the
+        // stream has gone.
+        let mut clf = TuiClassifier::new(30);
+        let at = Instant::now() + Duration::from_millis(10);
+        clf.feed("working\\r\\n\x1b[?25l", at, 30);
+        assert!(!clf.quiet_idle(at + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_bare_command_end_marker_reports_no_exit_code() {
+        let mut clf = TuiClassifier::new(30);
+        let at = Instant::now() + Duration::from_millis(10);
+        clf.feed("\x1b]133;D\x07", at, 30);
+        assert_eq!(
+            clf.take_shell_markers(),
+            vec![ShellMarker::CommandEnd { exit_code: None }]
+        );
+    }
+
+    #[test]
+    fn markers_a_program_paints_inside_a_frame_are_not_collected() {
+        // The gate that keeps an inline harness from flapping the mode
+        // has to keep it from flapping the activity state too: the
+        // harness marks its own composer with OSC 133 on every repaint.
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        at += Duration::from_millis(10);
+        clf.feed("\x1b[?2026h\x1b]133;A\x07\x1b]133;C\x07frame", at, 30);
+        assert!(
+            clf.take_shell_markers().is_empty(),
+            "a marker inside a sync bracket is the program, not the shell"
+        );
+
+        at += Duration::from_millis(10);
+        clf.feed("\x1b[?2026l\x1b]133;A\x07", at, 30);
+        assert_eq!(
+            clf.take_shell_markers(),
+            vec![ShellMarker::PromptStart],
+            "the same marker outside the bracket is the shell's own prompt"
+        );
+    }
+
+    #[test]
+    fn quiet_idle_matches_the_exit_quiet_rule() {
+        let mut clf = TuiClassifier::new(30);
+        let mut at = Instant::now();
+        at += Duration::from_millis(10);
+        clf.feed("done\r\n", at, 30);
+        assert!(
+            !clf.quiet_idle(at + Duration::from_millis(STREAM_EXIT_QUIET_MS - 50)),
+            "the shell has not been quiet long enough to be at a prompt"
+        );
+        assert!(clf.quiet_idle(at + Duration::from_millis(STREAM_EXIT_QUIET_MS)));
+    }
+
+    #[test]
+    fn output_that_does_not_end_a_line_is_never_quiet_idle() {
+        // A program that stops mid-line (a progress bar, a `read` prompt)
+        // is still the foreground, however long it waits.
+        let mut clf = TuiClassifier::new(30);
+        let at = Instant::now() + Duration::from_millis(10);
+        clf.feed("Password: ", at, 30);
+        assert!(!clf.quiet_idle(at + Duration::from_secs(30)));
     }
 
     #[test]

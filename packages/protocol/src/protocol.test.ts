@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, MAX_ZOOM_FONT_SIZE, MIN_ZOOM_FONT_SIZE, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, findDecorationsFor, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, BASELINE_TERMINAL_ZOOM, MAX_TERMINAL_ZOOM, MIN_TERMINAL_ZOOM, TERMINAL_ZOOM_STEPS, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, terminalZoomFontSize, CLOSED_FIND, applyFindResults, closeFind, findCommandForKey, findStatusLabel, openFind, setFindQuery, type ClientMessage, type HostSnapshot } from "./index.js";
+import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, TERMINAL_SESSION_ACTIVITIES, isSessionActive, sessionActivityLabel, sessionActivityOf, sessionActivitySummary, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, MAX_ZOOM_FONT_SIZE, MIN_ZOOM_FONT_SIZE, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, findDecorationsFor, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, BASELINE_TERMINAL_ZOOM, MAX_TERMINAL_ZOOM, MIN_TERMINAL_ZOOM, TERMINAL_ZOOM_STEPS, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, terminalZoomFontSize, CLOSED_FIND, applyFindResults, closeFind, findCommandForKey, findStatusLabel, openFind, setFindQuery, type ClientMessage, type HostSnapshot, type SessionActivity, type TerminalSession } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -198,6 +198,100 @@ test("session.mode round-trips the three TUI modes", () => {
     assert.equal(message.mode, mode);
     assert.equal(message.offset, 2048);
   }
+});
+
+function activitySession(id: string, projectId: string, extra: Partial<TerminalSession> = {}): TerminalSession {
+  return { id, projectId, title: id, cwd: "C:/", shellId: "powershell", status: "running", createdAt: "2026-01-01T00:00:00Z", ...extra };
+}
+
+test("a session's activity defaults to idle on a host that does not report it", () => {
+  assert.equal(sessionActivityOf(activitySession("s1", "p1")), "idle");
+  assert.equal(sessionActivityOf(activitySession("s1", "p1", { activity: "active" })), "active");
+  assert.equal(isSessionActive(activitySession("s1", "p1", { activity: "active" })), true);
+});
+
+test("an exited session is idle whatever it was last doing", () => {
+  const exited = activitySession("s1", "p1", { activity: "active", status: "exited", exitCode: 130 });
+  assert.equal(sessionActivityOf(exited), "idle");
+  assert.equal(isSessionActive(exited), false);
+});
+
+test("the activity caption reserves the word active for the busy sessions", () => {
+  assert.equal(sessionActivityLabel(0, 0), "No active sessions");
+  assert.equal(sessionActivityLabel(0, 1), "1 idle session");
+  assert.equal(sessionActivityLabel(0, 4), "4 idle sessions");
+  assert.equal(sessionActivityLabel(1, 2), "1 of 2 sessions active");
+  assert.equal(sessionActivityLabel(3, 3), "3 of 3 sessions active");
+});
+
+test("the activity summary counts only live sessions, of one project or of the host", () => {
+  const sessions = [
+    activitySession("s1", "p1", { activity: "active" }),
+    activitySession("s2", "p1"),
+    activitySession("s3", "p2", { activity: "active" }),
+    activitySession("s4", "p1", { activity: "active", status: "exited", exitCode: 1 })
+  ];
+  assert.deepEqual(sessionActivitySummary(sessions, { projectId: "p1" }), { active: 1, running: 2, label: "1 of 2 sessions active" });
+  assert.deepEqual(sessionActivitySummary(sessions), { active: 2, running: 3, label: "2 of 3 sessions active" });
+  assert.deepEqual(sessionActivitySummary(sessions, { projectId: "p3" }), { active: 0, running: 0, label: "No active sessions" });
+});
+
+test("the activity summary of nothing is the empty caption", () => {
+  assert.deepEqual(sessionActivitySummary([]), { active: 0, running: 0, label: "No active sessions" });
+  assert.deepEqual(sessionActivitySummary([], { projectId: "p1" }), { active: 0, running: 0, label: "No active sessions" });
+});
+
+test("the activity summary ignores map entries for sessions that are gone", () => {
+  // The desktop map is pruned on the next snapshot, so between an event
+  // and that snapshot it can name a session the list no longer has.
+  const sessions = [activitySession("s1", "p1")];
+  const activity = new Map<string, SessionActivity>([["s1", "active"], ["ghost", "active"]]);
+  assert.deepEqual(sessionActivitySummary(sessions, { activity }), { active: 1, running: 1, label: "1 of 1 session active" });
+});
+
+test("an exited session cannot be revived by the caller's map", () => {
+  const sessions = [activitySession("s1", "p1", { status: "exited", exitCode: 0 })];
+  const activity = new Map<string, SessionActivity>([["s1", "active"]]);
+  assert.deepEqual(sessionActivitySummary(sessions, { activity }), { active: 0, running: 0, label: "No active sessions" });
+});
+
+test("the activity summary prefers a state the caller holds over the session's own", () => {
+  // The desktop renderer sees activity events ahead of the snapshot that
+  // will also carry them; its map is the newer of the two.
+  const sessions = [activitySession("s1", "p1"), activitySession("s2", "p1", { activity: "active" })];
+  const activity = new Map<string, SessionActivity>([["s1", "active"], ["s2", "idle"]]);
+  assert.equal(sessionActivitySummary(sessions, { activity }).label, "1 of 2 sessions active");
+});
+
+test("session.activity round-trips both states", () => {
+  for (const activity of TERMINAL_SESSION_ACTIVITIES) {
+    const since = "2026-09-06T12:00:00.000Z";
+    const message = decodeServerMessage(JSON.stringify({ type: "session.activity", sessionId: "s1", activity, since }));
+    assert.equal(message.type, "session.activity");
+    if (message.type !== "session.activity") assert.fail("expected session.activity");
+    assert.equal(message.activity, activity);
+    assert.equal(message.since, since);
+  }
+});
+
+test("TerminalSession.activity is optional so a host without it still parses", () => {
+  const decoded = decodeServerMessage(JSON.stringify({
+    type: "snapshot",
+    snapshot: { host: { id: "h1", name: "Desktop One", version: "0.3.5" }, projects: [], sessions: [{ id: "s1", projectId: "p1", title: "pwsh", cwd: "C:\\repo", shellId: "powershell", status: "running", createdAt: "now" }], devices: [], shells: [], defaultShellId: "" }
+  }));
+  if (decoded.type !== "snapshot") assert.fail("expected snapshot");
+  assert.equal(decoded.snapshot.sessions[0]?.activity, undefined);
+  assert.equal(decoded.snapshot.sessions[0]?.activitySince, undefined);
+});
+
+test("an active session carries the state and the time it started", () => {
+  const decoded = decodeServerMessage(JSON.stringify({
+    type: "snapshot",
+    snapshot: { host: { id: "h1", name: "Desktop One", version: "0.3.5" }, projects: [], sessions: [{ id: "s1", projectId: "p1", title: "pwsh", cwd: "C:\\repo", shellId: "powershell", status: "running", createdAt: "now", activity: "active", activitySince: "2026-09-06T12:00:00.000Z" }], devices: [], shells: [], defaultShellId: "" }
+  }));
+  if (decoded.type !== "snapshot") assert.fail("expected snapshot");
+  assert.equal(decoded.snapshot.sessions[0]?.activity, "active");
+  assert.equal(decoded.snapshot.sessions[0]?.activitySince, "2026-09-06T12:00:00.000Z");
 });
 
 test("TerminalSession.tuiMode is optional so old snapshots parse cleanly", () => {

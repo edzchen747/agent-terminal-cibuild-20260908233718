@@ -1,6 +1,6 @@
 import { Preferences } from "@capacitor/preferences";
 import { Capacitor } from "@capacitor/core";
-import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage, TuiMode } from "@agentterminal/protocol";
+import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage, SessionActivity, TuiMode } from "@agentterminal/protocol";
 import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, VIEWPORT_KEEPALIVE_INTERVAL_MS } from "@agentterminal/protocol";
 import { deviceName } from "./device";
 import { canAttemptConnection, heartbeatActive, heartbeatCatchUpNeeded, heartbeatIntervalMs, nextReconnectDelay, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS } from "./connectionPolicy";
@@ -53,6 +53,7 @@ type EventMap = {
   output: { sessionId: string; data: string; offset: number };
   grid: { sessionId: string; cols: number; rows: number; offset: number };
   mode: { sessionId: string; mode: TuiMode; offset: number };
+  activity: { sessionId: string; activity: SessionActivity; since: string };
   disconnected: undefined;
   connected: HostSnapshot;
   heartbeat: HostSnapshot;
@@ -964,6 +965,7 @@ export class HostConnection {
     if (message.type === "session.output") { this.emit("output", { sessionId: message.sessionId, data: message.data, offset: message.offset }); return; }
     if (message.type === "session.grid") { this.emit("grid", { sessionId: message.sessionId, cols: message.cols, rows: message.rows, offset: message.offset }); return; }
     if (message.type === "session.mode") { this.emit("mode", { sessionId: message.sessionId, mode: message.mode, offset: message.offset }); return; }
+    if (message.type === "session.activity") { this.applyActivity(message.sessionId, message.activity, message.since); return; }
     if (message.type === "snapshot") { this.snapshot = message.snapshot; this.emit("snapshot", message.snapshot); }
     if ((message.type === "auth.accepted" || message.type === "pair.accepted") && message.snapshot) this.snapshot = message.snapshot;
     const requestId = "requestId" in message ? message.requestId : undefined;
@@ -974,6 +976,23 @@ export class HostConnection {
         if (message.type === "error") pending.reject(new Error(message.message)); else pending.resolve(message);
       }
     }
+  }
+
+  /**
+   * The host detected that a session started or finished running something.
+   * The state also rides along on every snapshot, so the held snapshot is
+   * patched here rather than left to drift until the next one arrives -
+   * the session list reads it from there.
+   */
+  private applyActivity(sessionId: string, activity: SessionActivity, since: string): void {
+    this.emit("activity", { sessionId, activity, since });
+    const snapshot = this.snapshot;
+    if (!snapshot?.sessions.some((session) => session.id === sessionId)) return;
+    const sessions = snapshot.sessions.map((session) =>
+      session.id === sessionId ? { ...session, activity, activitySince: since } : session
+    );
+    this.snapshot = { ...snapshot, sessions };
+    this.emit("snapshot", this.snapshot);
   }
 
   private emit<K extends keyof EventMap>(event: K, value: EventMap[K]): void {
