@@ -130,3 +130,224 @@ test("finishAttachment re-measures and claims after the replay, so a fresh open 
   assert.ok(finish.includes("if (activeRef.current) resize(true);"),
     "a fresh open (or reconnect) must claim with the post-replay measurement");
 });
+
+test("organic viewport announces are suppressed for the whole journal replay", () => {
+  // The desktop's replay gate (merge.attached) was ported only as the
+  // blocking overlay: with the overlay hiding the reflow storm, the
+  // ResizeObserver kept announcing - and the tap/slider claims kept
+  // claiming - the container grid segment by segment mid-replay, stamping
+  // the PTY (and re-stamping every other client) until the grid started
+  // flip-flopping between the clients. The queued frame must still run
+  // the fill pass (applyZoom is render-only and the replay has to paint),
+  // then drop the announce while the replay gate is down.
+  const resizeFn = terminal.slice(terminal.indexOf("const resize = (force = false) => {"), terminal.indexOf("resizeRef.current = resize;"));
+  const fillPass = resizeFn.indexOf("applyZoom();");
+  const gate = resizeFn.indexOf("if (!initialized) return;");
+  const announce = resizeFn.indexOf("const dims = announcedGrid();");
+  const send = resizeFn.indexOf('connection.send({ type: "session.resize"');
+  assert.ok(fillPass >= 0 && gate > fillPass && announce > gate && send > announce,
+    "the frame must run the fill pass, then gate the announce (and therefore the send) on the replay gate");
+  assert.ok(resizeFn.includes("const claim = pendingForce;\n        pendingForce = false;"),
+    "the claim flag must be read and reset before the gate, so a swallowed frame never latches a stale claim");
+  // The gate must be a variable declared BEFORE resize (startAttachment
+  // lowers it, finishAttachment lifts it), not a closure that only works
+  // by call-order luck.
+  const declaration = terminal.indexOf("let initialized = false;");
+  assert.ok(declaration >= 0 && declaration < terminal.indexOf("const resize = (force = false) => {"),
+    "the replay gate must be hoisted above resize() so its suppression is not call-order luck");
+  assert.strictEqual(terminal.match(/let initialized = false;/g)?.length, 1,
+    "the gate must be declared exactly once (the old later declaration would shadow nothing and confuse the reader)");
+  // And the gate must lift exactly once, per attach: finishAttachment is
+  // the only place that re-announces after the drain (plus the failed-
+  // attach path below), so the re-announce cannot double up either.
+  const finish = terminal.slice(terminal.indexOf("const finishAttachment = () => {"), terminal.indexOf("const replayPendingOutput = () => {"));
+  const lift = finish.indexOf("initialized = true;");
+  const reClaim = finish.indexOf("if (activeRef.current) resize(true);");
+  assert.ok(lift >= 0 && reClaim > lift,
+    "finishAttachment must lift the gate, then re-announce with a fresh claiming measurement - exactly once");
+});
+
+test("tap claims are suppressed while a journal replay is in flight", () => {
+  // A tap mid-replay measures a size the replayed segments are still
+  // driving; claiming it would stamp the PTY mid-replay. finishAttachment
+  // claims once the drain is done, so the tap is never simply lost (the
+  // desktop gates its pointerdown claim on merge.attached the same way).
+  const pointerUp = terminal.slice(terminal.indexOf("const handlePointerUp = (event: PointerEvent) => {"), terminal.indexOf("const handlePointerCancel = "));
+  assert.ok(pointerUp.includes("if (initialized) resize(true);"),
+    "the mouse tap's claim must wait for the replay gate to lift");
+  const touchEnd = terminal.slice(terminal.indexOf("const handleTouchEnd = (event: TouchEvent) => {"), terminal.indexOf("const handleTouchCancel = () => {"));
+  assert.ok(touchEnd.includes("if (initialized) resize(true);"),
+    "the touch tap's claim must wait for the replay gate to lift");
+});
+
+test("a failed attach runs finishAttachment, so the replay gate never latches shut", () => {
+  // With the announce gate in place a bare setReplaying(false) here would
+  // leave initialized false forever: the phone could never announce again
+  // (every resize frame, tap and slider claim would be swallowed). The
+  // desktop closes the lifecycle on this path through finishAttachment
+  // too: overlay lifted, gate re-opened, and the post-drain re-claim -
+  // and any later tap - can still announce.
+  const catchBlock = terminal.slice(terminal.indexOf("}).catch((cause) => {"), terminal.indexOf("attachmentPromise = pending;"));
+  assert.ok(catchBlock.includes("finishAttachment();"),
+    "the failed-attach path must run finishAttachment, not a bare overlay lift");
+  assert.ok(!catchBlock.includes("setReplaying(false)"),
+    "the overlay lift must come from finishAttachment, which also re-opens the gate");
+  assert.ok(catchBlock.includes("Could not attach terminal"),
+    "the red error must still be written after the gate re-opens");
+});
+
+test("the startAttachment re-entrancy guard is real", () => {
+  // attachmentPromise was declared, read by the guard, and cleared by
+  // .then/.catch - but never ASSIGNED, so the guard at the top of
+  // startAttachment never fired. Android flaps visibility freely and
+  // startAttachment is called from mount, connected, the active effect and
+  // visibilitychange; every overlapping call reset the replay state,
+  // re-raised the overlay, and ended in its own duplicate claiming resize
+  // (the duplicate claim in the sync log). The in-flight promise must be
+  // stored so the second call bails, and cleanup's detach sequences after
+  // it (it always read undefined before, so it raced the attach).
+  const guard = terminal.slice(terminal.indexOf("let attachmentPromise: Promise<unknown> | undefined;"), terminal.indexOf("const announced = announcedGrid();"));
+  assert.ok(guard.includes("if (disposed || attachmentPromise !== undefined) return;"),
+    "an in-flight attach must suppress a second startAttachment");
+  assert.ok(terminal.includes("const pending = connection.request({\n        type: \"session.attach\","),
+    "the attach's own promise must be captured, not fire-and-forget");
+  assert.ok(terminal.includes("attachmentPromise = pending;"),
+    "the guard and cleanup must see the in-flight promise");
+  assert.ok(terminal.includes("void (attachmentPromise ?? Promise.resolve())\n        .finally(() => connection.send({ type: \"session.detach\", requestId: createRequestId(), sessionId: session.id }))"),
+    "cleanup must still sequence the detach after the in-flight attach");
+});
+
+test("the announced viewport is scale-invariant", () => {
+  // (offsetWidth - padding) * scale drifted 8 * (1 - scale) with the paint
+  // scale (the 8px unscaled padding frame), and the integer offsetWidth
+  // added rounding on top: a fill-pass scale change moved the announced
+  // width, which moved the announced cols (gridForContent floors it),
+  // which moved the grid, which moved the scale again - a self-sustaining
+  // loop. Measure the post-transform box in visual space and subtract the
+  // padding as an unscaled frame, so renderScale cancels exactly; the
+  // fractional rect also drops the integer rounding. The width
+  // under-reports the painted width by 8 * (1 - scale), at most 8px - the
+  // safe direction (fewer columns, never a clip). Height has no vertical
+  // transform, so it keeps the integer offsetHeight.
+  const box = terminal.slice(terminal.indexOf("const visualContentBox = (): Size | null => {"), terminal.indexOf("// One UNSQUISHED cell"));
+  assert.ok(box.includes("hostElement.getBoundingClientRect()"),
+    "the width must come from the post-transform box, not the layout box");
+  assert.ok(box.includes("const width = rect.width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);"),
+    "the padding must be subtracted as an unscaled frame from the visual width");
+  assert.ok(box.includes("const height = hostElement.offsetHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);"),
+    "height keeps the integer offsetHeight (no vertical transform)");
+  assert.ok(!box.includes("renderScaleRef") && !box.includes("offsetWidth"),
+    "the announced viewport must not depend on the live paint scale");
+});
+
+test("an overlapping startAttachment must not touch the in-flight replay", () => {
+  // The guard must run before ANY replay state is reset: the reported bug
+  // was that overlapping calls (mount, connected, the active effect and
+  // visibilitychange all firing around an Android flap) reset
+  // appliedUpTo/pendingOutput and re-raised the overlay of the replay that
+  // was already running - and each one ended in its own duplicate claiming
+  // resize (the doubled claim in the sync log).
+  const attach = terminal.slice(terminal.indexOf("const startAttachment = () => {"), terminal.indexOf("const announced = announcedGrid();"));
+  const guard = attach.indexOf("if (disposed || attachmentPromise !== undefined) return;");
+  const lowerGate = attach.indexOf("initialized = false;");
+  const raiseOverlay = attach.indexOf("setReplaying(true);");
+  const resetQueue = attach.indexOf("pendingOutput.length = 0;");
+  assert.ok(guard >= 0 && guard < lowerGate && guard < raiseOverlay && guard < resetQueue,
+    "the guard must precede every replay-state mutation an overlapping call used to make");
+});
+
+test("a claim latched mid-replay is consumed, never carried across the gate", () => {
+  // The frame reads AND resets pendingForce before the replay gate, so a
+  // force latched while a replay is in flight is dropped by the swallowed
+  // frame instead of leaking into the post-replay frame and claiming a
+  // stale measurement. The post-drain claim is finishAttachment's own
+  // forcing resize (a fresh measurement), so nothing is owed by the
+  // latched force.
+  const resizeFn = terminal.slice(terminal.indexOf("const resize = (force = false) => {"), terminal.indexOf("resizeRef.current = resize;"));
+  const reset = resizeFn.indexOf("pendingForce = false;");
+  const gate = resizeFn.indexOf("if (!initialized) return;");
+  assert.ok(reset >= 0 && reset < gate,
+    "the claim flag must be read and reset before the gate, so a swallowed frame drops the force it just read");
+  const finish = terminal.slice(terminal.indexOf("const finishAttachment = () => {"), terminal.indexOf("const replayPendingOutput = () => {"));
+  assert.ok(finish.includes("if (activeRef.current) resize(true);"),
+    "the post-drain claim is a fresh forcing resize, not a force latched during the replay");
+});
+
+test("the replay gate has exactly one lowering site and exactly one lifting site", () => {
+  // startAttachment lowers the gate, and it must do so for EVERY attach -
+  // a reconnect or re-foreground must re-gate its replay, or a second
+  // replay would stamp the PTY segment by segment again. finishAttachment
+  // is the only lifter, so the post-drain announce cannot double up and
+  // no other path can silently re-open the gate.
+  const attach = terminal.slice(terminal.indexOf("const startAttachment = () => {"), terminal.indexOf("const announced = announcedGrid();"));
+  assert.ok(attach.includes("initialized = false;"),
+    "every attach - mount, reconnect, re-foreground - must lower the gate for its replay");
+  assert.strictEqual(terminal.split("\n      initialized = false;\n").length - 1, 1,
+    "exactly one site may lower the gate (startAttachment, after the re-entrancy guard - not the declaration)");
+  assert.strictEqual(terminal.split("initialized = true;").length - 1, 1,
+    "exactly one site may lift the gate (finishAttachment)");
+});
+
+test("a failed attach does not wedge the re-entrancy guard", () => {
+  // A kill-mid-attach must leave the guard clear: if attachmentPromise
+  // stayed set after the failure, every later attach attempt - host
+  // restarted, user taps again, app re-foregrounds - would bail at the
+  // guard and the phone could never re-attach.
+  const thenBlock = terminal.slice(terminal.indexOf("}).then((message) => {"), terminal.indexOf("}).catch((cause) => {"));
+  assert.ok(thenBlock.includes("attachmentPromise = undefined;"),
+    "a settled attach must clear the guard so the next attach can start");
+  const catchBlock = terminal.slice(terminal.indexOf("}).catch((cause) => {"), terminal.indexOf("attachmentPromise = pending;"));
+  const clear = catchBlock.indexOf("attachmentPromise = undefined;");
+  const reOpen = catchBlock.indexOf("finishAttachment();");
+  assert.ok(clear >= 0 && reOpen > clear,
+    "a failed attach must clear the guard, so a retry can start (and the gate re-opens only after the clear)");
+});
+
+test("a disposed component never re-opens the gate or paints the error", () => {
+  // The catch's disposed check must come before finishAttachment (which
+  // would run resize() and the focus hand-off inside a disposed effect)
+  // and before the red terminal.write (a disposed xterm instance must not
+  // be painted).
+  const catchBlock = terminal.slice(terminal.indexOf("}).catch((cause) => {"), terminal.indexOf("attachmentPromise = pending;"));
+  const disposed = catchBlock.indexOf("if (disposed) return;");
+  const reOpen = catchBlock.indexOf("finishAttachment();");
+  const errorWrite = catchBlock.indexOf("terminal.write(");
+  assert.ok(disposed >= 0 && disposed < reOpen && reOpen < errorWrite,
+    "the disposed check must precede both the gate re-open and the error write");
+});
+
+test("the fill pass and the announcement share one measured box", () => {
+  // The ratchet ran while the two paths could measure different boxes: a
+  // fill-pass scale change moved one without the other. Both must consume
+  // visualContentBox(), so whatever the box reports, the paint and the
+  // announcement move together - and after the post-transform rewrite,
+  // together at all.
+  const applyZoom = terminal.slice(terminal.indexOf("const applyZoom = "), terminal.indexOf("let resizeFrame: number | undefined;"));
+  assert.ok(applyZoom.includes("const content = visualContentBox();"),
+    "the fill pass must measure the same box the announcement measures");
+  const propose = terminal.slice(terminal.indexOf("const proposeGrid = () => {"), terminal.indexOf("const announcedGrid = () => {"));
+  assert.ok(propose.includes("const content = visualContentBox();"),
+    "the announced viewport must come from the same box the fill pass fits");
+});
+
+test("a zero-sized box still announces nothing", () => {
+  // A host element that has not laid out (the WebView hidden mid-attach)
+  // must degrade to the unmeasured attach - claim deferred to the
+  // post-replay resize - never to a zero-column claim that would resize
+  // the shared PTY to nothing.
+  const box = terminal.slice(terminal.indexOf("const visualContentBox = (): Size | null => {"), terminal.indexOf("// One UNSQUISHED cell"));
+  assert.ok(box.includes("if (!(width > 0 && height > 0)) return null;"),
+    "a non-positive box must stay unmeasurable, not announce a degenerate grid");
+});
+
+test("a tap mid-replay still focuses the terminal; it only loses its claim", () => {
+  // The gate suppresses the grid claim, not the interaction: a tap during
+  // replay must still hand focus to the IME field (the user is typing
+  // into the terminal even mid-replay); only the resize claim is deferred
+  // to finishAttachment.
+  const pointerUp = terminal.slice(terminal.indexOf("const handlePointerUp = (event: PointerEvent) => {"), terminal.indexOf("const handlePointerCancel = "));
+  const focus = pointerUp.indexOf("applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: true }));");
+  const claim = pointerUp.indexOf("if (initialized) resize(true);");
+  assert.ok(focus >= 0 && focus < claim,
+    "the tap's focus hand-off must run un-gated, before the gated claim");
+});

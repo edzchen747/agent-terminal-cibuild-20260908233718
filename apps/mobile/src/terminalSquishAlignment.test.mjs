@@ -105,8 +105,8 @@ test("the slider drives the announcement and the paint scale drives the renderin
     "the announcement must ask for columns at the SLIDER's density, not the painted one");
   assert.ok(terminal.includes("applyRenderScale(squishScaleToFill(grid, cell, content, userScale))"),
     "the painted scale must come from the rendered grid against the visual box");
-  assert.ok(terminal.includes("const width = layoutWidth * renderScaleRef.current;"),
-    "the visual box must be the layout box times the painted scale, so it is stable across scale changes");
+  assert.ok(terminal.includes("const width = rect.width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);"),
+    "the visual box must be the post-transform box minus the unscaled padding frame, so it is stable across scale changes (renderScale cancels exactly - the old layout-box-times-scale drifted 8 * (1 - scale) with the scale and fed the grid back into itself)");
   assert.ok(terminal.includes("const renderScaleRef = useRef(fontWidthScale);"),
     "the painted scale starts at the slider value and relaxes from there");
 });

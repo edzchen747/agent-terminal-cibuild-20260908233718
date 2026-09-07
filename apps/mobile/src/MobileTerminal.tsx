@@ -365,16 +365,23 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     };
     // The box the terminal actually occupies ON SCREEN. The host element is
     // laid out `100 / renderScale` % wide and then squished back by
-    // `scaleX(renderScale)`, so its LAYOUT box (offsetWidth/offsetHeight -
-    // never getBoundingClientRect, which reports the post-transform box)
-    // times that scale is the same visual box whatever scale is applied.
-    // Measuring in visual space is what lets the paint scale change without
-    // moving the announced viewport underneath it.
+    // `scaleX(renderScale)`, so its POST-TRANSFORM box - getBoundingClientRect,
+    // the only measure that sees the transform - is the same visual box
+    // whatever scale is applied: renderScale cancels exactly, so a fill-pass
+    // scale change can never move the announced viewport underneath it.
+    // getBoundingClientRect is deliberate here (the old LAYOUT box times the
+    // scale was only invariant in exact arithmetic: with the 8px unscaled
+    // padding frame it drifted 8 * (1 - scale) with the scale, and the
+    // integer offsetWidth added rounding on top). The padding is subtracted
+    // as an unscaled frame, so the width under-reports the true painted
+    // width by 8 * (1 - scale), at most 8px - the safe direction (fewer
+    // columns, never a clip). Height has no vertical transform, so it keeps
+    // the integer offsetHeight.
     const visualContentBox = (): Size | null => {
       const style = window.getComputedStyle(hostElement);
-      const layoutWidth = hostElement.offsetWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+      const rect = hostElement.getBoundingClientRect();
+      const width = rect.width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
       const height = hostElement.offsetHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
-      const width = layoutWidth * renderScaleRef.current;
       if (!(width > 0 && height > 0)) return null;
       return { width, height };
     };
@@ -510,6 +517,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     let resizeFrame: number | undefined;
     let pendingForce = false;
     let lastSize = { cols: 0, rows: 0 };
+    // The journal-replay gate: startAttachment lowers it, finishAttachment
+    // lifts it once the drain is done. Declared before resize, so the
+    // announce suppression below is not just call-order luck.
+    let initialized = false;
     const resize = (force = false) => {
       if (!activeRef.current) return;
       // A force must never be dropped by coalescing: a tap that lands
@@ -525,6 +536,12 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
         pendingForce = false;
         if (!activeRef.current) return;
         applyZoom();
+        // Organic viewport announces are suppressed for the whole journal
+        // replay: the ResizeObserver still fires as the replayed segments
+        // resize the emulator, and announcing the container grid then would
+        // stamp the PTY - and re-stamp every other client - mid-replay.
+        // finishAttachment re-announces once the drain is done.
+        if (!initialized) return;
         const dims = announcedGrid();
         if (!dims) return;
         // A tap, a slider drag, or entering the terminal view is an
@@ -572,7 +589,11 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       // PSReadLine treats those synthetic arrows as editing commands and can
       // ring the bell or corrupt the first real key at a line boundary.
       applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: true }));
-      resize(true);
+      // Suppressed while a journal replay is in flight: the tap's size is
+      // being driven by the replayed segments, and a tap-claim would stamp
+      // the PTY - and re-stamp every other client - mid-replay. The tap is
+      // never simply lost: finishAttachment claims once the drain is done.
+      if (initialized) resize(true);
     };
     const handlePointerCancel = (event: PointerEvent) => {
       // The platform took the gesture away; it can never still be a tap.
@@ -676,7 +697,6 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
         inputElement.value = "";
       }, 0);
     };
-    let initialized = false;
     const input = terminal.onData((data) => {
       if (isCursorPositionReport(data)) {
         // A replayed buffer can contain a CPR query for which the shell is
@@ -991,7 +1011,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       resetTouch();
       if (wasTap) {
         applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: true }));
-        resize(true);
+        // Suppressed for the whole journal replay, exactly like the
+        // pointer-tap claim: finishAttachment claims once the drain is done.
+        if (initialized) resize(true);
       }
     };
     const handleTouchCancel = () => {
@@ -1069,7 +1091,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       const announced = announcedGrid();
       const attachDims = announced ?? { cols: terminal.cols, rows: terminal.rows };
       syncDebug(`attach send session=${session.id} cols=${attachDims.cols} rows=${attachDims.rows}${announced ? "" : " (unmeasured - claiming deferred to the post-replay resize)"}`);
-      connection.request({
+      const pending = connection.request({
         type: "session.attach",
         requestId: createRequestId(),
         sessionId: session.id,
@@ -1120,11 +1142,16 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       }).catch((cause) => {
         attachmentPromise = undefined;
         syncDebug(`attach session=${session.id} failed: ${String(cause)}`);
-        // A failed attach never drains the queue, so lift the overlay
-        // explicitly - otherwise the error below would be painted behind it.
-        if (!disposed) setReplaying(false);
-        if (!disposed) terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
+        if (disposed) return;
+        // A failed attach never drains the queue, so finishAttachment must
+        // lift the overlay explicitly - otherwise the error below would be
+        // painted behind it. It also re-opens the replay gate (initialized),
+        // so a failed open cannot leave the phone permanently unable to
+        // announce: the post-drain re-claim and later taps still work.
+        finishAttachment();
+        terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
       });
+      attachmentPromise = pending;
     };
     // Attachment and viewport keepalive follow the visible view (see the
     // active-gating effect below), not the mount lifecycle: the pager keeps
