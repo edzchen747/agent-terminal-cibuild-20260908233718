@@ -17,6 +17,17 @@ pub enum TuiMode {
     Fullscreen,
 }
 
+/// Whether a session's shell is blocked on a foreground program (`Active`)
+/// or owns its prompt and is waiting for the user (`Idle`). See
+/// `activity.rs` for how the host decides.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionActivity {
+    #[default]
+    Idle,
+    Active,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceIdentity {
@@ -87,6 +98,13 @@ pub struct TerminalSession {
     /// inline/fullscreen follow the host grid announcements.
     #[serde(default)]
     pub tui_mode: TuiMode,
+    /// Whether the shell is currently blocked on a foreground program.
+    #[serde(default)]
+    pub activity: SessionActivity,
+    /// When the session entered `activity`, RFC3339, so clients can show
+    /// how long the current command has been running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_since: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -235,6 +253,18 @@ pub struct TerminalTuiModeEvent {
     pub session_id: String,
     pub mode: TuiMode,
     pub offset: u64,
+}
+
+/// The host reclassified whether the session is blocked on a foreground
+/// program. Unlike the grid and mode events this carries no stream offset:
+/// idle is discovered by a timeout, not by a byte in the stream, so there
+/// is no position to anchor it to.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalActivityEvent {
+    pub session_id: String,
+    pub activity: SessionActivity,
+    pub since: String,
 }
 
 /// One contiguous slice of the session's PTY stream recorded under a single
@@ -485,6 +515,12 @@ pub enum ServerMessage {
         mode: TuiMode,
         offset: u64,
     },
+    #[serde(rename = "session.activity")]
+    SessionActivityChanged {
+        session_id: String,
+        activity: SessionActivity,
+        since: String,
+    },
     #[serde(rename = "ok")]
     Ok { request_id: String },
     #[serde(rename = "error")]
@@ -500,7 +536,7 @@ pub enum ServerMessage {
 mod tests {
     use super::{
         ClientMessage, DARK_TERMINAL_SCHEME_IDS, DEFAULT_DARK_TERMINAL_SCHEME_ID,
-        DEFAULT_LIGHT_TERMINAL_SCHEME_ID, LIGHT_TERMINAL_SCHEME_IDS, ServerMessage, SessionSegment,
+        DEFAULT_LIGHT_TERMINAL_SCHEME_ID, LIGHT_TERMINAL_SCHEME_IDS, ServerMessage, SessionActivity, SessionSegment,
         TerminalSession, TerminalTuiModeEvent, TuiMode, normalize_terminal_scheme_id,
     };
 
@@ -586,6 +622,16 @@ mod tests {
         assert_eq!(mode["type"], "session.mode");
         assert_eq!(mode["mode"], "fullscreen");
         assert_eq!(mode["offset"], 200);
+
+        let activity = serde_json::to_value(ServerMessage::SessionActivityChanged {
+            session_id: "s1".into(),
+            activity: SessionActivity::Active,
+            since: "2026-09-06T00:00:00Z".into(),
+        })
+        .expect("session.activity");
+        assert_eq!(activity["type"], "session.activity");
+        assert_eq!(activity["activity"], "active");
+        assert_eq!(activity["since"], "2026-09-06T00:00:00Z");
     }
 
     #[test]
@@ -600,6 +646,8 @@ mod tests {
             created_at: "now".into(),
             exit_code: None,
             tui_mode: TuiMode::Inline,
+            activity: SessionActivity::Active,
+            activity_since: Some("2026-09-06T00:00:00Z".into()),
         };
         let json = serde_json::to_value(&session).expect("TerminalSession");
         assert_eq!(json["tuiMode"], "inline", "the TUI mode must be camelCased");

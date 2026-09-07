@@ -19,6 +19,8 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{Duration, Utc};
 use percent_encoding::percent_decode_str;
 use portable_pty::{ChildKiller, MasterPty, PtySize, native_pty_system};
+
+use crate::activity::ActivityDetector;
 use regex::Regex;
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, EventTarget, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -31,8 +33,9 @@ use crate::{
         AuthorizedDevice, ClientMessage, DesktopState, DirectoryEntry, DirectoryListing,
         FocusSessionEvent, HostInfo,
         HostSnapshot, PROTOCOL_VERSION, PairingPayload, Project, RemoteRegistration, ServerMessage,
-        SessionSegment, SessionSnapshot, ShellProfile, TerminalDataEvent, TerminalGridEvent,
-        TerminalSession, TerminalThemeSettings, TerminalTuiModeEvent, TuiMode,
+        SessionActivity, SessionSegment, SessionSnapshot, ShellProfile,
+        TerminalActivityEvent, TerminalDataEvent, TerminalGridEvent, TerminalSession,
+        TerminalThemeSettings, TerminalTuiModeEvent, TuiMode,
         normalize_terminal_scheme_id,
     },
     network,
@@ -113,6 +116,12 @@ const VIEWPORT_WATCHDOG_TIMEOUT_MS: u64 = 2_000;
 /// Sweep cadence: half the keepalive interval, so a client that stops
 /// pinging is evicted promptly after its watchdog window lapses.
 const VIEWPORT_WATCHDOG_TICK_MS: u64 = VIEWPORT_KEEPALIVE_INTERVAL_MS / 2;
+/// How often the host re-checks whether a session has gone idle. Idle is
+/// a timeout - a session that stopped producing output produces no chunk
+/// to notice it on - so it has to be swept for. The tick also releases
+/// the deferred `Active` announcement (see `activity::ACTIVE_MIN_MS`),
+/// which is why it is not slower than that delay.
+const ACTIVITY_WATCHDOG_TICK_MS: u64 = 250;
 
 // ---------------------------------------------------------------------------
 // Terminal sync diagnostics (for debugging history parity between devices).
@@ -387,6 +396,9 @@ struct ManagedSession {
     /// and applied to the PTY on the next alternate-screen entry so a freshly
     /// launched TUI opens at that grid.
     requested_viewport: Option<(u16, u16)>,
+    /// Active/idle detection for this session, fed from the same
+    /// classifier pass as the TUI mode.
+    activity: ActivityDetector,
     control_tail: String,
     cursor_query_tail: String,
     pending_cursor_reports: usize,
@@ -641,6 +653,7 @@ impl Core {
         });
         core.spawn_presence_refresh();
         core.spawn_viewport_watchdog();
+        core.spawn_activity_watchdog();
         core
     }
 
@@ -1286,6 +1299,54 @@ impl Core {
         });
     }
 
+    fn spawn_activity_watchdog(self: &Arc<Self>) {
+        let core = Arc::clone(self);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    ACTIVITY_WATCHDOG_TICK_MS,
+                ));
+                core.sweep_session_activity();
+            }
+        });
+    }
+
+    /// Re-evaluate every session's activity with no new bytes: this is
+    /// where a command that has stopped producing output is finally
+    /// called idle, and where an `Active` that has now lasted long enough
+    /// to be worth showing is announced.
+    fn sweep_session_activity(self: &Arc<Self>) {
+        let changed = {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let now = Instant::now();
+            let mut changed = Vec::new();
+            for session in inner.sessions.values_mut() {
+                if session.metadata.status != "running" {
+                    continue;
+                }
+                let mode = session.metadata.tui_mode;
+                let quiet_idle = session.tui.quiet_idle(now);
+                if let Some((activity, since)) =
+                    session.activity.observe(&[], mode, quiet_idle, false, now)
+                {
+                    session.metadata.activity = activity;
+                    session.metadata.activity_since = Some(since.clone());
+                    changed.push((session.metadata.id.clone(), activity, since));
+                }
+            }
+            changed
+        };
+        if changed.is_empty() {
+            return;
+        }
+        for (session_id, activity, since) in changed {
+            self.broadcast_activity(&session_id, activity, &since);
+        }
+        // The snapshot carries `activity` too, so a window that opens (or a
+        // phone that reconnects) mid-command starts with the right badge.
+        self.broadcast();
+    }
+
     fn sweep_stale_viewports(self: &Arc<Self>) {
         let mut changed = Vec::new();
         let viewing = {
@@ -1889,11 +1950,13 @@ impl Core {
         Ok(project)
     }
 
-    /// How many terminal tabs are open, including a tab kept for
-    /// inspection after its shell exited non-zero. The tray's session
-    /// label reports this number.
-    pub fn session_count(&self) -> usize {
-        open_session_count(&self.inner.lock().expect("desktop state poisoned"))
+    /// How many terminal tabs are open, and how many of those are
+    /// running something. Open includes a tab kept for inspection after
+    /// its shell exited non-zero; that tab can never be busy. The tray's
+    /// session label reports both.
+    pub fn session_counts(&self) -> (usize, usize) {
+        let inner = self.inner.lock().expect("desktop state poisoned");
+        (active_session_count(&inner), open_session_count(&inner))
     }
 
     pub fn create_session(
@@ -1947,6 +2010,8 @@ impl Core {
             created_at: Utc::now().to_rfc3339(),
             exit_code: None,
             tui_mode: TuiMode::Canonical,
+            activity: SessionActivity::Idle,
+            activity_since: None,
         };
         {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
@@ -1971,6 +2036,7 @@ impl Core {
             synthetic_alt: false,
             deferred_tui_resize: false,
             requested_viewport: None,
+            activity: ActivityDetector::new(Instant::now()),
             control_tail: String::new(),
             cursor_query_tail: String::new(),
             pending_cursor_reports: 0,
@@ -2129,6 +2195,8 @@ impl Core {
             created_at: Utc::now().to_rfc3339(),
             exit_code: None,
             tui_mode: TuiMode::Canonical,
+            activity: SessionActivity::Idle,
+            activity_since: None,
         };
         let master = crate::default_terminal::build_handoff_master(
             handoff.reader,
@@ -2167,6 +2235,7 @@ impl Core {
                     synthetic_alt: false,
                     deferred_tui_resize: false,
                     requested_viewport: None,
+                    activity: ActivityDetector::new(Instant::now()),
                     control_tail: String::new(),
                     cursor_query_tail: String::new(),
                     pending_cursor_reports: 0,
@@ -2292,7 +2361,7 @@ impl Core {
         controller: TerminalController,
         size: Option<(u16, u16)>,
     ) {
-        let grid_changed = {
+        let (grid_changed, activity_change) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
@@ -2300,6 +2369,7 @@ impl Core {
             if session.metadata.status != "running" {
                 return;
             }
+            let mut activity_change = None;
 
             // The grid the PTY actually ended up on, if this write moved it.
             // Read from the apply call rather than re-derived from the epoch
@@ -2348,11 +2418,24 @@ impl Core {
 
             if data.contains('\r') || data.contains('\n') {
                 session.has_run_command = true;
+                // A submitted line is the command start. It is the only
+                // such signal in the shells whose prompt hooks report
+                // `A`/`B`/`D` but no `C`, and the only one at all in a
+                // shell we could not hook.
+                if let Some((activity, since)) = session.activity.on_input_line(Instant::now()) {
+                    session.metadata.activity = activity;
+                    session.metadata.activity_since = Some(since.clone());
+                    activity_change = Some((activity, since));
+                }
             }
             session.writer.write(session_id, data);
 
-            applied_grid
+            (applied_grid, activity_change)
         };
+        if let Some((activity, since)) = activity_change {
+            self.broadcast_activity(session_id, activity, &since);
+            self.broadcast();
+        }
         if let Some(epoch) = grid_changed {
             sync_log!(
                 "grid",
@@ -2627,6 +2710,56 @@ impl Core {
     /// Fullscreen clients own the PTY grid (strict cell grid, no reflow
     /// heuristics); canonical clients render the journal as their own
     /// viewport.
+    /// Announce a session's active/idle change to every client watching
+    /// it. Modelled on `broadcast_tui_mode`, minus the stream offset: idle
+    /// is discovered by a timeout, so there is no byte position to anchor
+    /// it to.
+    fn broadcast_activity(&self, session_id: &str, activity: SessionActivity, since: &str) {
+        let targets = self
+            .clients
+            .lock()
+            .expect("remote clients poisoned")
+            .iter()
+            .filter(|(_, client)| {
+                client.device_id.is_some() && client.attached_sessions.contains(session_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for client_id in &targets {
+            self.send_to_client(
+                client_id,
+                ServerMessage::SessionActivityChanged {
+                    session_id: session_id.to_string(),
+                    activity,
+                    since: since.to_string(),
+                },
+            );
+        }
+        let event = TerminalActivityEvent {
+            session_id: session_id.to_string(),
+            activity,
+            since: since.to_string(),
+        };
+        let windows = self
+            .inner
+            .lock()
+            .expect("desktop state poisoned")
+            .windows
+            .subscribers(session_id);
+        sync_log!(
+            "activity",
+            "broadcast session={session_id} activity={activity:?} clients={}",
+            targets.len()
+        );
+        for label in windows {
+            let _ = self.app.emit_to(
+                EventTarget::webview_window(label),
+                "desktop-activity",
+                event.clone(),
+            );
+        }
+    }
+
     fn broadcast_tui_mode(&self, session_id: &str, mode: TuiMode, offset: u64) {
         let targets = self
             .clients
@@ -3452,6 +3585,7 @@ impl Core {
             payload,
             mode_change,
             tui_entry_grid,
+            activity_change,
         ) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let Some(session) = inner.sessions.get_mut(session_id) else {
@@ -3468,7 +3602,8 @@ impl Core {
             // releases) grid ownership. The chunk is journaled together
             // with any host-injected synthetic alt-screen bytes so replay
             // and live clients see the exact same stream.
-            let tui_transition = session.tui.feed(&data, Instant::now(), session.grid.1);
+            let now = Instant::now();
+            let tui_transition = session.tui.feed(&data, now, session.grid.1);
             // History isolation: a FULLSCREEN TUI that never enters the
             // alternate screen of its own (a raw primary-buffer harness)
             // is wrapped in a host-injected alt pair so its frames stay
@@ -3655,6 +3790,22 @@ impl Core {
                     .requested_viewport
                     .and_then(|(cols, rows)| apply_session_grid(session, cols, rows));
             }
+            // Active/idle detection runs off the same classifier pass:
+            // the OSC 133 markers it accepted (a marker painted inside a
+            // synchronized-output bracket is a program's own composer and
+            // never reaches this list), the mode it settled on, and its
+            // prompt-quiet verdict.
+            let markers = session.tui.take_shell_markers();
+            let quiet_idle = session.tui.quiet_idle(now);
+            let mode_now = session.metadata.tui_mode;
+            let activity_change = session
+                .activity
+                .observe(&markers, mode_now, quiet_idle, true, now)
+                .map(|(activity, since)| {
+                    session.metadata.activity = activity;
+                    session.metadata.activity_since = Some(since.clone());
+                    (activity, since)
+                });
             (
                 reported,
                 title_changed,
@@ -3663,6 +3814,7 @@ impl Core {
                 payload,
                 mode_change,
                 tui_entry_grid,
+                activity_change,
             )
         };
         let event = TerminalDataEvent {
@@ -3684,9 +3836,12 @@ impl Core {
         if let Some(epoch) = tui_entry_grid {
             self.broadcast_grid_change(session_id, epoch);
         }
+        if let Some((activity, since)) = &activity_change {
+            self.broadcast_activity(session_id, *activity, since);
+        }
         if let Some(cwd) = reported_cwd {
             self.handle_session_working_directory(session_id, &cwd);
-        } else if title_changed {
+        } else if title_changed || activity_change.is_some() {
             self.broadcast();
         }
     }
@@ -4200,6 +4355,12 @@ fn mark_session_exited(inner: &mut Inner, session_id: &str, exit_code: u32) -> b
     };
     session.metadata.status = "exited".into();
     session.metadata.exit_code = Some(exit_code);
+    // An exited tab must not keep a busy badge, and no further signal is
+    // coming to clear one: the stream is closed and the sweeper skips
+    // sessions that are no longer running.
+    session.activity.on_exit(Instant::now());
+    session.metadata.activity = session.activity.state();
+    session.metadata.activity_since = Some(session.activity.since().to_string());
     true
 }
 
@@ -4208,6 +4369,20 @@ fn mark_session_exited(inner: &mut Inner, session_id: &str, exit_code: u32) -> b
 /// it, so it is part of the count the tray's session label reports.
 fn open_session_count(inner: &Inner) -> usize {
     inner.sessions.len()
+}
+
+/// How many open tabs are blocked on a foreground program. An exited tab
+/// is never counted: `mark_session_exited` drops its activity, and the
+/// sweeper stops looking at it.
+fn active_session_count(inner: &Inner) -> usize {
+    inner
+        .sessions
+        .values()
+        .filter(|session| {
+            session.metadata.status == "running"
+                && session.metadata.activity == SessionActivity::Active
+        })
+        .count()
 }
 
 /// Picks the project a window should fall back to when its current project is
@@ -5081,15 +5256,16 @@ fn registration_status_for_display(
 #[cfg(test)]
 mod tests {
     use super::{
-        CdOutcome, CdPlan, ConnectivityAction, ConnectivityTracker,
+        ActivityDetector, CdOutcome, CdPlan, ConnectivityAction, ConnectivityTracker,
         EmbeddedNodeStatus, Inner, ManagedSession, PRESENCE_WINDOW_MS, PairingGrant,
         PENDING_FOCUS_TTL, PendingFocus, RetireOutcome, SESSION_MAX_COLS, SESSION_MAX_ROWS,
-        SessionWriter, claim_pending_focus,
+        SessionActivity, SessionWriter, claim_pending_focus,
         VIEWPORT_WATCHDOG_TIMEOUT_MS, apply_grid_if_tui,
         apply_session_grid, ensure_home_project, evict_stale_viewports, folder_name,
         is_cursor_position_report, is_device_attributes_report, is_dropped_node_status,
         is_system_directory, is_within_project, log_escape,
-        newest_running_session_project_id, open_session_count, parse_terminal_titles,
+        active_session_count, newest_running_session_project_id, open_session_count,
+        parse_terminal_titles,
         parse_working_directories, preferred_project, presence_alive, project_is_usable,
         project_for_directory, project_name_or_folder, record_cursor_position_requests,
         record_device_attribute_requests, reselect_owner_on_departure,
@@ -7872,6 +8048,39 @@ mod tests {
     }
 
     #[test]
+    fn active_session_count_ignores_idle_and_exited_tabs() {
+        // The other half of the tray label. A tab that was running
+        // something when its shell died must not stay in the numerator:
+        // nothing is coming to clear it once the sweeper drops the
+        // session.
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "p", r"C:\Work\P", true);
+        inner.sessions.insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        inner.sessions.insert("s2".into(), test_session("s2", "p", r"C:\Work\P"));
+        assert_eq!(active_session_count(&inner), 0, "a fresh tab sits at its prompt");
+
+        for id in ["s1", "s2"] {
+            inner
+                .sessions
+                .get_mut(id)
+                .expect("test session")
+                .metadata
+                .activity = SessionActivity::Active;
+        }
+        assert_eq!(active_session_count(&inner), 2, "both tabs are running something");
+
+        assert!(mark_session_exited(&mut inner, "s1", 1));
+        assert_eq!(open_session_count(&inner), 2, "the exited tab is still open");
+        assert_eq!(
+            active_session_count(&inner),
+            1,
+            "but an exited tab is never counted as busy"
+        );
+
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
     fn open_session_count_tracks_tabs_through_exit_and_close() {
         // The tray's session label reports this count, so its edge cases
         // must hold: an empty tray reads zero, a tab kept for inspection
@@ -8030,7 +8239,9 @@ mod tests {
             status: status.into(),
             created_at: created_at.into(),
             exit_code: None,
-                tui_mode: TuiMode::Canonical,
+            tui_mode: TuiMode::Canonical,
+            activity: SessionActivity::Idle,
+            activity_since: None,
         }
     }
 
@@ -8125,6 +8336,8 @@ mod tests {
                 created_at: "now".into(),
                 exit_code: None,
                 tui_mode: TuiMode::Canonical,
+                activity: SessionActivity::Idle,
+                activity_since: None,
             },
             master: Box::new(InertMaster),
             writer: SessionWriter::spawn(session_id, Box::new(std::io::sink())),
@@ -8143,6 +8356,7 @@ mod tests {
             synthetic_alt: false,
             deferred_tui_resize: false,
             requested_viewport: None,
+            activity: ActivityDetector::new(Instant::now()),
             control_tail: String::new(),
             cursor_query_tail: String::new(),
             pending_cursor_reports: 0,

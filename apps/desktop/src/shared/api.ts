@@ -1,4 +1,4 @@
-import type { HostSnapshot, PairingPayload, Project, SessionSegment, TerminalSession, TuiMode } from "@agentterminal/protocol";
+import type { HostSnapshot, PairingPayload, Project, SessionActivity, SessionSegment, TerminalSession, TuiMode } from "@agentterminal/protocol";
 
 export interface DesktopState extends HostSnapshot {
   currentProjectId: string;
@@ -73,4 +73,10 @@ export interface DesktopApi {
   onData(callback: (sessionId: string, data: string, offset: number) => void): () => void;
   onGrid(callback: (sessionId: string, cols: number, rows: number, offset: number) => void): () => void;
   onTuiMode(callback: (sessionId: string, mode: TuiMode, offset: number) => void): () => void;
+  /**
+   * The host reclassified whether a session is blocked on a foreground
+   * program. There is no stream offset: idle is found by a timeout on
+   * the host, not by a byte in the stream.
+   */
+  onActivity(callback: (sessionId: string, activity: SessionActivity, since: string) => void): () => void;
 }

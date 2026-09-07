@@ -1,4 +1,5 @@
-import type { Project, TerminalSession } from "@agentterminal/protocol";
+import type { Project, SessionActivity, TerminalSession } from "@agentterminal/protocol";
+import { projectActivitySummary } from "./session-activity.ts";
 
 /**
  * A snapshot of a project card that just left the sidebar list. While the
@@ -11,6 +12,12 @@ export interface LeavingProject {
   index: number;
   /** Running-session count the card showed when it left. */
   count: number;
+  /**
+   * The caption the card showed when it left, frozen with it. The
+   * ghost outlives the sessions it is describing, so it cannot
+   * recompute one.
+   */
+  label: string;
 }
 
 /** One row of the sidebar render list: a live project card or a leaving ghost. */
@@ -29,16 +36,13 @@ export const PROJECT_LEAVE_MS = 420;
  * Projects from `previous` that no longer appear in `current`, each pinned to
  * the index it held so the sidebar can render a leaving ghost per card.
  */
-export function departedProjects(previous: readonly Project[], current: readonly Project[], previousSessions: readonly TerminalSession[]): LeavingProject[] {
+export function departedProjects(previous: readonly Project[], current: readonly Project[], previousSessions: readonly TerminalSession[], activity: ReadonlyMap<string, SessionActivity> = new Map()): LeavingProject[] {
   const remaining = new Set(current.map((project) => project.id));
   const leavings: LeavingProject[] = [];
   previous.forEach((project, index) => {
     if (remaining.has(project.id)) return;
-    leavings.push({
-      project,
-      index,
-      count: previousSessions.filter((session) => session.projectId === project.id && session.status === "running").length
-    });
+    const summary = projectActivitySummary(previousSessions, activity, project.id);
+    leavings.push({ project, index, count: summary.running, label: summary.label });
   });
   return leavings;
 }
