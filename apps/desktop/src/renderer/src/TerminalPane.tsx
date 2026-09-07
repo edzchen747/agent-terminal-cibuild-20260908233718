@@ -504,11 +504,31 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
         return false;
       }
 
+      // Ctrl+V pastes the clipboard into the shell. The WebView swallows the
+      // native paste before xterm can turn it into a paste event, and letting
+      // the key fall through would forward a bare \x16 (the Ctrl-V control
+      // character) to the shell instead - so the clipboard is read on the
+      // host and handed to xterm's own paste path: byte-for-byte what a
+      // right-click paste does, including the bracketed-paste wrapping that
+      // keeps a pasted Enter from being read as a typed one while the shell
+      // runs in mode 2004. (Its onData fires straight into the pane's input
+      // forwarder, so the grid claim is the typing one.) Repeats are
+      // skipped: holding the chord must not re-paste.
+      if (event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey && event.key.toLowerCase() === "v") {
+        event.preventDefault();
+        if (!event.repeat) {
+          void window.agentTerminal.readClipboard().then((text) => {
+            if (text) terminal.paste(text);
+          }).catch(() => undefined);
+        }
+        return false;
+      }
+
       // WebView2 can consume Ctrl shortcuts before xterm emits onData. Forward
       // the control sequence ourselves so Ctrl+D, Ctrl+C, Ctrl+Backspace, and
       // Ctrl+Arrow work consistently in every Windows shell.
       const data = keyInput(event);
-      if (!data || (event.key.toLowerCase() === "v" && !event.altKey)) return true;
+      if (!data) return true;
       event.preventDefault();
       sendKeyboardInput(data);
       return false;

@@ -92,6 +92,7 @@ const api: DesktopApi = {
   detachSession: (sessionId) => { void invoke("detach_session", { sessionId }); },
   releaseSessionViewport: (sessionId) => { void invoke("release_session_viewport", { sessionId }); },
   copyText: (text) => invoke("copy_text", { text }),
+  readClipboard: () => invoke<string>("read_clipboard"),
   logDebug: (message) => { void invoke("log_debug", { message }); },
   openExternalUrl: (url) => openUrl(url),
   startPairing: () => invoke("start_pairing"),

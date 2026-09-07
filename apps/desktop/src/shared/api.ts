@@ -50,6 +50,9 @@ export interface DesktopApi {
    * candidate. A hidden tab sends this instead of detaching. */
   releaseSessionViewport(sessionId: string): void;
   copyText(text: string): Promise<void>;
+  /** Read the system clipboard text (the host's arboard-backed copy, the
+   * same source Ctrl+V pastes into a pane). */
+  readClipboard(): Promise<string>;
   logDebug(message: string): void;
   openExternalUrl(url: string): Promise<void>;
   startPairing(): Promise<PairingPayload>;

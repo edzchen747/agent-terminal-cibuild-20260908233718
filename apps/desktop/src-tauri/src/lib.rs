@@ -199,6 +199,16 @@ fn copy_text(text: String) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// The system clipboard's text, for a pane's Ctrl+V: the WebView swallows
+/// the native paste before xterm can turn it into a paste event, so the pane
+/// reads the clipboard here and types it in as ordinary input.
+#[tauri::command]
+fn read_clipboard() -> Result<String, String> {
+    Clipboard::new()
+        .and_then(|mut clipboard| clipboard.get_text())
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 fn log_debug(message: String) {
     core::sync_debug_from_webview(&message);
@@ -367,6 +377,7 @@ pub fn run() {
             detach_session,
             release_session_viewport,
             copy_text,
+            read_clipboard,
             log_debug,
             start_pairing,
             retry_remote_registration,
