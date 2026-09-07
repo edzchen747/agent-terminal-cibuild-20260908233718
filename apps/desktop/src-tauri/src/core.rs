@@ -615,6 +615,22 @@ impl ConnectivityTracker {
     }
 }
 
+/// Restores the native edge-resize behaviour on a freshly built window
+/// (see edge_resize). These build sites can be reached from a worker
+/// thread (async commands), and the WndProc subclass belongs on the thread
+/// that dispatches the window's messages, so the attach is marshalled to
+/// the main thread. Best effort: if the window is gone or the attach
+/// fails, it simply keeps working without edge resizing.
+fn install_edge_resize(app: &AppHandle, label: &str) {
+    let for_thread = app.clone();
+    let label = label.to_owned();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(window) = for_thread.get_webview_window(&label) {
+            crate::edge_resize::install(&window);
+        }
+    });
+}
+
 impl Core {
     pub fn new(app: AppHandle, store: DesktopStore) -> Arc<Self> {
         if sync_debug_enabled() {
@@ -1531,6 +1547,9 @@ impl Core {
                 .title(format!("{} — Agent Terminal", project.name))
                 .inner_size(1320.0, 820.0)
                 .min_inner_size(680.0, 560.0)
+                // Undecorated: the renderer paints its own title bar with the
+                // traffic-light window controls (see WindowControls).
+                .decorations(false)
                 .visible(false)
                 .build();
         let window = match built {
@@ -1544,6 +1563,10 @@ impl Core {
                 return Err(error.into());
             }
         };
+        // The window is undecorated, so restore the native edge-resize
+        // handle it lost (see edge_resize). The subclass is attached on the
+        // main thread, where the window's messages are dispatched.
+        install_edge_resize(&self.app, &label);
         window.show()?;
         Ok(())
     }
@@ -1675,6 +1698,9 @@ impl Core {
                 .title(format!("{} — Agent Terminal", project.name))
                 .inner_size(1320.0, 820.0)
                 .min_inner_size(680.0, 560.0)
+                // Undecorated: the renderer paints its own title bar with the
+                // traffic-light window controls (see WindowControls).
+                .decorations(false)
                 .visible(focus)
                 .build();
         let window = match built {
@@ -1688,6 +1714,10 @@ impl Core {
                 return Err(error.into());
             }
         };
+        // The window is undecorated, so restore the native edge-resize
+        // handle it lost (see edge_resize). The subclass is attached on the
+        // main thread, where the window's messages are dispatched.
+        install_edge_resize(&self.app, &label);
         if !focus {
             window.show()?;
         }

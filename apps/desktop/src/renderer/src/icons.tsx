@@ -12,6 +12,9 @@ export const SettingsIcon = (props: IconProps) => <svg {...base} {...props}><cir
 export const BookmarkIcon = (props: IconProps) => <svg {...base} {...props}><path d="M6 3h12v18l-6-4-6 4z"/></svg>;
 export const ClockIcon = (props: IconProps) => <svg {...base} {...props}><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>;
 export const CloseIcon = (props: IconProps) => <svg {...base} {...props}><path d="m7 7 10 10M17 7 7 17"/></svg>;
+export const MinimizeIcon = (props: IconProps) => <svg {...base} {...props}><path d="M6 12h12"/></svg>;
+export const MaximizeIcon = (props: IconProps) => <svg {...base} {...props}><rect x="5.5" y="5.5" width="13" height="13" rx="2"/></svg>;
+export const RestoreIcon = (props: IconProps) => <svg {...base} {...props}><rect x="9.5" y="9.5" width="10" height="10" rx="1.5"/><path d="M5.5 14.5v-9h10"/></svg>;
 export const TrashIcon = (props: IconProps) => <svg {...base} {...props}><path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14"/></svg>;
 export const EditIcon = (props: IconProps) => <svg {...base} {...props}><path d="M4 20h4l11-11-4-4L4 16v4Z"/><path d="m13.5 6.5 4 4"/></svg>;
 export const WifiIcon = (props: IconProps) => <svg {...base} {...props}><path d="M5 12.5a10 10 0 0 1 14 0M8 16a6 6 0 0 1 8 0M11 19.5a2 2 0 0 1 2 0"/></svg>;

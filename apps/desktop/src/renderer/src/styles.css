@@ -55,6 +55,13 @@
   --shadow-strong: #000a;
   --shadow-deep: #000b;
 
+  /* Traffic-light window controls (the window is undecorated; see
+     .window-controls below). Fixed colors: the dots stay the same in both
+     themes, macOS-style. */
+  --window-ctl-minimize: #ff9f0a;
+  --window-ctl-maximize: #2ec94e;
+  --window-ctl-close: #ff5f57;
+
   /* Fallback until a terminal mounts and sets the active scheme background
      (TerminalPane / MobileTerminal set --terminal-bg from the shared scheme).
      It is the terminal surface, not app chrome, so it is not themed here. */
@@ -114,6 +121,10 @@
   --shadow-soft: #1c273614;
   --shadow-strong: #1c27361f;
   --shadow-deep: #1c273629;
+
+  --window-ctl-minimize: #ff9f0a;
+  --window-ctl-maximize: #2ec94e;
+  --window-ctl-close: #ff5f57;
 }
 
 * { box-sizing: border-box; }
@@ -122,8 +133,22 @@ button, select, input { font: inherit; }
 button { color: inherit; }
 .display-name { min-width: 0; max-width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .app-shell { height: 100%; display: grid; grid-template-rows: 42px 1fr; background: var(--app-bg); }
-.titlebar { -webkit-app-region: drag; display: flex; align-items: center; border-bottom: 1px solid var(--border); background: var(--surface); padding-right: 145px; user-select: none; }
+.titlebar { -webkit-app-region: drag; position: relative; display: flex; align-items: center; border-bottom: 1px solid var(--border); background: var(--surface); padding-right: 105px; user-select: none; }
 .titlebar button, .titlebar select { -webkit-app-region: no-drag; }
+/* The window runs undecorated (see core.rs), so these traffic-light
+   buttons are the only minimise/maximise/close. They sit in the space the
+   .titlebar padding-right already reserves at the top-right corner; icons
+   fade in on hover, macOS-style. Keep the padding-right in sync with this
+   control strip's width. */
+.window-controls { position: absolute; top: 50%; right: 12px; transform: translateY(-50%); display: flex; gap: 20px; }
+.window-control { width: 13px; height: 13px; padding: 0; border: 0; border-radius: 50%; display: grid; place-items: center; cursor: pointer; transition: filter .12s ease; }
+.window-control:hover { filter: brightness(1.12); }
+.window-control:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.window-control svg { width: 7px; height: 7px; pointer-events: none; opacity: 0; transition: opacity .12s ease; }
+.window-controls:hover .window-control svg, .window-control:focus-visible svg { opacity: 1; }
+.window-control.is-minimize { background: var(--window-ctl-minimize); color: #6e4200; }
+.window-control.is-maximize { background: var(--window-ctl-maximize); color: #0a4a1e; }
+.window-control.is-close { background: var(--window-ctl-close); color: #5c120e; }
 .title-action { margin-left: 7px; }
 .brand-mark { width: 28px; height: 28px; margin-left: 4px; border-radius: 7px; display: grid; place-items: center; color: var(--accent-contrast); background: linear-gradient(135deg,#8ed0fe,var(--accent)); }
 .brand-mark svg { width: 17px; }

@@ -1,6 +1,7 @@
 mod activity;
 mod core;
 mod default_terminal;
+mod edge_resize;
 
 /// Registers the handoff class object on the calling (main) thread.
 pub fn register_handoff_on_main_thread() {

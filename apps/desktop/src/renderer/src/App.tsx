@@ -18,6 +18,7 @@ import { connectedDevices, NO_DEVICES_LABEL } from "./statusbar";
 import { effectiveAutoCollapse, isNarrowLayout, loadSidebarPreferences, NARROW_SIDEBAR_WIDTH, saveSidebarPreferences, sidebarOpenAfterAutoCollapseToggle, sidebarOpenAfterNarrowLayout, shouldCollapseSidebar } from "./sidebar";
 import { applyTheme, loadThemePreference, resolveTheme, saveThemePreference, SYSTEM_DARK_QUERY, THEME_LABELS, THEME_PREFERENCES, type ThemePreference } from "./theme";
 import { TerminalPane } from "./TerminalPane";
+import { WindowControls, toggleWindowMaximize } from "./window-controls";
 
 interface TabDragState {
   sessionId: string;
@@ -857,7 +858,7 @@ export function App() {
 
   return (
     <main className="app-shell">
-      <header className="titlebar">
+      <header className="titlebar" onDoubleClick={(event) => { if (!(event.target as HTMLElement).closest("button, select, input, a")) toggleWindowMaximize(); }}>
         <button className="icon-button title-action" onClick={() => setSidebarOpen((value) => !value)} aria-label="Toggle project sidebar"><MenuIcon /></button>
         <div className="brand-mark"><TerminalIcon /></div>
         <div className="window-title">
@@ -874,6 +875,7 @@ export function App() {
           <button className="icon-button" onClick={() => setModal(deviceListEntryModal(state.devices.length))} title="Connected devices"><PhoneIcon /></button>
           <button className="icon-button" onClick={() => setModal("settings")} title="Settings"><SettingsIcon /></button>
         </div>
+        <WindowControls />
       </header>
 
       <div className="workspace">
