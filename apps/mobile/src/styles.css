@@ -274,7 +274,11 @@ button { color: inherit; }
    shell's top-left corner (the wrapper width mirrors the squish scale) and
    paint the surplus in the terminal background so it reads as a frame rather
    than dead layout. */
-.mobile-terminal { min-height: 0; padding: 8px 0 4px 8px; overflow: hidden; display: grid; place-items: start; background: var(--terminal-bg); }
+.mobile-terminal { grid-area: 1 / 1; min-height: 0; padding: 8px 0 4px 8px; overflow: hidden; display: grid; place-items: start; background: var(--terminal-bg); }
+/* The terminal and the keys are placed EXPLICITLY, never auto-placed: the
+   replay overlay shares the terminal's cell, and an auto-placed terminal
+   would be pushed into a row of its own below it instead of under it. */
+.mobile-terminal-shell > .extra-keys { grid-area: 2 / 1; }
 .mobile-terminal .xterm, .mobile-terminal .xterm-scrollable-element { width: 100%; min-width: 0; }
 .mobile-terminal .xterm { height: 100%; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
 .mobile-terminal .xterm-viewport,
@@ -311,6 +315,15 @@ button { color: inherit; }
    active scheme rather than the app theme, so its accent is a fixed
    translucent blue that reads on both light and dark schemes. */
 .mobile-terminal .xterm-scrollable-element > .scrollbar.vertical > .slider.active::after { width: 7px; background: #3f9be0cc; }
+/* The journal-replay overlay, the phone's twin of the desktop pane's. It
+   shares the shell's FIRST grid cell with the terminal, so it covers the
+   terminal only and leaves the utility keys visible, and it is a child of the
+   shell rather than of .mobile-terminal so the scaleX squish never stretches
+   its label. Painting over the terminal depends on both sharing that cell:
+   see the explicit grid-area on .mobile-terminal. */
+.replay-overlay { grid-area: 1 / 1; z-index: 6; display: flex; align-items: center; justify-content: center; gap: 9px; background: var(--terminal-bg); color: var(--text-muted); font-size: 11px; font-weight: 600; letter-spacing: .04em; user-select: none; }
+.replay-spinner { width: 13px; height: 13px; flex: none; border: 2px solid var(--border-strong); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+
 /* The find bar floats over the top of the terminal, where it covers the
    least of what a search is usually looking for (the recent output at the
    bottom). It is a child of the SHELL, never of .mobile-terminal: that div

@@ -97,6 +97,13 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
   const searchRef = useRef<SearchAddon | null>(null);
   const findInputRef = useRef<HTMLInputElement>(null);
   const [findState, setFindState] = useState<FindState>(CLOSED_FIND);
+  // A blocking "loading" overlay covers the terminal for the whole journal
+  // replay, exactly as the desktop pane does: the buffer is reset and
+  // re-rendered segment by segment, and showing that storm behind a spinner
+  // reads as loading rather than as activity. It lifts only when the pending
+  // drain completes (finishAttachment), so every re-attach - opening the
+  // page, returning to it, a reconnect - raises it again.
+  const [replaying, setReplaying] = useState(true);
   const activeRef = useRef(active);
   activeRef.current = active;
   const fontWidthScaleRef = useRef(fontWidthScale);
@@ -1000,6 +1007,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
     const finishAttachment = () => {
       if (disposed) return;
       initialized = true;
+      setReplaying(false);
       applyFocusAction(terminalFocusAction({ active: activeRef.current, explicitInput: false }));
       // The replay has landed the host grid and the fill pass has
       // settled, so a fresh measurement exists now (and the attach's own
@@ -1055,6 +1063,7 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       if (disposed || attachmentPromise !== undefined) return;
       initialized = false;
       replayingSessionBuffer = false;
+      setReplaying(true);
       pendingOutput.length = 0;
       appliedUpTo = 0;
       const announced = announcedGrid();
@@ -1111,6 +1120,9 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       }).catch((cause) => {
         attachmentPromise = undefined;
         syncDebug(`attach session=${session.id} failed: ${String(cause)}`);
+        // A failed attach never drains the queue, so lift the overlay
+        // explicitly - otherwise the error below would be painted behind it.
+        if (!disposed) setReplaying(false);
         if (!disposed) terminal.write(`\r\n\x1b[31mCould not attach terminal: ${String(cause)}\x1b[0m\r\n`);
       });
     };
@@ -1334,9 +1346,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
   const squishFontSize = calibratedSquishFontSize(currentFontSize, renderScale, a11yAdvanceRatioRef.current);
   const squishLineHeight = squishLineHeightValue(renderScale);
   const squishInverse = squishInverseValue(renderScale);
-  return <div className="mobile-terminal-shell">
+  return <div className="mobile-terminal-shell" style={{ "--terminal-bg": scheme.background } as CSSProperties}>
     <input ref={inputRef} className="mobile-terminal-input" type="text" inputMode="text" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} aria-label="Terminal input" />
     <div ref={hostRef} className="mobile-terminal" style={{ width: squishWidthPercent(renderScale), transform: `scaleX(${renderScale})`, transformOrigin: "left center", "--terminal-bg": scheme.background, "--terminal-squish-font-size": squishFontSize, "--terminal-squish-line-height": squishLineHeight, "--terminal-squish-inverse": `${squishInverse}` } as CSSProperties} />
+    {replaying && <div className="replay-overlay"><span className="replay-spinner" /><span>Loading terminal…</span></div>}
     {findState.open && <div className="terminal-find-bar" data-no-swipe role="search">
       <input
         ref={findInputRef}
