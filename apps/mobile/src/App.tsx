@@ -11,7 +11,7 @@ import {
   CapacitorBarcodeScannerTypeHint
 } from "@capacitor/barcode-scanner";
 import type { DirectoryListing, HostSnapshot, PairingPayload, Platform, Project, TerminalSession } from "@agentterminal/protocol";
-import { createRequestId, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSettings, parsePairingPayload, resolveTerminalScheme, terminalSchemesFor } from "@agentterminal/protocol";
+import { createRequestId, isSessionActive, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSettings, parsePairingPayload, resolveTerminalScheme, sessionActivitySummary, terminalSchemesFor } from "@agentterminal/protocol";
 import { HostConnection, type RemoteRegistrationState, type SavedHost, type SavedHostRecord } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
 import { notificationStateFor, type ConnectionNotificationState } from "./connectionPolicy";
@@ -1220,7 +1220,7 @@ export function App() {
       <div className="mobile-page">{homeView}</div>
       {activeProject && <div className="mobile-page"><ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={navigateBack} onRename={() => setProjectToRename(activeProject)} onOpen={openTerminal} /></div>}
       {activeProject && activeSession && <div className="mobile-page"><div className="mobile-app terminal-view">
-        <MobileHeader title={activeSession.title} subtitle={activeProject.name} onBack={navigateBack} trailing={<div className="session-actions"><span className={`session-state ${activeSession.status}`}>{activeSession.status}</span><button className="terminal-settings-button" onClick={() => setShowTerminalSettings(true)} aria-label="Terminal display settings"><SettingsIcon /></button><button className="close-session-button" onClick={() => setSessionToClose(activeSession)} aria-label="Close terminal session" title="Close terminal session"><CloseIcon /></button></div>} />
+        <MobileHeader title={activeSession.title} subtitle={activeProject.name} onBack={navigateBack} trailing={<div className="session-actions"><span className={`session-state ${terminalStateOf(activeSession)}`}>{terminalStateOf(activeSession)}</span><button className="terminal-settings-button" onClick={() => setShowTerminalSettings(true)} aria-label="Terminal display settings"><SettingsIcon /></button><button className="close-session-button" onClick={() => setSessionToClose(activeSession)} aria-label="Close terminal session" title="Close terminal session"><CloseIcon /></button></div>} />
         <MobileTerminal key={activeSession.id} active={view.type === "terminal"} fontWidthScale={fontWidthPercent / 100} connection={connection} session={activeSession} scheme={terminalScheme} />
       </div></div>}
     </div>
@@ -1316,14 +1316,33 @@ function ProjectScreen({ project, snapshot, connection, onBack, onRename, onOpen
     <MobileHeader title={project.name} subtitle={project.path} onBack={onBack} trailing={<><button className="header-edit-button" onClick={onRename} aria-label="Rename project"><EditIcon /></button>{project.persistent ? <BookmarkIcon className="saved-icon" /> : <ClockIcon className="temp-icon" />}</>} />
     <section className="project-hero"><div className="large-folder"><FolderIcon /></div><span>{project.persistent ? "Saved project" : "Temporary project"}</span><h1 className="display-name" title={project.name}>{project.name}</h1><p>{project.path}</p><div className="project-actions"><button className="mobile-primary" onClick={() => void createSession()}><PlusIcon /> New terminal</button><button className="mobile-secondary" disabled={changingPersistence} onClick={() => void togglePersistence()}>{project.persistent ? <ClockIcon /> : <BookmarkIcon />}{changingPersistence ? "Updating…" : project.persistent ? "Make temporary" : "Save project"}</button></div>{persistenceError && <div className="form-error project-error">{persistenceError}</div>}</section>
     <section className="session-section"><div className="section-title"><span>Sessions</span><small>{sessions.length}</small></div>
-      {sessions.length ? <div className="session-list">{sessions.map((session) => <button key={session.id} onClick={() => onOpen(session)}><span className="session-icon"><TerminalIcon /></span><span><strong className="display-name" title={session.title}>{session.title}</strong><small>{session.status === "running" ? "Active now" : `Exited · ${session.exitCode ?? "—"}`}</small></span><i className={session.status} /><ChevronIcon /></button>)}</div> : <div className="inline-empty">No open terminal sessions.</div>}
+      {sessions.length ? <div className="session-list">{sessions.map((session) => <button key={session.id} onClick={() => onOpen(session)}><span className="session-icon"><TerminalIcon /></span><span><strong className="display-name" title={session.title}>{session.title}</strong><small>{session.status !== "running" ? `Exited · ${session.exitCode ?? "—"}` : session.activity === "active" ? "Running" : "Idle"}</small></span><i className={sessionDotClass(session)} /><ChevronIcon /></button>)}</div> : <div className="inline-empty">No open terminal sessions.</div>}
     </section>
   </div>;
 }
 
+/**
+ * The status dot beside a terminal tab, on the project list and inside a
+ * project alike. `running` colors it green; `is-active` blinks it while
+ * the host reports the shell blocked on a foreground program.
+ */
+function sessionDotClass(session: TerminalSession): string {
+  return `${session.status} ${isSessionActive(session) ? "is-active" : ""}`.trim();
+}
+
+/**
+ * The chip in the terminal header. `status` alone only ever said
+ * "running", which is true of a shell sitting at a prompt and of one
+ * halfway through a build; the distinction is the point of the chip.
+ */
+function terminalStateOf(session: TerminalSession): "running" | "idle" | "exited" {
+  if (session.status !== "running") return "exited";
+  return isSessionActive(session) ? "running" : "idle";
+}
+
 function ProjectCard({ project, sessions, dragging, reordering, transform, elementRef, onDragStart, onDragMove, onDragEnd, onClick, onSession }: { project: Project; sessions: TerminalSession[]; dragging: boolean; reordering: boolean; transform?: string; elementRef: (element: HTMLElement | null) => void; onDragStart: (event: ReactPointerEvent<HTMLElement>) => void; onDragMove: (event: ReactPointerEvent<HTMLElement>) => void; onDragEnd: (event: ReactPointerEvent<HTMLElement>, commit: boolean) => void; onClick: () => void; onSession: (session: TerminalSession) => void }) {
   return <article ref={elementRef} className={`project-card ${dragging ? "is-dragging" : ""} ${reordering ? "is-reordering" : ""}`} style={{ transform }}><button className="project-card-main" onClick={onClick}><span className="card-folder"><FolderIcon /></span><span className="card-copy"><strong className="display-name" title={project.name}>{project.name}</strong><small>{project.path}</small></span><span className="card-persist">{project.persistent ? <BookmarkIcon /> : <ClockIcon />}</span><span className="mobile-project-drag" role="button" aria-label={`Reorder ${project.name}`} data-no-swipe onClick={(event) => event.stopPropagation()} onPointerDown={onDragStart} onPointerMove={onDragMove} onPointerUp={(event) => onDragEnd(event, true)} onPointerCancel={(event) => onDragEnd(event, false)}>⠿</span><ChevronIcon /></button>
-    {!!sessions.length && <div className="card-sessions">{sessions.slice(0, 3).map((session) => <button key={session.id} onClick={() => onSession(session)}><TerminalIcon /><span className="display-name" title={session.title}>{session.title}</span><i className={session.status} /></button>)}{sessions.length > 3 && <span className="more-sessions">+{sessions.length - 3}</span>}</div>}
+    {!!sessions.length && <div className="card-sessions">{sessions.slice(0, 3).map((session) => <button key={session.id} onClick={() => onSession(session)}><TerminalIcon /><span className="display-name" title={session.title}>{session.title}</span><i className={sessionDotClass(session)} /></button>)}{sessions.length > 3 && <span className="more-sessions">+{sessions.length - 3}</span>}</div>}
   </article>;
 }
 
@@ -1357,7 +1376,7 @@ function HomeScreen({ snapshot, remoteRegistration, remoteStatus, remoteStatusLa
   return <div className="mobile-app home-view">
     <RemoteRegistrationBanner state={remoteRegistration} onRetry={onRetryRegistration} />
     <header className="home-header">
-      <div><span className="eyebrow">Connected desktop</span><h1>{snapshot.host.name}</h1><span className="connection-label"><i /> Online · {snapshot.sessions.filter((s) => s.status === "running").length} sessions</span></div>
+      <div><span className="eyebrow">Connected desktop</span><h1>{snapshot.host.name}</h1><span className="connection-label"><i /> Online · {sessionActivitySummary(snapshot.sessions).label}</span></div>
       <div className="home-header-actions"><span className={`mobile-remote-status is-${remoteStatus}`} role="status"><i />{remoteStatusLabel}</span><button className="round-button" onClick={onShowSettings} title="Settings" aria-label="App settings"><MoreIcon /></button></div>
     </header>
     <section className="home-content">

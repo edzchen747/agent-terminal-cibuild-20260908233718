@@ -12,7 +12,7 @@ function session(id: string, projectId: string, status: "running" | "exited" = "
 }
 
 function leaving(projectId: string, index: number, count = 0): LeavingProject {
-  return { project: project(projectId), index, count };
+  return { project: project(projectId), index, count, label: `${count} idle sessions` };
 }
 
 describe("departed projects", () => {
@@ -44,6 +44,7 @@ describe("departed projects", () => {
     const leavings = departedProjects(previous, [project("a")], sessions);
     assert.equal(leavings.length, 1);
     assert.equal(leavings[0]?.count, 2);
+    assert.equal(leavings[0]?.label, "2 idle sessions", "the caption is frozen with the card");
   });
 
   it("reports nothing when a project is added", () => {

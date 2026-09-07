@@ -5,6 +5,7 @@ export * from "./terminal-layout.js";
 export * from "./terminal-grid.js";
 export * from "./terminal-zoom.js";
 export * from "./terminal-find.js";
+export * from "./session-activity.js";
 
 export const PROTOCOL_VERSION = 1 as const;
 
@@ -104,6 +105,20 @@ export type TerminalModifier = "ctrl" | "alt" | "shift";
  */
 export type TuiMode = "canonical" | "inline" | "fullscreen";
 export const TERMINAL_TUI_MODES: readonly TuiMode[] = ["canonical", "inline", "fullscreen"];
+
+/**
+ * Whether a session is blocked waiting for a foreground program to
+ * finish (`active`) or has its prompt back and is waiting for the user
+ * (`idle`). `status: "running"` only says the shell process is alive;
+ * this says whether the tab is doing anything.
+ *
+ * The host decides, so every client agrees: it reads the OSC 133 markers
+ * its own shell hooks emit, treats any non-canonical TUI period as
+ * active, and falls back to submitted input plus stream quiet in a shell
+ * it could not hook. See `activity.rs` on the desktop.
+ */
+export type SessionActivity = "idle" | "active";
+export const TERMINAL_SESSION_ACTIVITIES: readonly SessionActivity[] = ["idle", "active"];
 
 /**
  * The 16 ANSI colors the desktop terminal renders with. These are the
@@ -284,6 +299,14 @@ export interface TerminalSession {
    * (see the grid ownership note above).
    */
   tuiMode?: TuiMode;
+  /**
+   * Whether the shell is currently blocked on a foreground program.
+   * Absent on a host that predates activity detection; treat that as
+   * `"idle"`.
+   */
+  activity?: SessionActivity;
+  /** When the session entered `activity`, RFC3339. */
+  activitySince?: string;
 }
 
 export interface ShellProfile {
@@ -397,6 +420,12 @@ export type ServerMessage =
   | { type: "session.buffer"; requestId: string; sessionId: string; segments: SessionSegment[]; endOffset: number }
   | { type: "session.grid"; sessionId: string; cols: number; rows: number; offset: number }
   | { type: "session.mode"; sessionId: string; mode: TuiMode; offset: number }
+  /**
+   * Carries no stream offset, unlike the grid and mode events: idle is
+   * found by a timeout on the host, not by a byte in the stream, so
+   * there is no position to anchor it to.
+   */
+  | { type: "session.activity"; sessionId: string; activity: SessionActivity; since: string }
   | { type: "ok"; requestId: string }
   | { type: "error"; requestId?: string; code: string; message: string };
 

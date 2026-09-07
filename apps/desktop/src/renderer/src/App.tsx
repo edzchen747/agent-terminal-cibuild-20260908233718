@@ -2,13 +2,14 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import QRCode from "qrcode";
 import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemesFor } from "@agentterminal/protocol";
-import type { Project, TerminalSession } from "@agentterminal/protocol";
+import type { Project, SessionActivity, TerminalSession } from "@agentterminal/protocol";
 import type { DesktopState, FocusSessionEvent } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
 import { projectPersistenceAction, projectRowOpensOnKey } from "./persistence";
 import { projectDragTransform, reorderBlock, shouldCommitProjectReorder } from "./project-drag";
 import { departedProjects, PROJECT_LEAVE_MS, projectListEntries, type LeavingProject } from "./project-leave";
 import { pruneRememberedActiveSessions, rememberProjectActiveSession, resolveProjectActiveSession } from "./active-tab";
+import { applyActivityEvent, mergeActivity, projectActivitySummary } from "./session-activity";
 import { shellSwitchSessionOrder, shellSwitchSplitGroups } from "./shell-switch";
 import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
 import type { SplitGroup, SplitLayout } from "./split-tabs";
@@ -67,6 +68,7 @@ export function App() {
   const [sessionOrder, setSessionOrder] = useState<string[]>([]);
   const [tabDrag, setTabDrag] = useState<TabDragState | null>(null);
   const [closingSessionIds, setClosingSessionIds] = useState<Set<string>>(() => new Set());
+  const [activityBySession, setActivityBySession] = useState<ReadonlyMap<string, SessionActivity>>(() => new Map());
   const [projectDrag, setProjectDrag] = useState<ProjectDragState | null>(null);
   const [projectReordering, setProjectReordering] = useState(false);
   const [leavingProjects, setLeavingProjects] = useState<LeavingProject[]>([]);
@@ -100,6 +102,22 @@ export function App() {
     return window.agentTerminal.onState(setState);
   }, []);
 
+  // Active/idle is detected on the host, so every window and the paired
+  // phone agree on it. The event is the fast path; the snapshot below
+  // seeds sessions this window has not heard an event about yet (a window
+  // opened mid-command) without undoing a state an event already set.
+  useEffect(() => {
+    return window.agentTerminal.onActivity((sessionId, activity) => {
+      setActivityBySession((current) => applyActivityEvent(current, sessionId, activity));
+    });
+  }, []);
+
+  useEffect(() => {
+    const sessions = state?.sessions;
+    if (!sessions) return;
+    setActivityBySession((current) => mergeActivity(current, sessions));
+  }, [state?.sessions]);
+
   // When a project disappears from the host list (e.g. it was removed), keep
   // a ghost card in its old slot so the sidebar can play the leave: the card
   // slides off the left edge, then its slot collapses and the cards below
@@ -112,7 +130,7 @@ export function App() {
     previousProjectsRef.current = projects;
     previousSessionsRef.current = state?.sessions ?? [];
     if (!previousProjects || previousProjects === projects) return;
-    const leavings = departedProjects(previousProjects, projects, previousSessions);
+    const leavings = departedProjects(previousProjects, projects, previousSessions, activityBySession);
     if (!leavings.length) return;
     // The tab-reorder slides skip animation under the same setting, so the
     // leave does too.
@@ -867,19 +885,18 @@ export function App() {
                 // The ghost card playing its leave: it slides off the left
                 // edge first, then its slot collapses. Not interactive, and
                 // App unmounts it once the animation completes.
-                const count = entry.entry.count;
                 return <div key={`leaving-${entry.entry.project.id}`} className="project-item is-leaving" aria-hidden="true">
                   <span className="project-icon"><FolderIcon /></span>
-                  <span className="project-copy"><strong className="display-name">{entry.entry.project.name}</strong><small>{count ? `${count} active session${count === 1 ? "" : "s"}` : "No active sessions"}</small></span>
+                  <span className="project-copy"><strong className="display-name">{entry.entry.project.name}</strong><small>{entry.entry.label}</small></span>
                 </div>;
               }
               const project = entry.project;
               const index = entry.index;
-              const count = state.sessions.filter((session) => session.projectId === project.id && session.status === "running").length;
+              const summary = projectActivitySummary(state.sessions, activityBySession, project.id);
               const action = projectPersistenceAction(project.persistent);
               return <div key={project.id} ref={(element) => { if (element) projectElementsRef.current.set(project.id, element); else projectElementsRef.current.delete(project.id); }} role="button" tabIndex={0} className={`project-item ${project.id === state.currentProjectId ? "active" : ""} ${project.id === projectDrag?.projectId ? "is-dragging" : ""} ${projectReordering ? "is-reordering" : ""}`} style={{ transform: projectDragTransform(projectDrag, project.id, index) }} onClick={() => void window.agentTerminal.openProject(project.id)} onKeyDown={(event) => { if (projectRowOpensOnKey(event.target, event.currentTarget, event.key)) void window.agentTerminal.openProject(project.id); }}>
                 <span className="project-icon"><FolderIcon /></span>
-                <span className="project-copy"><strong className="display-name" title={project.name}>{project.name}</strong><small>{count ? `${count} active session${count === 1 ? "" : "s"}` : "No active sessions"}</small></span>
+                <span className="project-copy"><strong className="display-name" title={project.name}>{project.name}</strong><small>{summary.label}</small></span>
                 <span className="project-item-actions"><span className="project-drag-handle" role="button" aria-label={`Reorder ${project.name}`} title="Drag to reorder" onClick={(event) => event.stopPropagation()} onPointerDown={(event) => beginProjectDrag(event, project.id, index)} onPointerMove={moveProjectDrag} onPointerUp={(event) => finishProjectDrag(event, true)} onPointerCancel={(event) => finishProjectDrag(event, false)}>⠿</span><button className="persistence" onClick={(event) => { event.stopPropagation(); void toggleProjectPersistence(project.id); }} title={action.tooltip} aria-label={action.tooltip}>{project.persistent ? <BookmarkIcon /> : <ClockIcon />}</button><button className="project-rename" onClick={(event) => { event.stopPropagation(); startRename(project.id); }} title={`Rename ${project.name}`} aria-label={`Rename ${project.name}`}><EditIcon /></button></span>
               </div>;
             })}
@@ -898,7 +915,7 @@ export function App() {
                 const draggedSplit = findSplitGroup(splitGroups, tabDrag?.sessionId);
                 const isDragging = tabDrag?.sessionId === session.id || draggedSplit?.sessionIds.includes(session.id);
                 return <button key={session.id} ref={(element) => { if (element) tabElementsRef.current.set(session.id, element); else tabElementsRef.current.delete(session.id); }} role="tab" aria-selected={session.id === activeSessionId} className={`terminal-tab ${session.id === activeSessionId ? "active" : ""} ${selectedSplit ? "is-split-selected" : ""} ${sessionSplit ? "is-split" : ""} ${splitIndex === 0 ? "split-first" : splitIndex === 1 ? "split-second" : ""} ${isDragging ? "is-dragging" : ""} ${closingSessionIds.has(session.id) ? "is-closing" : ""}`} style={{ transform: tabDragTransform(session.id, index) }} onClick={() => { if (!suppressTabClickRef.current) setActiveSessionId(session.id); }} onContextMenu={(event) => { event.preventDefault(); setSplitMenu({ kind: "tab", sessionId: session.id, x: event.clientX, y: event.clientY }); }} onPointerDown={(event) => beginTabDrag(event, session.id, index)} onPointerMove={moveTabDrag} onPointerUp={(event) => finishTabDrag(event, true)} onPointerCancel={(event) => finishTabDrag(event, false)}>
-                  <TerminalIcon /><span className="terminal-tab-label display-name" title={session.title}>{session.title}</span>{session.status === "exited" && <i className="exit-dot" title={`Exited (${session.exitCode ?? "unknown"})`} />}
+                  <TerminalIcon /><span className="terminal-tab-label display-name" title={session.title}>{session.title}</span>{activityBySession.get(session.id) === "active" && <i className="activity-dot" title="Running" />}{session.status === "exited" && <i className="exit-dot" title={`Exited (${session.exitCode ?? "unknown"})`} />}
                   <span className="tab-close" role="button" aria-label={`Close ${session.title}`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void closeTab(session.id); }}><CloseIcon /></span>
                 </button>;
               })}

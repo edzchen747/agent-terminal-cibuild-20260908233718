@@ -1,3 +1,4 @@
+mod activity;
 mod core;
 mod default_terminal;
 
@@ -401,7 +402,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let session_count = MenuItem::with_id(
         app,
         "session-count",
-        session_count_label(core.session_count()),
+        session_count_label(core.session_counts()),
         false,
         None::<&str>,
     )?;
@@ -446,10 +447,10 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 const TRAY_SESSION_COUNT_TICK_MS: u64 = 500;
 
 fn spawn_tray_session_count_refresher(core: Arc<Core>, label: MenuItem<Wry>) {
-    let mut last = session_count_label(core.session_count());
+    let mut last = session_count_label(core.session_counts());
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(TRAY_SESSION_COUNT_TICK_MS));
-        let text = session_count_label(core.session_count());
+        let text = session_count_label(core.session_counts());
         if text != last {
             last = text.clone();
             let _ = label.set_text(&text);
@@ -457,11 +458,20 @@ fn spawn_tray_session_count_refresher(core: Arc<Core>, label: MenuItem<Wry>) {
     });
 }
 
-fn session_count_label(count: usize) -> String {
-    match count {
+/// The tray's one-line summary of what the host is doing: how many open
+/// tabs are running something, out of how many are open. A bare count of
+/// open tabs reads as a claim about activity it was not making, so the
+/// word "active" is reserved for the tabs that earned it, and the plain
+/// count stands when none have.
+fn session_count_label((active, open): (usize, usize)) -> String {
+    if active > 0 {
+        let sessions = if open == 1 { "session" } else { "sessions" };
+        return format!("{active} of {open} {sessions} active");
+    }
+    match open {
         0 => "No open sessions".to_string(),
         1 => "1 open session".to_string(),
-        count => format!("{count} open sessions"),
+        open => format!("{open} open sessions"),
     }
 }
 
@@ -524,17 +534,28 @@ mod tests {
 
     #[test]
     fn label_reports_zero_as_no_open_sessions() {
-        assert_eq!(session_count_label(0), "No open sessions");
+        assert_eq!(session_count_label((0, 0)), "No open sessions");
     }
 
     #[test]
-    fn label_uses_the_singular_form_for_one_session() {
-        assert_eq!(session_count_label(1), "1 open session");
+    fn label_uses_the_singular_form_for_one_idle_session() {
+        assert_eq!(session_count_label((0, 1)), "1 open session");
     }
 
     #[test]
-    fn label_uses_the_plural_form_from_two_sessions_up() {
-        assert_eq!(session_count_label(2), "2 open sessions");
-        assert_eq!(session_count_label(42), "42 open sessions");
+    fn label_uses_the_plural_form_from_two_idle_sessions_up() {
+        assert_eq!(session_count_label((0, 2)), "2 open sessions");
+        assert_eq!(session_count_label((0, 42)), "42 open sessions");
+    }
+
+    #[test]
+    fn label_reports_how_many_of_the_open_tabs_are_running_something() {
+        assert_eq!(session_count_label((1, 2)), "1 of 2 sessions active");
+        assert_eq!(session_count_label((3, 3)), "3 of 3 sessions active");
+    }
+
+    #[test]
+    fn label_keeps_the_singular_when_the_one_open_tab_is_the_busy_one() {
+        assert_eq!(session_count_label((1, 1)), "1 of 1 session active");
     }
 }

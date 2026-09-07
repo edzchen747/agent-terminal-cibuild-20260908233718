@@ -222,6 +222,13 @@ button { color: inherit; }
 .tab-close:hover { background: var(--surface-hover); }
 .tab-close svg { width: 12px; }
 .exit-dot { width: 6px; height: 6px; flex: none; background: var(--warn); border-radius: 50%; }
+/* The tab is running something: the host says the shell is blocked on a
+   foreground program (a build, a TUI, anything waiting). It sits before
+   the exit dot, and the two never show together - an exited tab is never
+   also busy. */
+.activity-dot { width: 6px; height: 6px; flex: none; background: var(--accent); border-radius: 50%; animation: activity-pulse 1.6s ease-in-out infinite; }
+@keyframes activity-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .activity-dot { animation: none; } }
 .add-tab { width: 40px; height: 36px; flex: none; border: 0; background: transparent; color: var(--text-muted); display: grid; place-items: center; cursor: pointer; }
 .add-tab:hover { color: var(--text); background: var(--surface-hover); }
 .add-tab svg { width: 15px; }
