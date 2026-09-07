@@ -67,7 +67,8 @@ async fn create_project(state: State<'_, Arc<Core>>) -> Result<Option<Project>, 
         core.create_session(&project.id, None)
             .map_err(error_string)?;
     }
-    core.ensure_project_window(&project.id)
+    let _ = core
+        .ensure_project_window(&project.id)
         .map_err(error_string)?;
     Ok(Some(project))
 }

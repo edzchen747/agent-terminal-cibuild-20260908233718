@@ -128,7 +128,9 @@ const ACTIVITY_WATCHDOG_TICK_MS: u64 = 250;
 // Enable by setting AGENT_TERMINAL_SYNC_DEBUG=1 before starting the host. The
 // log is written to %TEMP%/agent-terminal-sync.log and truncated at startup,
 // with one timestamped line per journal append, resize/broadcast, attach,
-// snapshot, and input point of interest.
+// snapshot, and input point of interest. Lines in the `handoff` scope are
+// written unconditionally: a console handoff with no window open has no
+// console to surface a failure in, so the file is the only trace.
 // ---------------------------------------------------------------------------
 
 static SYNC_DEBUG_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -528,10 +530,10 @@ pub struct Core {
     /// stale stored verdict while the machine has no network.
     network_online: AtomicBool,
     /// The console handoff waiting to be brought to the front, claimed by
-    /// the renderer when it mounts. A cold start - Windows launching us
-    /// *because* a console was opened - has no window to emit to yet, and a
-    /// window that has just been created has not finished loading its
-    /// webview, so the event alone is lost exactly when it matters most.
+    /// the renderer when it mounts. A window that the handoff opened has
+    /// not finished loading its webview yet, and a window that already
+    /// exists may still be loading it - in both cases the event emitted at
+    /// handoff time goes nowhere, so the renderer claims this instead.
     pending_focus: Mutex<Option<PendingFocus>>,
 }
 
@@ -550,11 +552,12 @@ fn claim_pending_focus(
         *pending = None;
         return None;
     }
-    // A focus recorded before any window existed (a cold start) names no
-    // window, and the first one up takes it.
+    // The focus names the window it was recorded for; only that window may
+    // act on it, so a later-unrelated window cannot be yanked onto a
+    // stale tab.
     let claimable = pending
         .as_ref()
-        .is_some_and(|focus| focus.label.as_deref().is_none_or(|target| target == label));
+        .is_some_and(|focus| focus.label == label);
     if !claimable {
         return None;
     }
@@ -564,11 +567,31 @@ fn claim_pending_focus(
     })
 }
 
+/// Records `pending` as the handoff focus waiting for `label`, overwriting
+/// any older entry: the newest console the user launched is the one they
+/// are waiting to look at, so an unclaimed older focus must not pull the
+/// window back to an older tab.
+fn record_pending_focus(
+    pending: &mut Option<PendingFocus>,
+    label: &str,
+    project_id: &str,
+    session_id: &str,
+) {
+    *pending = Some(PendingFocus {
+        label: label.to_owned(),
+        project_id: project_id.to_owned(),
+        session_id: session_id.to_owned(),
+        at: Instant::now(),
+    });
+}
+
 /// A handoff session that should be shown as soon as a window can show it.
 struct PendingFocus {
-    /// The window the host picked, when one already existed; `None` on a
-    /// cold start, where whichever window comes up first takes it.
-    label: Option<String>,
+    /// The window the focus was recorded for: the one that already showed
+    /// the project, or the one the handoff just opened for it. The webview
+    /// of either may still be loading, which is why the focus is claimed
+    /// on mount rather than emitted live.
+    label: String,
     project_id: String,
     session_id: String,
     at: Instant,
@@ -682,7 +705,7 @@ impl Core {
             inner.store.ensure_network_identity()?;
             startup_project(&mut inner)?
         };
-        self.ensure_project_window_with_focus(&project.id, true, None)?;
+        let _ = self.ensure_project_window_with_focus(&project.id, true, None)?;
         Ok(())
     }
 
@@ -1503,11 +1526,11 @@ impl Core {
         }
     }
 
-    pub fn ensure_project_window(self: &Arc<Self>, project_id: &str) -> Result<()> {
+    pub fn ensure_project_window(self: &Arc<Self>, project_id: &str) -> Result<String> {
         self.ensure_project_window_with_focus(project_id, true, None)
     }
 
-    fn ensure_project_window_in_background(self: &Arc<Self>, project_id: &str) -> Result<()> {
+    fn ensure_project_window_in_background(self: &Arc<Self>, project_id: &str) -> Result<String> {
         self.ensure_project_window_with_focus(project_id, false, None)
     }
 
@@ -1571,34 +1594,16 @@ impl Core {
         Ok(())
     }
 
-    /// Puts the project's window on screen for a handed-off console.
-    ///
-    /// Deliberately narrower than `ensure_project_window_with_focus`: that
-    /// one honours single-window mode by reassigning whichever window was
-    /// last used, which destroys the window it displaces. Tearing a window
-    /// down mid-handoff deadlocks — the teardown holds the desktop lock
-    /// while the sessions it owns are still being read — and a console the
-    /// user launched has no business closing an unrelated project either.
-    /// So: reuse this project's own window if it has one, otherwise open a
-    /// new one, and never take a window away from another project.
-    /// The window a handed-off console should surface in: the one already
-    /// showing its project, otherwise whichever window is in front.
-    ///
-    /// This only raises a window. Switching which project a window shows is
-    /// left to the renderer, which drives it through the same `open_project`
-    /// command a click on the sidebar uses — doing it from here deadlocks,
-    /// because the switch re-attaches every session in the window while the
-    /// desktop lock is held.
     /// Records the handoff to bring forward, for a renderer that is not
     /// listening yet. Overwrites any older entry: the newest console the
     /// user launched is the one they are waiting to look at.
-    fn set_pending_focus(&self, label: Option<&str>, project_id: &str, session_id: &str) {
-        *self.pending_focus.lock().expect("pending focus poisoned") = Some(PendingFocus {
-            label: label.map(str::to_owned),
-            project_id: project_id.to_owned(),
-            session_id: session_id.to_owned(),
-            at: Instant::now(),
-        });
+    fn set_pending_focus(&self, label: &str, project_id: &str, session_id: &str) {
+        record_pending_focus(
+            &mut self.pending_focus.lock().expect("pending focus poisoned"),
+            label,
+            project_id,
+            session_id,
+        );
     }
 
     /// Claims the pending handoff focus for `label`, if it is for this
@@ -1610,21 +1615,31 @@ impl Core {
         )
     }
 
+    /// The window a handed-off console should surface in: the one already
+    /// showing its project, otherwise whichever window is in front.
+    /// `None` when no window is open at all — the handoff path then opens
+    /// one, shown and focused, so the console the user launched lands on
+    /// screen.
     fn handoff_window(self: &Arc<Self>, project_id: &str) -> Option<String> {
-        let inner = self.inner.lock().expect("desktop state poisoned");
-        inner
+        self.inner
+            .lock()
+            .expect("desktop state poisoned")
             .windows
-            .window_for_project(project_id)
-            .map(str::to_owned)
-            .or_else(|| inner.windows.last_or_any())
+            .handoff_target(project_id)
     }
 
+    /// Ensures the project owns a window on screen, taking focus when
+    /// asked. Single-window mode reassigns the preferred window (or the
+    /// last-used one) to the project and destroys whatever that displaces;
+    /// multi-window mode reuses the project's own window when it has one
+    /// and opens a new window otherwise. Returns the label of the window
+    /// that ends up showing the project.
     fn ensure_project_window_with_focus(
         self: &Arc<Self>,
         project_id: &str,
         focus: bool,
         preferred_window: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let reusable = {
             let inner = self.inner.lock().expect("desktop state poisoned");
             (!inner.store.settings().open_projects_in_new_windows)
@@ -1662,7 +1677,7 @@ impl Core {
                     self.mark_window_focused(&label);
                 }
                 self.broadcast();
-                return Ok(());
+                return Ok(label);
             }
         }
         let existing = self
@@ -1681,7 +1696,7 @@ impl Core {
                 window.set_focus()?;
                 self.mark_window_focused(&label);
             }
-            return Ok(());
+            return Ok(label);
         }
 
         let project = self.project_by_id(project_id)?;
@@ -1724,7 +1739,7 @@ impl Core {
         if focus {
             window.set_focus()?;
         }
-        Ok(())
+        Ok(label)
     }
 
     pub fn open_project(
@@ -1744,7 +1759,7 @@ impl Core {
         if !has_running {
             self.create_session(project_id, None)?;
         }
-        self.ensure_project_window_with_focus(project_id, true, preferred_window)?;
+        let _ = self.ensure_project_window_with_focus(project_id, true, preferred_window)?;
         Ok(())
     }
 
@@ -2311,20 +2326,79 @@ impl Core {
         let window_project = project.id.clone();
         let window_session = id.clone();
         std::thread::spawn(move || {
-            // Record before raising anything. On a cold start no window is
-            // registered yet, and a window that exists may still be loading
-            // its webview - either way the emit below goes nowhere, and the
-            // renderer claims this instead when it mounts.
-            let target = window_core.handoff_window(&window_project);
-            window_core.set_pending_focus(target.as_deref(), &window_project, &window_session);
-            let Some(label) = target else {
-                return;
+            // A console the user launched has to end up on screen. A
+            // window that is open gets raised; when none is open - they
+            // were all closed and the app keeps running from the tray -
+            // open one for the console's project, shown and focused.
+            // (The phone's "New terminal" deliberately does not do this:
+            // its sessions land in a quiet background window that never
+            // pulls the desktop forward, see `ensure_project_window_quietly`.)
+            let label = match window_core.handoff_window(&window_project) {
+                Some(label) => {
+                    sync_log_line(
+                        "handoff",
+                        format_args!("surfacing the handoff in the open window {label}"),
+                    );
+                    // Record before raising anything: a window that exists
+                    // may still be loading its webview, so the emit below
+                    // goes nowhere and the renderer claims this instead
+                    // when it mounts.
+                    window_core.set_pending_focus(&label, &window_project, &window_session);
+                    label
+                }
+                None => {
+                    // No window is registered: opening the console has
+                    // given the app nothing to show it in, so give it one.
+                    sync_log_line(
+                        "handoff",
+                        format_args!("no window is open; opening one for the handoff (project {window_project})"),
+                    );
+                    let label = match window_core.ensure_project_window(&window_project) {
+                        Ok(label) => {
+                            sync_log_line(
+                                "handoff",
+                                format_args!("opened window {label} for the handoff"),
+                            );
+                            label
+                        }
+                        Err(error) => {
+                            // Unconditional: with no window open there is no
+                            // console to show the error in, and the tray has
+                            // no error UI - the sync log is the only trace.
+                            sync_log_line(
+                                "handoff",
+                                format_args!(
+                                    "could not open a window for the handoff: {error}"
+                                ),
+                            );
+                            eprintln!(
+                                "agent-terminal: could not open a window for the handed-off console: {error}"
+                            );
+                            return;
+                        }
+                    };
+                    // The fresh webview is not listening yet, so the emit
+                    // below goes nowhere; the renderer claims this when
+                    // it mounts.
+                    window_core.set_pending_focus(&label, &window_project, &window_session);
+                    label
+                }
             };
             if let Some(window) = window_core.app.get_webview_window(&label) {
                 let _ = window.unminimize();
                 let _ = window.show();
                 let _ = window.set_focus();
                 window_core.mark_window_focused(&label);
+            } else {
+                // The label came from a registered window (or from
+                // `ensure_project_window`, which registers before it
+                // builds); a miss means the window was destroyed in the
+                // meantime. The recorded focus still lets a later window
+                // claim the handoff within its TTL.
+                sync_log_line(
+                    "handoff",
+                    format_args!("window {label} was gone before the handoff could raise it"),
+                );
             }
             let _ = window_core.app.emit_to(
                 EventTarget::webview_window(label),
@@ -5289,7 +5363,7 @@ mod tests {
         ActivityDetector, CdOutcome, CdPlan, ConnectivityAction, ConnectivityTracker,
         EmbeddedNodeStatus, Inner, ManagedSession, PRESENCE_WINDOW_MS, PairingGrant,
         PENDING_FOCUS_TTL, PendingFocus, RetireOutcome, SESSION_MAX_COLS, SESSION_MAX_ROWS,
-        SessionActivity, SessionWriter, claim_pending_focus,
+        SessionActivity, SessionWriter, claim_pending_focus, record_pending_focus,
         VIEWPORT_WATCHDOG_TIMEOUT_MS, apply_grid_if_tui,
         apply_session_grid, ensure_home_project, evict_stale_viewports, folder_name,
         is_cursor_position_report, is_device_attributes_report, is_dropped_node_status,
@@ -6851,7 +6925,7 @@ mod tests {
     #[test]
     fn a_pending_focus_is_claimed_once_by_the_window_it_names() {
         let mut pending = Some(PendingFocus {
-            label: Some("main".into()),
+            label: "main".into(),
             project_id: "p1".into(),
             session_id: "s1".into(),
             at: Instant::now(),
@@ -6870,7 +6944,7 @@ mod tests {
     #[test]
     fn a_pending_focus_for_another_window_is_left_for_its_owner() {
         let mut pending = Some(PendingFocus {
-            label: Some("main".into()),
+            label: "main".into(),
             project_id: "p1".into(),
             session_id: "s1".into(),
             at: Instant::now(),
@@ -6885,17 +6959,18 @@ mod tests {
     }
 
     #[test]
-    fn a_cold_start_focus_names_no_window_and_the_first_one_up_takes_it() {
-        // Nothing was registered when the console handed over, so the focus
-        // carries no label: whichever window finishes loading first shows it.
+    fn a_focus_recorded_for_a_not_yet_loaded_window_is_claimed_when_it_mounts() {
+        // The handoff opened a window for the console's project; its
+        // webview is still loading, so the focus sits recorded against the
+        // label until that window's renderer mounts and claims it.
         let mut pending = Some(PendingFocus {
-            label: None,
+            label: "terminal-fresh".into(),
             project_id: "p1".into(),
             session_id: "s1".into(),
             at: Instant::now(),
         });
 
-        let claimed = claim_pending_focus(&mut pending, "whichever-window").expect("claimed");
+        let claimed = claim_pending_focus(&mut pending, "terminal-fresh").expect("claimed");
         assert_eq!(claimed.session_id, "s1");
         assert!(pending.is_none());
     }
@@ -6903,7 +6978,7 @@ mod tests {
     #[test]
     fn an_expired_pending_focus_is_dropped_rather_than_shown_late() {
         let mut pending = Some(PendingFocus {
-            label: None,
+            label: "main".into(),
             project_id: "p1".into(),
             session_id: "s1".into(),
             at: Instant::now() - PENDING_FOCUS_TTL - std::time::Duration::from_secs(1),
@@ -6920,6 +6995,73 @@ mod tests {
     fn no_pending_focus_claims_nothing() {
         let mut pending = None;
         assert!(claim_pending_focus(&mut pending, "main").is_none());
+    }
+
+    #[test]
+    fn a_pending_focus_at_exactly_its_ttl_is_expired() {
+        // The boundary uses `>=`, so a focus that has lived out its full
+        // TTL is dropped even though the claim arrives (nanoseconds) later.
+        let mut pending = Some(PendingFocus {
+            label: "main".into(),
+            project_id: "p1".into(),
+            session_id: "s1".into(),
+            at: Instant::now() - PENDING_FOCUS_TTL,
+        });
+
+        assert!(claim_pending_focus(&mut pending, "main").is_none());
+        assert!(
+            pending.is_none(),
+            "the entry is cleared at the boundary, not left for a later claim"
+        );
+    }
+
+    #[test]
+    fn a_pending_focus_one_tick_before_its_ttl_is_still_claimable() {
+        let mut pending = Some(PendingFocus {
+            label: "main".into(),
+            project_id: "p1".into(),
+            session_id: "s1".into(),
+            at: Instant::now() - (PENDING_FOCUS_TTL - Duration::from_millis(1)),
+        });
+
+        assert!(
+            claim_pending_focus(&mut pending, "main").is_some(),
+            "inside the TTL the focus is still fresh"
+        );
+    }
+
+    #[test]
+    fn an_expired_focus_is_cleared_even_when_its_window_never_mounts() {
+        // Expiry is checked before the label, so a focus recorded for a
+        // window that never loaded its webview cannot outlive its TTL and
+        // yank some later claim onto a stale tab.
+        let mut pending = Some(PendingFocus {
+            label: "terminal-never-mounted".into(),
+            project_id: "p1".into(),
+            session_id: "s1".into(),
+            at: Instant::now() - PENDING_FOCUS_TTL - Duration::from_secs(1),
+        });
+
+        assert!(claim_pending_focus(&mut pending, "main").is_none());
+        assert!(pending.is_none(), "the expired entry is cleared for good");
+    }
+
+    #[test]
+    fn a_newer_handoff_focus_replaces_the_older_unclaimed_one() {
+        // Two consoles launched back to back while no window is open: the
+        // window the second handoff opens must show the newest console, so
+        // the older focus must not pull it back to the older tab.
+        let mut pending: Option<PendingFocus> = None;
+        record_pending_focus(&mut pending, "terminal-old", "p1", "s1");
+        record_pending_focus(&mut pending, "terminal-new", "p2", "s2");
+
+        let claimed = claim_pending_focus(&mut pending, "terminal-new").expect("the newest wins");
+        assert_eq!(claimed.project_id, "p2");
+        assert_eq!(claimed.session_id, "s2");
+        assert!(
+            claim_pending_focus(&mut pending, "terminal-old").is_none(),
+            "the replaced focus is gone, not just unclaimed"
+        );
     }
 
     /// A writer whose consumer never reads: the shape of a handed-off console
