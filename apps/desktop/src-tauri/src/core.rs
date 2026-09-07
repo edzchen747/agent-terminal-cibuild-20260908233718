@@ -20,7 +20,7 @@ use chrono::{Duration, Utc};
 use percent_encoding::percent_decode_str;
 use portable_pty::{ChildKiller, MasterPty, PtySize, native_pty_system};
 
-use crate::activity::ActivityDetector;
+use crate::activity::{ActivityDetector, TUI_QUIET_MS};
 use regex::Regex;
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, EventTarget, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -1365,8 +1365,13 @@ impl Core {
                 }
                 let mode = session.metadata.tui_mode;
                 let quiet_idle = session.tui.quiet_idle(now);
-                if let Some((activity, since)) =
-                    session.activity.observe(&[], mode, quiet_idle, false, now)
+                // A TUI screen that has been quiet for TUI_QUIET_MS no
+                // longer reads as active (see activity.rs for the
+                // Windows Terminal reference).
+                let tui_quiet = session.tui.quiet_ms(now) >= TUI_QUIET_MS;
+                if let Some((activity, since)) = session
+                    .activity
+                    .observe(&[], mode, quiet_idle, tui_quiet, false, now)
                 {
                     session.metadata.activity = activity;
                     session.metadata.activity_since = Some(since.clone());
@@ -3901,10 +3906,15 @@ impl Core {
             // prompt-quiet verdict.
             let markers = session.tui.take_shell_markers();
             let quiet_idle = session.tui.quiet_idle(now);
+            // A chunk was just fed above, so its quiet gap is zero; this
+            // stays false here and only the sweeper can see a TUI screen
+            // go quiet (see activity.rs for the Windows Terminal
+            // reference).
+            let tui_quiet = session.tui.quiet_ms(now) >= TUI_QUIET_MS;
             let mode_now = session.metadata.tui_mode;
             let activity_change = session
                 .activity
-                .observe(&markers, mode_now, quiet_idle, true, now)
+                .observe(&markers, mode_now, quiet_idle, tui_quiet, true, now)
                 .map(|(activity, since)| {
                     session.metadata.activity = activity;
                     session.metadata.activity_since = Some(since.clone());

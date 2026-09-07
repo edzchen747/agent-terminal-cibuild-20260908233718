@@ -219,6 +219,22 @@ impl TuiClassifier {
         std::mem::take(&mut self.shell_markers)
     }
 
+    /// Milliseconds since the last output chunk reached the classifier,
+    /// or [`u64::MAX`] if no chunk has ever arrived. The activity
+    /// detector times out a TUI period whose screen has stopped
+    /// changing with this: a frozen TUI (a paused htop, a waiting
+    /// pager, a stopped agent harness) must not keep a busy badge the
+    /// way Windows Terminal never keeps a progress indicator for a
+    /// terminal whose screen has stopped changing. Unlike
+    /// [`quiet_idle`](Self::quiet_idle) it measures *any* output -
+    /// TUI frames are absolute-addressed repaints, not line-terminated
+    /// shell output, so the prompt heuristic never applies to them.
+    pub fn quiet_ms(&self, now: Instant) -> u64 {
+        self.last_chunk_at
+            .map(|at| now.duration_since(at).as_millis() as u64)
+            .unwrap_or(u64::MAX)
+    }
+
     /// Whether the stream currently looks like a shell sitting at a
     /// prompt: line-terminated output, a visible cursor, and quiet for
     /// at least [`STREAM_EXIT_QUIET_MS`]. This is the same rule the
@@ -889,6 +905,43 @@ fn exit_code_of(code: &str) -> Option<i32> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn quiet_ms_is_the_gap_since_the_last_chunk() {
+        let mut clf = TuiClassifier::new(30);
+        let at = Instant::now();
+        assert_eq!(
+            clf.quiet_ms(at),
+            u64::MAX,
+            "no chunk ever means the stream is fully quiet"
+        );
+        clf.feed("\x1b[?1049h", at, 30);
+        assert_eq!(clf.quiet_ms(at), 0, "a just-fed chunk is not quiet");
+        assert_eq!(
+            clf.quiet_ms(at + Duration::from_millis(1_500)),
+            1_500
+        );
+    }
+
+    #[test]
+    fn quiet_ms_counts_any_chunk_regardless_of_mode() {
+        // The quiet window measures output, not TUI state: when the TUI
+        // exits and the shell prompt lands, the gap restarts from that
+        // prompt chunk, so the activity detector never sees a false
+        // quiet across the transition.
+        let mut clf = TuiClassifier::new(30);
+        let at = Instant::now();
+        clf.feed("\x1b[?1049h", at, 30); // alt enter: TUI period starts
+        clf.feed("frame\x1b[?25l", at + Duration::from_millis(500), 30);
+        assert_eq!(clf.quiet_ms(at + Duration::from_millis(1_500)), 1_000);
+        // The TUI leaves the alt screen and the shell prompt lands.
+        clf.feed("\x1b[?1049l\x1b[?25l", at + Duration::from_millis(3_000), 30);
+        assert_eq!(
+            clf.quiet_ms(at + Duration::from_millis(3_500)),
+            500,
+            "the prompt chunk restarted the gap"
+        );
+    }
 
     /// Feed chunks 5ms apart, starting 5ms after `at`.
     fn feed(at: Instant, rows: u16, chunks: &[&str]) -> Vec<TuiTransition> {
