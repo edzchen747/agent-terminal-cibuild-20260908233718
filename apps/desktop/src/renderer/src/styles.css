@@ -266,6 +266,18 @@ button { color: inherit; }
 .split-mini-toolbar button:hover { background: var(--surface-hover); color: var(--text-strong); }
 .split-mini-toolbar button:last-child:hover { background: var(--danger-surface); color: var(--danger-hover); }
 .split-mini-toolbar button svg { width: 12px; }
+/* The find bar: pinned inside the terminal surface like the split toolbar,
+   but at the top, where it covers the least of what a search is usually
+   looking for (the recent output at the bottom). Above the replay overlay
+   (8) so it is never buried, below the link-confirm modal (40). */
+.terminal-find-bar { height: 31px; position: absolute; z-index: 10; top: 9px; right: 9px; display: flex; align-items: center; gap: 6px; padding: 0 4px 0 9px; border: 1px solid var(--border-input); border-radius: 8px; background: var(--surface-raised); box-shadow: 0 7px 24px var(--shadow-strong); backdrop-filter: blur(8px); }
+.terminal-find-input { width: 168px; height: 23px; padding: 0 6px; border: 1px solid var(--border-strong); border-radius: 5px; outline: 0; background: var(--surface-input); color: var(--text-strong); font: 11px/1 "Cascadia Code", Consolas, monospace; }
+.terminal-find-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-wash); }
+.terminal-find-count { min-width: 52px; color: var(--text-dim); font-size: 10.5px; font-variant-numeric: tabular-nums; text-align: right; user-select: none; }
+.terminal-find-bar button { width: 23px; height: 23px; flex: none; padding: 0; display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent; color: var(--text-muted); font-size: 11px; cursor: pointer; }
+.terminal-find-bar button:hover:not(:disabled) { background: var(--surface-hover); color: var(--text-strong); }
+.terminal-find-bar button:disabled { opacity: .35; cursor: default; }
+.terminal-find-bar button:last-child:hover { background: var(--danger-surface); color: var(--danger-hover); }
 .split-divider { position: absolute; z-index: 10; touch-action: none; outline: none; }
 .split-divider.side-by-side { width: 8px; top: 0; bottom: 0; cursor: col-resize; }
 .split-divider.stacked { height: 8px; left: 0; right: 0; cursor: row-resize; }

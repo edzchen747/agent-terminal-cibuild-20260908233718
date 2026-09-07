@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { Terminal } from "@xterm/xterm";
-import { applyTerminalModifiers, BASELINE_TERMINAL_ZOOM, ConsoleFrame, findHttpLinks, gridForContent, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, streamByteLength, TERMINAL_SCROLLBACK_LINES, writeHostChunk, terminalZoomFontSize, xtermThemeFor, zoomedFontSize, type Size, type TerminalModifier, type TerminalScheme } from "@agentterminal/protocol";
+import { SearchAddon } from "@xterm/addon-search";
+import { applyTerminalModifiers, BASELINE_TERMINAL_ZOOM, CLOSED_FIND, ConsoleFrame, applyFindResults, closeFind, findCommandForKey, findDecorationsFor, findHttpLinks, findStatusLabel, openFind, setFindQuery, gridForContent, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, streamByteLength, TERMINAL_SCROLLBACK_LINES, writeHostChunk, terminalZoomFontSize, xtermThemeFor, zoomedFontSize, type FindState, type Size, type TerminalModifier, type TerminalScheme } from "@agentterminal/protocol";
 import { JournalMerge, planSegmentReplay } from "./terminal-stream";
 import "@xterm/xterm/css/xterm.css";
 
@@ -54,6 +55,11 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
   // showing that storm behind a spinner reads as loading, not activity.
   // false only when the pending drain completes (finishAttachment).
   const [replaying, setReplaying] = useState(true);
+  // Find is per pane: each split searches its own buffer and keeps its own
+  // bar, exactly as each keeps its own selection and zoom.
+  const [findState, setFindState] = useState<FindState>(CLOSED_FIND);
+  const searchRef = useRef<SearchAddon | null>(null);
+  const findInputRef = useRef<HTMLInputElement>(null);
   activeRef.current = active;
   visibleRef.current = visible;
   confirmExternalLinksRef.current = confirmExternalLinks;
@@ -115,10 +121,41 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
     }
   };
 
+  // Runs the query against this pane's buffer. `incremental` is set while the
+  // user is still typing, which keeps the active match anchored where it is
+  // instead of jumping the viewport on every keystroke; the arrows and Enter
+  // pass it off so they actually step.
+  const runSearch = (query: string, direction: "next" | "previous", incremental = false) => {
+    const search = searchRef.current;
+    if (!search) return;
+    if (!query) {
+      search.clearDecorations();
+      return;
+    }
+    const options = { incremental, decorations: findDecorationsFor(scheme) };
+    if (direction === "previous") search.findPrevious(query, options);
+    else search.findNext(query, options);
+  };
+
+  // Leaves find: the highlights go, and the shell gets the keyboard back.
+  const dismissFind = () => {
+    searchRef.current?.clearDecorations();
+    setFindState(closeFind);
+    terminalRef.current?.focus();
+  };
+
+  const changeFindQuery = (query: string) => {
+    setFindState((state) => setFindQuery(state, query));
+    runSearch(query, "next", true);
+  };
+
   useEffect(() => {
     if (!hostRef.current) return;
     const terminal = new Terminal({
-      allowProposedApi: false,
+      // Find highlights every match with a decoration, and xterm gates
+      // registerDecoration (and therefore the addon's result counts) behind
+      // this flag. Without it the first search throws.
+      allowProposedApi: true,
       cursorBlink: true,
       cursorStyle: "bar",
       fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, monospace',
@@ -136,6 +173,12 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
     });
     terminalRef.current = terminal;
     terminal.open(hostRef.current);
+    // Find searches this pane's own buffer; nothing about it crosses the host
+    // connection, so two clients on the same session search independently.
+    const search = new SearchAddon();
+    terminal.loadAddon(search);
+    searchRef.current = search;
+    const searchResults = search.onDidChangeResults((event) => setFindState((state) => applyFindResults(state, event)));
     const httpLinkProvider = terminal.registerLinkProvider({
       provideLinks: (y, callback) => {
         const line = terminal.buffer.active.getLine(y - 1);
@@ -449,6 +492,18 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
         return false;
       }
 
+      // Ctrl+F opens this pane's find bar, seeded from the selection if there
+      // is one. Ctrl+Shift+F is deliberately left alone so it falls through to
+      // the forwarding below as a plain \x06: shells bind that key (bash's
+      // forward-char, tmux prefixes), and claiming Ctrl+F outright would
+      // otherwise put it out of reach entirely.
+      if (event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        const selection = terminal.getSelection();
+        setFindState((state) => openFind(state, selection));
+        return false;
+      }
+
       // WebView2 can consume Ctrl shortcuts before xterm emits onData. Forward
       // the control sequence ourselves so Ctrl+D, Ctrl+C, Ctrl+Backspace, and
       // Ctrl+Arrow work consistently in every Windows shell.
@@ -630,6 +685,9 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       if (copyToastTimer) window.clearTimeout(copyToastTimer);
       if (zoomToastTimer) window.clearTimeout(zoomToastTimer);
       httpLinkProvider.dispose();
+      searchResults.dispose();
+      search.dispose();
+      searchRef.current = null;
       terminal.dispose();
       terminalRef.current = null;
       resizeRef.current = () => undefined;
@@ -638,6 +696,10 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
 
   useEffect(() => {
     if (!active) {
+      // A background pane's find bar would keep highlights on a buffer nobody
+      // is looking at, and its input would still hold the keyboard.
+      searchRef.current?.clearDecorations();
+      setFindState(closeFind);
       terminalRef.current?.blur();
       return;
     }
@@ -669,6 +731,16 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
     return () => window.cancelAnimationFrame(frame);
   }, [visible, sessionId]);
 
+  // Opening the bar hands it the keyboard, and selects whatever query it was
+  // seeded with so typing replaces it rather than appending to it.
+  useEffect(() => {
+    if (!findState.open) return;
+    const input = findInputRef.current;
+    if (!input) return;
+    input.focus();
+    input.select();
+  }, [findState.open]);
+
   // Repaint a live terminal when the shared scheme changes, so switching the
   // app between light and dark (or picking another scheme) recolors the open
   // sessions instead of waiting for a fresh one.
@@ -676,12 +748,39 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
     const terminal = terminalRef.current;
     if (!terminal) return;
     terminal.options.theme = xtermThemeFor(scheme);
+    // Decoration colors are baked into each match when it is drawn, so a live
+    // find has to be re-run for its highlights to follow the new scheme.
+    if (findState.open && findState.query) runSearch(findState.query, "next", true);
   }, [scheme]);
 
   // The pane letterboxes the host grid, so its surround must be the scheme's
   // own background rather than a fixed black.
   return <div ref={hostRef} className={`terminal-pane ${visible ? "is-visible" : ""} ${active ? "is-active" : ""}`} style={{ "--terminal-bg": scheme.background } as CSSProperties}>
     {replaying && <div className="replay-overlay"><span className="replay-spinner" /><span>Loading terminal…</span></div>}
+    {findState.open && <div className="terminal-find-bar" role="search" onMouseDown={(event) => event.stopPropagation()}>
+      <input
+        ref={findInputRef}
+        type="text"
+        className="terminal-find-input"
+        placeholder="Find"
+        aria-label="Find in terminal"
+        spellCheck={false}
+        autoComplete="off"
+        value={findState.query}
+        onChange={(event) => changeFindQuery(event.target.value)}
+        onKeyDown={(event) => {
+          const command = findCommandForKey(event);
+          if (command === "none") return;
+          event.preventDefault();
+          if (command === "close") dismissFind();
+          else runSearch(findState.query, command);
+        }}
+      />
+      <span className="terminal-find-count" role="status" aria-live="polite">{findStatusLabel(findState)}</span>
+      <button type="button" aria-label="Previous match" disabled={findState.count === 0} onMouseDown={(event) => event.preventDefault()} onClick={() => runSearch(findState.query, "previous")}>↑</button>
+      <button type="button" aria-label="Next match" disabled={findState.count === 0} onMouseDown={(event) => event.preventDefault()} onClick={() => runSearch(findState.query, "next")}>↓</button>
+      <button type="button" aria-label="Close find" onClick={dismissFind}>✕</button>
+    </div>}
     {pendingUrl && <div className="modal-backdrop link-confirm-backdrop" onMouseDown={() => { if (!linkOpening) setPendingUrl(null); }}>
       <section className="modal link-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="link-confirm-title" onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-kicker">Agent Terminal</div>

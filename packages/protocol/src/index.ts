@@ -4,6 +4,7 @@ export * from "./terminal-themes.js";
 export * from "./terminal-layout.js";
 export * from "./terminal-grid.js";
 export * from "./terminal-zoom.js";
+export * from "./terminal-find.js";
 
 export const PROTOCOL_VERSION = 1 as const;
 
