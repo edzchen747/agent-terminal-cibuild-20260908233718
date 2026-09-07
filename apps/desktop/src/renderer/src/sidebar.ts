@@ -40,6 +40,16 @@ export function sidebarOpenAfterAutoCollapseToggle(open: boolean, autoCollapse: 
   return autoCollapse ? open : true;
 }
 
+/**
+ * The user started typing into the terminal - the same "I am working in the
+ * terminal now" signal the auto-collapse click behavior reacts to: collapse
+ * an open sidebar so the terminal gets the space back. Auto collapse off
+ * leaves the sidebar in whatever state it was in.
+ */
+export function sidebarOpenAfterTerminalInput(open: boolean, autoCollapse: boolean): boolean {
+  return autoCollapse ? false : open;
+}
+
 const STORAGE_KEY = "agent-terminal.desktop.sidebar.v1";
 const DEFAULT_PREFERENCES: SidebarPreferences = { autoCollapse: true };
 

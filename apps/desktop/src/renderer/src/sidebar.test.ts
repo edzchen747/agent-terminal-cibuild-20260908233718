@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { beforeEach, describe, it } from "node:test";
-import { effectiveAutoCollapse, isNarrowLayout, loadSidebarPreferences, NARROW_SIDEBAR_WIDTH, saveSidebarPreferences, sidebarOpenAfterAutoCollapseToggle, sidebarOpenAfterNarrowLayout, shouldCollapseSidebar } from "./sidebar.ts";
+import { effectiveAutoCollapse, isNarrowLayout, loadSidebarPreferences, NARROW_SIDEBAR_WIDTH, saveSidebarPreferences, sidebarOpenAfterAutoCollapseToggle, sidebarOpenAfterNarrowLayout, sidebarOpenAfterTerminalInput, shouldCollapseSidebar } from "./sidebar.ts";
 
 class MemoryStorage implements Storage {
   private values = new Map<string, string>();
@@ -185,6 +185,37 @@ describe("sidebar state after toggling auto collapse", () => {
   it("leaves the sidebar unchanged when auto collapse is turned on", () => {
     assert.equal(sidebarOpenAfterAutoCollapseToggle(true, true), true);
     assert.equal(sidebarOpenAfterAutoCollapseToggle(false, true), false);
+  });
+});
+
+describe("sidebar state after terminal input", () => {
+  it("collapses an open sidebar when auto collapse is on", () => {
+    assert.equal(sidebarOpenAfterTerminalInput(true, true), false);
+  });
+
+  it("leaves a collapsed sidebar collapsed", () => {
+    assert.equal(sidebarOpenAfterTerminalInput(false, true), false);
+  });
+
+  it("keeps the sidebar in its current state when auto collapse is off", () => {
+    assert.equal(sidebarOpenAfterTerminalInput(true, false), true);
+    assert.equal(sidebarOpenAfterTerminalInput(false, false), false);
+  });
+
+  // The app feeds the EFFECTIVE auto-collapse (the narrow layout enables it
+  // implicitly), so compose it here exactly as App.tsx does: the edge cases
+  // are the narrow-layout ones, where a keystroke collapses even though the
+  // saved setting is off.
+  it("collapses on terminal input in the narrow layout, where auto collapse is implicit", () => {
+    assert.equal(sidebarOpenAfterTerminalInput(true, effectiveAutoCollapse(false, true)), false);
+  });
+
+  it("keeps an open sidebar open on terminal input when wide and the setting is off", () => {
+    assert.equal(sidebarOpenAfterTerminalInput(true, effectiveAutoCollapse(false, false)), true);
+  });
+
+  it("collapses on terminal input in the narrow layout regardless of a saved on-setting", () => {
+    assert.equal(sidebarOpenAfterTerminalInput(true, effectiveAutoCollapse(true, true)), false);
   });
 });
 

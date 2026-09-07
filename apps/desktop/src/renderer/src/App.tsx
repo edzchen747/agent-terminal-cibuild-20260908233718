@@ -14,8 +14,9 @@ import { shellSwitchSessionOrder, shellSwitchSplitGroups } from "./shell-switch"
 import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
 import type { SplitGroup, SplitLayout } from "./split-tabs";
 import { deviceListEntryModal, nextModalAfterPairing, nextModalOnEscape, pairModalEscapeTarget, type Modal } from "./modal-navigation";
+import { classifyKeyboardFocus, shouldReturnKeyboardToTerminal, type FocusPlacement, type TerminalKeyboardHandle } from "./keyboard-ownership";
 import { connectedDevices, NO_DEVICES_LABEL } from "./statusbar";
-import { effectiveAutoCollapse, isNarrowLayout, loadSidebarPreferences, NARROW_SIDEBAR_WIDTH, saveSidebarPreferences, sidebarOpenAfterAutoCollapseToggle, sidebarOpenAfterNarrowLayout, shouldCollapseSidebar } from "./sidebar";
+import { effectiveAutoCollapse, isNarrowLayout, loadSidebarPreferences, NARROW_SIDEBAR_WIDTH, saveSidebarPreferences, sidebarOpenAfterAutoCollapseToggle, sidebarOpenAfterNarrowLayout, sidebarOpenAfterTerminalInput, shouldCollapseSidebar } from "./sidebar";
 import { applyTheme, loadThemePreference, resolveTheme, saveThemePreference, SYSTEM_DARK_QUERY, THEME_LABELS, THEME_PREFERENCES, type ThemePreference } from "./theme";
 import { TerminalPane } from "./TerminalPane";
 import { WindowControls, toggleWindowMaximize } from "./window-controls";
@@ -52,6 +53,20 @@ interface ProjectDragState {
   targetIndex: number;
   didMove: boolean;
   centers: number[];
+}
+
+// Where document focus has settled, in the terms of the keyboard-ownership
+// policy (keyboard-ownership.ts). The terminal-surface check must come
+// first: xterm's helper textarea is a textarea, and a control check must
+// come before the overlay check: the find input and the settings inputs
+// live inside overlay regions but keep the keyboard the user moved there.
+function classifyFocusedElement(element: Element | null): FocusPlacement {
+  if (!(element instanceof Element)) return "chrome";
+  return classifyKeyboardFocus({
+    isTerminalSurface: element.classList.contains("xterm-helper-textarea"),
+    isControl: element instanceof HTMLElement && element.matches("input, select, textarea"),
+    insideOverlay: element.closest(".modal-backdrop, .split-menu, .terminal-find-bar") !== null
+  });
 }
 
 export function App() {
@@ -97,6 +112,13 @@ export function App() {
   const splitMenuRef = useRef<HTMLDivElement>(null);
   const splitDropSideRef = useRef<SplitDropSide>(null);
   const splitResizeRef = useRef<SplitResizeState | null>(null);
+  // The keyboard handles the terminal panes register (TerminalPane), one
+  // per session, resolved through the session the window is actively
+  // showing - only the active pane's terminal may take or give up the
+  // document keyboard.
+  const terminalKeyboardsRef = useRef(new Map<string, TerminalKeyboardHandle>());
+  const activeSessionIdRef = useRef<string | null>(null);
+  activeSessionIdRef.current = activeSessionId;
 
   useEffect(() => {
     void window.agentTerminal.getState().then(setState);
@@ -247,6 +269,89 @@ export function App() {
     document.addEventListener("click", handleClick);
     return () => document.removeEventListener("click", handleClick);
   }, [sidebarOpen, autoCollapseEffective, modal]);
+
+  // A keystroke into the terminal is the same "I am working in the terminal
+  // now" signal the click behavior above reacts to: with auto collapse on,
+  // an open sidebar collapses so the terminal gets the space back. Only the
+  // terminal's own input surface counts - while the find bar, split menu,
+  // or a modal owns the keyboard, the terminal does not hold focus (see the
+  // keyboard-ownership policy), so none of them collapses the sidebar out
+  // from under them. Capture phase so no stopPropagation along the way
+  // can hide the key from here.
+  useEffect(() => {
+    if (!sidebarOpen || !autoCollapseEffective) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element) || !target.classList.contains("xterm-helper-textarea")) return;
+      setSidebarOpen((open) => sidebarOpenAfterTerminalInput(open, autoCollapseEffective));
+    };
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [sidebarOpen, autoCollapseEffective]);
+
+  // ---------------------------------------------------------------------
+  // Keyboard ownership (keyboard-ownership.ts): the active terminal pane
+  // owns the document keyboard, and window chrome does not take it. A
+  // click on the sidebar, title bar, tab bar, or status bar settles the
+  // keyboard on an element that cannot type into the shell, so one frame
+  // later - after the click's state changes (a tab selection, a project
+  // switch, a menu or modal opening) have committed - the keyboard is
+  // handed back to the active terminal pane. Only blocking overlays own
+  // the keyboard while open: the modals (pair, settings, devices, rename,
+  // and the per-pane link confirm) and the split context menu. When the
+  // last one closes, the keyboard goes back to the terminal.
+  const registerTerminalKeyboard = useCallback((sessionId: string, keyboard: TerminalKeyboardHandle | null) => {
+    const keyboards = terminalKeyboardsRef.current;
+    if (keyboard) keyboards.set(sessionId, keyboard);
+    else keyboards.delete(sessionId);
+  }, []);
+
+  // Hand the keyboard back to the active terminal pane unless it already
+  // sits where it belongs (on the terminal or an input control), or a
+  // blocking overlay is on screen and owns it. The find bar is not in the
+  // blocking set: it floats over a pane without covering the terminal, so
+  // the keyboard is still returned when the user clicks elsewhere.
+  const restoreTerminalKeyboard = useCallback(() => {
+    const focus = classifyFocusedElement(document.activeElement);
+    const overlayOpen = document.querySelector(".modal-backdrop, .split-menu") !== null;
+    if (!shouldReturnKeyboardToTerminal({ focus, overlayOpen })) return;
+    terminalKeyboardsRef.current.get(activeSessionIdRef.current ?? "")?.focus();
+  }, []);
+
+  useEffect(() => {
+    // Every click in the window may have pulled the keyboard off the
+    // terminal (a button, a project row, the title bar, the document
+    // itself), and reactivating the window - Alt+Tab, restoring from the
+    // tray, a minimized window - leaves it unsettled the same way. Both
+    // schedule the guarded restore one frame later; a stale frame re-checks
+    // the live DOM, so at worst it is a no-op.
+    const scheduleRestore = () => window.requestAnimationFrame(restoreTerminalKeyboard);
+    document.addEventListener("click", scheduleRestore, true);
+    window.addEventListener("focus", scheduleRestore);
+    return () => {
+      document.removeEventListener("click", scheduleRestore, true);
+      window.removeEventListener("focus", scheduleRestore);
+    };
+  }, [restoreTerminalKeyboard]);
+
+  useEffect(() => {
+    // A blocking overlay just opened: take the keyboard off the terminal
+    // explicitly. The overlay may have opened while the terminal still
+    // held the keyboard (a pairing grant that committed in the background,
+    // a right-click context menu over a tab), and the overlay's own focus
+    // - a menu item, or none at all - does not always take it.
+    if (modal === null && splitMenu === null) return;
+    terminalKeyboardsRef.current.get(activeSessionIdRef.current ?? "")?.blur();
+  }, [modal, splitMenu]);
+
+  useEffect(() => {
+    // The last blocking overlay closed: return the keyboard to the
+    // terminal. Deferred one frame so the closed element has unmounted and
+    // the native focus has settled (usually back on the document).
+    if (modal !== null || splitMenu !== null) return;
+    const frame = window.requestAnimationFrame(restoreTerminalKeyboard);
+    return () => window.cancelAnimationFrame(frame);
+  }, [modal, splitMenu, restoreTerminalKeyboard]);
 
   // The scheme pair is a host setting shared with the phone; which of the two
   // this window paints is decided by its own light/dark theme.
@@ -947,7 +1052,7 @@ export function App() {
                 }
               }
               return <div key={session.id} className={`terminal-surface ${visible ? "is-visible" : ""} ${paneActive ? "is-active" : "is-inactive"} ${activeSplit ? `is-split ${activeSplit.layout}` : ""}`} style={surfaceStyle} onPointerDown={() => { if (visible && !paneActive) setActiveSessionId(session.id); }}>
-                <TerminalPane sessionId={session.id} visible={visible} active={paneActive} confirmExternalLinks={state.confirmExternalLinks} scheme={terminalScheme} />
+                <TerminalPane sessionId={session.id} visible={visible} active={paneActive} confirmExternalLinks={state.confirmExternalLinks} scheme={terminalScheme} registerKeyboard={registerTerminalKeyboard} />
                 {visible && activeSplit && !paneActive && <div className="split-mini-toolbar" onPointerDown={(event) => event.stopPropagation()}>
                   <TerminalIcon /><span className="display-name" title={session.title}>{session.title}</span>
                   <button title="Manage split view" aria-label="Manage split view" onClick={(event) => { const bounds = event.currentTarget.getBoundingClientRect(); setSplitMenu({ kind: "manage", groupId: activeSplit.id, x: bounds.right, y: bounds.top }); }}><MoreIcon /></button>

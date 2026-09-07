@@ -4,9 +4,18 @@ import { Terminal } from "@xterm/xterm";
 import { SearchAddon } from "@xterm/addon-search";
 import { applyTerminalModifiers, BASELINE_TERMINAL_ZOOM, CLOSED_FIND, ConsoleFrame, applyFindResults, closeFind, findCommandForKey, findDecorationsFor, findHttpLinks, findStatusLabel, openFind, setFindQuery, gridForContent, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, streamByteLength, TERMINAL_SCROLLBACK_LINES, writeHostChunk, terminalZoomFontSize, xtermThemeFor, zoomedFontSize, type FindState, type Size, type TerminalModifier, type TerminalScheme } from "@agentterminal/protocol";
 import { JournalMerge, planSegmentReplay } from "./terminal-stream";
+import type { TerminalKeyboardHandle } from "./keyboard-ownership";
 import "@xterm/xterm/css/xterm.css";
 
-interface Props { sessionId: string; visible: boolean; active: boolean; confirmExternalLinks: boolean; scheme: TerminalScheme; }
+interface Props {
+  sessionId: string;
+  visible: boolean;
+  active: boolean;
+  confirmExternalLinks: boolean;
+  scheme: TerminalScheme;
+  /** The app's keyboard-ownership policy (App.tsx): register this pane's keyboard handle. */
+  registerKeyboard?: (sessionId: string, keyboard: TerminalKeyboardHandle | null) => void;
+}
 
 // The font size a 100% zoom paints at - the pane's baseline, and the size a
 // desktop that is the session's only client sizes the PTY from.
@@ -35,11 +44,12 @@ const dbg = (message: string) => {
   window.agentTerminal.logDebug(`[ATSync] ${message}`);
 };
 
-export function TerminalPane({ sessionId, visible, active, confirmExternalLinks, scheme }: Props) {
+export function TerminalPane({ sessionId, visible, active, confirmExternalLinks, scheme, registerKeyboard }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const activeRef = useRef(active);
   const visibleRef = useRef(visible);
+  const replayingRef = useRef(false);
   const resizeRef = useRef<(claim?: boolean) => void>(() => undefined);
   // The in-flight attach, so the join/leave effect below can sequence a
   // release after it: a release can never be sent before the claim that
@@ -64,6 +74,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
   visibleRef.current = visible;
   confirmExternalLinksRef.current = confirmExternalLinks;
   schemeRef.current = scheme;
+  replayingRef.current = replaying;
 
   useEffect(() => {
     setPendingUrl(null);
@@ -768,6 +779,39 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
     resizeRef.current(true);
     terminalRef.current?.focus();
   }, [active]);
+
+  // The app's keyboard-ownership policy (App.tsx): hand this pane's
+  // terminal to it so the active, settled pane can take or give up the
+  // document keyboard. A pane mid-replay refuses to take it: the replay
+  // overlay is showing, and finishAttachment takes the focus itself when
+  // the drain completes.
+  useEffect(() => {
+    registerKeyboard?.(sessionId, {
+      focus: () => {
+        if (!activeRef.current || replayingRef.current) return;
+        terminalRef.current?.focus();
+      },
+      blur: () => terminalRef.current?.blur()
+    });
+    return () => registerKeyboard?.(sessionId, null);
+  }, [registerKeyboard, sessionId]);
+
+  // The link-confirm overlay is per-pane: while it is up its button holds
+  // the keyboard, and when it goes away the keyboard is this pane's again -
+  // the Escape close has no click to trigger the app's restore, so the pane
+  // takes the focus itself. A pane switch has its own focus move, and a
+  // pane mid-replay keeps refusing until its drain completes.
+  const previousPendingUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    const wasOpen = previousPendingUrlRef.current !== null;
+    previousPendingUrlRef.current = pendingUrl;
+    if (!wasOpen) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (!activeRef.current || replayingRef.current) return;
+      terminalRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [pendingUrl]);
 
   useEffect(() => {
     if (!visible) {
