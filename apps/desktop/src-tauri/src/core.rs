@@ -418,7 +418,9 @@ struct ManagedSession {
     taskbar: SessionTaskbar,
     /// The host-persisted "come look" marker: the session's command just
     /// finished (its taskbar indicator moved non-clear to clear) and no
-    /// client has viewed it since. A client that connects AFTER the edge
+    /// client has viewed it since - the marker is never raised while a
+    /// client is actively viewing the session, since that client is the
+    /// look itself. A client that connects AFTER the edge
     /// reads it from the snapshot (`look_here_session_ids`) and raises
     /// its static-dot marker, the way a client that saw the live edge
     /// does. Cleared when a desktop window makes the session's tab its
@@ -1401,6 +1403,7 @@ impl Core {
     fn sweep_session_activity_step(
         session: &mut ManagedSession,
         now: Instant,
+        viewed: bool,
     ) -> Option<(SessionActivity, String, Option<TaskbarProgress>)> {
         let mode = session.metadata.tui_mode;
         let quiet_idle = session.tui.quiet_idle(now);
@@ -1422,8 +1425,10 @@ impl Core {
             // edge (the transition INTO the clear state) raises the
             // flag; a re-armed indicator would lower it, and the sweep
             // only clears the badge, so in practice it only ever raises
-            // here. (The sweep's own broadcast carries the change.)
-            move_look_here(session, *taskbar);
+            // here - and only for a session no client is viewing (a
+            // viewer is the look the marker exists for). (The sweep's
+            // own broadcast carries the change.)
+            move_look_here(session, *taskbar, viewed);
         }
         Some((activity, since, taskbar))
     }
@@ -1432,12 +1437,24 @@ impl Core {
         let changed = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let now = Instant::now();
+            // The "come look" marker is not raised for a session a
+            // client is actively viewing (see `viewed_session_ids`):
+            // the client looking at it is the look itself, so a command
+            // finishing there earns no marker. Computed up front, while
+            // `inner` is still unborrowed, so the per-session steps need
+            // no shared borrow of `inner` while its sessions are
+            // borrowed out.
+            let viewed = viewed_session_ids(&inner);
             let mut changed = Vec::new();
             for session in inner.sessions.values_mut() {
                 if session.metadata.status != "running" {
                     continue;
                 }
-                if let Some((activity, since, taskbar)) = Self::sweep_session_activity_step(session, now) {
+                if let Some((activity, since, taskbar)) = Self::sweep_session_activity_step(
+                    session,
+                    now,
+                    viewed.contains(&session.metadata.id),
+                ) {
                     changed.push((
                         session.metadata.id.clone(),
                         activity,
@@ -3946,6 +3963,14 @@ impl Core {
             look_here_changed,
         ) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            // The "come look" marker is not raised for a session a
+            // client is actively viewing (see `viewed_session_ids`):
+            // the client looking at it is the look itself, so a command
+            // finishing there earns no marker. Computed before the
+            // session's mutable borrow: the viewing sets live in the
+            // window and device state `inner` also owns, and a shared
+            // borrow of them may not overlap the mutable borrow.
+            let viewed = viewed_session_ids(&inner).contains(session_id);
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
             };
@@ -4240,7 +4265,7 @@ impl Core {
             // their markers from it - so it reports a change broadcast.
             let mut look_here_changed = false;
             if let Some(taskbar) = taskbar_change {
-                look_here_changed = move_look_here(session, taskbar);
+                look_here_changed = move_look_here(session, taskbar, viewed);
             }
             (
                 reported,
@@ -4875,18 +4900,47 @@ fn mark_session_exited(inner: &mut Inner, session_id: &str, exit_code: u32) -> b
 /// report whether the flag changed. The flag is raised by the finished
 /// edge (the indicator's only transition INTO the clear state) and
 /// dropped whenever the indicator is re-armed - a new command or an
-/// explicit state, i.e. any non-clear state. Callers invoke it only
+/// explicit state, i.e. any non-clear state. The finished edge raises
+/// the flag only when no client is viewing the session (`viewed`):
+/// a client that IS on it is the look the marker exists for, so a
+/// command finishing there needs no marker. Callers invoke it only
 /// after the state machine actually changed state; the flag's other
 /// death is a look at the session ({@link clear_session_look_here}) or
 /// the session's exit ({@link mark_session_exited}).
-fn move_look_here(session: &mut ManagedSession, taskbar: TaskbarProgress) -> bool {
-    let look_here = taskbar == TaskbarProgress::Clear;
+fn move_look_here(session: &mut ManagedSession, taskbar: TaskbarProgress, viewed: bool) -> bool {
+    let look_here = taskbar == TaskbarProgress::Clear && !viewed;
     if session.look_here != look_here {
         session.look_here = look_here;
         true
     } else {
         false
     }
+}
+
+/// The session ids a client is actively viewing right now: a desktop
+/// window's active tabs (a terminal merely attached in a window's
+/// background is not a look - its finished edge still earns a marker,
+/// the way the window's own tab indicators show it), and the sessions a
+/// remote device keeps a live viewport in (a phone attaches only the
+/// terminal page it is showing, so its viewport set is exactly the
+/// terminal it is on). A session in this set needs no "come look"
+/// marker when its command finishes: the client looking at it is the
+/// look itself, and raising the flag would let a later snapshot re-seed
+/// the marker on the very client that watched the finish.
+fn viewed_session_ids(inner: &Inner) -> HashSet<String> {
+    let mut viewed: HashSet<String> = inner
+        .windows
+        .active_session_ids()
+        .into_iter()
+        .collect();
+    for session in inner.sessions.values() {
+        for controller in session.viewports.keys() {
+            if matches!(controller, TerminalController::Remote(_)) {
+                viewed.insert(session.metadata.id.clone());
+            }
+        }
+    }
+    viewed
 }
 
 /// A look at a session - a desktop window making its tab active, or a
@@ -5833,6 +5887,7 @@ mod tests {
         retire_empty_temporary_project, set_client_viewport, should_open_quiet_window,
         snapshot_from_inner, snapshot_of, split_journal_by_epochs, starts_with_screen_repaint,
         startup_project, take_valid_pairing_grant, truncate_journal_front, validate_project_name,
+        viewed_session_ids,
     };
     use crate::models::TaskbarProgress;
     use crate::taskbar::SessionTaskbar;
@@ -9261,7 +9316,7 @@ mod tests {
         // The screen has now been quiet for longer than TUI_QUIET_MS: the
         // sweep step drops the badge and moves the spinner to clear.
         let quiet = start + Duration::from_millis(crate::activity::ACTIVE_MIN_MS + TUI_QUIET_MS + 500);
-        let step = Core::sweep_session_activity_step(&mut session, quiet)
+        let step = Core::sweep_session_activity_step(&mut session, quiet, false)
             .expect("the quiet screen drops its badge");
         assert_eq!(step.0, SessionActivity::Idle);
         assert_eq!(step.2, Some(TaskbarProgress::Clear));
@@ -9278,8 +9333,77 @@ mod tests {
         );
         assert_eq!(
             session.look_here, true,
-            "the finished edge raises the host's \"come look\" marker"
+            "the finished edge raises the host's \"come look\" marker for a session no client is viewing"
         );
+    }
+
+    #[test]
+    fn the_sweep_step_raises_no_marker_for_a_session_a_client_is_viewing() {
+        // The same quiet-screen step, but a client is on the session (its
+        // tab is active, its terminal page is open): the finished edge
+        // must not raise the marker. The client watching the finish is
+        // the look itself, and a persisted flag would only let a later
+        // snapshot re-seed the marker once the client navigates away.
+        let mut session = test_session("s1", "p", r"C:\Work\P");
+        session.metadata.tui_mode = TuiMode::Fullscreen;
+        let start = Instant::now();
+        session.tui.mark_spontaneous_output(start);
+        session
+            .activity
+            .observe(&[], TuiMode::Fullscreen, false, false, true, true, start);
+        let settled = start + Duration::from_millis(crate::activity::ACTIVE_MIN_MS + 250);
+        let announced = session
+            .activity
+            .observe(&[], TuiMode::Fullscreen, false, false, false, false, settled)
+            .expect("the held badge is published");
+        let (activity, _) = announced;
+        session.taskbar.on_activity(activity, settled);
+        session.metadata.taskbar = session.taskbar.effective();
+
+        let quiet = start + Duration::from_millis(crate::activity::ACTIVE_MIN_MS + TUI_QUIET_MS + 500);
+        let step = Core::sweep_session_activity_step(&mut session, quiet, true)
+            .expect("the quiet screen drops its badge");
+        assert_eq!(step.2, Some(TaskbarProgress::Clear));
+        assert_eq!(
+            session.look_here, false,
+            "a viewed session's finished edge raises no marker"
+        );
+    }
+
+    #[test]
+    fn viewed_session_ids_unions_active_tabs_and_remote_viewports() {
+        // "Viewed" means actively looking: a desktop window's ACTIVE tab
+        // counts, a remote device's live viewport counts (a phone attaches
+        // only the terminal page it is showing), and a desktop terminal
+        // attached in a window's BACKGROUND does not - that tab still
+        // earns a marker when its command finishes.
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "p", r"C:\Work\P", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        inner
+            .sessions
+            .insert("s2".into(), test_session("s2", "p", r"C:\Work\P"));
+        inner
+            .sessions
+            .insert("s3".into(), test_session("s3", "p", r"C:\Work\P"));
+        // window-a is on s1; phone-a is on s2.
+        inner.windows.set_active_session("window-a", Some("s1".into()));
+        let second = inner.sessions.get_mut("s2").unwrap();
+        set_client_viewport(second, TerminalController::Remote("phone-a".into()), 80, 24);
+        // s3 is attached in window-b's background (attached, not active).
+        let third = inner.sessions.get_mut("s3").unwrap();
+        set_client_viewport(third, TerminalController::Desktop("window-b".into()), 120, 40);
+
+        let viewed = viewed_session_ids(&inner);
+        assert!(viewed.contains("s1"), "a window's active tab is viewed");
+        assert!(viewed.contains("s2"), "a phone's open terminal is viewed");
+        assert!(
+            !viewed.contains("s3"),
+            "a background-attached desktop terminal is not a look"
+        );
+        fs::remove_file(state_path).expect("remove test state");
     }
 
     #[test]
@@ -9321,30 +9445,178 @@ mod tests {
         let mut session = test_session("s1", "p", r"C:\Work\P");
         assert!(!session.look_here, "a fresh session holds no marker");
         assert!(
-            !move_look_here(&mut session, TaskbarProgress::Indeterminate),
+            !move_look_here(&mut session, TaskbarProgress::Indeterminate, false),
             "a new command from an unmarked state stays unmarked"
         );
         assert!(
-            move_look_here(&mut session, TaskbarProgress::Clear),
-            "the finished edge raises the marker"
+            move_look_here(&mut session, TaskbarProgress::Clear, false),
+            "the finished edge raises the marker for a session nobody is viewing"
         );
         assert!(
-            move_look_here(&mut session, TaskbarProgress::Indeterminate),
+            move_look_here(&mut session, TaskbarProgress::Indeterminate, false),
             "a re-armed indicator drops the marker"
         );
         assert!(
-            !move_look_here(&mut session, TaskbarProgress::Value(57)),
+            !move_look_here(&mut session, TaskbarProgress::Value(57), false),
             "an explicit report on an unmarked state stays unmarked"
         );
         assert!(
-            move_look_here(&mut session, TaskbarProgress::Clear),
+            move_look_here(&mut session, TaskbarProgress::Clear, false),
             "a second finished edge raises the marker again"
         );
         assert!(
-            move_look_here(&mut session, TaskbarProgress::Value(100)),
+            move_look_here(&mut session, TaskbarProgress::Value(100), false),
             "the next command's 100% report drops it at once"
         );
         assert_eq!(session.look_here, false);
+    }
+
+    #[test]
+    fn the_finished_edge_raises_no_marker_while_the_session_is_viewed() {
+        // A client that is on the session (its active tab, its open
+        // terminal) is the look the marker exists for: the finished edge
+        // raises the flag only for a session nobody is viewing, and a
+        // re-armed indicator still drops whatever the flag held.
+        let mut session = test_session("s1", "p", r"C:\Work\P");
+        assert!(!session.look_here, "a fresh session holds no marker");
+        assert!(
+            !move_look_here(&mut session, TaskbarProgress::Indeterminate, false),
+            "the command's start earns no marker on an unviewed session"
+        );
+        assert!(
+            !move_look_here(&mut session, TaskbarProgress::Clear, true),
+            "a command finishing while a client is on the session raises nothing"
+        );
+        assert_eq!(session.look_here, false);
+        // A marker that predates the view still dies when the indicator
+        // re-arms, whatever the viewing state.
+        session.look_here = true;
+        assert!(
+            move_look_here(&mut session, TaskbarProgress::Indeterminate, true),
+            "a re-armed indicator on a viewed session still drops the marker"
+        );
+        assert_eq!(session.look_here, false);
+    }
+
+    #[test]
+    fn viewing_one_session_does_not_suppress_the_marker_for_the_other() {
+        // The suppression is per-session: a client sitting on s1 is a
+        // look AT s1, not a look at s2. s1's finished edge is
+        // suppressed while s2's still raises - the marker's job is to
+        // pull the user back to the session they are NOT on.
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "p", r"C:\Work\P", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        inner
+            .sessions
+            .insert("s2".into(), test_session("s2", "p", r"C:\Work\P"));
+        // phone-a is on s1; nobody is looking at s2.
+        let first = inner.sessions.get_mut("s1").unwrap();
+        set_client_viewport(first, TerminalController::Remote("phone-a".into()), 80, 24);
+
+        // s1's command finishes while the phone is on it: suppressed.
+        let s1_viewed = viewed_session_ids(&inner).contains("s1");
+        assert!(s1_viewed, "the phone's open terminal counts as a look");
+        let first = inner.sessions.get_mut("s1").unwrap();
+        assert!(
+            !move_look_here(first, TaskbarProgress::Indeterminate, s1_viewed),
+            "a new command from an unmarked state stays unmarked"
+        );
+        assert!(
+            !move_look_here(first, TaskbarProgress::Clear, s1_viewed),
+            "a command finishing while a client is on the session raises nothing"
+        );
+
+        // s2's command finishes with nobody on it: raised, even though a
+        // client is looking right now - at the other session.
+        let s2_viewed = viewed_session_ids(&inner).contains("s2");
+        assert!(!s2_viewed, "a client sitting on s1 is not a look at s2");
+        let second = inner.sessions.get_mut("s2").unwrap();
+        assert!(!move_look_here(second, TaskbarProgress::Indeterminate, s2_viewed));
+        assert!(
+            move_look_here(second, TaskbarProgress::Clear, s2_viewed),
+            "the other session's finished edge still raises its marker"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn a_session_stops_counting_as_viewed_once_the_viewer_leaves() {
+        // Suppression lasts only as long as the view: once the phone's
+        // terminal page is gone (its live viewport evicted), the
+        // session is unviewed again and the next finished edge raises
+        // the marker the way it always did.
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "p", r"C:\Work\P", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        let phone = TerminalController::Remote("phone-a".into());
+        let first = inner.sessions.get_mut("s1").unwrap();
+        set_client_viewport(first, phone.clone(), 80, 24);
+        assert!(
+            viewed_session_ids(&inner).contains("s1"),
+            "the phone's open terminal counts as a look"
+        );
+
+        // The phone leaves the terminal page: the viewport is evicted.
+        let first = inner.sessions.get_mut("s1").unwrap();
+        first.viewports.remove(&phone);
+        assert!(
+            !viewed_session_ids(&inner).contains("s1"),
+            "the evicted viewport no longer counts as a look"
+        );
+
+        // The command finishes with nobody on the session: the marker
+        // earns itself again.
+        let s1_viewed = viewed_session_ids(&inner).contains("s1");
+        let first = inner.sessions.get_mut("s1").unwrap();
+        assert!(!move_look_here(first, TaskbarProgress::Indeterminate, s1_viewed));
+        assert!(
+            move_look_here(first, TaskbarProgress::Clear, s1_viewed),
+            "once the viewer leaves, the finished edge raises the marker"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn a_background_attached_session_still_earns_its_marker() {
+        // A terminal attached in a window's BACKGROUND tab is not a
+        // look: the window's "viewed" set is its active tab. The
+        // attached session's finished edge must still raise the marker
+        // so the window's tab indicator tells the user to come back.
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "p", r"C:\Work\P", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        inner
+            .sessions
+            .insert("s2".into(), test_session("s2", "p", r"C:\Work\P"));
+        // window-b has s1 attached (background); its active tab is s2.
+        let first = inner.sessions.get_mut("s1").unwrap();
+        set_client_viewport(first, TerminalController::Desktop("window-b".into()), 120, 40);
+        inner.windows.set_active_session("window-b", Some("s2".into()));
+        assert!(
+            !viewed_session_ids(&inner).contains("s1"),
+            "a background-attached terminal is not a look"
+        );
+        assert!(
+            viewed_session_ids(&inner).contains("s2"),
+            "the active tab is a look"
+        );
+
+        // s1's command finishes while the window sits on s2: raised.
+        let s1_viewed = viewed_session_ids(&inner).contains("s1");
+        let first = inner.sessions.get_mut("s1").unwrap();
+        assert!(!move_look_here(first, TaskbarProgress::Indeterminate, s1_viewed));
+        assert!(
+            move_look_here(first, TaskbarProgress::Clear, s1_viewed),
+            "a background tab's finished edge still raises the marker"
+        );
+        fs::remove_file(state_path).expect("remove test state");
     }
 
     #[test]

@@ -29,7 +29,7 @@ import { FONT_WIDTH_MAX, FONT_WIDTH_MIN, FONT_WIDTH_STEP, normalizeFontWidthPerc
 import { applyTheme, loadThemePreference, resolveTheme, saveThemePreference, SYSTEM_DARK_QUERY, THEME_LABELS, THEME_PREFERENCES, type ResolvedTheme, type ThemePreference } from "./theme";
 import { syncSystemBars } from "./systemBars";
 import { backProjectId, resolveViewGeometry } from "./projectNavigation";
-import { sessionProgressModel, taskbarJustCompleted, taskbarOf, type SessionProgressModel } from "./session-taskbar";
+import { sessionProgressModel, taskbarOf, type SessionProgressModel } from "./session-taskbar";
 
 type View = { type: "home" } | { type: "hosts" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
 // The bottom sheets of the connected pager. While one is set, that sheet is
@@ -178,10 +178,6 @@ export function App() {
   const swallowTapClickRef = useRef(false);
   const swallowTapClickAtRef = useRef({ x: 0, y: 0 });
   const swallowTapClickTimerRef = useRef<number | undefined>(undefined);
-  // The taskbar state each session showed at the last snapshot, so the
-  // running -> clear edge (a command finishing) can be detected for the
-  // "come look" marker.
-  const previousTaskbarRef = useRef(new Map<string, TaskbarProgress>());
 
   useEffect(() => {
     void Preferences.get({ key: TERMINAL_FONT_WIDTH_KEY }).then(({ value }) => {
@@ -612,39 +608,29 @@ export function App() {
     return () => { offSnapshot(); offConnected(); offHeartbeat(); offReconnecting(); offReconnectFailed(); offDisconnect(); offRemoteRegistration(); };
   }, [connection]);
 
-  // A command that finished on a session the user is not viewing holds
-  // its "come look" marker - the static green dot and the 100% progress
-  // ring (completedHold) - until the session is opened. The host's
-  // taskbar machine emits the running -> clear edge; comparing each
-  // session's effective state against the last snapshot's catches it.
-  // The connection patches every session.taskbar event into the snapshot
-  // it holds, so the snapshot alone carries the newest state (a desktop
-  // window instead needs the event/snapshot merge machinery).
+  // The host alone RAISES the "come look" marker - the static green dot
+  // and the 100% progress ring (completedHold): it flags a session whose
+  // command just finished while no client is viewing it - a client on the
+  // session (this phone's open terminal, another device's) is the look
+  // itself - persists the flag across connects, and clears it the moment
+  // any client opens the session. The seed effect below lifts the holds
+  // from the flag list, so this effect only EXPIRES them locally: a new
+  // command re-arms the indicator, and a held session that left the host
+  // list takes its marker with it. The connection patches every
+  // session.taskbar event into the snapshot it holds, so the snapshot
+  // alone carries the newest state (a desktop window instead needs the
+  // event/snapshot merge machinery).
   useEffect(() => {
     const sessions = snapshot?.sessions;
     if (!sessions) return;
-    const previous = previousTaskbarRef.current;
     const now = new Map<string, TaskbarProgress>();
     for (const session of sessions) now.set(session.id, taskbarOf(session));
-    for (const id of [...previous.keys()]) if (!now.has(id)) previous.delete(id);
-    previousTaskbarRef.current = now;
-    // The session the user is viewing is the terminal view's; every other
-    // session (or none, while the terminal page is not showing) is
-    // "looking elsewhere" from the finished command's point of view.
-    const activeSessionId = view.type === "terminal" ? view.sessionId : null;
     setCompletedHold((current) => {
       const holds = new Set(current);
       let changed = false;
       for (const session of sessions) {
         const effective = now.get(session.id);
         if (!effective) continue;
-        const last = previous.get(session.id);
-        // The running -> clear edge on a session the user is not on: hold
-        // the marker until the session is opened.
-        if (last && taskbarJustCompleted(last, effective) && session.status === "running" && session.id !== activeSessionId && !holds.has(session.id)) {
-          holds.add(session.id);
-          changed = true;
-        }
         // A new command on the session: the marker is stale.
         if (effective.state !== "clear" && holds.delete(session.id)) changed = true;
       }
@@ -652,7 +638,7 @@ export function App() {
       for (const id of [...holds]) if (!now.has(id) && holds.delete(id)) changed = true;
       return changed ? holds : current;
     });
-  }, [snapshot, view]);
+  }, [snapshot]);
 
   // Opening a held session resets its marker to the idle state: the
   // marker is only for sessions the user has not looked at yet.
@@ -695,9 +681,13 @@ export function App() {
 
   // The host persists the "come look" markers across client connects
   // (snapshot.lookHereSessionIds): a phone that connects AFTER the
-  // command finished still raises the 100% ring and static dot. Seed
-  // only - the open, new-command and cross-client view effects above
-  // own the removals - and skip the terminal this phone has open: it is
+  // command finished still raises the 100% ring and static dot. This
+  // list is the ONLY raiser of the local holds - the host flagged the
+  // session while no client was viewing it, and no client's event stream
+  // may raise a hold of its own (a device that watched the finish is the
+  // look itself, and the other devices must not mark a terminal someone
+  // is sitting on). The open, new-command and cross-client view effects
+  // above own the removals. Skip the terminal this phone has open: it is
   // the look itself, not a marker.
   useEffect(() => {
     const ids = snapshot?.lookHereSessionIds;

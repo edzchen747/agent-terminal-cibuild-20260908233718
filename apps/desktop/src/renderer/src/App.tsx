@@ -10,7 +10,7 @@ import { projectDragTransform, reorderBlock, shouldCommitProjectReorder } from "
 import { departedProjects, PROJECT_LEAVE_MS, projectListEntries, type LeavingProject } from "./project-leave";
 import { pruneRememberedActiveSessions, rememberProjectActiveSession, resolveProjectActiveSession } from "./active-tab";
 import { applyActivityEvent, mergeActivity, projectActivitySummary } from "./session-activity";
-import { applyTaskbarEvent, mergeTaskbar, tabProgressModel, taskbarJustCompleted, taskbarOf } from "./session-taskbar";
+import { applyTaskbarEvent, mergeTaskbar, tabProgressModel, taskbarOf } from "./session-taskbar";
 import { shellSwitchSessionOrder, shellSwitchSplitGroups } from "./shell-switch";
 import { clampSplitRatio, findSplitGroup, isSplitEdgeHintVisible, loadSplitPreferences, moveSessionBlock, normalizeSplitOrder, pairSessionsInOrder, reconcileSplitGroups, replaceSessionInOrder, saveSplitPreferences } from "./split-tabs";
 import type { SplitGroup, SplitLayout } from "./split-tabs";
@@ -88,11 +88,16 @@ export function App() {
   const [activityBySession, setActivityBySession] = useState<ReadonlyMap<string, SessionActivity>>(() => new Map());
   const [taskbarBySession, setTaskbarBySession] = useState<ReadonlyMap<string, TaskbarProgress>>(() => new Map());
   const [completedHold, setCompletedHold] = useState<ReadonlySet<string>>(() => new Set());
-  const previousTaskbarRef = useRef(new Map<string, TaskbarProgress>());
-  // The remote devices' viewing sets as the last snapshot said them: a
-  // "come look" marker only dies for a session a client NEWLY opened,
-  // not one that was already open before the command finished.
-  const phoneViewedRef = useRef<Set<string>>(new Set());
+  // Every other client's viewing sets as the last snapshot said them -
+  // the phones' open terminals (the devices' viewingSessionIds) and the
+  // other windows' active tabs (desktopActiveSessionIds, this window's
+  // own included - opening a held tab here is harmless, the open effect
+  // owns it). A "come look" marker only dies for a session a client
+  // NEWLY opened: a session already viewed before the command finished
+  // would have suppressed the host's marker in the first place, so a
+  // held marker is always one no client was viewing when the command
+  // finished, and the first new look at it is the look that kills it.
+  const viewedRef = useRef<Set<string>>(new Set());
   const [projectDrag, setProjectDrag] = useState<ProjectDragState | null>(null);
   const [projectReordering, setProjectReordering] = useState(false);
   const [leavingProjects, setLeavingProjects] = useState<LeavingProject[]>([]);
@@ -152,35 +157,29 @@ export function App() {
     });
   }, []);
 
-  // A command that finished on a tab the user is not looking at holds
-  // its bar at 100% - the "come look" marker - until the tab is opened.
-  // The host's machine emits the running -> clear edge; comparing each
-  // session's effective state against the last render's catches it.
+  // This window's "come look" holds are raised ONLY by the host, which
+  // flags a session whose command just finished while no client is
+  // viewing it - a client sitting on the session is the look itself -
+  // and persists the flag across connects (the seed effect below reads
+  // it from state.lookHereSessionIds; the host broadcasts the flag
+  // change with the snapshot, so a command finishing on a non-active
+  // tab raises the hold the moment this window's snapshot carries it).
+  // This effect only EXPIRES the holds the host's truth no longer
+  // carries: a new command re-arms the indicator, and a held tab that
+  // left the project takes its marker with it.
   useEffect(() => {
     const sessions = state?.sessions;
     if (!sessions) return;
-    const previous = previousTaskbarRef.current;
     const now = new Map<string, TaskbarProgress>();
     for (const session of sessions) {
       now.set(session.id, taskbarBySession.get(session.id) ?? taskbarOf(session));
     }
-    for (const id of previous.keys()) {
-      if (!now.has(id)) previous.delete(id);
-    }
-    previousTaskbarRef.current = now;
     setCompletedHold((current) => {
       const holds = new Set(current);
       let changed = false;
       for (const session of sessions) {
         const effective = now.get(session.id);
         if (!effective) continue;
-        const last = previous.get(session.id);
-        // The running -> clear edge on a tab the user is not on: hold
-        // the 100% bar until the tab is opened.
-        if (last && taskbarJustCompleted(last, effective) && session.status === "running" && session.id !== activeSessionId && !holds.has(session.id)) {
-          holds.add(session.id);
-          changed = true;
-        }
         // A new command on the tab: the bar shows progress again, so
         // the hold is stale.
         if (effective.state !== "clear" && holds.delete(session.id)) changed = true;
@@ -191,7 +190,7 @@ export function App() {
       }
       return changed ? holds : current;
     });
-  }, [state, taskbarBySession, activeSessionId]);
+  }, [state, taskbarBySession]);
 
   // Opening a held tab resets its bar to the idle colour: the marker
   // is only for tabs the user has not looked at yet. Covers every
@@ -208,9 +207,13 @@ export function App() {
 
   // The host persists the "come look" markers across client connects
   // (state.lookHereSessionIds): a window (re)loaded after the command
-  // finished still raises the 100% bar. Seed only - the local edge and
-  // view effects own the removals - and skip the tab this window is on:
-  // it is the look itself, not a marker.
+  // finished still raises the 100% bar. This list is the ONLY raiser of
+  // the local holds - the host flagged the session while no client was
+  // viewing it, and no client's event stream may raise a hold of its
+  // own (the window that watched the finish is the look itself, and the
+  // other windows must not mark a tab someone is sitting on). The open,
+  // new-command and view effects own the removals. Skip the tab this
+  // window is on: it is the look itself, not a marker.
   useEffect(() => {
     const ids = state?.lookHereSessionIds;
     if (!ids || ids.length === 0) return;
@@ -230,20 +233,22 @@ export function App() {
     void window.agentTerminal.setActiveSession(activeSessionId);
   }, [activeSessionId]);
 
-  // The marker dies on the desktop too when the user looks at the
-  // session from a phone: the snapshot's per-device viewing sets carry
-  // the sessions a remote device is displaying. Only a NEW entry resets
-  // a marker: a phone that already had the session open when the
-  // command finished is not "looking at the finish", so the marker
-  // survives until a client actually opens the session.
+  // A marker dies here the moment any client looks at the session: the
+  // snapshot's per-device viewing sets carry the sessions a phone is
+  // displaying, and desktopActiveSessionIds the tabs the other windows
+  // (and this one) have active. Only a NEW entry resets a marker - see
+  // the ref's comment: a held marker is one no client was viewing when
+  // the command finished, so the first new look at it is the look that
+  // kills it.
   useEffect(() => {
     if (!state) return;
     const viewed = new Set<string>();
     for (const device of state.devices) {
       for (const id of device.viewingSessionIds ?? []) viewed.add(id);
     }
-    const newly = [...viewed].filter((id) => !phoneViewedRef.current.has(id));
-    phoneViewedRef.current = viewed;
+    for (const id of state.desktopActiveSessionIds ?? []) viewed.add(id);
+    const newly = [...viewed].filter((id) => !viewedRef.current.has(id));
+    viewedRef.current = viewed;
     if (newly.length === 0) return;
     setCompletedHold((current) => {
       const next = new Set(current);
