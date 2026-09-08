@@ -411,9 +411,10 @@ struct ManagedSession {
     /// classifier pass as the TUI mode.
     activity: ActivityDetector,
     /// The session's ConEmu `OSC 9;4` taskbar progress state machine
-    /// (explicit program reports plus the shell's command lifecycle);
-    /// see `crate::taskbar`. Fed in the same stream pass as the activity
-    /// detector.
+    /// (explicit program reports plus the shell's command lifecycle, and
+    /// the running command's start time for the window's last-ran
+    /// ordering); see `crate::taskbar`. Fed in the same stream pass as
+    /// the activity detector.
     taskbar: SessionTaskbar,
     /// The host-persisted "come look" marker: the session's command just
     /// finished (its taskbar indicator moved non-clear to clear) and no
@@ -1413,7 +1414,7 @@ impl Core {
         // into the snapshot metadata as well (see the method docs).
         let taskbar = session
             .taskbar
-            .on_activity(activity)
+            .on_activity(activity, now)
             .then(|| session.taskbar.effective());
         if let Some(taskbar) = &taskbar {
             session.metadata.taskbar = *taskbar;
@@ -3071,10 +3072,13 @@ impl Core {
     }
 
     /// Recomputes the project's window taskbar state and pushes it to the
-    /// taskbar engine. The window-level state follows Windows Terminal's
-    /// group rule (error, paused, value, indeterminate, clear), so the
-    /// button always shows the state that matters most, whatever its
-    /// sessions are doing.
+    /// taskbar engine. The button follows the project's last-ran command:
+    /// the most-recently-started still-running command owns the button,
+    /// so it animates that process's progress or spinner, and when it
+    /// finishes the next-newest still-running command takes over, and so
+    /// on (see `taskbar::window_state`). When no command is running, the
+    /// button falls back to Windows Terminal's group rule (error, paused,
+    /// value, indeterminate, clear) over the sessions' lingering states.
     fn update_window_taskbar(&self, project_id: &str) {
         let _ = project_id; // keep the argument on every platform
         #[cfg(windows)]
@@ -3090,12 +3094,15 @@ impl Core {
                 let Ok(hwnd) = window.hwnd() else {
                     return;
                 };
-                let states = inner
+                let candidates = inner
                     .sessions
                     .values()
                     .filter(|session| session.metadata.project_id == project_id)
-                    .map(|session| session.taskbar.effective());
-                ((hwnd.0) as isize, crate::taskbar::combine(states))
+                    .map(|session| crate::taskbar::WindowTaskbarCandidate {
+                        started_at: session.taskbar.command_started_at(),
+                        state: session.taskbar.effective(),
+                    });
+                ((hwnd.0) as isize, crate::taskbar::window_state(candidates))
             };
             if taskbar.is_clear() {
                 // A clear push also forgets the window in the engine's
@@ -4201,7 +4208,7 @@ impl Core {
                 taskbar_changed |= session.taskbar.apply_report(report);
             }
             if let Some((activity, _)) = &activity_change {
-                taskbar_changed |= session.taskbar.on_activity(*activity);
+                taskbar_changed |= session.taskbar.on_activity(*activity, now);
             }
             let failed_exit = markers.iter().any(|marker| {
                 matches!(
@@ -9187,6 +9194,13 @@ mod tests {
         inner
             .sessions
             .insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        // The session's command is mid-run when the shell dies: the
+        // machine's start record must die with it, so the window's
+        // last-ran ordering never cascades onto a dead session's slot.
+        inner.sessions.get_mut("s1").unwrap().taskbar.on_activity(
+            SessionActivity::Active,
+            Instant::now(),
+        );
         inner.sessions.get_mut("s1").unwrap().metadata.taskbar = TaskbarProgress::Value(42);
         inner.sessions.get_mut("s1").unwrap().look_here = true;
 
@@ -9200,6 +9214,11 @@ mod tests {
         assert_eq!(
             inner.sessions.get("s1").unwrap().look_here, false,
             "the finished session's marker dies with the process"
+        );
+        assert_eq!(
+            inner.sessions.get("s1").unwrap().taskbar.command_started_at(),
+            None,
+            "the running command's start record dies with the process"
         );
         fs::remove_file(state_path).expect("remove test state");
     }
@@ -9227,11 +9246,17 @@ mod tests {
             .observe(&[], TuiMode::Fullscreen, false, false, false, false, settled)
             .expect("the held badge is published");
         // The stream pass synced the running command's spinner the same
-        // way its activity transition does.
+        // way its activity transition does, stamping the command's start
+        // at the moment the transition was observed.
         let (activity, _) = announced;
-        session.taskbar.on_activity(activity);
+        session.taskbar.on_activity(activity, settled);
         session.metadata.taskbar = session.taskbar.effective();
         assert_eq!(session.metadata.taskbar, TaskbarProgress::Indeterminate);
+        assert_eq!(
+            session.taskbar.command_started_at(),
+            Some(settled),
+            "the running command's start is recorded for the window's last-ran ordering"
+        );
 
         // The screen has now been quiet for longer than TUI_QUIET_MS: the
         // sweep step drops the badge and moves the spinner to clear.
@@ -9240,6 +9265,11 @@ mod tests {
             .expect("the quiet screen drops its badge");
         assert_eq!(step.0, SessionActivity::Idle);
         assert_eq!(step.2, Some(TaskbarProgress::Clear));
+        assert_eq!(
+            session.taskbar.command_started_at(),
+            None,
+            "the quiet screen ends the recorded run, so the window's last-ran ordering drops it"
+        );
         assert_eq!(session.metadata.activity, SessionActivity::Idle);
         assert_eq!(
             session.metadata.taskbar,
