@@ -9071,6 +9071,42 @@ mod tests {
     }
 
     #[test]
+    fn a_tray_only_restore_surfaces_the_newest_running_sessions_project() {
+        // No window open at all (the app runs from the tray - and the
+        // quiet-window path skips the windowless desktop, so this is where
+        // a phone-created session lives until the user restores the app):
+        // `last_project` is gone with the windows, so the restore must
+        // fall back to the newest RUNNING session's project (the phone's
+        // tab), not merely the first public one - and a dead terminal
+        // must not win either.
+        let (mut inner, state_path) = inner_with_settings(true, true);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        test_project(&mut inner, "b", r"C:\Work\B", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner
+            .sessions
+            .get_mut("s1")
+            .expect("s1")
+            .metadata
+            .status = "exited".into();
+        inner
+            .sessions
+            .insert("s2".into(), test_session("s2", "b", r"C:\Work\B"));
+
+        assert!(inner.windows.labels().is_empty(), "the tray-only state: no window at all");
+        assert_eq!(inner.windows.last_project(), None, "no window means no last project");
+
+        assert_eq!(
+            preferred_project(&mut inner).map(|project| project.id),
+            Some("b".into()),
+            "the running session's project wins over the first public project"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
     fn ensure_home_project_reuses_an_existing_saved_home_project() {
         let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
@@ -11329,6 +11365,74 @@ mod tests {
         assert_eq!(plan.displaced_window, None);
         assert_eq!(inner.sessions["s1"].metadata.project_id, "b");
         assert_eq!(inner.windows.window_for_project("b"), None);
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn a_windowless_empty_temporary_project_retires_without_a_window_or_replacement() {
+        // The tray-only phone flow, end to end at the state level: with no
+        // window open, a cd creates a temporary project (the quiet-window
+        // path skips it), a second cd empties it, and the retire must drop
+        // the project from the store while touching no window: with no
+        // window attached, `window_label` and `replacement` are both None
+        // - which is what makes the caller's cleanup a strict no-op.
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        assert!(inner.windows.labels().is_empty(), "the tray-only state: no window at all");
+
+        let first = expect_reassigned(resolve_working_directory(
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Temp\x"),
+            false,
+        ))
+        .project
+        .id
+        .clone();
+        let second = expect_reassigned(resolve_working_directory(
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Temp\y"),
+            false,
+        ));
+        assert_eq!(
+            second.previous_project_id,
+            first,
+            "the second cd empties the first temporary project"
+        );
+
+        use super::RetireOutcome;
+        match retire_empty_temporary_project(&mut inner, &first) {
+            RetireOutcome::Removed {
+                window_label,
+                replacement,
+            } => {
+                assert_eq!(window_label, None, "no window owned the temporary project");
+                assert!(
+                    replacement.is_none(),
+                    "with no window to hand over, no replacement project is picked"
+                );
+            }
+            RetireOutcome::NotEligible => {
+                panic!("an empty temporary project must be eligible for retirement");
+            }
+        }
+        assert!(
+            !inner.temporary_projects.contains_key(&first),
+            "the empty temporary project is gone from the store"
+        );
+        assert!(
+            !inner.project_order.contains(&first),
+            "and from the project order"
+        );
+        assert!(
+            inner.windows.labels().is_empty(),
+            "the tray-only state stays windowless"
+        );
+        assert_eq!(inner.sessions["s1"].metadata.project_id, second.project.id);
         fs::remove_file(state_path).expect("remove test state");
     }
 
