@@ -2,9 +2,10 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import QRCode from "qrcode";
 import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSettings, resolveTerminalScheme, terminalSchemesFor } from "@agentterminal/protocol";
-import type { Project, SessionActivity, TaskbarProgress, TerminalSession } from "@agentterminal/protocol";
+import type { PortBridge, Project, SessionActivity, TaskbarProgress, TerminalSession } from "@agentterminal/protocol";
 import type { DesktopState, FocusSessionEvent } from "../../shared/api";
-import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
+import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, PortBridgeIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
+import { deviceHasBridgeWarning, PortBridgeDevicePage, PortBridgeListPage } from "./PortBridgePages";
 import { projectPersistenceAction, projectRowOpensOnKey } from "./persistence";
 import { projectDragTransform, reorderBlock, shouldCommitProjectReorder } from "./project-drag";
 import { departedProjects, PROJECT_LEAVE_MS, projectListEntries, type LeavingProject } from "./project-leave";
@@ -90,6 +91,9 @@ export function App() {
   const previousProjectIdRef = useRef<string | null>(null);
   const previousProjectOriginRef = useRef<string | null>(null);
   const [modal, setModal] = useState<Modal>(null);
+  // Which device the per-device port page is showing. Kept next to `modal`
+  // rather than inside it so stepping back to the list does not lose it.
+  const [bridgeDeviceId, setBridgeDeviceId] = useState<string | null>(null);
   const [qr, setQr] = useState("");
   const [pairError, setPairError] = useState("");
   const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
@@ -521,9 +525,19 @@ export function App() {
     return groups;
   }, [splitGroups]);
   const renamingProject = state?.projects.find((project) => project.id === renamingProjectId);
+  const bridgeDevice = state?.devices.find((device) => device.id === bridgeDeviceId);
+  // A port that could not be bridged is only visible on the Port Bridge page,
+  // so the title-bar button carries the marker that sends the user there.
+  const bridgeWarning = (state?.devices ?? []).some((device) => deviceHasBridgeWarning(device, state?.portBridgeStatuses));
   // Sidebar render list: live cards with leaving ghosts spliced back into the
   // slots their projects used to hold, so a removed card can play its leave
   // while the cards below slide up into the freed space.
+  // Every edit on either port page goes through here: the host is the source
+  // of truth, and the pages re-render from the state broadcast it sends back
+  // rather than from a local mutation.
+  const savePortBridging = useCallback((deviceId: string, enabled: boolean, bridges: PortBridge[]) => {
+    void window.agentTerminal.setDevicePortBridging(deviceId, enabled, bridges);
+  }, []);
   const projectList = useMemo(
     () => projectListEntries(state?.projects ?? [], leavingProjects),
     [state?.projects, leavingProjects]
@@ -1161,6 +1175,7 @@ export function App() {
             <button onClick={() => void window.agentTerminal.retryRemoteRegistration()}>Retry</button>
           </span>}
           {currentProject && (() => { const action = projectPersistenceAction(currentProject.persistent); return <button className={`project-persistence-action ${currentProject.persistent ? "is-saved" : ""}`} onClick={() => void toggleProjectPersistence(currentProject.id)} title={action.tooltip}>{currentProject.persistent ? <BookmarkIcon /> : <ClockIcon />}<span>{action.shortLabel}</span></button>; })()}
+          <button className={`icon-button ${bridgeWarning ? "has-warning" : ""}`} onClick={() => setModal("bridges")} title={bridgeWarning ? "Port bridges - a port could not be bridged" : "Port bridges"}><PortBridgeIcon /></button>
           <button className="icon-button" onClick={() => setModal(deviceListEntryModal(state.devices.length))} title="Connected devices"><PhoneIcon /></button>
           <button className="icon-button" onClick={() => setModal("settings")} title="Settings"><SettingsIcon /></button>
         </div>
@@ -1364,6 +1379,23 @@ export function App() {
         </div>
         <button className="primary wide" onClick={() => void showPairing()}><PhoneIcon /> Pair new device</button>
       </section></div>}
+
+      {/* A device revoked while its port page was open falls back to the
+          list rather than leaving an empty modal behind. */}
+      {(modal === "bridges" || (modal === "bridgeDevice" && !bridgeDevice)) && <PortBridgeListPage
+        devices={state.devices}
+        statuses={state.portBridgeStatuses}
+        onClose={() => setModal(null)}
+        onOpenDevice={(deviceId) => { setBridgeDeviceId(deviceId); setModal("bridgeDevice"); }}
+        onSave={savePortBridging}
+      />}
+
+      {modal === "bridgeDevice" && bridgeDevice && <PortBridgeDevicePage
+        device={bridgeDevice}
+        onBack={() => setModal("bridges")}
+        onClose={() => setModal(null)}
+        onSave={savePortBridging}
+      />}
 
       {modal === "rename" && renamingProject && <div className="modal-backdrop" onMouseDown={() => { if (!renaming) setModal(null); }}><form className="modal rename-modal" onMouseDown={(event) => event.stopPropagation()} onSubmit={(event) => { event.preventDefault(); void renameProject(); }}>
         <button type="button" className="modal-close icon-button" disabled={renaming} onClick={() => setModal(null)}><CloseIcon /></button>

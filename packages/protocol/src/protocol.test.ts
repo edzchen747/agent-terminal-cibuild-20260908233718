@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, TERMINAL_SESSION_ACTIVITIES, isSessionActive, sessionActivityLabel, sessionActivityOf, sessionActivitySummary, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, combineTaskbarProgress, CLEAR_TASKBAR_PROGRESS, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, MAX_ZOOM_FONT_SIZE, MIN_ZOOM_FONT_SIZE, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TASKBAR_PROGRESS_STATES, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, findDecorationsFor, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, BASELINE_TERMINAL_ZOOM, MAX_TERMINAL_ZOOM, MIN_TERMINAL_ZOOM, TERMINAL_ZOOM_STEPS, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, terminalZoomFontSize, CLOSED_FIND, applyFindResults, closeFind, findCommandForKey, findStatusLabel, openFind, setFindQuery, type ClientMessage, type HostSnapshot, type SessionActivity, type TerminalSession, type TaskbarProgress } from "./index.js";
+import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, TERMINAL_SESSION_ACTIVITIES, isSessionActive, sessionActivityLabel, sessionActivityOf, sessionActivitySummary, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, combineTaskbarProgress, CLEAR_TASKBAR_PROGRESS, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, MAX_ZOOM_FONT_SIZE, MIN_ZOOM_FONT_SIZE, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TASKBAR_PROGRESS_STATES, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, findDecorationsFor, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, BASELINE_TERMINAL_ZOOM, MAX_TERMINAL_ZOOM, MIN_TERMINAL_ZOOM, TERMINAL_ZOOM_STEPS, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, terminalZoomFontSize, CLOSED_FIND, applyFindResults, closeFind, findCommandForKey, findStatusLabel, openFind, setFindQuery, addBridge, removeBridge, sortedBridges, updateBridge, bridgeDirectionLabel, bridgeStateLabel, bridgeWarningDetail, canAddBridgePort, duplicatePortIds, isPortBridgeWarning, isValidBridgePort, normalizePortBridging, portBridgeStatusOf, type ClientMessage, type HostSnapshot, type SessionActivity, type TerminalSession, type TaskbarProgress } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -1531,4 +1531,102 @@ test("a host that predates the marker fields still decodes", () => {
   const wire = (decoded as { type: "snapshot"; snapshot: HostSnapshot }).snapshot;
   assert.equal(wire.lookHereSessionIds, undefined);
   assert.equal(wire.desktopActiveSessionIds, undefined);
+});
+
+test("a bridge port is valid only inside the TCP port range", () => {
+  assert.equal(isValidBridgePort(1), true);
+  assert.equal(isValidBridgePort(5173), true);
+  assert.equal(isValidBridgePort(65_535), true);
+  assert.equal(isValidBridgePort(0), false);
+  assert.equal(isValidBridgePort(65_536), false);
+  assert.equal(isValidBridgePort(80.5), false);
+});
+
+test("only the later duplicates of a repeated port are flagged", () => {
+  const bridges = [
+    { id: "a", port: 8080, server: "host" as const },
+    { id: "b", port: 5173, server: "client" as const },
+    { id: "c", port: 8080, server: "client" as const }
+  ];
+  assert.deepEqual(duplicatePortIds(bridges), ["c"]);
+  assert.equal(canAddBridgePort(bridges, 8080), false);
+  assert.equal(canAddBridgePort(bridges, 9000), true);
+  assert.equal(canAddBridgePort(bridges, 0), false);
+});
+
+test("a host that predates port bridging reads as disabled with no bridges", () => {
+  assert.deepEqual(normalizePortBridging(undefined), { enabled: false, bridges: [] });
+  assert.deepEqual(normalizePortBridging({ enabled: true, bridges: undefined as never }), { enabled: true, bridges: [] });
+});
+
+test("the direction label names the machine the service actually runs on", () => {
+  assert.equal(bridgeDirectionLabel({ server: "host" }, "desktop"), "Served by this PC");
+  assert.equal(bridgeDirectionLabel({ server: "host" }, "mobile"), "Served by the desktop");
+  assert.equal(bridgeDirectionLabel({ server: "client" }, "desktop"), "Served by the device");
+  assert.equal(bridgeDirectionLabel({ server: "client" }, "mobile"), "Served by this phone");
+});
+
+test("only unbridged ports carry a warning, and the host's reason wins", () => {
+  const bridge = { port: 8080 };
+  assert.equal(isPortBridgeWarning({ bridgeId: "a", state: "active" }), false);
+  assert.equal(isPortBridgeWarning({ bridgeId: "a", state: "pending" }), false);
+  assert.equal(isPortBridgeWarning(undefined), false);
+  assert.equal(bridgeWarningDetail(bridge, { bridgeId: "a", state: "active" }), "");
+  assert.equal(
+    bridgeWarningDetail(bridge, { bridgeId: "a", state: "conflict", detail: "Port 8080 is already bridged by Pixel 8." }),
+    "Port 8080 is already bridged by Pixel 8."
+  );
+  assert.equal(
+    bridgeWarningDetail(bridge, { bridgeId: "a", state: "conflict" }),
+    "Port 8080 is already bridged by another device."
+  );
+  assert.equal(bridgeStateLabel("conflict"), "Port taken");
+});
+
+test("a bridge status is looked up per device", () => {
+  const statuses = { "device-1": [{ bridgeId: "a", state: "active" as const }] };
+  assert.deepEqual(portBridgeStatusOf(statuses, "device-1", "a"), { bridgeId: "a", state: "active" });
+  assert.equal(portBridgeStatusOf(statuses, "device-2", "a"), undefined);
+  assert.equal(portBridgeStatusOf(undefined, "device-1", "a"), undefined);
+});
+
+test("adding a bridge refuses a port the device already uses", () => {
+  const first = addBridge([], 5173, "host");
+  assert.equal(first.length, 1);
+  assert.deepEqual(first.map((bridge) => [bridge.port, bridge.server]), [[5173, "host"]]);
+  assert.equal(addBridge(first, 5173, "client").length, 1);
+  assert.equal(addBridge(first, 0, "client").length, 1);
+  assert.equal(addBridge(first, 9000, "client").length, 2);
+});
+
+test("editing a bridge keeps the ports on one device unique", () => {
+  const bridges = [
+    { id: "first", port: 5173, server: "host" as const },
+    { id: "second", port: 9000, server: "client" as const }
+  ];
+  const portsOf = (list: readonly { port: number }[]) => list.map((bridge) => bridge.port);
+  const serversOf = (list: readonly { server: string }[]) => list.map((bridge) => bridge.server);
+
+  assert.deepEqual(portsOf(updateBridge(bridges, "first", { port: 8080 })), [8080, 9000]);
+  // 9000 belongs to the other bridge, so the edit is refused rather than
+  // creating a duplicate the host would then have to reject.
+  assert.deepEqual(portsOf(updateBridge(bridges, "first", { port: 9000 })), [5173, 9000]);
+  assert.deepEqual(portsOf(updateBridge(bridges, "first", { port: 70_000 })), [5173, 9000]);
+  // Its own port is not a duplicate of itself.
+  assert.deepEqual(portsOf(updateBridge(bridges, "first", { port: 5173 })), [5173, 9000]);
+  assert.deepEqual(serversOf(updateBridge(bridges, "first", { server: "client" })), ["client", "client"]);
+  assert.deepEqual(serversOf(updateBridge(bridges, "second", { server: "host" })), ["host", "host"]);
+
+  assert.deepEqual(removeBridge(bridges, "first").map((bridge) => bridge.id), ["second"]);
+  assert.deepEqual(removeBridge(bridges, "missing").map((bridge) => bridge.id), ["first", "second"]);
+});
+
+test("bridges render in port order regardless of when they were added", () => {
+  const bridges = [
+    { id: "b", port: 9000, server: "host" as const },
+    { id: "a", port: 5173, server: "host" as const }
+  ];
+  assert.deepEqual(sortedBridges(bridges).map((bridge) => bridge.port), [5173, 9000]);
+  // Sorting must not mutate the caller's list.
+  assert.deepEqual(bridges.map((bridge) => bridge.port), [9000, 5173]);
 });

@@ -14,7 +14,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{
-    models::{AuthorizedDevice, Project},
+    models::{AuthorizedDevice, DevicePortBridging, Project},
     path_utils::strip_windows_verbatim_prefix,
 };
 
@@ -279,6 +279,32 @@ impl DesktopStore {
         Ok(false)
     }
 
+    /// Replace a device's Port Bridge configuration. Returns false when the
+    /// device is unknown (it was revoked while a page was still showing it).
+    /// The ports are the user's to choose; the host arbitrates collisions
+    /// between devices at connection time rather than at save time, so a port
+    /// another device already holds is stored here and reported as a conflict.
+    pub fn set_device_port_bridging(
+        &mut self,
+        device_id: &str,
+        bridging: DevicePortBridging,
+    ) -> Result<bool> {
+        let Some(device) = self
+            .state
+            .devices
+            .iter_mut()
+            .find(|item| item.device.id == device_id)
+        else {
+            return Ok(false);
+        };
+        if device.device.port_bridging == bridging {
+            return Ok(true);
+        }
+        device.device.port_bridging = bridging;
+        self.write()?;
+        Ok(true)
+    }
+
     pub fn revoke_device(&mut self, device_id: &str) -> Result<()> {
         self.state
             .devices
@@ -413,7 +439,7 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, ()> {
 #[cfg(test)]
 mod tests {
     use super::{DesktopStore, NetworkState};
-    use crate::models::AuthorizedDevice;
+    use crate::models::{AuthorizedDevice, DevicePortBridging, PortBridge, PortBridgeServer};
     use std::{fs, path::PathBuf};
     use uuid::Uuid;
 
@@ -525,6 +551,7 @@ mod tests {
             last_seen_at: "2026-08-27T00:00:00Z".into(),
             online: false,
             viewing_session_ids: Vec::new(),
+            port_bridging: DevicePortBridging::default(),
         };
 
         let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
@@ -654,6 +681,7 @@ mod tests {
             last_seen_at: "2026-08-27T00:00:00Z".into(),
             online: false,
             viewing_session_ids: Vec::new(),
+            port_bridging: DevicePortBridging::default(),
         };
         let mut store = DesktopStore::load(state_path.clone()).expect("initial store");
         store
@@ -709,5 +737,61 @@ mod tests {
                 .update_device_name("phone-missing", "Other phone")
                 .expect("unknown device rename")
         );
+    }
+
+    #[test]
+    fn a_device_written_before_port_bridging_loads_with_bridging_switched_off() {
+        let test_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-state");
+        fs::create_dir_all(&test_root).expect("test state directory");
+        let state_path = test_root.join(format!("{}.json", Uuid::new_v4()));
+        // A state file from a build that had never heard of port bridges.
+        let legacy = serde_json::json!({
+            "host": { "id": "host-1", "name": "Workstation" },
+            "projects": [],
+            "devices": [{
+                "id": "phone-a",
+                "name": "Pixel 7",
+                "platform": "android",
+                "addedAt": "2026-08-27T00:00:00Z",
+                "lastSeenAt": "2026-08-27T00:00:00Z",
+                "tokenHash": "00"
+            }],
+            "settings": { "defaultShellId": "cmd", "port": 47831 }
+        });
+        fs::write(
+            &state_path,
+            serde_json::to_vec(&legacy).expect("serialize legacy"),
+        )
+        .expect("write legacy state");
+
+        let mut store = DesktopStore::load(state_path.clone()).expect("load legacy store");
+        assert_eq!(store.devices()[0].device.port_bridging.enabled, false);
+        assert!(store.devices()[0].device.port_bridging.bridges.is_empty());
+
+        let bridging = DevicePortBridging {
+            enabled: true,
+            bridges: vec![PortBridge {
+                id: "b1".into(),
+                port: 5173,
+                server: PortBridgeServer::Host,
+            }],
+        };
+        assert!(
+            store
+                .set_device_port_bridging("phone-a", bridging.clone())
+                .expect("save bridging")
+        );
+        // A device that was revoked while a config page was still open must
+        // not silently create a record.
+        assert!(
+            !store
+                .set_device_port_bridging("gone", bridging.clone())
+                .expect("unknown device is not an error")
+        );
+
+        let reloaded = DesktopStore::load(state_path).expect("reload store");
+        assert_eq!(reloaded.devices()[0].device.port_bridging, bridging);
     }
 }

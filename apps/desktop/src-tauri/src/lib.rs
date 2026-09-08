@@ -11,6 +11,7 @@ pub fn register_handoff_on_main_thread() {
 mod models;
 mod network;
 mod path_utils;
+mod port_bridges;
 mod provisioning;
 mod remote;
 mod shells;
@@ -26,7 +27,8 @@ use std::sync::Arc;
 use arboard::Clipboard;
 use core::Core;
 use models::{
-    DesktopState, FocusSessionEvent, PairingPayload, Project, SessionSnapshot, TerminalSession,
+    DesktopState, DevicePortBridging, FocusSessionEvent, PairingPayload, PortBridge, Project,
+    SessionSnapshot, TerminalSession,
 };
 use store::DesktopStore;
 use tauri::{
@@ -239,6 +241,22 @@ fn revoke_device(state: State<'_, Arc<Core>>, device_id: String) -> Result<(), S
     state.revoke_device(&device_id).map_err(error_string)
 }
 
+/// Replace a device's Port Bridge configuration. Ports are the user's to
+/// choose here; a port another device already holds is saved and reported as
+/// a conflict rather than refused, because the holder may disconnect at any
+/// moment and the bridge then comes up on its own.
+#[tauri::command]
+fn set_device_port_bridging(
+    state: State<'_, Arc<Core>>,
+    device_id: String,
+    enabled: bool,
+    bridges: Vec<PortBridge>,
+) -> Result<(), String> {
+    state
+        .set_device_port_bridging(&device_id, DevicePortBridging { enabled, bridges })
+        .map_err(error_string)
+}
+
 #[tauri::command]
 fn set_default_shell(state: State<'_, Arc<Core>>, shell_id: String) -> Result<(), String> {
     state.set_default_shell(&shell_id).map_err(error_string)
@@ -408,6 +426,7 @@ pub fn run() {
             start_pairing,
             retry_remote_registration,
             revoke_device,
+            set_device_port_bridging,
             set_default_shell,
             set_terminal_theme,
             set_open_projects_in_new_windows,

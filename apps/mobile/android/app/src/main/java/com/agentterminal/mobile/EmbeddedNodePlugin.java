@@ -1,5 +1,6 @@
 package com.agentterminal.mobile;
 
+import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
@@ -23,6 +24,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 /**
@@ -195,6 +197,75 @@ public class EmbeddedNodePlugin extends Plugin {
                 stopNodeProcess(stateDirFor(stateKey));
             }
             call.resolve();
+        });
+    }
+
+    /**
+     * Publish the desired port bridges for this host's node.
+     *
+     * The node polls this file and reconciles its listeners against it, so a
+     * bridge can be added or removed while it runs. Writing works even with no
+     * node process alive: the file is picked up on the next start, which is
+     * what makes a bridge come up as soon as the connection does.
+     */
+    @PluginMethod
+    public void setBridges(PluginCall call) {
+        final String stateKey = call.getString("stateKey");
+        final JSArray bridges = call.getArray("bridges", new JSArray());
+        final int revision = call.getInt("revision", 0);
+        nodeLifecycle.execute(() -> {
+            File stateDir = stateDirFor(stateKey);
+            if (!stateDir.exists() && !stateDir.mkdirs()) {
+                call.reject("Could not create the embedded node state directory.");
+                return;
+            }
+            try {
+                JSONObject document = new JSONObject();
+                document.put("revision", revision);
+                document.put("bridges", bridges == null ? new JSArray() : bridges);
+                // Atomic publish: the node must never read a half-written file.
+                File target = new File(stateDir, "bridges.json");
+                File temporary = new File(stateDir, "bridges.json.tmp");
+                try (java.io.FileOutputStream out = new java.io.FileOutputStream(temporary)) {
+                    out.write(document.toString().getBytes(StandardCharsets.UTF_8));
+                }
+                if (!temporary.renameTo(target)) {
+                    // renameTo does not replace on every filesystem.
+                    if (!target.delete() || !temporary.renameTo(target)) {
+                        call.reject("Could not publish the port bridge configuration.");
+                        return;
+                    }
+                }
+                Log.i(TAG, "published " + (bridges == null ? 0 : bridges.length()) + " bridge(s) revision=" + revision + " stateDir=" + stateDir.getName());
+                call.resolve();
+            } catch (Exception error) {
+                Log.e(TAG, "Could not publish port bridges", error);
+                call.reject("Could not publish the port bridge configuration.");
+            }
+        });
+    }
+
+    /**
+     * What the node made of those bridges. Absent until it has reconciled at
+     * least once, which the caller reads as "nothing to report yet".
+     */
+    @PluginMethod
+    public void bridgeStatus(PluginCall call) {
+        final String stateKey = call.getString("stateKey");
+        nodeLifecycle.execute(() -> {
+            JSObject result = new JSObject();
+            result.put("bridges", new JSArray());
+            File status = new File(stateDirFor(stateKey), "bridges-status.json");
+            if (status.isFile()) {
+                try {
+                    JSONObject json = new JSONObject(new String(java.nio.file.Files.readAllBytes(status.toPath()), StandardCharsets.UTF_8));
+                    JSONArray bridges = json.optJSONArray("bridges");
+                    if (bridges != null) result.put("bridges", JSArray.from(bridges));
+                } catch (Exception ignored) {
+                    // The node may be mid-publish; an empty report is correct.
+                }
+            }
+            call.resolve(result);
         });
     }
 

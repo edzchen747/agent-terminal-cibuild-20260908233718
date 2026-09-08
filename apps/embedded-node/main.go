@@ -101,7 +101,11 @@ func main() {
 		defer listener.Close()
 		result.ProxyAddress = listener.Addr().String()
 		writeStatus(*stateDir, result)
-		serve(listener, func() (net.Conn, error) { return node.Dial(context.Background(), "tcp", remoteDialAddress) })
+		// The terminal proxy is the reason this process exists, but it is no
+		// longer the only thing it serves: port bridges are added and removed
+		// while it runs, so the main goroutine stays free to reconcile them.
+		go serve(listener, func() (net.Conn, error) { return node.Dial(context.Background(), "tcp", remoteDialAddress) })
+		runBridgeReconciler(node, *stateDir)
 		return
 	}
 
@@ -111,7 +115,8 @@ func main() {
 	}
 	defer listener.Close()
 	writeStatus(*stateDir, result)
-	serve(listener, func() (net.Conn, error) { return net.DialTimeout("tcp", "127.0.0.1:"+*targetPort, 2*time.Second) })
+	go serve(listener, func() (net.Conn, error) { return net.DialTimeout("tcp", "127.0.0.1:"+*targetPort, 2*time.Second) })
+	runBridgeReconciler(node, *stateDir)
 }
 
 // Start returns once the tsnet backend has been initialized, which is not the
@@ -339,18 +344,23 @@ func setKeepAlive(conn net.Conn) {
 }
 
 func writeStatus(stateDir string, value status) {
-	path := filepath.Join(stateDir, "status.json")
+	writeJSON(filepath.Join(stateDir, "status.json"), value)
+}
+
+// Publish a small JSON document the launcher reads. The write is atomic so a
+// reader polling the path never sees a half-written document.
+func writeJSON(path string, value any) {
 	temporary := path + ".tmp"
 	data, err := json.Marshal(value)
 	if err != nil {
-		log.Printf("embedded-node: could not encode status: %v", err)
+		log.Printf("embedded-node: could not encode %s: %v", filepath.Base(path), err)
 		return
 	}
 	if err := os.WriteFile(temporary, data, 0600); err != nil {
-		log.Printf("embedded-node: could not write status: %v", err)
+		log.Printf("embedded-node: could not write %s: %v", filepath.Base(path), err)
 		return
 	}
 	if err := os.Rename(temporary, path); err != nil {
-		log.Printf("embedded-node: could not publish status: %v", err)
+		log.Printf("embedded-node: could not publish %s: %v", filepath.Base(path), err)
 	}
 }

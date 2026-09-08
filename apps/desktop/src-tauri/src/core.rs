@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{Read, Write},
     net::UdpSocket,
@@ -7,7 +7,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     },
     thread,
     time::Instant,
@@ -30,15 +30,20 @@ use uuid::Uuid;
 
 use crate::{
     models::{
-        AuthorizedDevice, ClientMessage, DesktopState, DirectoryEntry, DirectoryListing,
-        FocusSessionEvent, HostInfo, HostSnapshot, PROTOCOL_VERSION, PairingPayload, Project,
-        RemoteRegistration, ServerMessage, SessionActivity, SessionSegment, SessionSnapshot,
-        ShellProfile, TaskbarProgress, TerminalActivityEvent, TerminalDataEvent, TerminalGridEvent,
-        TerminalSession, TerminalTaskbarEvent, TerminalThemeSettings, TerminalTuiModeEvent,
-        TuiMode, normalize_terminal_scheme_id,
+        AuthorizedDevice, ClientMessage, DesktopState, DevicePortBridging, DirectoryEntry,
+        DirectoryListing, FocusSessionEvent, HostInfo, HostSnapshot, PROTOCOL_VERSION,
+        PairingPayload, PortBridgeStatus, Project, RemoteRegistration, ServerMessage,
+        SessionActivity, SessionSegment, SessionSnapshot, ShellProfile, TaskbarProgress,
+        TerminalActivityEvent, TerminalDataEvent, TerminalGridEvent, TerminalSession,
+        TerminalTaskbarEvent, TerminalThemeSettings, TerminalTuiModeEvent, TuiMode,
+        normalize_terminal_scheme_id,
     },
     network,
     path_utils::user_visible_path,
+    port_bridges::{
+        BridgeCandidate, BridgeEntry, BridgeFile, NodeBridgeStatusFile, merge_device_reports,
+        merge_node_statuses, plan_port_bridges,
+    },
     provisioning,
     shells::{command_for, detect_shells},
     store::{DesktopStore, NetworkState, random_token},
@@ -101,6 +106,11 @@ const PRESENCE_WINDOW_MS: i64 = 2 * MOBILE_HEARTBEAT_INTERVAL_MS;
 /// How often to re-check liveness so the indicator flips without waiting for
 /// an unrelated broadcast.
 const PRESENCE_REFRESH_INTERVAL_MS: u64 = (MOBILE_HEARTBEAT_INTERVAL_MS / 2) as u64;
+
+/// How often the port-bridge arbitration is re-run from scratch. It only
+/// broadcasts when the outcome moved, so this is the latency of a warning
+/// appearing or clearing, not a broadcast rate.
+const BRIDGE_REFRESH_INTERVAL_MS: u64 = 2_000;
 /// How often the connectivity monitor re-probes for internet access.
 const CONNECTIVITY_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 /// Remote clients join a session's viewport set while they keep sending
@@ -602,7 +612,21 @@ struct RemoteClient {
     enrollment_requests: u8,
     attached_sessions: HashSet<String>,
     last_seen_at_ms: i64,
+    /// The overlay address this connection's device reported for its own
+    /// node. A port bridge cannot be set up without it, so a device's bridges
+    /// stay pending until it arrives (see `port_bridges`).
+    tailnet_address: Option<String>,
+    /// Connection order. Port claims are first-come-first-served, and this is
+    /// the key that decides who came first.
+    connected_seq: u64,
     sink: ClientSink,
+}
+
+/// The port-bridge arbitration as the snapshot reports it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BridgeSnapshot {
+    statuses: BTreeMap<String, Vec<PortBridgeStatus>>,
+    host_tailnet_address: String,
 }
 
 struct PairingGrant {
@@ -648,6 +672,18 @@ pub struct Core {
     /// whole app on a machine whose registry provider is slow.
     default_terminal_cache: Mutex<Option<(bool, i64)>>,
     embedded_node: Mutex<Option<Child>>,
+    /// Hands out `RemoteClient::connected_seq`.
+    client_sequence: AtomicU64,
+    /// The arbitration the last reconcile produced. Cached so a broadcast
+    /// never has to redo the planning.
+    bridge_state: Mutex<BridgeSnapshot>,
+    /// The desired state last written to the node. Reconciling is idempotent,
+    /// so the file is only rewritten when the allowed set actually changed.
+    bridge_entries: Mutex<Vec<BridgeEntry>>,
+    bridge_revision: AtomicU64,
+    /// What each device said about its own half of the bridges, keyed by
+    /// device id. Dropped when the device disconnects.
+    device_bridge_reports: Mutex<BTreeMap<String, Vec<PortBridgeStatus>>>,
     desktop_enrollment_running: AtomicBool,
     /// A saved remote identity re-verification run is in flight. The stored
     /// verdict is stale for its duration, so the badge stays on "pending"
@@ -815,6 +851,11 @@ impl Core {
             }),
             clients: Mutex::new(HashMap::new()),
             embedded_node: Mutex::new(None),
+            client_sequence: AtomicU64::new(0),
+            bridge_state: Mutex::new(BridgeSnapshot::default()),
+            bridge_entries: Mutex::new(Vec::new()),
+            bridge_revision: AtomicU64::new(0),
+            device_bridge_reports: Mutex::new(BTreeMap::new()),
             desktop_enrollment_running: AtomicBool::new(false),
             remote_verification_running: AtomicBool::new(false),
             remote_port: AtomicU16::new(remote_port),
@@ -828,6 +869,7 @@ impl Core {
             taskbar_engine: TaskbarEngine::start(),
         });
         core.spawn_presence_refresh();
+        core.spawn_bridge_refresh();
         core.spawn_viewport_watchdog();
         core.spawn_activity_watchdog();
         // A sync-debug-only probe: it reveals a stuck or poisoned state
@@ -1169,6 +1211,238 @@ impl Core {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
         Err(anyhow!("embedded node registration timed out"))
+    }
+
+    /// Re-arbitrate every device's port bridges, publish the result to the
+    /// embedded node, and broadcast when the outcome changed.
+    ///
+    /// Called whenever any input to the decision moves: a device
+    /// authenticating or dropping, a device reporting its overlay address, a
+    /// configuration edit from either UI, a presence flip, and the periodic
+    /// poll that picks up the node's own bind failures. Planning is pure (see
+    /// `port_bridges`), so calling it more often than needed is only work,
+    /// never a behaviour change.
+    pub fn reconcile_port_bridges(&self) {
+        let host_tailnet_address = self
+            .inner
+            .lock()
+            .expect("desktop state poisoned")
+            .store
+            .network()
+            .tailnet_address
+            .clone()
+            .unwrap_or_default();
+        let node_ready = !host_tailnet_address.is_empty() && self.embedded_node_running();
+        let candidates = self.bridge_candidates();
+
+        let mut plan = plan_port_bridges(&candidates, node_ready);
+        let entries = std::mem::take(&mut plan.entries);
+        merge_node_statuses(&mut plan, &entries, &self.read_node_bridge_statuses());
+        merge_device_reports(
+            &mut plan,
+            &self
+                .device_bridge_reports
+                .lock()
+                .expect("device bridge reports poisoned"),
+        );
+
+        self.publish_bridge_entries(entries);
+
+        let next = BridgeSnapshot {
+            statuses: plan.statuses,
+            host_tailnet_address,
+        };
+        let changed = {
+            let mut current = self.bridge_state.lock().expect("bridge state poisoned");
+            if *current == next {
+                false
+            } else {
+                *current = next;
+                true
+            }
+        };
+        if changed {
+            self.broadcast();
+        }
+    }
+
+    /// Every paired device as the arbiter sees it: its saved configuration
+    /// plus whatever its live connection has told us.
+    fn bridge_candidates(&self) -> Vec<BridgeCandidate> {
+        let online = self.online_device_ids();
+        let mut connections: HashMap<String, (u64, Option<String>)> = HashMap::new();
+        for client in self
+            .clients
+            .lock()
+            .expect("remote clients poisoned")
+            .values()
+        {
+            let Some(device_id) = client.device_id.clone() else {
+                continue;
+            };
+            let entry = connections
+                .entry(device_id)
+                .or_insert((client.connected_seq, client.tailnet_address.clone()));
+            // A device that reconnected while an old socket lingered keeps the
+            // queue position its earliest live connection earned, and takes
+            // the overlay address from its newest connection to report one.
+            if client.tailnet_address.is_some() && client.connected_seq >= entry.0 {
+                entry.1 = client.tailnet_address.clone();
+            }
+            entry.0 = entry.0.min(client.connected_seq);
+        }
+
+        let inner = self.inner.lock().expect("desktop state poisoned");
+        inner
+            .store
+            .devices()
+            .iter()
+            .map(|stored| {
+                let device = &stored.device;
+                let connection = connections.get(&device.id);
+                BridgeCandidate {
+                    device_id: device.id.clone(),
+                    device_name: device.name.clone(),
+                    connected: online.contains(&device.id) && connection.is_some(),
+                    tailnet_address: connection.and_then(|entry| entry.1.clone()),
+                    connected_seq: connection.map(|entry| entry.0).unwrap_or(u64::MAX),
+                    enabled: device.port_bridging.enabled,
+                    bridges: device.port_bridging.bridges.clone(),
+                }
+            })
+            .collect()
+    }
+
+    fn embedded_node_running(&self) -> bool {
+        let mut process = self.embedded_node.lock().expect("embedded node poisoned");
+        match process.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(None) => true,
+                _ => {
+                    *process = None;
+                    false
+                }
+            },
+            None => false,
+        }
+    }
+
+    /// Write the node's desired state, but only when the allowed set moved.
+    /// The node reconciles by content, so rewriting an identical file would
+    /// only cost a poll; skipping it also keeps the revision meaningful.
+    fn publish_bridge_entries(&self, entries: Vec<BridgeEntry>) {
+        {
+            let current = self.bridge_entries.lock().expect("bridge entries poisoned");
+            if *current == entries {
+                return;
+            }
+        }
+        let Ok(state_dir) = self.embedded_node_state_dir() else {
+            return;
+        };
+        if std::fs::create_dir_all(&state_dir).is_err() {
+            return;
+        }
+        let revision = self.bridge_revision.fetch_add(1, Ordering::Relaxed) + 1;
+        let file = BridgeFile {
+            revision,
+            bridges: entries.clone(),
+        };
+        let path = state_dir.join("bridges.json");
+        let temporary = path.with_extension("json.tmp");
+        let Ok(encoded) = serde_json::to_vec(&file) else {
+            return;
+        };
+        // Atomic publish: the node polls this path and must never read a
+        // half-written document.
+        if std::fs::write(&temporary, encoded).is_ok() && std::fs::rename(&temporary, &path).is_ok()
+        {
+            *self.bridge_entries.lock().expect("bridge entries poisoned") = entries;
+        }
+    }
+
+    fn read_node_bridge_statuses(&self) -> NodeBridgeStatusFile {
+        let Ok(state_dir) = self.embedded_node_state_dir() else {
+            return NodeBridgeStatusFile::default();
+        };
+        std::fs::read_to_string(state_dir.join("bridges-status.json"))
+            .ok()
+            .and_then(|contents| serde_json::from_str(&contents).ok())
+            .unwrap_or_default()
+    }
+
+    /// Replace a device's saved bridge configuration. Used by the desktop
+    /// command and by a device configuring itself over the protocol.
+    pub fn set_device_port_bridging(
+        &self,
+        device_id: &str,
+        bridging: DevicePortBridging,
+    ) -> Result<()> {
+        let known = self
+            .inner
+            .lock()
+            .expect("desktop state poisoned")
+            .store
+            .set_device_port_bridging(device_id, bridging)?;
+        if !known {
+            return Err(anyhow!("That device is no longer paired."));
+        }
+        // Arbitration re-runs from the saved state and broadcasts its result,
+        // which is also how both UIs learn that the edit landed.
+        self.reconcile_port_bridges();
+        self.broadcast();
+        Ok(())
+    }
+
+    /// Record the overlay address a device reported for its own node.
+    fn set_client_tailnet_address(&self, client_id: &str, address: &str) {
+        let address = address.trim();
+        {
+            let mut clients = self.clients.lock().expect("remote clients poisoned");
+            let Some(client) = clients.get_mut(client_id) else {
+                return;
+            };
+            let next = (!address.is_empty()).then(|| address.to_string());
+            if client.tailnet_address == next {
+                return;
+            }
+            client.tailnet_address = next;
+        }
+        self.reconcile_port_bridges();
+    }
+
+    /// Record what a device made of its own half of the bridges.
+    fn set_device_bridge_report(&self, client_id: &str, statuses: Vec<PortBridgeStatus>) {
+        let Some(device_id) = self
+            .clients
+            .lock()
+            .expect("remote clients poisoned")
+            .get(client_id)
+            .and_then(|client| client.device_id.clone())
+        else {
+            return;
+        };
+        {
+            let mut reports = self
+                .device_bridge_reports
+                .lock()
+                .expect("device bridge reports poisoned");
+            if reports.get(&device_id) == Some(&statuses) {
+                return;
+            }
+            reports.insert(device_id, statuses);
+        }
+        self.reconcile_port_bridges();
+    }
+
+    /// The bridge configuration a device may set: its own, and only when it
+    /// is authenticated.
+    fn device_id_of(&self, client_id: &str) -> Option<String> {
+        self.clients
+            .lock()
+            .expect("remote clients poisoned")
+            .get(client_id)
+            .and_then(|client| client.device_id.clone())
     }
 
     fn embedded_node_status(&self) -> Option<EmbeddedNodeStatus> {
@@ -1514,6 +1788,9 @@ impl Core {
     }
 
     pub fn state_for_window(&self, label: &str) -> DesktopState {
+        // Read before the state lock, like the presence set below: the bridge
+        // arbitration has its own lock and must never be taken under it.
+        let bridges = self.bridge_state.lock().expect("bridge state poisoned").clone();
         let inner = self.inner.lock().expect("desktop state poisoned");
         let _scope = InnerScopeGuard::enter("state_for_window", Some(label));
         let entered_at = std::time::Instant::now();
@@ -1538,7 +1815,7 @@ impl Core {
                 || self.desktop_enrollment_running.load(Ordering::Acquire),
         );
         let state = DesktopState {
-            snapshot: snapshot_from_inner(&inner, &online_device_ids),
+            snapshot: snapshot_from_inner(&inner, &online_device_ids, &bridges),
             current_project_id,
             current_project_origin,
             open_projects_in_new_windows: inner.store.settings().open_projects_in_new_windows,
@@ -1564,10 +1841,11 @@ impl Core {
     }
 
     pub fn snapshot(&self) -> HostSnapshot {
+        let bridges = self.bridge_state.lock().expect("bridge state poisoned").clone();
         let inner = self.inner.lock().expect("desktop state poisoned");
         let _scope = InnerScopeGuard::enter("snapshot", None);
         let online_device_ids = self.online_device_ids();
-        snapshot_from_inner(&inner, &online_device_ids)
+        snapshot_from_inner(&inner, &online_device_ids, &bridges)
     }
 
     fn online_device_ids(&self) -> HashSet<String> {
@@ -1594,12 +1872,34 @@ impl Core {
         });
     }
 
+    /// Re-arbitrate port bridges on a steady tick.
+    ///
+    /// Most inputs to the decision push (a device connects, an edit is saved),
+    /// but two only pull: whether this PC's node is up, and whether it managed
+    /// to open each listener. The node retries a failed bind every half
+    /// second, so a warning about a port some other program is holding must
+    /// clear without waiting for the next connection. Deliberately separate
+    /// from the presence refresher, whose interval is a two-minute liveness
+    /// concern rather than a two-second one.
+    fn spawn_bridge_refresh(self: &Arc<Self>) {
+        let core = Arc::clone(self);
+        with_thread_tag("bridges".into(), move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    BRIDGE_REFRESH_INTERVAL_MS,
+                ));
+                core.reconcile_port_bridges();
+            }
+        });
+    }
+
     fn refresh_online_presence(self: &Arc<Self>) {
         let online = self.online_device_ids();
         let mut cache = self.presence_cache.lock().expect("presence cache poisoned");
         if cache.as_ref() != Some(&online) {
             *cache = Some(online);
             drop(cache);
+            self.reconcile_port_bridges();
             self.broadcast();
         }
     }
@@ -3720,6 +4020,13 @@ impl Core {
             // it fresh even though the saved verdict is stale.
             self.stop_embedded_node();
         }
+        // The revoked device's ports are free now; a device that was waiting
+        // on one of them takes it over without reconnecting.
+        self.device_bridge_reports
+            .lock()
+            .expect("device bridge reports poisoned")
+            .remove(device_id);
+        self.reconcile_port_bridges();
         self.broadcast();
         Ok(())
     }
@@ -3741,6 +4048,8 @@ impl Core {
                     enrollment_requests: 0,
                     attached_sessions: HashSet::new(),
                     last_seen_at_ms: presence_now_ms(),
+                    tailnet_address: None,
+                    connected_seq: self.client_sequence.fetch_add(1, Ordering::Relaxed),
                     sink: ClientSink::Direct { messages, close },
                 },
             );
@@ -3774,7 +4083,24 @@ impl Core {
         for (session_id, epoch) in changed {
             self.broadcast_grid_change(&session_id, epoch);
         }
-        if device_id.is_some() {
+        if let Some(device_id) = device_id.as_deref() {
+            // The device may still hold another socket; only a device with
+            // none left releases its port claims and its self-reported
+            // statuses, and a port it gives up is re-awarded here to the
+            // longest-connected device that was waiting for it.
+            let still_connected = self
+                .clients
+                .lock()
+                .expect("remote clients poisoned")
+                .values()
+                .any(|client| client.device_id.as_deref() == Some(device_id));
+            if !still_connected {
+                self.device_bridge_reports
+                    .lock()
+                    .expect("device bridge reports poisoned")
+                    .remove(device_id);
+            }
+            self.reconcile_port_bridges();
             self.broadcast();
         }
     }
@@ -3972,6 +4298,10 @@ impl Core {
                     // instantly while its banner says pairing is required.
                     client.paired_connection = true;
                 }
+                // The device is connected now, so its bridges may claim
+                // their ports. It still has to report its overlay address
+                // before any of them can actually come up.
+                self.reconcile_port_bridges();
                 self.send_to_client(
                     client_id,
                     ServerMessage::AuthAccepted {
@@ -4210,6 +4540,40 @@ impl Core {
                 self.release_remote_controller(client_id, &session_id);
                 Some(ServerMessage::Ok { request_id })
             }
+            ClientMessage::BridgeSet {
+                request_id,
+                enabled,
+                bridges,
+            } => {
+                // A device configures only itself. The desktop edits any
+                // device through its own command instead, so there is no
+                // device id on the wire to validate.
+                let Some(device_id) = self.device_id_of(client_id) else {
+                    return Ok(None);
+                };
+                self.set_device_port_bridging(
+                    &device_id,
+                    DevicePortBridging { enabled, bridges },
+                )?;
+                Some(ServerMessage::Snapshot {
+                    request_id: Some(request_id),
+                    snapshot: self.snapshot(),
+                })
+            }
+            ClientMessage::BridgeNode {
+                request_id,
+                tailnet_address,
+            } => {
+                self.set_client_tailnet_address(client_id, &tailnet_address);
+                Some(ServerMessage::Snapshot {
+                    request_id: Some(request_id),
+                    snapshot: self.snapshot(),
+                })
+            }
+            ClientMessage::BridgeStatus { statuses } => {
+                self.set_device_bridge_report(client_id, statuses);
+                None
+            }
             ClientMessage::Ping => None,
             ClientMessage::DebugDiagnostics { message } => {
                 // Phone-side terminal sync diagnostics ([ATSync] lines from
@@ -4244,6 +4608,7 @@ impl Core {
             last_seen_at: now.to_rfc3339(),
             online: false,
             viewing_session_ids: Vec::new(),
+            port_bridging: DevicePortBridging::default(),
         };
         inner
             .store
@@ -4959,7 +5324,11 @@ fn ordered_session_ids(inner: &Inner) -> Vec<String> {
     ids
 }
 
-fn snapshot_from_inner(inner: &Inner, online_device_ids: &HashSet<String>) -> HostSnapshot {
+fn snapshot_from_inner(
+    inner: &Inner,
+    online_device_ids: &HashSet<String>,
+    bridges: &BridgeSnapshot,
+) -> HostSnapshot {
     let default_shell_id = if inner
         .shells
         .iter()
@@ -5048,6 +5417,8 @@ fn snapshot_from_inner(inner: &Inner, online_device_ids: &HashSet<String>) -> Ho
                 false,
             ),
         },
+        port_bridge_statuses: bridges.statuses.clone(),
+        host_tailnet_address: bridges.host_tailnet_address.clone(),
     }
 }
 
@@ -6337,8 +6708,9 @@ fn registration_status_for_display(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityDetector, CdOutcome, CdPlan, ConnectivityAction, ConnectivityTracker,
-        Core, EmbeddedNodeStatus, GridEpoch, Inner, ManagedSession, PENDING_FOCUS_TTL,
+        ActivityDetector, BridgeSnapshot, CdOutcome, CdPlan, ConnectivityAction,
+        ConnectivityTracker, Core, DevicePortBridging, EmbeddedNodeStatus, GridEpoch, Inner,
+        ManagedSession, PENDING_FOCUS_TTL,
         PRESENCE_WINDOW_MS, PairingGrant, PendingFocus, RetireOutcome, SESSION_DEFAULT_COLS,
         SESSION_DEFAULT_ROWS, SESSION_MAX_COLS, SESSION_MAX_ROWS, SessionActivity, SessionWriter,
         TUI_QUIET_MS, TUI_USER_ATTRIBUTION_MS, TerminalController, VIEWPORT_WATCHDOG_TIMEOUT_MS,
@@ -8203,6 +8575,7 @@ mod tests {
             last_seen_at: "2026-08-27T00:00:00Z".into(),
             online: false,
             viewing_session_ids: Vec::new(),
+            port_bridging: DevicePortBridging::default(),
         };
         store
             .authorize_device(device("phone-a", "Pixel 7"), "cred-a")
@@ -8223,13 +8596,13 @@ mod tests {
         };
 
         let online = HashSet::from(["phone-a".to_string()]);
-        let snapshot = snapshot_from_inner(&inner, &online);
+        let snapshot = snapshot_from_inner(&inner, &online, &BridgeSnapshot::default());
         assert_eq!(snapshot.devices.len(), 2);
         assert_eq!(snapshot.devices[0].online, true);
         assert_eq!(snapshot.devices[1].online, false);
 
         let nobody = HashSet::new();
-        let snapshot = snapshot_from_inner(&inner, &nobody);
+        let snapshot = snapshot_from_inner(&inner, &nobody, &BridgeSnapshot::default());
         assert!(
             snapshot.devices.iter().all(|device| !device.online),
             "devices outside the presence window are offline"
@@ -8253,6 +8626,7 @@ mod tests {
             last_seen_at: "2026-08-27T00:00:00Z".into(),
             online: false,
             viewing_session_ids: Vec::new(),
+            port_bridging: DevicePortBridging::default(),
         };
         store
             .authorize_device(device("phone-a", "Pixel 7"), "cred-a")
@@ -8290,7 +8664,7 @@ mod tests {
         );
 
         let online = HashSet::from(["phone-a".to_string(), "phone-b".to_string()]);
-        let snapshot = snapshot_from_inner(&inner, &online);
+        let snapshot = snapshot_from_inner(&inner, &online, &BridgeSnapshot::default());
         let viewing = |id: &str| {
             snapshot
                 .devices
@@ -8308,7 +8682,7 @@ mod tests {
         second
             .viewports
             .remove(&TerminalController::Remote("phone-b".into()));
-        let snapshot = snapshot_from_inner(&inner, &online);
+        let snapshot = snapshot_from_inner(&inner, &online, &BridgeSnapshot::default());
         assert!(
             snapshot
                 .devices
@@ -8808,7 +9182,7 @@ mod tests {
             .expect("valid pair");
 
         let mut inner = test_inner(store, vec![shell_profile("powershell")]);
-        let snapshot = snapshot_from_inner(&inner, &HashSet::new());
+        let snapshot = snapshot_from_inner(&inner, &HashSet::new(), &BridgeSnapshot::default());
         assert_eq!(snapshot.terminal_theme.dark_scheme_id, "vintage");
         assert_eq!(snapshot.terminal_theme.light_scheme_id, "novel");
 
@@ -8819,7 +9193,7 @@ mod tests {
             .store
             .set_terminal_theme("novel".into(), "vintage".into())
             .expect("stale swapped pair");
-        let repaired = snapshot_from_inner(&inner, &HashSet::new());
+        let repaired = snapshot_from_inner(&inner, &HashSet::new(), &BridgeSnapshot::default());
         assert_eq!(
             repaired.terminal_theme.dark_scheme_id,
             crate::models::DEFAULT_DARK_TERMINAL_SCHEME_ID,
@@ -8837,7 +9211,7 @@ mod tests {
             .set_terminal_theme("not-a-scheme".into(), "novel".into())
             .expect("unknown id");
         assert_eq!(
-            snapshot_from_inner(&inner, &HashSet::new())
+            snapshot_from_inner(&inner, &HashSet::new(), &BridgeSnapshot::default())
                 .terminal_theme
                 .dark_scheme_id,
             crate::models::DEFAULT_DARK_TERMINAL_SCHEME_ID
@@ -8890,7 +9264,7 @@ mod tests {
 
         let mut inner = test_inner(store, shells.clone());
         assert_eq!(
-            snapshot_from_inner(&inner, &HashSet::new()).default_shell_id,
+            snapshot_from_inner(&inner, &HashSet::new(), &BridgeSnapshot::default()).default_shell_id,
             "git-bash",
             "the stored default name is reported unchanged"
         );
@@ -8902,7 +9276,7 @@ mod tests {
             .set_default_shell("removed-profile".into())
             .expect("stale value");
         assert_eq!(
-            snapshot_from_inner(&inner, &HashSet::new()).default_shell_id,
+            snapshot_from_inner(&inner, &HashSet::new(), &BridgeSnapshot::default()).default_shell_id,
             "powershell",
             "a stale default falls back to the first available shell"
         );
@@ -8919,7 +9293,7 @@ mod tests {
         let store = DesktopStore::load(state_path.clone()).expect("initial store");
         let inner = test_inner(store, Vec::new());
         assert_eq!(
-            snapshot_from_inner(&inner, &HashSet::new()).default_shell_id,
+            snapshot_from_inner(&inner, &HashSet::new(), &BridgeSnapshot::default()).default_shell_id,
             "cmd",
             "an empty shell list still reports a usable default"
         );
@@ -8944,7 +9318,7 @@ mod tests {
             let store = DesktopStore::load(state_path.clone()).expect("reload store");
             let inner = test_inner(store, vec![shell]);
             assert_eq!(
-                snapshot_from_inner(&inner, &HashSet::new()).default_shell_id,
+                snapshot_from_inner(&inner, &HashSet::new(), &BridgeSnapshot::default()).default_shell_id,
                 "cmd",
                 "the desktop option persists across restarts so a phone pick sticks"
             );
@@ -9928,7 +10302,7 @@ mod tests {
         inner.sessions.get_mut("s1").unwrap().look_here = true;
 
         let empty: HashSet<String> = HashSet::new();
-        let snapshot = snapshot_from_inner(&inner, &empty);
+        let snapshot = snapshot_from_inner(&inner, &empty, &BridgeSnapshot::default());
         assert_eq!(
             snapshot.look_here_session_ids,
             vec!["s1".to_string()],
@@ -9936,7 +10310,7 @@ mod tests {
         );
 
         inner.sessions.get_mut("s1").unwrap().look_here = false;
-        let cleared = snapshot_from_inner(&inner, &empty);
+        let cleared = snapshot_from_inner(&inner, &empty, &BridgeSnapshot::default());
         assert!(
             cleared.look_here_session_ids.is_empty(),
             "a viewed (or re-armed) session leaves the list at once"

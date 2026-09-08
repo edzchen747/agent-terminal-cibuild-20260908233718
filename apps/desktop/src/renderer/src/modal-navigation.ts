@@ -1,4 +1,4 @@
-export type Modal = "pair" | "settings" | "devices" | "rename" | null;
+export type Modal = "pair" | "settings" | "devices" | "bridges" | "bridgeDevice" | "rename" | null;
 
 /**
  * The modal the devices button should open. With no paired devices the list
@@ -21,6 +21,9 @@ export function nextModalOnEscape(modal: Modal, renaming: boolean, deviceCount: 
   if (!modal) return modal;
   if (modal === "rename" && renaming) return modal;
   if (modal === "pair") return pairModalEscapeTarget(deviceCount);
+  // A device's port list is a page inside the Port Bridge page, so escape
+  // steps back to the list of devices rather than out to the terminal.
+  if (modal === "bridgeDevice") return "bridges";
   return null;
 }
 

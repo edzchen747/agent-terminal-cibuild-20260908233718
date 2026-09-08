@@ -17,6 +17,10 @@ export const MaximizeIcon = (props: IconProps) => <svg {...base} {...props}><rec
 export const RestoreIcon = (props: IconProps) => <svg {...base} {...props}><rect x="9.5" y="9.5" width="10" height="10" rx="1.5"/><path d="M5.5 14.5v-9h10"/></svg>;
 export const TrashIcon = (props: IconProps) => <svg {...base} {...props}><path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14"/></svg>;
 export const EditIcon = (props: IconProps) => <svg {...base} {...props}><path d="M4 20h4l11-11-4-4L4 16v4Z"/><path d="m13.5 6.5 4 4"/></svg>;
+/* Two hosts joined by a link: the Port Bridge page. */
+export const PortBridgeIcon = (props: IconProps) => <svg {...base} {...props}><rect x="2.5" y="4" width="6" height="6" rx="1.5"/><rect x="15.5" y="14" width="6" height="6" rx="1.5"/><path d="M5.5 10v4.5a2 2 0 0 0 2 2h8"/><path d="M18.5 14V9.5a2 2 0 0 0-2-2h-8"/></svg>;
+export const WarningIcon = (props: IconProps) => <svg {...base} {...props}><path d="M12 4.5 21 19.5H3z"/><path d="M12 10v4"/><path d="M12 17h.01"/></svg>;
+export const ChevronRightIcon = (props: IconProps) => <svg {...base} {...props}><path d="m9.5 6 6 6-6 6"/></svg>;
 export const WifiIcon = (props: IconProps) => <svg {...base} {...props}><path d="M5 12.5a10 10 0 0 1 14 0M8 16a6 6 0 0 1 8 0M11 19.5a2 2 0 0 1 2 0"/></svg>;
 export const MoreIcon = (props: IconProps) => <svg {...base} {...props}><circle cx="5" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1" fill="currentColor" stroke="none"/></svg>;
 export const SplitViewIcon = (props: IconProps) => <svg {...base} {...props}><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M12 4v16"/></svg>;

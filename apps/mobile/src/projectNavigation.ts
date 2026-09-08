@@ -1,11 +1,12 @@
 import type { HostSnapshot, Project, TerminalSession } from "@agentterminal/protocol";
 
-export type ViewType = "home" | "hosts" | "project" | "terminal";
+export type ViewType = "home" | "hosts" | "ports" | "project" | "terminal";
 
 export interface ViewGeometryInput {
   viewType: ViewType;
-  /** The project the view was opened for: the selected project on the home
-   * and hosts pages, the view's own project on the project/terminal pages. */
+  /** The project the view was opened for: the selected project on the home,
+   * hosts and ports pages, the view's own project on the project/terminal
+   * pages. */
   requestedProjectId: string | null;
   /** The session the view was opened for: the view's session on the terminal
    * page, the selected session everywhere else. */

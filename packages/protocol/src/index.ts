@@ -1,5 +1,6 @@
 import type { TerminalThemeSettings } from "./terminal-themes.js";
 import type { TaskbarProgress } from "./taskbar.js";
+import type { DevicePortBridging, PortBridge, PortBridgeStatus } from "./port-bridges.js";
 
 export * from "./terminal-themes.js";
 export * from "./terminal-layout.js";
@@ -8,6 +9,7 @@ export * from "./terminal-zoom.js";
 export * from "./terminal-find.js";
 export * from "./session-activity.js";
 export * from "./taskbar.js";
+export * from "./port-bridges.js";
 
 export const PROTOCOL_VERSION = 1 as const;
 
@@ -263,6 +265,11 @@ export interface AuthorizedDevice extends DeviceIdentity {
    * watchdog evicts a backgrounded phone.
    */
   viewingSessionIds?: string[];
+  /**
+   * The device's Port Bridge configuration. Optional because a host older
+   * than this feature omits it; read it through `normalizePortBridging`.
+   */
+  portBridging?: DevicePortBridging;
 }
 
 export interface Project {
@@ -360,6 +367,20 @@ export interface HostSnapshot {
    * normalizeTerminalThemeSettings rather than reaching into it.
    */
   terminalTheme?: TerminalThemeSettings;
+  /**
+   * What the host made of every device's configured port bridges, keyed by
+   * device id. The host is the sole arbiter of a port: two devices may both
+   * configure port 8080, but only the one that claimed it first while
+   * connected is `active`, and the other is `conflict` until the holder
+   * disconnects. Optional because a host older than this field omits it.
+   */
+  portBridgeStatuses?: Record<string, PortBridgeStatus[]>;
+  /**
+   * The host's own overlay address. A client needs it as the dial target for
+   * a bridge the host serves. Absent while the host's node is not enrolled,
+   * which is also when no bridge can come up.
+   */
+  hostTailnetAddress?: string;
 }
 
 export interface PairingPayload {
@@ -423,7 +444,27 @@ export type ClientMessage =
   | { type: "ping" }
   | { type: "debug.diagnostics"; message: string }
   | { type: "shell.default"; requestId: string; shellId: string }
-  | { type: "terminal.theme"; requestId: string; darkSchemeId: string; lightSchemeId: string };
+  | { type: "terminal.theme"; requestId: string; darkSchemeId: string; lightSchemeId: string }
+  /**
+   * Replace this device's own Port Bridge configuration. A device may only
+   * configure itself; the desktop edits any device through its Tauri command
+   * instead, so there is no device id here.
+   */
+  | { type: "bridge.set"; requestId: string; enabled: boolean; bridges: PortBridge[] }
+  /**
+   * The overlay address this device's embedded node came up on. The host
+   * needs it both as the dial target for a bridge the device serves and as
+   * the peer allowlist entry for one the host serves, so a device's bridges
+   * stay `pending` until this arrives.
+   */
+  | { type: "bridge.node"; requestId: string; tailnetAddress: string }
+  /**
+   * What this device's own node made of its half of the bridges. Only
+   * failures matter to the host: they are merged into the snapshot so the
+   * desktop's Port Bridge page can warn about a port that is in use on the
+   * device.
+   */
+  | { type: "bridge.status"; statuses: PortBridgeStatus[] };
 
 /**
  * One contiguous slice of a session's PTY stream recorded under a single

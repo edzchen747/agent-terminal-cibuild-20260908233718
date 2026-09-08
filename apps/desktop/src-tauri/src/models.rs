@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -82,6 +84,53 @@ impl TaskbarProgress {
     }
 }
 
+/// Which side of a port bridge runs the real service on `127.0.0.1:port`.
+/// The other side opens the loopback listener and forwards over the overlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PortBridgeServer {
+    Host,
+    Client,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortBridge {
+    pub id: String,
+    pub port: u16,
+    pub server: PortBridgeServer,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevicePortBridging {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub bridges: Vec<PortBridge>,
+}
+
+/// What the host made of one configured bridge. Mirrors `PortBridgeState` in
+/// `packages/protocol/src/port-bridges.ts`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PortBridgeState {
+    Active,
+    Pending,
+    Conflict,
+    Failed,
+    Disabled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortBridgeStatus {
+    pub bridge_id: String,
+    pub state: PortBridgeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceIdentity {
@@ -106,6 +155,11 @@ pub struct AuthorizedDevice {
     /// the way out to clients and never meaningful in the store file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub viewing_session_ids: Vec<String>,
+    /// The device's Port Bridge configuration. Persisted with the device, so
+    /// unlike `online` this one is meaningful in the store file; a state file
+    /// written before this feature simply has bridging switched off.
+    #[serde(default)]
+    pub port_bridging: DevicePortBridging,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -249,6 +303,16 @@ pub struct HostSnapshot {
     pub shells: Vec<ShellProfile>,
     pub default_shell_id: String,
     pub terminal_theme: TerminalThemeSettings,
+    /// What the host made of every device's configured port bridges, keyed by
+    /// device id. The host alone arbitrates a port: two devices may both
+    /// configure 8080, but only the one that claimed it first while connected
+    /// is active, and the other stays in conflict until the holder leaves.
+    pub port_bridge_statuses: BTreeMap<String, Vec<PortBridgeStatus>>,
+    /// The host's own overlay address, which a client needs as the dial
+    /// target for a bridge the host serves. Empty while the node is not
+    /// enrolled, which is also when no bridge can come up.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub host_tailnet_address: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -525,6 +589,29 @@ pub enum ClientMessage {
         dark_scheme_id: String,
         light_scheme_id: String,
     },
+    /// Replace the sending device's own Port Bridge configuration. A device
+    /// may only configure itself, so there is no device id: the desktop edits
+    /// any device through its Tauri command instead.
+    #[serde(rename = "bridge.set")]
+    BridgeSet {
+        request_id: String,
+        enabled: bool,
+        bridges: Vec<PortBridge>,
+    },
+    /// The overlay address this device's embedded node came up on. The host
+    /// needs it as the dial target for a bridge the device serves and as the
+    /// peer allowlist entry for one the host serves, so a device's bridges
+    /// stay pending until it arrives.
+    #[serde(rename = "bridge.node")]
+    BridgeNode {
+        request_id: String,
+        tailnet_address: String,
+    },
+    /// What the device's own node made of its half of the bridges. Only
+    /// failures matter here: they are merged into the snapshot so the
+    /// desktop's Port Bridge page can warn about a port in use on the device.
+    #[serde(rename = "bridge.status")]
+    BridgeStatus { statuses: Vec<PortBridgeStatus> },
 }
 
 impl ClientMessage {
@@ -546,10 +633,13 @@ impl ClientMessage {
             | Self::SessionDetach { request_id, .. }
             | Self::SessionViewportRelease { request_id, .. }
             | Self::ShellDefault { request_id, .. }
-            | Self::TerminalTheme { request_id, .. } => Some(request_id),
+            | Self::TerminalTheme { request_id, .. }
+            | Self::BridgeSet { request_id, .. }
+            | Self::BridgeNode { request_id, .. } => Some(request_id),
             Self::SessionInput { .. }
             | Self::SessionResize { .. }
             | Self::DebugDiagnostics { .. }
+            | Self::BridgeStatus { .. }
             | Self::Ping => None,
         }
     }
@@ -642,7 +732,8 @@ pub enum ServerMessage {
 mod tests {
     use super::{
         ClientMessage, DARK_TERMINAL_SCHEME_IDS, DEFAULT_DARK_TERMINAL_SCHEME_ID,
-        DEFAULT_LIGHT_TERMINAL_SCHEME_ID, LIGHT_TERMINAL_SCHEME_IDS, ServerMessage,
+        DEFAULT_LIGHT_TERMINAL_SCHEME_ID, LIGHT_TERMINAL_SCHEME_IDS, PortBridgeServer,
+        PortBridgeState, PortBridgeStatus, ServerMessage,
         SessionActivity, SessionSegment, TaskbarProgress, TerminalSession, TerminalTuiModeEvent,
         TuiMode, normalize_terminal_scheme_id,
     };
@@ -1020,5 +1111,57 @@ mod tests {
                 if dark_scheme_id == "vintage" && light_scheme_id == "novel"
         ));
         assert_eq!(message.request_id(), Some("r9"));
+    }
+
+    #[test]
+    fn the_port_bridge_commands_match_the_shared_wire_contract() {
+        let set: ClientMessage = serde_json::from_str(
+            r#"{"type":"bridge.set","requestId":"r1","enabled":true,"bridges":[{"id":"b1","port":5173,"server":"host"},{"id":"b2","port":9000,"server":"client"}]}"#,
+        )
+        .expect("bridge.set command");
+        let ClientMessage::BridgeSet {
+            enabled, bridges, ..
+        } = &set
+        else {
+            panic!("bridge.set must decode as BridgeSet");
+        };
+        assert!(enabled);
+        assert_eq!(bridges[0].port, 5173);
+        assert_eq!(bridges[0].server, PortBridgeServer::Host);
+        assert_eq!(bridges[1].server, PortBridgeServer::Client);
+        assert_eq!(set.request_id(), Some("r1"));
+
+        let node: ClientMessage = serde_json::from_str(
+            r#"{"type":"bridge.node","requestId":"r2","tailnetAddress":"100.64.0.3"}"#,
+        )
+        .expect("bridge.node command");
+        assert!(matches!(
+            node,
+            ClientMessage::BridgeNode { ref tailnet_address, .. } if tailnet_address == "100.64.0.3"
+        ));
+
+        // A status report is a notification, not a request: it carries no id
+        // and is never answered.
+        let status: ClientMessage = serde_json::from_str(
+            r#"{"type":"bridge.status","statuses":[{"bridgeId":"b1","state":"failed","detail":"in use"}]}"#,
+        )
+        .expect("bridge.status command");
+        assert_eq!(status.request_id(), None);
+        let ClientMessage::BridgeStatus { statuses } = &status else {
+            panic!("bridge.status must decode as BridgeStatus");
+        };
+        assert_eq!(statuses[0].state, PortBridgeState::Failed);
+        assert_eq!(statuses[0].detail.as_deref(), Some("in use"));
+
+        // The names the phone reads back out of the snapshot.
+        let encoded = serde_json::to_value(PortBridgeStatus {
+            bridge_id: "b1".into(),
+            state: PortBridgeState::Conflict,
+            detail: None,
+        })
+        .expect("encode status");
+        assert_eq!(encoded["bridgeId"], "b1");
+        assert_eq!(encoded["state"], "conflict");
+        assert!(encoded.get("detail").is_none());
     }
 }

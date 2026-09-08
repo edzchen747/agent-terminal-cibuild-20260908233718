@@ -2,6 +2,7 @@ import { Capacitor, registerPlugin } from "@capacitor/core";
 import { Preferences } from "@capacitor/preferences";
 import { OVERLAY_CONTROL_URL } from "@agentterminal/protocol";
 import { asEmbeddedNodeFailure } from "./nodeEnrollment";
+import type { NodeBridgeSpec } from "./portBridges";
 
 const ENGINE_STATE_KEY = "agent-terminal-embedded-node";
 
@@ -22,6 +23,8 @@ interface EmbeddedNodePlugin {
     endpoint?: string;
   }>;
   stop(options?: { stateKey?: string }): Promise<void>;
+  setBridges(options: { stateKey?: string; revision: number; bridges: NodeBridgeSpec[] }): Promise<void>;
+  bridgeStatus(options: { stateKey?: string }): Promise<{ bridges?: { id?: string; state?: string; error?: string }[] }>;
 }
 
 const NativeEmbeddedNode = registerPlugin<EmbeddedNodePlugin>("EmbeddedNode");
@@ -51,7 +54,14 @@ export class EmbeddedNodeEngine {
     this.storageKey = hostId ? `${ENGINE_STATE_KEY}-${hostId}` : ENGINE_STATE_KEY;
   }
 
-  async start(controlUrl: string = OVERLAY_CONTROL_URL, remoteEndpoint?: string, transport: "direct" | "overlay" = "overlay", authKey?: string): Promise<EmbeddedNodeState> {
+  /**
+   * Start (or adopt) this host's node.
+   *
+   * `force` starts the node even on a direct/LAN connection. Port bridges run
+   * through the node whatever the terminal socket happens to be using, so a
+   * phone that is bridging keeps its node up on LAN too.
+   */
+  async start(controlUrl: string = OVERLAY_CONTROL_URL, remoteEndpoint?: string, transport: "direct" | "overlay" = "overlay", authKey?: string, force = false): Promise<EmbeddedNodeState> {
     const current = await this.load();
     const state: EmbeddedNodeState = {
       ...current,
@@ -61,7 +71,7 @@ export class EmbeddedNodeEngine {
       lastConnectedAt: new Date().toISOString()
     };
 
-    if (Capacitor.isNativePlatform() && remoteEndpoint && transport === "overlay") {
+    if (Capacitor.isNativePlatform() && remoteEndpoint && (transport === "overlay" || force)) {
       try {
         const result = await NativeEmbeddedNode.start({
           controlUrl,
@@ -89,6 +99,27 @@ export class EmbeddedNodeEngine {
 
     await this.save(state);
     return state;
+  }
+
+  /**
+   * Publish this phone's half of the port bridges for the node to reconcile
+   * against. Safe with no node running: the file is picked up on its next
+   * start, which is how a bridge comes up as soon as the node does.
+   */
+  async setBridges(bridges: NodeBridgeSpec[], revision: number): Promise<void> {
+    if (!Capacitor.isNativePlatform()) return;
+    await NativeEmbeddedNode.setBridges({ stateKey: this.hostId, revision, bridges });
+  }
+
+  /**
+   * What the node made of them. An empty list means it has not reconciled
+   * yet, which is not the same as "everything failed".
+   */
+  async bridgeStatus(): Promise<{ id: string; state: string; error?: string }[]> {
+    if (!Capacitor.isNativePlatform()) return [];
+    const result = await NativeEmbeddedNode.bridgeStatus({ stateKey: this.hostId });
+    return (result.bridges ?? [])
+      .filter((entry): entry is { id: string; state: string; error?: string } => typeof entry.id === "string" && typeof entry.state === "string");
   }
 
   /**

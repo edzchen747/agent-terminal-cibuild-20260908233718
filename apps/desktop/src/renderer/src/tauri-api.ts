@@ -109,6 +109,7 @@ const api: DesktopApi = {
   startPairing: () => invoke("start_pairing"),
   retryRemoteRegistration: () => invoke("retry_remote_registration"),
   revokeDevice: (deviceId) => invoke("revoke_device", { deviceId }),
+  setDevicePortBridging: (deviceId, enabled, bridges) => invoke("set_device_port_bridging", { deviceId, enabled, bridges }),
   setDefaultShell: (shellId) => invoke("set_default_shell", { shellId }),
   setDefaultTerminal: () => invoke("set_default_terminal"),
   unsetDefaultTerminal: () => invoke("unset_default_terminal"),

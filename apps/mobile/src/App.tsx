@@ -10,8 +10,8 @@ import {
   CapacitorBarcodeScannerScanOrientation,
   CapacitorBarcodeScannerTypeHint
 } from "@capacitor/barcode-scanner";
-import type { DirectoryListing, HostSnapshot, PairingPayload, Platform, Project, TaskbarProgress, TerminalSession } from "@agentterminal/protocol";
-import { createRequestId, isSessionActive, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSettings, parsePairingPayload, resolveTerminalScheme, sessionActivitySummary, terminalSchemesFor } from "@agentterminal/protocol";
+import type { DirectoryListing, HostSnapshot, PairingPayload, PortBridge, PortBridgeServer, Platform, Project, TaskbarProgress, TerminalSession } from "@agentterminal/protocol";
+import { addBridge, bridgeDirectionLabel, bridgeStateLabel, bridgeWarningDetail, canAddBridgePort, createRequestId, duplicatePortIds, isSessionActive, isValidBridgePort, MAX_BRIDGE_PORT, MAX_PROJECT_NAME_LENGTH, MIN_BRIDGE_PORT, normalizePortBridging, normalizeTerminalThemeSettings, parsePairingPayload, portBridgeStatusOf, removeBridge, resolveTerminalScheme, sessionActivitySummary, sortedBridges, terminalSchemesFor, updateBridge } from "@agentterminal/protocol";
 import { HostConnection, type RemoteRegistrationState, type SavedHost, type SavedHostRecord } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
 import { notificationStateFor, type ConnectionNotificationState } from "./connectionPolicy";
@@ -23,7 +23,7 @@ import { deviceIdentity } from "./device";
 import { classifyGestureAxis, shouldBridgeTapClick, shouldBridgeTapControl, shouldCommitSheetDismiss, shouldSwallowTrailingClick, SHEET_SLIDER_HORIZONTAL_BIAS, SWIPE_COMMIT_DISTANCE_RATIO, SWIPE_COMMIT_VELOCITY_PX_MS } from "./gesture";
 import { shouldCommitBackSwipe } from "./backSwipe";
 import { effectiveDefaultShell } from "./defaultShell";
-import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, RefreshIcon, ScanIcon, SettingsIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
+import { BackIcon, BookmarkIcon, ChevronIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MoreIcon, PlusIcon, PortsIcon, RefreshIcon, ScanIcon, SettingsIcon, TerminalIcon, TrashIcon, WarningIcon, WifiIcon } from "./icons";
 import { MobileTerminal } from "./MobileTerminal";
 import { FONT_WIDTH_MAX, FONT_WIDTH_MIN, FONT_WIDTH_STEP, normalizeFontWidthPercent } from "./fontWidth";
 import { applyTheme, loadThemePreference, resolveTheme, saveThemePreference, SYSTEM_DARK_QUERY, THEME_LABELS, THEME_PREFERENCES, type ResolvedTheme, type ThemePreference } from "./theme";
@@ -31,7 +31,7 @@ import { syncSystemBars } from "./systemBars";
 import { backProjectId, resolveViewGeometry } from "./projectNavigation";
 import { sessionProgressModel, taskbarOf, type SessionProgressModel } from "./session-taskbar";
 
-type View = { type: "home" } | { type: "hosts" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
+type View = { type: "home" } | { type: "hosts" } | { type: "ports" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
 // The bottom sheets of the connected pager. While one is set, that sheet is
 // playing its slide-down exit and stays mounted until it finishes.
 type SheetKind = "settings" | "terminalSettings" | "createProject" | "rename" | "closeSession";
@@ -102,9 +102,10 @@ export function App() {
   // The user reached the pairing screen from the hosts page; back restores
   // the pre-pair status captured in prePairStatusRef.
   const [pairFromHosts, setPairFromHosts] = useState(false);
-  // The user reached the pairing screen from the home view's bottom nav;
-  // back returns to the home view.
-  const [pairFromHome, setPairFromHome] = useState(false);
+  // A port-bridge edit is in flight. The desktop owns the configuration, so
+  // the page waits for its snapshot instead of guessing.
+  const [portsSaving, setPortsSaving] = useState(false);
+  const [portsError, setPortsError] = useState("");
   const [remoteRegistration, setRemoteRegistration] = useState<RemoteRegistrationState>({ status: "unregistered" });
   // The phone's raw route state: while offline the registration verdict on
   // top is stale, so the badge falls back to "Offline" (desktop parity).
@@ -142,8 +143,8 @@ export function App() {
   connectionRef.current = connection;
   const screenAwakeRef = useRef(true);
   const deviceSleepingRef = useRef(false);
-  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts, pairFromHome, snapshot, hostsEmpty: false });
-  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts, pairFromHome, snapshot, hostsEmpty: hostsLoaded && hostRecords.length === 0 };
+  const navigationRef = useRef({ view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts, snapshot, hostsEmpty: false });
+  navigationRef.current = { view, status, showCreateProject, projectToRename, sessionToClose, showTerminalSettings, showSettings, pairFromHosts, snapshot, hostsEmpty: hostsLoaded && hostRecords.length === 0 };
   // The status and error message captured when the user leaves the hosts
   // page for the pairing screen, so pressing back restores the same screen
   // (the try-again screen with its original message when the hosts page was
@@ -156,8 +157,6 @@ export function App() {
   const pairFromHostsRef = useRef(false);
   pairFromHostsRef.current = pairFromHosts;
   // Same hold for the bottom-nav path.
-  const pairFromHomeRef = useRef(false);
-  pairFromHomeRef.current = pairFromHome;
   // Live status/error for enterPairFromHosts, which the Android back-key
   // listener (registered once on mount) can reach with a stale closure:
   // the pre-pair capture must see the status the hosts page is showing,
@@ -254,7 +253,6 @@ export function App() {
         hasCloseSessionSheet: navigation.sessionToClose !== null,
         showCreateProject: navigation.showCreateProject,
         pairFromHosts: navigation.pairFromHosts,
-        pairFromHome: navigation.pairFromHome,
         hostsEmpty: navigation.hostsEmpty
       })) {
         case "closeTerminalSettings":
@@ -566,7 +564,7 @@ export function App() {
 
   useEffect(() => {
     if (!connection) return;
-    const pairingHolds = () => pairFromHostsRef.current || pairFromHomeRef.current;
+    const pairingHolds = () => pairFromHostsRef.current;
     const offSnapshot = connection.on("snapshot", setSnapshot);
     const offConnected = connection.on("connected", (nextSnapshot) => {
       setSnapshot(nextSnapshot);
@@ -714,7 +712,7 @@ export function App() {
       // Pairing succeeded: HostConnection.pair persisted the newly paired
       // desktop as the launch default and added it to the previously paired
       // list; every other desktop stays listed.
-      setConnection(next); setSnapshot(next.snapshot ?? null); setRemoteRegistration(next.remoteRegistrationState()); setStatus("connected"); setView({ type: "home" }); setHostName(next.host.name); setPairFromHosts(false); setPairFromHome(false);
+      setConnection(next); setSnapshot(next.snapshot ?? null); setRemoteRegistration(next.remoteRegistrationState()); setStatus("connected"); setView({ type: "home" }); setHostName(next.host.name); setPairFromHosts(false);
       await startConnectionNotification(next.host.name, next.endpoint());
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Pairing failed."); setStatus("pairing");
@@ -748,6 +746,31 @@ export function App() {
   // connected desktop's row shows its "connected" indicator. From the
   // try-again screen the dead attempt is dropped and the error status stays
   // put, so back from the page lands back on the try-again screen.
+  function openPorts() {
+    setPortsError("");
+    setView({ type: "ports" });
+  }
+
+  /**
+   * Every edit on the ports page goes to the desktop, which owns the
+   * configuration and arbitrates the ports across devices. The page re-renders
+   * from the snapshot the desktop sends back rather than from a local guess,
+   * so a port another device already holds is shown as the desktop sees it.
+   */
+  async function savePortBridging(enabled: boolean, bridges: PortBridge[]) {
+    const live = connectionRef.current;
+    if (!live) return;
+    setPortsSaving(true);
+    setPortsError("");
+    try {
+      setSnapshot(await live.setPortBridging(enabled, bridges));
+    } catch (saveError) {
+      setPortsError(saveError instanceof Error ? saveError.message : "The desktop did not accept the change.");
+    } finally {
+      setPortsSaving(false);
+    }
+  }
+
   function openHosts() {
     if (status === "error") {
       connectionRef.current?.close();
@@ -789,13 +812,6 @@ export function App() {
   // The home view's bottom-nav "Pair" button. The home view only renders
   // while connected, so back always returns to it: no pre-pair capture is
   // needed beyond pinning the restore ref to "connected".
-  function enterPairFromHome() {
-    prePairStatusRef.current = "connected";
-    setError("");
-    setPairFromHome(true);
-    setStatus("pairing");
-  }
-
   // Shared by the pairing screen's back button and the Android back key:
   // return to the page the pairing screen was opened from (the hosts page or
   // the home view). While the pairing screen was open the live
@@ -808,7 +824,6 @@ export function App() {
   // this only executes the chosen branch.
   function backFromPairing() {
     setPairFromHosts(false);
-    setPairFromHome(false);
     const live = connectionRef.current;
     const decision = pairingRestoreDecision({
       prePairStatus: prePairStatusRef.current,
@@ -880,6 +895,9 @@ export function App() {
       setView({ type: "project", projectId: backProjectId(snapshot, view) });
     }
     else if (view.type === "project") setView({ type: "home" });
+    // The ports page is opened from the home bottom nav, so home is always
+    // there to go back to (navigationPolicy agrees for the Android back key).
+    else if (view.type === "ports") setView({ type: "home" });
     // The hosts page keeps the app status, so "home" lands on the home view
     // when connected and on the try-again screen when not. With a loaded,
     // empty list there is no useful back target - retrying with no saved
@@ -985,7 +1003,7 @@ export function App() {
       onOpenSession={openTerminal}
       onShowSettings={() => setShowSettings(true)}
       onShowCreateProject={() => setShowCreateProject(true)}
-      onPairNew={enterPairFromHome}
+      onOpenPorts={openPorts}
       onOpenHosts={openHosts}
     />
   ) : null;
@@ -1022,8 +1040,19 @@ export function App() {
     // open the pairing screen again), so that pairing screen behaves like a
     // first launch: no back button and no back swipe. The branch choices
     // live in navigationPolicy.pairScreenShowsBack so they stay tested.
-    const pairShowsBack = pairScreenShowsBack({ pairFromHosts, pairFromHome, hostsEmpty: hostsLoaded && hostRecords.length === 0 });
+    const pairShowsBack = pairScreenShowsBack({ pairFromHosts, hostsEmpty: hostsLoaded && hostRecords.length === 0 });
     return <PairScreen error={error} manualCode={manualCode} showManual={showManual} onManualCode={setManualCode} onShowManual={() => setShowManual(true)} onScan={() => void scan()} onPair={() => void pair(manualCode)} onBack={pairShowsBack ? backFromPairing : undefined} preview={pairShowsBack ? pairBackPreview : undefined} />;
+  }
+  if (view.type === "ports" && status === "connected" && connection && snapshot) {
+    return <PortsPage
+      snapshot={snapshot}
+      deviceId={connection.host.deviceId}
+      saving={portsSaving}
+      error={portsError}
+      onBack={navigateBack}
+      onSave={savePortBridging}
+      preview={homeView}
+    />;
   }
   if (view.type === "hosts" && (status === "connected" || status === "error")) {
     // Reached from home the live connection stays open and its row carries
@@ -1034,9 +1063,10 @@ export function App() {
   if (status === "error") return <ErrorScreen message={error} hostName={hostName || undefined} onRetry={() => window.location.reload()} onConnectDifferent={openHosts} />;
   if (!connection || !snapshot) return null;
 
-  // The "hosts" case is unreachable here (the hosts branch returned above);
-  // listing it keeps the union exhaustive for the type checker.
-  const requestedProjectId = view.type === "home" || view.type === "hosts" ? selectedProjectId : view.projectId;
+  // The "hosts" and "ports" cases are unreachable here (both branches
+  // returned above); listing them keeps the union exhaustive for the type
+  // checker.
+  const requestedProjectId = view.type === "home" || view.type === "hosts" || view.type === "ports" ? selectedProjectId : view.projectId;
   const requestedSessionId = view.type === "terminal" ? view.sessionId : selectedSessionId;
   // A terminal view follows its session even when a cd in the shell moves it
   // to another project: the phone stays attached, and the project shown (and
@@ -1532,7 +1562,7 @@ function ProjectCard({ project, sessions, completedHold, dragging, reordering, t
  * exactly the same thing: the preview instance sits in the zone's fill,
  * where pointer events are disabled, so its controls can never fire.
  */
-function HomeScreen({ snapshot, remoteRegistration, remoteStatus, remoteStatusLabel, orderedProjects, completedHold, projectDrag, projectReordering, transformFor, cardElement, onDragStart, onDragMove, onDragEnd, onRetryRegistration, onOpenProject, onOpenSession, onShowSettings, onShowCreateProject, onPairNew, onOpenHosts }: {
+function HomeScreen({ snapshot, remoteRegistration, remoteStatus, remoteStatusLabel, orderedProjects, completedHold, projectDrag, projectReordering, transformFor, cardElement, onDragStart, onDragMove, onDragEnd, onRetryRegistration, onOpenProject, onOpenSession, onShowSettings, onShowCreateProject, onOpenPorts, onOpenHosts }: {
   snapshot: HostSnapshot;
   remoteRegistration: RemoteRegistrationState;
   remoteStatus: RegistrationDisplayStatus;
@@ -1551,7 +1581,7 @@ function HomeScreen({ snapshot, remoteRegistration, remoteStatus, remoteStatusLa
   onOpenSession: (session: TerminalSession) => void;
   onShowSettings: () => void;
   onShowCreateProject: () => void;
-  onPairNew: () => void;
+  onOpenPorts: () => void;
   onOpenHosts: () => void;
 }) {
   return <div className="mobile-app home-view">
@@ -1567,7 +1597,7 @@ function HomeScreen({ snapshot, remoteRegistration, remoteStatus, remoteStatusLa
       </div>
       {!snapshot.projects.length && <div className="mobile-empty"><FolderIcon /><h2>No projects yet</h2><p>Add a folder from your desktop to begin.</p></div>}
     </section>
-    <nav className="bottom-nav"><button className="active"><FolderIcon /><span>Projects</span></button><button onClick={onPairNew}><ScanIcon /><span>Pair</span></button><button onClick={onOpenHosts}><WifiIcon /><span>Hosts</span></button></nav>
+    <nav className="bottom-nav"><button className="active"><FolderIcon /><span>Projects</span></button><button onClick={onOpenPorts}><PortsIcon /><span>Ports</span></button><button onClick={onOpenHosts}><WifiIcon /><span>Hosts</span></button></nav>
   </div>;
 }
 
@@ -1956,6 +1986,136 @@ function HostsPage({ records, loaded, connectedId, registration, online, checks,
       </div>}
     </section>
     <footer className="hosts-actions"><button className="mobile-primary full" onClick={onPairNew}><PlusIcon /> Pair a new desktop</button></footer>
+  </div></BackSwipeZone>;
+}
+
+/**
+ * A port field that commits when the user is done with it rather than on every
+ * keystroke. Typing "5173" passes through "5", "51" and "517", and each of
+ * those would be a round-trip to the desktop - and any of them may collide
+ * with another bridge on this phone, which `updateBridge` refuses, snapping
+ * the field back mid-word.
+ */
+function PortField({ port, disabled, onCommit }: { port: number; disabled: boolean; onCommit: (port: number) => void }) {
+  const [draft, setDraft] = useState(String(port));
+  const [editing, setEditing] = useState(false);
+  // While the user is not typing, the saved value wins: a rejected edit and a
+  // change made on the desktop both have to show up here.
+  const value = editing ? draft : String(port);
+
+  return <input
+    type="number"
+    inputMode="numeric"
+    min={MIN_BRIDGE_PORT}
+    max={MAX_BRIDGE_PORT}
+    value={value}
+    disabled={disabled}
+    onFocus={() => { setDraft(String(port)); setEditing(true); }}
+    onChange={(event) => setDraft(event.target.value)}
+    onBlur={() => {
+      setEditing(false);
+      const next = Number(draft);
+      if (isValidBridgePort(next) && next !== port) onCommit(next);
+    }}
+    onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }}
+  />;
+}
+
+/**
+ * This phone's port bridges, as configured on the desktop that owns them.
+ *
+ * The same operations as the desktop's per-device page: switch bridging on or
+ * off, add a port, choose which side runs the service, remove a port. Unlike
+ * the desktop's overview it lists only this phone, so a port another device
+ * holds shows up here as an ordinary status rather than a comparison.
+ */
+function PortsPage({ snapshot, deviceId, saving, error, onBack, onSave, preview }: {
+  snapshot: HostSnapshot;
+  deviceId: string;
+  saving: boolean;
+  error: string;
+  onBack: () => void;
+  onSave: (enabled: boolean, bridges: PortBridge[]) => void;
+  preview?: React.ReactNode;
+}) {
+  const bridging = normalizePortBridging(snapshot.devices.find((device) => device.id === deviceId)?.portBridging);
+  const bridges = sortedBridges(bridging.bridges);
+  const duplicates = new Set(duplicatePortIds(bridges));
+  const [draftPort, setDraftPort] = useState("");
+  const [draftServer, setDraftServer] = useState<PortBridgeServer>("host");
+
+  const port = Number(draftPort);
+  const canAdd = !saving && draftPort.trim() !== "" && canAddBridgePort(bridges, port);
+  const addError = draftPort.trim() === "" || canAddBridgePort(bridges, port)
+    ? ""
+    : bridges.some((bridge) => bridge.port === port)
+      ? `Port ${draftPort} is already bridged on this phone.`
+      : `Enter a port between ${MIN_BRIDGE_PORT} and ${MAX_BRIDGE_PORT}.`;
+
+  function add() {
+    if (!canAdd) return;
+    onSave(bridging.enabled, addBridge(bridges, port, draftServer));
+    setDraftPort("");
+  }
+
+  return <BackSwipeZone onBack={onBack} preview={preview}><div className="mobile-app ports-page">
+    <MobileHeader title="Ports" subtitle={`Bridged with ${snapshot.host.name}`} onBack={onBack} />
+    <section className="ports-section">
+      <label className="ports-toggle">
+        <span><strong>Bridge ports</strong><small>Bridges are set up when this phone connects and removed when it disconnects.</small></span>
+        <input type="checkbox" checked={bridging.enabled} disabled={saving} onChange={(event) => onSave(event.target.checked, bridging.bridges)} />
+        <i />
+      </label>
+
+      <div className="ports-list">
+        {bridges.length ? bridges.map((bridge) => {
+          const status = portBridgeStatusOf(snapshot.portBridgeStatuses, deviceId, bridge.id);
+          const state = bridging.enabled ? status?.state ?? "pending" : "disabled";
+          const warning = bridging.enabled ? bridgeWarningDetail(bridge, status) : "";
+          return <div className={`ports-row${duplicates.has(bridge.id) ? " is-invalid" : ""}`} key={bridge.id}>
+            <label className="ports-field">Port<PortField
+              port={bridge.port}
+              disabled={saving}
+              onCommit={(port) => onSave(bridging.enabled, updateBridge(bridges, bridge.id, { port }))}
+            /></label>
+            <label className="ports-field">Server<select
+              value={bridge.server}
+              disabled={saving}
+              onChange={(event) => onSave(bridging.enabled, updateBridge(bridges, bridge.id, { server: event.target.value as PortBridgeServer }))}
+            >
+              <option value="host">The desktop</option>
+              <option value="client">This phone</option>
+            </select></label>
+            <button className="ports-remove" disabled={saving} onClick={() => onSave(bridging.enabled, removeBridge(bridges, bridge.id))} aria-label={`Remove port ${bridge.port}`}><TrashIcon /></button>
+            <div className="ports-meta">
+              <small>{bridgeDirectionLabel(bridge, "mobile")}</small>
+              <span className={`ports-state is-${state}`}>{bridgeStateLabel(state)}</span>
+              {warning && <span className="ports-warning" role="img" aria-label={warning} title={warning}><WarningIcon /></span>}
+            </div>
+            {warning && <p className="ports-warning-text">{warning}</p>}
+          </div>;
+        }) : <div className="ports-empty">No ports yet. Add one below to reach a service on the desktop from this phone, or the other way around.</div>}
+      </div>
+
+      <div className="ports-row is-draft">
+        <label className="ports-field">Port<input
+          type="number"
+          inputMode="numeric"
+          min={MIN_BRIDGE_PORT}
+          max={MAX_BRIDGE_PORT}
+          placeholder="5173"
+          value={draftPort}
+          disabled={saving}
+          onChange={(event) => setDraftPort(event.target.value)}
+        /></label>
+        <label className="ports-field">Server<select value={draftServer} disabled={saving} onChange={(event) => setDraftServer(event.target.value as PortBridgeServer)}>
+          <option value="host">The desktop</option>
+          <option value="client">This phone</option>
+        </select></label>
+        <button className="ports-add" disabled={!canAdd} onClick={add} aria-label="Add port"><PlusIcon /></button>
+      </div>
+      {(addError || error) && <div className="ports-error">{addError || error}</div>}
+    </section>
   </div></BackSwipeZone>;
 }
 

@@ -44,6 +44,16 @@ describe("desktop modal escape", () => {
     assert.equal(nextModalOnEscape("pair", true, 0), null);
   });
 
+  it("steps back from a device's port list to the Port Bridge page", () => {
+    assert.equal(nextModalOnEscape("bridgeDevice", false, 1), "bridges");
+    assert.equal(nextModalOnEscape("bridgeDevice", true, 1), "bridges");
+  });
+
+  it("closes the Port Bridge page", () => {
+    assert.equal(nextModalOnEscape("bridges", false, 1), null);
+    assert.equal(nextModalOnEscape("bridges", false, 0), null);
+  });
+
   it("closes the rename modal before a rename is in flight", () => {
     assert.equal(nextModalOnEscape("rename", false, 0), null);
     assert.equal(nextModalOnEscape("rename", false, 2), null);
@@ -73,6 +83,8 @@ describe("desktop modal after pairing succeeds", () => {
   it("leaves other modals untouched", () => {
     assert.equal(nextModalAfterPairing("settings"), "settings");
     assert.equal(nextModalAfterPairing("devices"), "devices");
+    assert.equal(nextModalAfterPairing("bridges"), "bridges");
+    assert.equal(nextModalAfterPairing("bridgeDevice"), "bridgeDevice");
     assert.equal(nextModalAfterPairing("rename"), "rename");
   });
 

@@ -7,7 +7,7 @@
  */
 
 export type AppStatus = "loading" | "pairing" | "connecting" | "connected" | "error";
-export type ViewType = "home" | "hosts" | "project" | "terminal";
+export type ViewType = "home" | "hosts" | "ports" | "project" | "terminal";
 
 export interface BackNavigationState {
   status: AppStatus;
@@ -21,8 +21,6 @@ export interface BackNavigationState {
   showCreateProject: boolean;
   /** The user reached the pairing screen from the hosts page. */
   pairFromHosts: boolean;
-  /** The user reached the pairing screen from the home view's bottom nav. */
-  pairFromHome: boolean;
   /** The hosts page finished loading and has no paired desktops. */
   hostsEmpty: boolean;
 }
@@ -42,10 +40,10 @@ export type BackAction =
 
 /**
  * Sheets close before anything else: an overlay always owns the back control
- * while it is open. The "pairing reached from the hosts page or the home
- * bottom nav" branch must run *before* the "not connected" guard - the user
- * is on the pairing screen (not connected) but back must restore the page the
- * pairing screen was opened from instead of doing nothing or exiting the app.
+ * while it is open. The "pairing reached from the hosts page" branch must run
+ * *before* the "not connected" guard - the user is on the pairing screen (not
+ * connected) but back must restore the page it was opened from instead of
+ * doing nothing or exiting the app.
  */
 export function backButtonAction(state: BackNavigationState): BackAction {
   if (state.showTerminalSettings) return "closeTerminalSettings";
@@ -53,7 +51,7 @@ export function backButtonAction(state: BackNavigationState): BackAction {
   if (state.hasRenameSheet) return "closeRenameSheet";
   if (state.hasCloseSessionSheet) return "closeSessionSheet";
   if (state.showCreateProject) return "closeCreateProject";
-  if (state.status === "pairing" && (state.pairFromHosts || state.pairFromHome)) return "backFromPairing";
+  if (state.status === "pairing" && state.pairFromHosts) return "backFromPairing";
   if (state.status !== "connected") {
     // The hosts page is also reachable from the try-again screen; back leaves
     // it, the view resets, and the unchanged error status re-lands the user
@@ -63,6 +61,9 @@ export function backButtonAction(state: BackNavigationState): BackAction {
   }
   if (state.viewType === "terminal") return "navToProject";
   if (state.viewType === "hosts") return hostsPageBackAction(state);
+  // The ports page is opened from the home bottom nav, so back always has the
+  // home view to return to.
+  if (state.viewType === "ports") return "navToHome";
   if (state.viewType === "project") return "navToHome";
   return "exitApp";
 }
@@ -80,13 +81,11 @@ function hostsPageBackAction(state: BackNavigationState): BackAction {
 
 /**
  * Whether the pairing screen shows its back control (the header button and
- * the back-swipe gesture):
- *  - reached from the home bottom nav, back always lands somewhere useful
- *    (the home view or the try-again screen) - show it;
- *  - reached from the hosts page, back restores that page - show it, unless
- *    the hosts list is loaded and empty: there, back would just open the
- *    pairing screen again (a loop), so the screen behaves like a first
- *    launch and hides its back control.
+ * the back-swipe gesture). The screen is reached from the hosts page, and
+ * back restores it - unless the hosts list is loaded and empty: there, back
+ * would just open the pairing screen again (a loop), so the screen behaves
+ * like a first launch and hides its back control.
+ *
  * The Android back key is deliberately decoupled from this: it still acts
  * (backFromPairing) in every pairing state, because it is the only exit a
  * first-launch-style screen offers.
@@ -94,14 +93,11 @@ function hostsPageBackAction(state: BackNavigationState): BackAction {
 export interface PairBackControlInput {
   /** The user reached the pairing screen from the hosts page. */
   pairFromHosts: boolean;
-  /** The user reached the pairing screen from the home view's bottom nav. */
-  pairFromHome: boolean;
   /** The hosts page finished loading and has no paired desktops. */
   hostsEmpty: boolean;
 }
 
 export function pairScreenShowsBack(input: PairBackControlInput): boolean {
-  if (input.pairFromHome) return true;
   return input.pairFromHosts && !input.hostsEmpty;
 }
 
@@ -109,8 +105,7 @@ export function pairScreenShowsBack(input: PairBackControlInput): boolean {
 
 export interface PairingRestoreInput {
   /** Status captured when the pairing screen was opened. "error" means the
-   * hosts page was reached from the try-again screen; the bottom-nav path
-   * always captures "connected". */
+   * hosts page was reached from the try-again screen. */
   prePairStatus: "connected" | "error";
   /** The live connection's socket is open right now. */
   liveConnectionOpen: boolean;

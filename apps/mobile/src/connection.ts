@@ -2,6 +2,8 @@ import { Preferences } from "@capacitor/preferences";
 import { Capacitor } from "@capacitor/core";
 import type { ClientMessage, DeviceIdentity, HostSnapshot, PairingPayload, ServerMessage, SessionActivity, TaskbarProgress, TuiMode } from "@agentterminal/protocol";
 import { createRequestId, decodeServerMessage, encodeMessage, LAN_CONNECT_TIMEOUT_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, VIEWPORT_KEEPALIVE_INTERVAL_MS } from "@agentterminal/protocol";
+import type { PortBridge, PortBridgeStatus } from "@agentterminal/protocol";
+import { bridgingEnabledFor, phoneBridgeSpecs, sameBridgeSpecs, type NodeBridgeSpec } from "./portBridges";
 import { deviceName } from "./device";
 import { canAttemptConnection, heartbeatActive, heartbeatCatchUpNeeded, heartbeatIntervalMs, nextReconnectDelay, RECONNECT_BASE_DELAY_MS, RECONNECT_MAX_DELAY_MS } from "./connectionPolicy";
 import { EmbeddedNodeEngine, type EmbeddedNodeState } from "./embedded-engine";
@@ -89,6 +91,19 @@ export class HostConnection {
   private remoteRegistration: RemoteRegistrationState;
   private pending = new Map<string, { resolve: (message: ServerMessage) => void; reject: (error: Error) => void }>();
   private listeners = new Map<keyof EventMap, Set<(value: never) => void>>();
+  /** The desired state last handed to the node, so an unchanged snapshot does
+   * not rewrite the file the node is polling. */
+  private publishedBridges: NodeBridgeSpec[] = [];
+  private bridgeRevision = 0;
+  /** The failures last reported to the host, so a steady state is silent. */
+  private reportedBridgeFailures = "";
+  private bridgeSyncRunning = false;
+  /** A snapshot arrived while a sync was running; run one more pass. */
+  private bridgeSyncQueued = false;
+  /** The overlay address this phone's node came up on, as reported to the
+   * host on *this* connection. The host tracks it per connection, so a
+   * reconnect has to report it again. */
+  private nodeAddress?: string;
   snapshot?: HostSnapshot;
 
   constructor(public readonly host: SavedHost) {
@@ -638,6 +653,12 @@ export class HostConnection {
 
   private async connectOnce(): Promise<HostSnapshot> {
     this.authenticated = false;
+    // The host tracks a device's overlay address and its bridges per
+    // connection, so a reconnect starts from nothing on its side and this
+    // one must re-report rather than assume the previous connection's state.
+    this.nodeAddress = undefined;
+    this.publishedBridges = [];
+    this.reportedBridgeFailures = "";
     this.stopHeartbeat();
     this.clearReconnectTimer();
     if (this.socket) this.abortSocket();
@@ -745,6 +766,119 @@ export class HostConnection {
     }
   }
 
+  /**
+   * Replace this phone's own Port Bridge configuration on the desktop, which
+   * owns it. The host answers with a snapshot, so the page re-renders from
+   * the desktop's view of the change rather than from a local guess.
+   */
+  async setPortBridging(enabled: boolean, bridges: PortBridge[]): Promise<HostSnapshot> {
+    const response = await this.request({ type: "bridge.set", requestId: createRequestId(), enabled, bridges });
+    if (response.type !== "snapshot") throw new Error("The desktop did not accept the port bridge change.");
+    this.snapshot = response.snapshot;
+    this.emit("snapshot", response.snapshot);
+    return response.snapshot;
+  }
+
+  /**
+   * Bring this phone's half of the bridges in line with the host's
+   * arbitration, and tell the host about anything the node could not open.
+   *
+   * The node is started even on a LAN connection: a bridge runs through the
+   * overlay whatever transport the terminal socket happens to be using, so a
+   * phone that is bridging keeps its node up either way.
+   */
+  private async syncPortBridges(): Promise<void> {
+    // Reporting the node address makes the host answer with a fresh snapshot,
+    // so this re-enters while it is still running. Queue instead of dropping:
+    // the snapshot that finally marks the bridges active often arrives during
+    // that very call, and dropping it would leave them unopened until the
+    // next heartbeat.
+    if (this.bridgeSyncRunning) { this.bridgeSyncQueued = true; return; }
+    this.bridgeSyncRunning = true;
+    try {
+      if (!bridgingEnabledFor(this.snapshot, this.host.deviceId)) {
+        if (!this.publishedBridges.length) return;
+      } else if (!this.nodeAddress) {
+        // The host cannot bridge anything for a device whose overlay address
+        // it does not know, so bringing the node up is the first step.
+        await this.reportNodeAddress();
+      }
+
+      // Read the desired state only now: the await above replaced the
+      // snapshot with the one that reflects the address we just reported.
+      const wanted = phoneBridgeSpecs(this.snapshot, this.host.deviceId);
+      if (!sameBridgeSpecs(wanted, this.publishedBridges)) {
+        this.bridgeRevision += 1;
+        await this.embeddedEngine.setBridges(wanted, this.bridgeRevision);
+        this.publishedBridges = wanted;
+      }
+      await this.reportBridgeFailures();
+    } catch {
+      // A node that is unavailable simply leaves the bridges pending; the
+      // next snapshot retries.
+    } finally {
+      this.bridgeSyncRunning = false;
+      if (this.bridgeSyncQueued) {
+        this.bridgeSyncQueued = false;
+        void this.syncPortBridges();
+      }
+    }
+  }
+
+  /**
+   * Tear this phone's half down. The host drops a device's bridges the moment
+   * it disconnects, so leaving local listeners up would only offer sockets
+   * that forward nowhere.
+   */
+  private async teardownPortBridges(): Promise<void> {
+    this.nodeAddress = undefined;
+    this.reportedBridgeFailures = "";
+    if (!this.publishedBridges.length) return;
+    this.publishedBridges = [];
+    this.bridgeRevision += 1;
+    try {
+      await this.embeddedEngine.setBridges([], this.bridgeRevision);
+    } catch {
+      // Nothing to tear down if the node is already gone.
+    }
+  }
+
+  /**
+   * Start this phone's node if needed and tell the host the address it came
+   * up on. The host needs it as the dial target for a bridge it reaches and
+   * as the peer allowlist entry for one it serves.
+   */
+  private async reportNodeAddress(): Promise<void> {
+    const remoteEndpoint = this.host.remoteEndpoint ?? defaultRemoteEndpoint(this.host.id);
+    const state = await this.embeddedEngine.start(
+      this.host.controlUrl ?? OVERLAY_CONTROL_URL,
+      remoteEndpoint,
+      this.host.remoteTransport ?? "overlay",
+      undefined,
+      true
+    );
+    if (!state.tailnetAddress) return;
+    this.nodeAddress = state.tailnetAddress;
+    await this.request({ type: "bridge.node", requestId: createRequestId(), tailnetAddress: state.tailnetAddress });
+  }
+
+  private async reportBridgeFailures(): Promise<void> {
+    const reported = await this.embeddedEngine.bridgeStatus();
+    const statuses: PortBridgeStatus[] = reported
+      .filter((entry) => entry.state === "failed")
+      .map((entry) => ({
+        bridgeId: entry.id,
+        state: "failed" as const,
+        detail: entry.error
+          ? `This phone could not open its side of the bridge (${entry.error}).`
+          : "This phone could not open its side of the bridge."
+      }));
+    const signature = JSON.stringify(statuses);
+    if (signature === this.reportedBridgeFailures) return;
+    this.reportedBridgeFailures = signature;
+    this.send({ type: "bridge.status", statuses });
+  }
+
   on<K extends keyof EventMap>(event: K, callback: (value: EventMap[K]) => void): () => void {
     const callbacks = this.listeners.get(event) ?? new Set();
     callbacks.add(callback as (value: never) => void);
@@ -836,6 +970,7 @@ export class HostConnection {
         this.authenticated = false;
         this.stopHeartbeat();
         this.rejectAll(new Error("Desktop disconnected."));
+        void this.teardownPortBridges();
         if (!this.closed) {
           this.emit("disconnected", undefined);
           this.scheduleReconnect();
@@ -969,6 +1104,11 @@ export class HostConnection {
     if (message.type === "session.taskbar") { this.applyTaskbar(message.sessionId, message.taskbar); return; }
     if (message.type === "snapshot") { this.snapshot = message.snapshot; this.emit("snapshot", message.snapshot); }
     if ((message.type === "auth.accepted" || message.type === "pair.accepted") && message.snapshot) this.snapshot = message.snapshot;
+    // Every snapshot carries the host's arbitration, so this is where this
+    // phone learns which of its bridges it is allowed to open.
+    if (message.type === "snapshot" || message.type === "auth.accepted" || message.type === "pair.accepted") {
+      void this.syncPortBridges();
+    }
     const requestId = "requestId" in message ? message.requestId : undefined;
     if (requestId) {
       const pending = this.pending.get(requestId);
@@ -1043,6 +1183,7 @@ export class HostConnection {
     this.stopHeartbeat();
     socket.close();
     this.rejectAll(new Error("Desktop disconnected."));
+    void this.teardownPortBridges();
     if (!this.closed) {
       this.emit("disconnected", undefined);
       this.scheduleReconnect();

@@ -1,4 +1,4 @@
-import type { HostSnapshot, PairingPayload, Project, SessionActivity, SessionSegment, TaskbarProgress, TerminalSession, TuiMode } from "@agentterminal/protocol";
+import type { HostSnapshot, PairingPayload, PortBridge, Project, SessionActivity, SessionSegment, TaskbarProgress, TerminalSession, TuiMode } from "@agentterminal/protocol";
 
 export interface DesktopState extends HostSnapshot {
   currentProjectId: string;
@@ -68,6 +68,12 @@ export interface DesktopApi {
   startPairing(): Promise<PairingPayload>;
   retryRemoteRegistration(): Promise<void>;
   revokeDevice(deviceId: string): Promise<void>;
+  /** Replace a device's Port Bridge configuration. Ports the user picks are
+   * saved as configured even when another device currently holds one: the
+   * host arbitrates collisions between devices at connection time and reports
+   * the loser as a conflict, so the bridge comes up on its own once the
+   * holder disconnects. */
+  setDevicePortBridging(deviceId: string, enabled: boolean, bridges: PortBridge[]): Promise<void>;
   setDefaultShell(shellId: string): Promise<void>;
   /** Register this app as the user's default terminal app (Windows, per-user
    * registry; no elevation). Resolves once the choice is stored. */

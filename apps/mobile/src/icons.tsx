@@ -16,3 +16,5 @@ export const SettingsIcon = (p: Props) => <svg {...base} {...p}><circle cx="12" 
 export const WifiIcon = (p: Props) => <svg {...base} {...p}><path d="M5 12.5a10 10 0 0 1 14 0M8 16a6 6 0 0 1 8 0M11 19.5a2 2 0 0 1 2 0"/></svg>;
 export const TrashIcon = (p: Props) => <svg {...base} {...p}><path d="M4.5 7h15M9.5 7V4.5h5V7M6.5 7l1 13h9l1-13"/></svg>;
 export const RefreshIcon = (p: Props) => <svg {...base} {...p}><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8"/><path d="M21 3v5h-5"/></svg>;
+export const PortsIcon = (p: Props) => <svg {...base} {...p}><rect x="2.5" y="4" width="6" height="6" rx="1.5"/><rect x="15.5" y="14" width="6" height="6" rx="1.5"/><path d="M5.5 10v4.5a2 2 0 0 0 2 2h8"/><path d="M18.5 14V9.5a2 2 0 0 0-2-2h-8"/></svg>;
+export const WarningIcon = (p: Props) => <svg {...base} {...p}><path d="M12 4.5 21 19.5H3z"/><path d="M12 10v4"/><path d="M12 17h.01"/></svg>;
