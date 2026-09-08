@@ -139,3 +139,66 @@ test("the squished accessibility layer is laid out inside the scaled wrapper", (
   assert.ok(styles.includes(".mobile-terminal .xterm .xterm-accessibility-tree > div { transform: none !important; }"),
     "xterm's own double-correcting row transforms must stay disabled");
 });
+
+test("mobile terminal taps are remapped through the inverse squish before xterm reads them", () => {
+  // xterm's mouse tracking (the reports a TUI receives for a tap) reads the
+  // pointer through the post-transform box but divides by its layout cell
+  // width, so a squished tap reports an offset column. The app must re-map the
+  // tap's viewport x back through the wrapper scale before xterm's own
+  // mousedown/wheel/mousemove/mouseup handlers read it.
+  const terminal = source("MobileTerminal.tsx");
+
+  assert.ok(terminal.includes("inverseSquishClientX"),
+    "the inverse squish remap must be imported from terminalSquish");
+  assert.ok(terminal.includes("const remapped = inverseSquishClientX(event.clientX, screenElement.getBoundingClientRect().left, renderScaleRef.current)"),
+    "the tap's clientX must be remapped against the screen element's live left edge and the painted scale");
+  assert.ok(terminal.includes('hostElement.querySelector<HTMLElement>(".xterm-screen")'),
+    "the remap must anchor to the same .xterm-screen element xterm measures against");
+
+  // The remap must reach xterm by shadowing the event's own clientX, in a
+  // capture-phase listener on the host that runs ahead of xterm's bubble-phase
+  // listeners on the terminal root.
+  assert.ok(terminal.includes("Object.defineProperty(event, \"clientX\", { value: remapped, configurable: true, writable: true, enumerable: true })"),
+    "the remapped x must shadow the event's clientX so xterm reads it");
+  assert.ok(terminal.includes("hostElement.addEventListener(\"mousedown\", handleSquishMouse, true)"),
+    "the mousedown remap must be capture-phase on the host");
+  assert.ok(terminal.includes("hostElement.addEventListener(\"wheel\", handleSquishMouse, { passive: true, capture: true })"),
+    "the wheel remap must be capture-phase and passive so it never delays scrolling");
+
+  // And the listeners must be torn down on unmount, or they leak across
+  // re-attach and keep remapping a dead host.
+  assert.ok(terminal.includes("hostElement.removeEventListener(\"mousedown\", handleSquishMouse, true)"),
+    "the mousedown remap listener must be removed on cleanup");
+  assert.ok(terminal.includes("hostElement.removeEventListener(\"wheel\", handleSquishMouse, true)"),
+    "the wheel remap listener must be removed on cleanup");
+});
+
+test("the tap remap degrades safely on its edge cases", () => {
+  // The remap handler must not crash or rewrite the event when the terminal
+  // is not ready or when there is nothing to correct - the coordinate must
+  // pass straight through to xterm in those cases.
+  const terminal = source("MobileTerminal.tsx");
+
+  assert.ok(terminal.includes("const screenElement = hostElement.querySelector<HTMLElement>(\".xterm-screen\");\n      if (!screenElement) return;"),
+    "a not-yet-mounted screen element must short-circuit, not remap against undefined");
+  assert.ok(terminal.includes("if (remapped === event.clientX) return;"),
+    "a no-op remap (scale 1 or an already-correct x) must skip the event rewrite");
+
+  // The shadow must be best-effort: if the event object is frozen the tap
+  // still reaches the terminal (at the un-corrected offset) rather than the
+  // whole gesture throwing.
+  assert.ok(terminal.includes("Object.defineProperty(event, \"clientX\", { value: remapped, configurable: true, writable: true, enumerable: true })"),
+    "the clientX shadow must define an own, configurable, writable value");
+  assert.ok(terminal.includes("} catch {"),
+    "the clientX shadow must be wrapped so a frozen event cannot throw");
+
+  // Every mouse-tracking event type xterm reads must be remapped in capture
+  // (so it wins the ordering race against xterm's bubble handlers), and all
+  // four must be torn down on cleanup.
+  for (const type of ["mousedown", "mouseup", "mousemove"]) {
+    assert.ok(terminal.includes(`hostElement.addEventListener(\"${type}\", handleSquishMouse, true)`),
+      `the ${type} remap must be a capture listener on the host`);
+    assert.ok(terminal.includes(`hostElement.removeEventListener(\"${type}\", handleSquishMouse, true)`),
+      `the ${type} remap listener must be removed on cleanup`);
+  }
+});

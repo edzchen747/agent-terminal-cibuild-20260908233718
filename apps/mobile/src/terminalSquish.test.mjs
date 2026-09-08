@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { TERMINAL_FONT_SIZE, calibratedSquishFontSize, squishAdvanceRatio, squishedCharAdvance, squishFontSize, squishInverse, squishLineHeight, squishNetScale, squishWidthPercent } from "./terminalSquish.ts";
+import { TERMINAL_FONT_SIZE, calibratedSquishFontSize, inverseSquishClientX, squishAdvanceRatio, squishedCharAdvance, squishFontSize, squishInverse, squishLineHeight, squishNetScale, squishWidthPercent } from "./terminalSquish.ts";
 
 const BASE_CELL_WIDTH = 7.2;
 
@@ -129,4 +129,124 @@ test("the squished font size tracks the terminal's live, possibly-zoomed font si
   const ratio = 1.1;
   const fontSize = calibratedSquishFontSize(zoomedFontSize, 0.8, ratio);
   assert.equal(fontSize, `${zoomedFontSize * 0.8 * ratio}px`);
+});
+
+test("the inverse squish maps a viewport tap back through the wrapper scale", () => {
+  // xterm reads a tap's x through the post-transform (visual) box but divides
+  // by its pre-transform (layout) cell width, so the two must be reconciled.
+  // A visual offset from the terminal's (unmoved) left edge is a LAYOUT offset
+  // divided by the scale, so the remapped x anchors the visual offset back at
+  // the left edge scaled by 1/scale.
+  const left = 100;
+  // scale < 1 (squished, wider than the layout): a tap nearer the right edge
+  // is closer to the left edge in layout space than in visual space.
+  assertMachineEqual(inverseSquishClientX(left + 90, left, 0.5), left + 180);
+  // scale > 1 (stretched): a tap is farther from the left edge in layout space.
+  assertMachineEqual(inverseSquishClientX(left + 30, left, 3), left + 10);
+  // The remap is a pure re-anchor: clientX maps to the same visual point.
+  assertMachineEqual(inverseSquishClientX(left + 42, left, 0.65), left + (42 / 0.65));
+});
+
+test("a unity or invalid scale leaves the tap coordinate unchanged", () => {
+  const left = 12;
+  // scale === 1 is the unsquished terminal: the coordinate must pass through
+  // untouched, so a no-squish phone is never affected by the remap.
+  assert.equal(inverseSquishClientX(200, left, 1), 200);
+  // A degenerate scale (0, negative, NaN) must not divide by zero or poison
+  // the coordinate - it degrades to the un-remapped value.
+  for (const scale of [0, -1, Number.NaN]) {
+    assert.equal(inverseSquishClientX(200, left, scale), 200);
+  }
+  // Non-finite inputs must pass through rather than produce NaN.
+  assert.equal(inverseSquishClientX(Number.NaN, left, 0.5), Number.NaN);
+  assert.equal(inverseSquishClientX(200, Number.NaN, 0.5), 200);
+});
+
+test("the remap is the exact inverse of the forward squish (net identity round-trip)", () => {
+  // A layout x paints at visual x = left + (layoutX - left) * scale. Running
+  // that visual coordinate through inverseSquishClientX must recover the
+  // original layout x - the forward and inverse transforms cancel - for any
+  // left, any positive scale, and any layout x (including outside the box).
+  const cases = [
+    { left: 100, scale: 0.5, xs: [0, 50, 100, 200, 300, 1000] },
+    { left: 0, scale: 1, xs: [-3, 0, 1, 42] },
+    { left: 0, scale: 2.5, xs: [0, 16, 64, 1024] },
+    { left: 0, scale: 0.65, xs: [0, 7.2, 7.03125, 403.2] } // fractional/sub-pixel cells
+  ];
+  for (const { left, scale, xs } of cases) {
+    for (const layoutX of xs) {
+      const visualX = left + (layoutX - left) * scale;
+      assertMachineEqual(inverseSquishClientX(visualX, left, scale), layoutX,
+        `round-trip failed for left=${left} scale=${scale} layoutX=${layoutX}`);
+    }
+  }
+});
+
+test("a tap on the terminal's left edge is the fixed point of the remap", () => {
+  // The transform origin sits on the left edge, so that edge does not move
+  // under the scaleX. A tap exactly on it must map to itself for ANY scale
+  // (including the squished and stretched cases), and a tap anywhere on a
+  // degenerate box (clientX === elementLeft) is a no-op.
+  for (const scale of [0.1, 0.5, 0.65, 1.5, 3]) {
+    assertMachineEqual(inverseSquishClientX(250, 250, scale), 250);
+  }
+});
+
+test("taps outside the terminal's right edge keep remapping linearly", () => {
+  // A drag that runs off the right edge still reports a column (xterm clamps
+  // it to the last one), so the remap must stay a valid linear map there too -
+  // it must not saturate, flip, or produce NaN for large positive offsets.
+  const left = 100;
+  assertMachineEqual(inverseSquishClientX(left + 100000, left, 0.5), left + 200000);
+  assertMachineEqual(inverseSquishClientX(left + 100000, left, 4), left + 25000);
+  // And a tap far to the LEFT of the element (negative offset) maps left of
+  // the element in layout space as well - the offset just grows by 1/scale.
+  assertMachineEqual(inverseSquishClientX(left - 40, left, 0.5), left - 80);
+});
+
+test("a negative elementLeft (scrolled / off-screen terminal) still remaps correctly", () => {
+  // The page can be scrolled so the terminal's viewport x is negative. The
+  // remap is anchored at that left edge, so a negative left must not break the
+  // round-trip or the arithmetic.
+  const left = -120;
+  for (const layoutX of [-400, -120, 0, 300]) {
+    const visualX = left + (layoutX - left) * 0.75;
+    assertMachineEqual(inverseSquishClientX(visualX, left, 0.75), layoutX);
+  }
+  // A clientX of 0 (the viewport origin) with a negative left is a plain
+  // linear offset from the left edge.
+  assertMachineEqual(inverseSquishClientX(0, -100, 0.5), -100 + 200);
+});
+
+test("infinite and non-finite coordinates and scales degrade to pass-through", () => {
+  // Infinity / -Infinity coordinates are not finite, so they must pass
+  // through untouched rather than turn into NaN.
+  assert.equal(inverseSquishClientX(Number.POSITIVE_INFINITY, 100, 0.5), Number.POSITIVE_INFINITY);
+  assert.equal(inverseSquishClientX(Number.NEGATIVE_INFINITY, 100, 0.5), Number.NEGATIVE_INFINITY);
+  // An infinite elementLeft is not finite either - pass through the clientX.
+  assert.equal(inverseSquishClientX(200, Number.POSITIVE_INFINITY, 0.5), 200);
+  // An infinite or non-finite scale must not be divided: the coordinate is
+  // returned un-remapped (the same path as a scale of 0).
+  for (const scale of [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NaN]) {
+    assert.equal(inverseSquishClientX(200, 100, scale), 200);
+  }
+});
+
+test("a negative-zero scale is treated as a degenerate scale (no-op)", () => {
+  // -0 > 0 is false, so -0 takes the same safe path as 0: no division, the
+  // coordinate passes through. This guards against a scale of -0 sneaking in
+  // and producing a sign-flipped division.
+  assert.equal(inverseSquishClientX(200, 100, -0), 200);
+});
+
+test("extreme (very small / very large) scales stay numerically sane", () => {
+  // The fill pass clamps the scale into a sane band, but the helper must not
+  // overflow or underflow on an extreme input: a tiny scale magnifies the
+  // offset by 1/scale and a huge one shrinks it, both still finite and exact.
+  const left = 100;
+  assertMachineEqual(inverseSquishClientX(left + 1, left, 0.001), left + 1000);
+  assertMachineEqual(inverseSquishClientX(left + 1000, left, 1000), left + 1);
+  // Sub-pixel inputs stay sub-pixel (no rounding to integer pixels).
+  assertMachineEqual(inverseSquishClientX(100.5, 100, 0.5), 101);
+  assertMachineEqual(inverseSquishClientX(100.25, 100, 0.5), 100.5);
 });

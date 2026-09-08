@@ -10,7 +10,7 @@ import type { TimedTerminalInput } from "./terminalInput";
 import { announcedViewport, shouldSendResize } from "./terminalResize";
 import { keyboardOpenByLayout, keyboardLayoutReference, keyboardOpenState, type KeyboardLayoutReference } from "./terminalKeyboard";
 import { terminalFocusAction, type TerminalFocusAction } from "./terminalFocus";
-import { TERMINAL_FONT_SIZE, calibratedSquishFontSize, squishAdvanceRatio, squishInverse as squishInverseValue, squishLineHeight as squishLineHeightValue, squishWidthPercent } from "./terminalSquish";
+import { TERMINAL_FONT_SIZE, calibratedSquishFontSize, inverseSquishClientX, squishAdvanceRatio, squishInverse as squishInverseValue, squishLineHeight as squishLineHeightValue, squishWidthPercent } from "./terminalSquish";
 import { TERMINAL_FONT_FAMILY, preloadTerminalFonts } from "./terminalFonts";
 import { activateTerminalCursor, deactivateTerminalCursor } from "./terminalCursor";
 import { guardUtilityKeySelection } from "./utilityKeySelection";
@@ -1021,6 +1021,37 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       if (touchAxis === "horizontal" && !selectionGesture && !terminal.hasSelection() && !hasNativeSelection()) clearTouchSelection();
       resetTouch();
     };
+    // xterm's mouse tracking - the reports a TUI app receives for a tap or
+    // drag - reads the pointer through the terminal's POST-transform box
+    // (getBoundingClientRect) but divides by its PRE-transform (layout) cell
+    // width, so on the squished wrapper every reported column is offset from
+    // the finger by the character-width scale. Re-map the tap's viewport x
+    // back through the wrapper's scaleX before xterm's own handlers read it,
+    // so the click lands on the cell the finger is actually over. A capture
+    // listener on the host runs ahead of xterm's bubble-phase listeners on
+    // the terminal root (and its document-level mouseup), and shadows the
+    // event's clientX with the remapped value; when the scale is 1 the
+    // remap is a no-op and nothing is rewritten.
+    const handleSquishMouse = (event: MouseEvent | WheelEvent) => {
+      const screenElement = hostElement.querySelector<HTMLElement>(".xterm-screen");
+      if (!screenElement) return;
+      const remapped = inverseSquishClientX(event.clientX, screenElement.getBoundingClientRect().left, renderScaleRef.current);
+      if (remapped === event.clientX) return;
+      try {
+        // xterm reads clientX off the very event object its mousedown/wheel/
+        // mousemove/mouseup handlers receive; an own value shadows the
+        // prototype getter and hands it the remapped coordinate. clientY is
+        // untouched: the squish is horizontal only.
+        Object.defineProperty(event, "clientX", { value: remapped, configurable: true, writable: true, enumerable: true });
+      } catch {
+        // A frozen event cannot be remapped; the input still reaches the
+        // terminal, just at the un-corrected offset.
+      }
+    };
+    hostElement.addEventListener("mousedown", handleSquishMouse, true);
+    hostElement.addEventListener("mouseup", handleSquishMouse, true);
+    hostElement.addEventListener("mousemove", handleSquishMouse, true);
+    hostElement.addEventListener("wheel", handleSquishMouse, { passive: true, capture: true });
     hostElement.addEventListener("touchstart", handleTouchStart, { passive: true });
     hostElement.addEventListener("touchmove", handleTouchMove, { passive: false });
     hostElement.addEventListener("touchend", handleTouchEnd, { passive: true });
@@ -1192,6 +1223,10 @@ export function MobileTerminal({ connection, session, active, fontWidthScale, sc
       hostElement.removeEventListener("touchmove", handleTouchMove);
       hostElement.removeEventListener("touchend", handleTouchEnd);
       hostElement.removeEventListener("touchcancel", handleTouchCancel);
+      hostElement.removeEventListener("mousedown", handleSquishMouse, true);
+      hostElement.removeEventListener("mouseup", handleSquishMouse, true);
+      hostElement.removeEventListener("mousemove", handleSquishMouse, true);
+      hostElement.removeEventListener("wheel", handleSquishMouse, true);
       clearLongPressTimer();
       if (statsTimer !== undefined) window.clearInterval(statsTimer);
       connected(); gridChange(); modeChange(); input.dispose(); output(); httpLinkProvider.dispose(); searchResults.dispose(); search.dispose(); searchRef.current = null; terminal.dispose(); terminalRef.current = null;

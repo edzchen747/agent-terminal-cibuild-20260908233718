@@ -58,6 +58,21 @@ export function squishNetScale(scale: number): number {
   return squishInverse(scale) * scale;
 }
 
+// xterm's mouse tracking (the reports a TUI receives for a tap) reads the tap
+// through the terminal's POST-transform box - getBoundingClientRect - but then
+// divides by its PRE-transform (layout) cell width. On the squished wrapper
+// the two spaces differ by exactly the scaleX scale, so a tap reports a column
+// offset from the finger by that factor. Map a viewport (visual) x coordinate
+// back through the wrapper scale, anchored at the terminal's own (unmoved, the
+// transform origin sits on its left edge) left edge, so the coordinate xterm
+// reads is in the same layout space as its cell width and the click lands on
+// the cell the finger is actually over.
+export function inverseSquishClientX(clientX: number, elementLeft: number, scale: number): number {
+  if (!(Number.isFinite(clientX)) || !Number.isFinite(elementLeft)) return clientX;
+  if (!(Number.isFinite(scale) && scale > 0) || scale === 1) return clientX;
+  return elementLeft + (clientX - elementLeft) / scale;
+}
+
 // The screenshot in the accessibility layer is at squishFontSize(scale), so a
 // character that is cellWidth px wide at base font size occupies cellWidth *
 // scale in that layer's layout - the same advance the scaled canvas glyphs
