@@ -205,13 +205,62 @@ button { color: inherit; }
 .card-sessions button { min-width: 0; flex: 0 0 auto; height: 29px; max-width: 125px; padding: 0 9px; display: flex; align-items: center; gap: 6px; overflow: hidden; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--surface-raised); color: var(--text-muted); font-size: 10px; }
 .card-sessions button svg { width: 13px; flex: none; }
 .card-sessions button i { flex: none; }
-.card-sessions i, .session-list i { width: 5px; height: 5px; border-radius: 50%; background: var(--idle); }
-.card-sessions i.running, .session-list i.running { background: var(--ok); box-shadow: 0 0 6px var(--ok-glow); }
-/* The shell is blocked on a foreground program (a build, a TUI, anything
-   waiting). Only the green dot blinks: an exited tab is never busy. */
-.card-sessions i.running.is-active, .session-list i.running.is-active { animation: session-active-blink 1.6s ease-in-out infinite; }
-@keyframes session-active-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
-@media (prefers-reduced-motion: reduce) { .card-sessions i.running.is-active, .session-list i.running.is-active { animation: none; } }
+/* The dot beside a terminal tab, the same set the desktop tab draws
+   (session-taskbar.ts decides which one): a blinking green dot while a
+   command runs, a static green dot on the "come look" marker of a
+   just-finished session, an empty circle on an idle session, a red dot
+   after a failure. A cleanly exited session draws nothing. */
+.session-dot { width: 6px; height: 6px; flex: none; border-radius: 50%; box-sizing: border-box; }
+.session-dot.is-running { background: var(--ok); animation: activity-pulse 1.6s ease-in-out infinite; }
+.session-dot.is-completed { background: var(--ok); }
+.session-dot.is-idle { border: 1.5px solid var(--text-muted); }
+.session-dot.is-error { background: var(--danger); }
+@keyframes activity-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+/* The progress ring around the session icon in the project's session list
+   (the phone's tabs view), the mobile twin of the desktop tab's
+   bottom-edge progress bar: the fill carries the command's percentage
+   in the icon's own colour on a transparent track - the phone paints
+   only the fill, never a dimmed background; an indeterminate run
+   sweeps a 35% band around the outline; a just-finished session holds
+   the 100% bright ring; an idle session paints nothing (a 0% fill).
+   The 3px stroke sits flush outside the 36px icon's outline: the 42px
+   box centres the icon with 3px of room, so a rect at 1.5 with a 3px
+   stroke spans 0..3, touching the icon's border and tracing its
+   corners (10.5 = 9 + 1.5 offset).
+   The sizing rule must beat `.session-icon svg { width: 18px }` - the
+   glyph-sizing rule that would otherwise squeeze the ring to the 18px
+   terminal glyph's width (two classes beat class+element). */
+.session-icon { position: relative; }
+.session-icon .session-ring { position: absolute; left: -3px; top: -3px; width: 42px; height: 42px; overflow: visible; pointer-events: none; }
+.session-ring rect, .session-ring path { fill: none; stroke-width: 3; }
+/* The track is transparent by design: on the phone the ring paints only
+   the fill (an idle session shows no ring at all), never a dimmed bar. */
+.session-ring .session-ring-track { stroke: transparent; }
+/* The fill is the icon's own colour at half strength: the ring sits
+   over the icon, and the reduced opacity keeps it light there. */
+.session-ring .session-ring-fill { stroke: currentColor; opacity: .5; transition: stroke-dasharray .25s ease; }
+/* The pulse for a value-state fill: a band that loops the ring at
+   constant speed (the indeterminate sweep's keyframes) and is masked
+   to the fill, so it only shows inside the progress region. The mask
+   is a copy of the fill (white = fully visible), transitioned the same
+   way the fill is, so the pulse "reaches" as the percentage grows.
+   Nothing in the animation depends on the percentage - no restart, no
+   speed change, no per-update glitch - so a bar that updates several
+   times a second still pulses steadily, and a stalled one keeps
+   looping. Half strength, the same as the fill itself: the band reads
+   as a gentle brightening moving through the progress region rather
+   than a bright comet. */
+.session-ring .session-ring-mask-fill { fill: none; stroke: #fff; stroke-width: 3; transition: stroke-dasharray .25s ease; }
+.session-ring.is-value .session-ring-comet {
+  stroke: currentColor;
+  opacity: .5;
+  stroke-linecap: round;
+  stroke-dasharray: 12 88;
+  animation: session-ring-sweep 1.4s linear infinite;
+}
+.session-ring.is-pulse .session-ring-fill { stroke-dasharray: 35 65; stroke-linecap: round; animation: session-ring-sweep 1.4s linear infinite; }
+@keyframes session-ring-sweep { from { stroke-dashoffset: 0; } to { stroke-dashoffset: -100; } }
+@media (prefers-reduced-motion: reduce) { .session-dot.is-running { animation: none; } .session-ring.is-pulse .session-ring-fill { animation: none; } .session-ring.is-value .session-ring-comet { display: none; } }
 .more-sessions { color: var(--text-muted); font-size: 10px; }
 .bottom-nav { position: fixed; z-index: 4; left: 0; right: 0; bottom: 0; height: calc(68px + env(safe-area-inset-bottom)); padding: 5px 22px env(safe-area-inset-bottom); display: flex; align-items: center; justify-content: space-around; border-top: 1px solid var(--border); background: var(--surface); backdrop-filter: blur(14px); }
 .bottom-nav button { width: 70px; height: 54px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; border: 0; background: transparent; color: var(--text-muted); font-size: 9px; }

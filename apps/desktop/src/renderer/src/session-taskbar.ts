@@ -40,8 +40,12 @@ export function sameTaskbarProgress(a: TaskbarProgress, b: TaskbarProgress): boo
 /**
  * Fold a `desktop-taskbar` event into the map the UI reads. Returns the
  * same map when nothing changed, so React state can skip the re-render.
- * A session the map has not seen yet defaults to clear, so a clear event
- * for one is a no-op while any other state lands as a change.
+ * The map keeps the latest state per session, clear included: a clear
+ * entry must survive, because a snapshot in flight was built *before*
+ * the clear transition and still carries the previous state - for a
+ * running session the event (which is newer) must win, or a cleared
+ * spinner would resurrect as a pulse and the running-to-clear edge the
+ * "come look" marker needs would never be seen.
  */
 export function applyTaskbarEvent(
   current: ReadonlyMap<string, TaskbarProgress>,
@@ -51,9 +55,7 @@ export function applyTaskbarEvent(
   const held = current.get(sessionId) ?? CLEAR_TASKBAR_PROGRESS;
   if (sameTaskbarProgress(held, taskbar)) return current;
   const next = new Map(current);
-  // The map only holds non-clear states: an absent entry is clear.
-  if (taskbar.state === "clear") next.delete(sessionId);
-  else next.set(sessionId, taskbar);
+  next.set(sessionId, taskbar);
   return next;
 }
 
@@ -61,10 +63,10 @@ export function applyTaskbarEvent(
  * Reconcile the map against a fresh snapshot: drop sessions that are
  * gone, and adopt the snapshot's state for sessions the map has not
  * heard an event about yet. A running session the map already holds
- * keeps its entry - the event that set it is newer than any snapshot
- * that can still arrive. The map only ever holds non-clear states:
- * an absent entry is clear, so a snapshot full of clear sessions
- * leaves an empty map untouched.
+ * keeps its entry (a clear one included) - the event that set it is
+ * newer than any snapshot that can still arrive. Exited sessions take
+ * the snapshot's verdict as-is: the host pushes their final taskbar
+ * (an error or a clear) with the lifecycle event.
  */
 export function mergeTaskbar(
   current: ReadonlyMap<string, TaskbarProgress>,
@@ -77,7 +79,13 @@ export function mergeTaskbar(
     // takes the snapshot's verdict outright.
     const held = session.status === "running" ? current.get(session.id) : undefined;
     const state = held ?? taskbarOf(session);
-    if (state.state !== "clear") next.set(session.id, state);
+    if (state.state !== "clear") {
+      next.set(session.id, state);
+    } else if (held !== undefined) {
+      // A clear event was heard for this running session: keep the clear
+      // entry so a stale snapshot cannot resurrect the previous state.
+      next.set(session.id, state);
+    }
   }
   if (
     next.size === current.size &&
@@ -165,11 +173,13 @@ export function tabProgressModel({
   }
   // No explicit state: the session's own verdict decides.
   if (session.status !== "running") return { dot: null, bar: null, fill: null };
-  if (activity === "active") return { dot: "running", bar: "pulse", fill: null };
-  // The command just finished while the user was on another tab: hold
-  // the bar at 100% and a static green dot (the "come look" marker)
-  // until the tab is opened.
+  // A command that just finished while the user was on another tab: the
+  // marker draws immediately, ahead of the activity's busy badge leaving
+  // its grace window - the taskbar's clear edge outranks the lingering
+  // "active" activity, or the marker would flash as a blinking running
+  // command instead of the static "come look" dot.
   if (justCompleted) return { dot: "completed", bar: "full", fill: null };
+  if (activity === "active") return { dot: "running", bar: "pulse", fill: null };
   // A normal idle tab: the empty circle, and the bar as a 0% progress
   // bar - only the dim track, no fill.
   return { dot: "idle", bar: "value", fill: 0 };

@@ -233,6 +233,19 @@ pub struct HostSnapshot {
     pub projects: Vec<Project>,
     pub sessions: Vec<TerminalSession>,
     pub devices: Vec<AuthorizedDevice>,
+    /// The sessions desktop windows are actively showing (their active
+    /// tabs, unioned across windows), reported by the renderers: a phone
+    /// resets a session's "come look" marker when it lands here - a
+    /// terminal actually opened, not a background tab.
+    pub desktop_active_session_ids: Vec<String>,
+    /// The sessions whose command just finished (taskbar indicator went
+    /// non-clear to clear) and that no client has viewed yet: the
+    /// host-persisted "come look" markers. A client that connects after
+    /// the edge seeds its own markers from this list (the live clients
+    /// raised theirs from the taskbar event stream); opening the session
+    /// anywhere - a desktop active tab or a phone's open terminal -
+    /// clears it on the host, and with it on every client.
+    pub look_here_session_ids: Vec<String>,
     pub shells: Vec<ShellProfile>,
     pub default_shell_id: String,
     pub terminal_theme: TerminalThemeSettings,

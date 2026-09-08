@@ -10,7 +10,7 @@ import {
   CapacitorBarcodeScannerScanOrientation,
   CapacitorBarcodeScannerTypeHint
 } from "@capacitor/barcode-scanner";
-import type { DirectoryListing, HostSnapshot, PairingPayload, Platform, Project, TerminalSession } from "@agentterminal/protocol";
+import type { DirectoryListing, HostSnapshot, PairingPayload, Platform, Project, TaskbarProgress, TerminalSession } from "@agentterminal/protocol";
 import { createRequestId, isSessionActive, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSettings, parsePairingPayload, resolveTerminalScheme, sessionActivitySummary, terminalSchemesFor } from "@agentterminal/protocol";
 import { HostConnection, type RemoteRegistrationState, type SavedHost, type SavedHostRecord } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
@@ -29,6 +29,7 @@ import { FONT_WIDTH_MAX, FONT_WIDTH_MIN, FONT_WIDTH_STEP, normalizeFontWidthPerc
 import { applyTheme, loadThemePreference, resolveTheme, saveThemePreference, SYSTEM_DARK_QUERY, THEME_LABELS, THEME_PREFERENCES, type ResolvedTheme, type ThemePreference } from "./theme";
 import { syncSystemBars } from "./systemBars";
 import { backProjectId, resolveViewGeometry } from "./projectNavigation";
+import { sessionProgressModel, taskbarJustCompleted, taskbarOf, type SessionProgressModel } from "./session-taskbar";
 
 type View = { type: "home" } | { type: "hosts" } | { type: "project"; projectId: string } | { type: "terminal"; sessionId: string; projectId: string };
 // The bottom sheets of the connected pager. While one is set, that sheet is
@@ -132,6 +133,11 @@ export function App() {
   const [sheetDragging, setSheetDragging] = useState(false);
   // The sheet whose exit animation is running (see closeSheet).
   const [closingSheet, setClosingSheet] = useState<SheetKind | null>(null);
+  // Sessions whose command just finished while the user was viewing
+  // another session: the "come look" marker (a static green dot, the
+  // 100% progress ring) is held until the session is opened or a new
+  // command starts on it (see the hold effect below, desktop parity).
+  const [completedHold, setCompletedHold] = useState<ReadonlySet<string>>(() => new Set());
   const connectionRef = useRef<HostConnection | null>(null);
   connectionRef.current = connection;
   const screenAwakeRef = useRef(true);
@@ -172,6 +178,10 @@ export function App() {
   const swallowTapClickRef = useRef(false);
   const swallowTapClickAtRef = useRef({ x: 0, y: 0 });
   const swallowTapClickTimerRef = useRef<number | undefined>(undefined);
+  // The taskbar state each session showed at the last snapshot, so the
+  // running -> clear edge (a command finishing) can be detected for the
+  // "come look" marker.
+  const previousTaskbarRef = useRef(new Map<string, TaskbarProgress>());
 
   useEffect(() => {
     void Preferences.get({ key: TERMINAL_FONT_WIDTH_KEY }).then(({ value }) => {
@@ -602,6 +612,105 @@ export function App() {
     return () => { offSnapshot(); offConnected(); offHeartbeat(); offReconnecting(); offReconnectFailed(); offDisconnect(); offRemoteRegistration(); };
   }, [connection]);
 
+  // A command that finished on a session the user is not viewing holds
+  // its "come look" marker - the static green dot and the 100% progress
+  // ring (completedHold) - until the session is opened. The host's
+  // taskbar machine emits the running -> clear edge; comparing each
+  // session's effective state against the last snapshot's catches it.
+  // The connection patches every session.taskbar event into the snapshot
+  // it holds, so the snapshot alone carries the newest state (a desktop
+  // window instead needs the event/snapshot merge machinery).
+  useEffect(() => {
+    const sessions = snapshot?.sessions;
+    if (!sessions) return;
+    const previous = previousTaskbarRef.current;
+    const now = new Map<string, TaskbarProgress>();
+    for (const session of sessions) now.set(session.id, taskbarOf(session));
+    for (const id of [...previous.keys()]) if (!now.has(id)) previous.delete(id);
+    previousTaskbarRef.current = now;
+    // The session the user is viewing is the terminal view's; every other
+    // session (or none, while the terminal page is not showing) is
+    // "looking elsewhere" from the finished command's point of view.
+    const activeSessionId = view.type === "terminal" ? view.sessionId : null;
+    setCompletedHold((current) => {
+      const holds = new Set(current);
+      let changed = false;
+      for (const session of sessions) {
+        const effective = now.get(session.id);
+        if (!effective) continue;
+        const last = previous.get(session.id);
+        // The running -> clear edge on a session the user is not on: hold
+        // the marker until the session is opened.
+        if (last && taskbarJustCompleted(last, effective) && session.status === "running" && session.id !== activeSessionId && !holds.has(session.id)) {
+          holds.add(session.id);
+          changed = true;
+        }
+        // A new command on the session: the marker is stale.
+        if (effective.state !== "clear" && holds.delete(session.id)) changed = true;
+      }
+      // A held session that left the host list: drop its marker with it.
+      for (const id of [...holds]) if (!now.has(id) && holds.delete(id)) changed = true;
+      return changed ? holds : current;
+    });
+  }, [snapshot, view]);
+
+  // Opening a held session resets its marker to the idle state: the
+  // marker is only for sessions the user has not looked at yet.
+  useEffect(() => {
+    if (view.type !== "terminal" || !completedHold.has(view.sessionId)) return;
+    setCompletedHold((current) => {
+      const next = new Set(current);
+      next.delete(view.sessionId);
+      return next;
+    });
+  }, [view, completedHold]);
+
+  // The marker dies the moment a client actually looks at the session:
+  // opening it on this phone is covered above, but a look on ANOTHER
+  // client reaches the phone only through the snapshot's viewing
+  // reports - each device's open terminals (viewingSessionIds) and the
+  // desktop windows' active tabs (desktopActiveSessionIds, added to the
+  // snapshot for exactly this). Only NEW entries reset a marker: a
+  // terminal that was already open on the desktop before the command
+  // finished is a background tab, not a look at the finish, so that
+  // session keeps its "come look" marker here until someone actually
+  // opens it.
+  const viewedBeforeRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!snapshot) return;
+    const viewed = new Set<string>();
+    for (const device of snapshot.devices) {
+      for (const id of device.viewingSessionIds ?? []) viewed.add(id);
+    }
+    for (const id of snapshot.desktopActiveSessionIds ?? []) viewed.add(id);
+    const newly = [...viewed].filter((id) => !viewedBeforeRef.current.has(id));
+    viewedBeforeRef.current = viewed;
+    if (newly.length === 0) return;
+    setCompletedHold((current) => {
+      const next = new Set(current);
+      for (const id of newly) next.delete(id);
+      return next.size === current.size ? current : next;
+    });
+  }, [snapshot]);
+
+  // The host persists the "come look" markers across client connects
+  // (snapshot.lookHereSessionIds): a phone that connects AFTER the
+  // command finished still raises the 100% ring and static dot. Seed
+  // only - the open, new-command and cross-client view effects above
+  // own the removals - and skip the terminal this phone has open: it is
+  // the look itself, not a marker.
+  useEffect(() => {
+    const ids = snapshot?.lookHereSessionIds;
+    if (!ids || ids.length === 0) return;
+    const activeSessionId = view.type === "terminal" ? view.sessionId : null;
+    setCompletedHold((current) => {
+      if (ids.every((id) => current.has(id))) return current;
+      const next = new Set(current);
+      for (const id of ids) if (id !== activeSessionId) next.add(id);
+      return next;
+    });
+  }, [snapshot, view]);
+
   async function pair(raw: string) {
     setStatus("connecting"); setError("");
     try {
@@ -873,6 +982,7 @@ export function App() {
       remoteStatus={remoteStatus}
       remoteStatusLabel={remoteStatusLabel}
       orderedProjects={orderedProjects}
+      completedHold={completedHold}
       projectDrag={projectDrag}
       projectReordering={projectReordering}
       transformFor={projectDragTransform}
@@ -1218,7 +1328,7 @@ export function App() {
   return <div className={`mobile-pager ${sheetDragging ? "is-sheet-dragging" : ""}`} style={{ ["--sheet-drag-y" as string]: `${sheetDragY}px` } as React.CSSProperties} onPointerDownCapture={beginSwipe} onTouchStartCapture={() => { suppressSwipeClickRef.current = false; swipeClickPageRef.current = null; if (swipeClickTimerRef.current !== undefined) window.clearTimeout(swipeClickTimerRef.current); swipeClickTimerRef.current = undefined; swallowTapClickRef.current = false; if (swallowTapClickTimerRef.current !== undefined) window.clearTimeout(swallowTapClickTimerRef.current); swallowTapClickTimerRef.current = undefined; }} onPointerMoveCapture={moveSwipe} onPointerUpCapture={(event) => finishSwipe(event)} onPointerCancelCapture={(event) => finishSwipe(event)} onClickCapture={suppressSwipeClick}>
     <div className={`mobile-page-track ${swipe?.horizontal ? "is-dragging" : ""}`} style={{ transform: `translate3d(calc(${-currentPage * 100}% + ${swipe?.deltaX ?? 0}px),0,0)` }}>
       <div className="mobile-page">{homeView}</div>
-      {activeProject && <div className="mobile-page"><ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} onBack={navigateBack} onRename={() => setProjectToRename(activeProject)} onOpen={openTerminal} /></div>}
+      {activeProject && <div className="mobile-page"><ProjectScreen project={activeProject} snapshot={snapshot} connection={connection} completedHold={completedHold} onBack={navigateBack} onRename={() => setProjectToRename(activeProject)} onOpen={openTerminal} /></div>}
       {activeProject && activeSession && <div className="mobile-page"><div className="mobile-app terminal-view">
         <MobileHeader title={activeSession.title} subtitle={activeProject.name} onBack={navigateBack} trailing={<div className="session-actions"><span className={`session-state ${terminalStateOf(activeSession)}`}>{terminalStateOf(activeSession)}</span><button className="terminal-settings-button" onClick={() => setShowTerminalSettings(true)} aria-label="Terminal display settings"><SettingsIcon /></button><button className="close-session-button" onClick={() => setSessionToClose(activeSession)} aria-label="Close terminal session" title="Close terminal session"><CloseIcon /></button></div>} />
         <MobileTerminal key={activeSession.id} active={view.type === "terminal"} fontWidthScale={fontWidthPercent / 100} connection={connection} session={activeSession} scheme={terminalScheme} />
@@ -1291,7 +1401,7 @@ function isEmbeddedNodeConfigurationError(cause: unknown): boolean {
   return cause instanceof Error && /update the (desktop|mobile) app|enrollment key was rejected|tsnet desktop host name|remote node is no longer registered/i.test(cause.message);
 }
 
-function ProjectScreen({ project, snapshot, connection, onBack, onRename, onOpen }: { project: Project; snapshot: HostSnapshot; connection: HostConnection; onBack: () => void; onRename: () => void; onOpen: (session: TerminalSession) => void }) {
+function ProjectScreen({ project, snapshot, connection, completedHold, onBack, onRename, onOpen }: { project: Project; snapshot: HostSnapshot; connection: HostConnection; completedHold: ReadonlySet<string>; onBack: () => void; onRename: () => void; onOpen: (session: TerminalSession) => void }) {
   const sessions = snapshot.sessions.filter((session) => session.projectId === project.id);
   const [changingPersistence, setChangingPersistence] = useState(false);
   const [persistenceError, setPersistenceError] = useState("");
@@ -1316,18 +1426,95 @@ function ProjectScreen({ project, snapshot, connection, onBack, onRename, onOpen
     <MobileHeader title={project.name} subtitle={project.path} onBack={onBack} trailing={<><button className="header-edit-button" onClick={onRename} aria-label="Rename project"><EditIcon /></button>{project.persistent ? <BookmarkIcon className="saved-icon" /> : <ClockIcon className="temp-icon" />}</>} />
     <section className="project-hero"><div className="large-folder"><FolderIcon /></div><span>{project.persistent ? "Saved project" : "Temporary project"}</span><h1 className="display-name" title={project.name}>{project.name}</h1><p>{project.path}</p><div className="project-actions"><button className="mobile-primary" onClick={() => void createSession()}><PlusIcon /> New terminal</button><button className="mobile-secondary" disabled={changingPersistence} onClick={() => void togglePersistence()}>{project.persistent ? <ClockIcon /> : <BookmarkIcon />}{changingPersistence ? "Updating…" : project.persistent ? "Make temporary" : "Save project"}</button></div>{persistenceError && <div className="form-error project-error">{persistenceError}</div>}</section>
     <section className="session-section"><div className="section-title"><span>Sessions</span><small>{sessions.length}</small></div>
-      {sessions.length ? <div className="session-list">{sessions.map((session) => <button key={session.id} onClick={() => onOpen(session)}><span className="session-icon"><TerminalIcon /></span><span><strong className="display-name" title={session.title}>{session.title}</strong><small>{session.status !== "running" ? `Exited · ${session.exitCode ?? "—"}` : session.activity === "active" ? "Running" : "Idle"}</small></span><i className={sessionDotClass(session)} /><ChevronIcon /></button>)}</div> : <div className="inline-empty">No open terminal sessions.</div>}
+      {sessions.length ? <div className="session-list">{sessions.map((session) => {
+        const model = sessionProgressModel({ session, taskbar: taskbarOf(session), justCompleted: completedHold.has(session.id) });
+        return <button key={session.id} onClick={() => onOpen(session)}>
+          <span className="session-icon"><TerminalIcon />{model.ring !== null && <SessionRing model={model} id={session.id} />}</span>
+          <span><strong className="display-name" title={session.title}>{session.title}</strong><small>{session.status !== "running" ? `Exited · ${session.exitCode ?? "—"}` : session.activity === "active" ? "Running" : "Idle"}</small></span>
+          <SessionDot model={model} session={session} />
+          <ChevronIcon />
+        </button>;
+      })}</div> : <div className="inline-empty">No open terminal sessions.</div>}
     </section>
   </div>;
 }
 
 /**
- * The status dot beside a terminal tab, on the project list and inside a
- * project alike. `running` colors it green; `is-active` blinks it while
- * the host reports the shell blocked on a foreground program.
+ * The status dot beside a terminal tab, on the home project cards and
+ * inside a project alike, the same set the desktop tab draws (see
+ * sessionProgressModel): a blinking green dot while a command runs,
+ * a static green dot on the "come look" marker of a just-finished
+ * session, an empty circle on an idle session, a red dot after a
+ * failure. A cleanly exited session draws nothing.
  */
-function sessionDotClass(session: TerminalSession): string {
-  return `${session.status} ${isSessionActive(session) ? "is-active" : ""}`.trim();
+function SessionDot({ model, session }: { model: SessionProgressModel; session: TerminalSession }) {
+  if (model.dot === null) return null;
+  const title = model.dot === "running" ? "Running" : model.dot === "completed" ? "Just finished" : model.dot === "idle" ? "Idle" : `Exited (${session.exitCode ?? "unknown"})`;
+  return <i className={`session-dot is-${model.dot}`} title={title} />;
+}
+
+/**
+ * The progress ring around the squircle session icon, drawn in the
+ * project's session list (the phone's tabs view): the mobile twin of
+ * the desktop tab's bottom-edge progress bar. The fill is the icon's
+ * own colour at half strength on a transparent track (the phone paints
+ * only the fill, and the half opacity keeps it light over the icon).
+ * A value-state fill carries a constant-speed pulse: a half-strength
+ * band (the fill's own colour at the fill's own opacity) loops the
+ * ring (the indeterminate sweep's keyframes) masked to the fill, so
+ * the pulse stays inside the progress region, "reaches" as the
+ * percentage grows, and keeps looping when it stalls - without ever
+ * restarting or changing speed as the percentage updates, so a bar
+ * ticking many times a second still pulses steadily (the
+ * indeterminate state shows the unmasked band instead). A
+ * just-finished session holds the 100% bright ring until it is opened,
+ * and an idle session leaves only the dim track (a 0% bar).
+ */
+// The fill's outline: the same rounded contour as the track rect, but
+// a path (not a rect) so its dash starts at the top centre and runs
+// clockwise - a rect's dash always starts at its top-left corner, and
+// the fill is meant to read like a gauge filling from twelve o'clock.
+// pathLength normalises it to 100, so dash values are percents. The
+// fill, the mask copy, and the pulse band all reuse it, so they line
+// up exactly.
+const SESSION_RING_OUTLINE =
+  "M 21 1.5 L 30 1.5 A 10.5 10.5 0 0 1 40.5 12 L 40.5 30 A 10.5 10.5 0 0 1 30 40.5 L 12 40.5 A 10.5 10.5 0 0 1 1.5 30 L 1.5 12 A 10.5 10.5 0 0 1 12 1.5 Z";
+
+function SessionRing({ model, id }: { model: SessionProgressModel; id: string }) {
+  if (model.ring === null) return null;
+  // The viewBox is the 36px icon (9px corner radius) centred with 3px
+  // of room: the 3px stroke sits flush outside the icon's outline.
+  const pct = model.fill ?? 0;
+  // The pulse's mask must be unique per row: SVG ids are document-
+  // global, and the session list renders many rings at once.
+  const maskId = `session-ring-mask-${id}`;
+  return (
+    <svg className={`session-ring${model.ring === "pulse" ? " is-pulse" : model.ring === "value" ? " is-value" : ""}`} viewBox="0 0 42 42" aria-hidden="true">
+      {model.ring === "value" && pct > 0 ? (
+        <mask id={maskId} maskUnits="userSpaceOnUse" x={-2} y={-2} width={46} height={46}>
+          <path
+            className="session-ring-mask-fill"
+            fill="none"
+            stroke="#fff"
+            strokeWidth={3}
+            pathLength={100}
+            d={SESSION_RING_OUTLINE}
+            style={{ strokeDasharray: `${pct} 100` } as React.CSSProperties}
+          />
+        </mask>
+      ) : null}
+      <rect className="session-ring-track" x="1.5" y="1.5" width="39" height="39" rx="10.5" pathLength={100} />
+      <path
+        className="session-ring-fill"
+        pathLength={100}
+        d={SESSION_RING_OUTLINE}
+        style={model.ring === "value" ? ({ strokeDasharray: `${pct} 100` } as React.CSSProperties) : undefined}
+      />
+      {model.ring === "value" && pct > 0 ? (
+        <path className="session-ring-comet" pathLength={100} d={SESSION_RING_OUTLINE} mask={`url(#${maskId})`} />
+      ) : null}
+    </svg>
+  );
 }
 
 /**
@@ -1340,9 +1527,12 @@ function terminalStateOf(session: TerminalSession): "running" | "idle" | "exited
   return isSessionActive(session) ? "running" : "idle";
 }
 
-function ProjectCard({ project, sessions, dragging, reordering, transform, elementRef, onDragStart, onDragMove, onDragEnd, onClick, onSession }: { project: Project; sessions: TerminalSession[]; dragging: boolean; reordering: boolean; transform?: string; elementRef: (element: HTMLElement | null) => void; onDragStart: (event: ReactPointerEvent<HTMLElement>) => void; onDragMove: (event: ReactPointerEvent<HTMLElement>) => void; onDragEnd: (event: ReactPointerEvent<HTMLElement>, commit: boolean) => void; onClick: () => void; onSession: (session: TerminalSession) => void }) {
+function ProjectCard({ project, sessions, completedHold, dragging, reordering, transform, elementRef, onDragStart, onDragMove, onDragEnd, onClick, onSession }: { project: Project; sessions: TerminalSession[]; completedHold: ReadonlySet<string>; dragging: boolean; reordering: boolean; transform?: string; elementRef: (element: HTMLElement | null) => void; onDragStart: (event: ReactPointerEvent<HTMLElement>) => void; onDragMove: (event: ReactPointerEvent<HTMLElement>) => void; onDragEnd: (event: ReactPointerEvent<HTMLElement>, commit: boolean) => void; onClick: () => void; onSession: (session: TerminalSession) => void }) {
   return <article ref={elementRef} className={`project-card ${dragging ? "is-dragging" : ""} ${reordering ? "is-reordering" : ""}`} style={{ transform }}><button className="project-card-main" onClick={onClick}><span className="card-folder"><FolderIcon /></span><span className="card-copy"><strong className="display-name" title={project.name}>{project.name}</strong><small>{project.path}</small></span><span className="card-persist">{project.persistent ? <BookmarkIcon /> : <ClockIcon />}</span><span className="mobile-project-drag" role="button" aria-label={`Reorder ${project.name}`} data-no-swipe onClick={(event) => event.stopPropagation()} onPointerDown={onDragStart} onPointerMove={onDragMove} onPointerUp={(event) => onDragEnd(event, true)} onPointerCancel={(event) => onDragEnd(event, false)}>⠿</span><ChevronIcon /></button>
-    {!!sessions.length && <div className="card-sessions">{sessions.slice(0, 3).map((session) => <button key={session.id} onClick={() => onSession(session)}><TerminalIcon /><span className="display-name" title={session.title}>{session.title}</span><i className={sessionDotClass(session)} /></button>)}{sessions.length > 3 && <span className="more-sessions">+{sessions.length - 3}</span>}</div>}
+    {!!sessions.length && <div className="card-sessions">{sessions.slice(0, 3).map((session) => {
+      const model = sessionProgressModel({ session, taskbar: taskbarOf(session), justCompleted: completedHold.has(session.id) });
+      return <button key={session.id} onClick={() => onSession(session)}><TerminalIcon /><span className="display-name" title={session.title}>{session.title}</span><SessionDot model={model} session={session} /></button>;
+    })}{sessions.length > 3 && <span className="more-sessions">+{sessions.length - 3}</span>}</div>}
   </article>;
 }
 
@@ -1352,12 +1542,13 @@ function ProjectCard({ project, sessions, dragging, reordering, transform, eleme
  * exactly the same thing: the preview instance sits in the zone's fill,
  * where pointer events are disabled, so its controls can never fire.
  */
-function HomeScreen({ snapshot, remoteRegistration, remoteStatus, remoteStatusLabel, orderedProjects, projectDrag, projectReordering, transformFor, cardElement, onDragStart, onDragMove, onDragEnd, onRetryRegistration, onOpenProject, onOpenSession, onShowSettings, onShowCreateProject, onPairNew, onOpenHosts }: {
+function HomeScreen({ snapshot, remoteRegistration, remoteStatus, remoteStatusLabel, orderedProjects, completedHold, projectDrag, projectReordering, transformFor, cardElement, onDragStart, onDragMove, onDragEnd, onRetryRegistration, onOpenProject, onOpenSession, onShowSettings, onShowCreateProject, onPairNew, onOpenHosts }: {
   snapshot: HostSnapshot;
   remoteRegistration: RemoteRegistrationState;
   remoteStatus: RegistrationDisplayStatus;
   remoteStatusLabel: string;
   orderedProjects: Project[];
+  completedHold: ReadonlySet<string>;
   projectDrag: ProjectDragState | null;
   projectReordering: boolean;
   transformFor: (projectId: string, index: number) => string | undefined;
@@ -1382,7 +1573,7 @@ function HomeScreen({ snapshot, remoteRegistration, remoteStatus, remoteStatusLa
     <section className="home-content">
       <div className="section-title"><span>Projects</span><button onClick={onShowCreateProject}><PlusIcon /> New</button></div>
       <div className="project-cards">
-        {orderedProjects.map((project, index) => <ProjectCard key={project.id} elementRef={(element) => cardElement(project.id, element)} project={project} sessions={snapshot.sessions.filter((session) => session.projectId === project.id)} dragging={project.id === projectDrag?.projectId} reordering={projectReordering} transform={transformFor(project.id, index)} onDragStart={(event) => onDragStart(event, project.id, index)} onDragMove={onDragMove} onDragEnd={onDragEnd} onClick={() => onOpenProject(project.id)} onSession={onOpenSession} />)}
+        {orderedProjects.map((project, index) => <ProjectCard key={project.id} elementRef={(element) => cardElement(project.id, element)} project={project} sessions={snapshot.sessions.filter((session) => session.projectId === project.id)} completedHold={completedHold} dragging={project.id === projectDrag?.projectId} reordering={projectReordering} transform={transformFor(project.id, index)} onDragStart={(event) => onDragStart(event, project.id, index)} onDragMove={onDragMove} onDragEnd={onDragEnd} onClick={() => onOpenProject(project.id)} onSession={onOpenSession} />)}
       </div>
       {!snapshot.projects.length && <div className="mobile-empty"><FolderIcon /><h2>No projects yet</h2><p>Add a folder from your desktop to begin.</p></div>}
     </section>

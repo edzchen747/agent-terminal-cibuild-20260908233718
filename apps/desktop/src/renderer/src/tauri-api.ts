@@ -113,6 +113,7 @@ const api: DesktopApi = {
   setDefaultTerminal: () => invoke("set_default_terminal"),
   unsetDefaultTerminal: () => invoke("unset_default_terminal"),
   takeFocusSession: () => invoke("take_focus_session"),
+  setActiveSession: (sessionId) => invoke("set_active_session", { sessionId }),
   setTerminalTheme: (darkSchemeId, lightSchemeId) => invoke("set_terminal_theme", { darkSchemeId, lightSchemeId }),
   setOpenProjectsInNewWindows: (enabled) => invoke("set_open_projects_in_new_windows", { enabled }),
   setConfirmExternalLinks: (enabled) => invoke("set_confirm_external_links", { enabled }),

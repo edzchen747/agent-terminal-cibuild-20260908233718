@@ -5,6 +5,11 @@ pub struct WindowClients {
     project_windows: HashMap<String, String>,
     window_projects: HashMap<String, String>,
     attached_sessions: HashMap<String, HashSet<String>>,
+    /// The session each window is actively showing (its active tab), as
+    /// reported by the renderer: "a desktop terminal was actually opened",
+    /// the signal a phone's "come look" markers reset against. A background
+    /// tab is attached but not active, so it never counts as a look.
+    active_sessions: HashMap<String, String>,
     last_window: Option<String>,
     last_project: Option<String>,
 }
@@ -90,6 +95,7 @@ impl WindowClients {
 
     pub fn remove_window(&mut self, label: &str) -> Option<String> {
         self.attached_sessions.remove(label);
+        self.active_sessions.remove(label);
         let was_last_window = self.last_window.as_deref() == Some(label);
         if was_last_window {
             self.last_window = None;
@@ -150,6 +156,33 @@ impl WindowClients {
             .filter(|(_, sessions)| sessions.contains(session_id))
             .map(|(label, _)| label.clone())
             .collect()
+    }
+
+    /// The session each window is actively showing (its active tab),
+    /// reported by the renderer through `set_active_session`; `None` on
+    /// the renderer side clears the window's entry (a window with no tab
+    /// open, or a project switch in flight). Closed windows lose their
+    /// entry with the window (`remove_window`), so the union only ever
+    /// contains live windows' active tabs.
+    pub fn set_active_session(&mut self, label: &str, session_id: Option<String>) {
+        if let Some(session_id) = session_id {
+            self.active_sessions.insert(label.to_string(), session_id);
+        } else {
+            self.active_sessions.remove(label);
+        }
+    }
+
+    /// The sessions desktop windows are actively showing right now (the
+    /// union of the per-window active tabs): "a desktop terminal was
+    /// opened". A phone's "come look" markers reset when a session lands
+    /// in this set - and only when it newly lands: a terminal that was
+    /// already open before a command finished is a background tab, not a
+    /// look at the finish.
+    pub fn active_session_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.active_sessions.values().cloned().collect();
+        ids.sort();
+        ids.dedup();
+        ids
     }
 }
 
@@ -317,5 +350,37 @@ mod tests {
             clients.handoff_target("project-2"),
             Some("window-1".to_string())
         );
+    }
+
+    #[test]
+    fn the_active_session_union_tracks_each_window_active_tab() {
+        // A window reports the tab it is actually showing; a background
+        // tab (attached but not active) never counts, `None` clears the
+        // window's entry, and a closed window's entry is gone with it.
+        let mut clients = WindowClients::default();
+        clients.assign("window-1", "project-1");
+        clients.assign("window-2", "project-2");
+        clients.attach("window-1", "session-a");
+        clients.attach("window-1", "session-b");
+        clients.set_active_session("window-1", Some("session-b".to_string()));
+        clients.set_active_session("window-2", Some("session-b".to_string()));
+
+        assert_eq!(
+            clients.active_session_ids(),
+            vec!["session-b"],
+            "the union spans windows, dedupes, and ignores background tabs"
+        );
+
+        clients.set_active_session("window-1", None);
+
+        assert_eq!(
+            clients.active_session_ids(),
+            vec!["session-b"],
+            "clearing a window's active tab drops its entry"
+        );
+
+        clients.remove_window("window-2");
+
+        assert_eq!(clients.active_session_ids(), Vec::<String>::new());
     }
 }

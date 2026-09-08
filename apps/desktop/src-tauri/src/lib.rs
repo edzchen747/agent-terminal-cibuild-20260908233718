@@ -318,6 +318,15 @@ async fn select_shell(
         .map_err(error_string)
 }
 
+/// The renderer reports the tab it is actively showing (or `None` when it
+/// shows no tab); the host records it per window and broadcasts, so a
+/// phone's "come look" marker for that session drops the moment the user
+/// opens the terminal on the desktop.
+#[tauri::command]
+fn set_active_session(window: WebviewWindow, state: State<'_, Arc<Core>>, session_id: Option<String>) {
+    state.set_active_session(window.label(), session_id);
+}
+
 pub fn run() {
     // COM starts us with `-Embedding` to serve a console handoff. That
     // instance has to keep running and register the handoff class itself,
@@ -390,6 +399,7 @@ pub fn run() {
             set_confirm_external_links,
             set_follow_working_directory,
             select_shell,
+            set_active_session,
             set_default_terminal,
             unset_default_terminal,
             take_focus_session,

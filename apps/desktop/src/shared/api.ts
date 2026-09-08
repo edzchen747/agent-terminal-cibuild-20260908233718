@@ -64,6 +64,11 @@ export interface DesktopApi {
   setDefaultTerminal(): Promise<void>;
   unsetDefaultTerminal(): Promise<void>;
   takeFocusSession(): Promise<FocusSessionEvent | null>;
+  /** Report the tab this window is actively showing (or `null` when it
+   * shows no tab): the host records it per window so a phone's "come
+   * look" marker for that session drops the moment the terminal is
+   * opened on the desktop. */
+  setActiveSession(sessionId: string | null): Promise<void>;
   setTerminalTheme(darkSchemeId: string, lightSchemeId: string): Promise<void>;
   setOpenProjectsInNewWindows(enabled: boolean): Promise<void>;
   setConfirmExternalLinks(enabled: boolean): Promise<void>;

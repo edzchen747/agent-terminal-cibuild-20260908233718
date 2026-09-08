@@ -259,13 +259,16 @@ button { color: inherit; }
 /* The progress bar along the tab's bottom edge: the same 2px thickness
    as the active tab's indicator bar, coloured like the tab's title text
    (the bar inherits the tab's colour, so it matches in every state),
-   with an even darker track. It is inset a few pixels so the bars of
-   neighbouring tabs keep a gap between them and never connect. The
-   active tab always shows its own indicator bar, never a progress bar. */
+   with the track mixed toward the tab's own surface - NOT black: a
+   black-mixed track reads as an invisible dark strip in the light
+   theme, where the tab's text (and therefore the fill) is dark. It is
+   inset a few pixels so the bars of neighbouring tabs keep a gap
+   between them and never connect. The active tab always shows its own
+   indicator bar, never a progress bar. */
 .tab-progress {
   position: absolute; left: 4px; right: 4px; bottom: 0; height: 2px;
   overflow: hidden;
-  background: color-mix(in srgb, currentColor 30%, black);
+  background: color-mix(in srgb, currentColor 30%, var(--surface-raised));
 }
 .tab-progress::before {
   content: ""; position: absolute; top: 0; bottom: 0; left: 0;

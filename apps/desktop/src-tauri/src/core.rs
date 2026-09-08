@@ -415,6 +415,15 @@ struct ManagedSession {
     /// see `crate::taskbar`. Fed in the same stream pass as the activity
     /// detector.
     taskbar: SessionTaskbar,
+    /// The host-persisted "come look" marker: the session's command just
+    /// finished (its taskbar indicator moved non-clear to clear) and no
+    /// client has viewed it since. A client that connects AFTER the edge
+    /// reads it from the snapshot (`look_here_session_ids`) and raises
+    /// its static-dot marker, the way a client that saw the live edge
+    /// does. Cleared when a desktop window makes the session's tab its
+    /// active tab, when a phone attaches (opens) the session, when a new
+    /// command re-arms the indicator, or when the session exits.
+    look_here: bool,
     control_tail: String,
     cursor_query_tail: String,
     pending_cursor_reports: usize,
@@ -1374,6 +1383,50 @@ impl Core {
     /// where a command that has stopped producing output is finally
     /// called idle, and where an `Active` that has now lasted long enough
     /// to be worth showing is announced.
+    /// The sweep's per-session activity pass: apply the quiet signals the
+    /// session has earned since the last tick and sync every state the
+    /// transition moves. A TUI screen that has had no *spontaneous*
+    /// output for TUI_QUIET_MS no longer reads as active: user-driven
+    /// repaints (keystroke reactions, resize redraws) never advanced the
+    /// quiet clock, so they cannot keep the badge lit (see activity.rs
+    /// for the Windows Terminal reference). Returns the new badge and its
+    /// timestamp, plus the taskbar state when the transition moved the
+    /// taskbar machine too - an idle command's implicit spinner goes
+    /// clear, and the snapshot metadata must carry it: the grace
+    /// transition runs outside the stream path, and every snapshot
+    /// (desktop-state push, phone heartbeat) is built from that metadata,
+    /// so a stale indeterminate state would resurrect a spinner on a
+    /// quiet screen.
+    fn sweep_session_activity_step(
+        session: &mut ManagedSession,
+        now: Instant,
+    ) -> Option<(SessionActivity, String, Option<TaskbarProgress>)> {
+        let mode = session.metadata.tui_mode;
+        let quiet_idle = session.tui.quiet_idle(now);
+        let tui_quiet = session.tui.spontaneous_quiet_ms(now) >= TUI_QUIET_MS;
+        let (activity, since) = session
+            .activity
+            .observe(&[], mode, quiet_idle, tui_quiet, false, false, now)?;
+        session.metadata.activity = activity;
+        session.metadata.activity_since = Some(since.clone());
+        // The same transition moves the taskbar state machine: sync it
+        // into the snapshot metadata as well (see the method docs).
+        let taskbar = session
+            .taskbar
+            .on_activity(activity)
+            .then(|| session.taskbar.effective());
+        if let Some(taskbar) = &taskbar {
+            session.metadata.taskbar = *taskbar;
+            // And the "come look" marker moves with it: the finished
+            // edge (the transition INTO the clear state) raises the
+            // flag; a re-armed indicator would lower it, and the sweep
+            // only clears the badge, so in practice it only ever raises
+            // here. (The sweep's own broadcast carries the change.)
+            move_look_here(session, *taskbar);
+        }
+        Some((activity, since, taskbar))
+    }
+
     fn sweep_session_activity(self: &Arc<Self>) {
         let changed = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
@@ -1383,30 +1436,7 @@ impl Core {
                 if session.metadata.status != "running" {
                     continue;
                 }
-                let mode = session.metadata.tui_mode;
-                let quiet_idle = session.tui.quiet_idle(now);
-                // A TUI screen that has had no *spontaneous* output for
-                // TUI_QUIET_MS no longer reads as active: user-driven
-                // repaints (keystroke reactions, resize redraws) never
-                // advanced the quiet clock, so they cannot keep the badge
-                // lit (see activity.rs for the Windows Terminal
-                // reference).
-                let tui_quiet = session.tui.spontaneous_quiet_ms(now) >= TUI_QUIET_MS;
-                if let Some((activity, since)) =
-                    session
-                        .activity
-                        .observe(&[], mode, quiet_idle, tui_quiet, false, false, now)
-                {
-                    session.metadata.activity = activity;
-                    session.metadata.activity_since = Some(since.clone());
-                    // The same transition moves the taskbar state machine:
-                    // an idle command's implicit spinner goes clear. The
-                    // project id rides along so the window taskbar can be
-                    // re-pushed after the lock.
-                    let taskbar = session
-                        .taskbar
-                        .on_activity(activity)
-                        .then(|| session.taskbar.effective());
+                if let Some((activity, since, taskbar)) = Self::sweep_session_activity_step(session, now) {
                     changed.push((
                         session.metadata.id.clone(),
                         activity,
@@ -1520,6 +1550,27 @@ impl Core {
     pub fn mark_window_focused(&self, label: &str) {
         let mut inner = self.inner.lock().expect("desktop state poisoned");
         inner.windows.mark_focused(label);
+    }
+
+    /// Records the session the window is actively showing (its active tab),
+    /// or clears the window's entry when it shows no tab. The phone's
+    /// "come look" markers reset against this set - a terminal the desktop
+    /// actually opened, not merely a background tab - so the snapshot
+    /// carries the active tabs, not the attachment sets. Broadcast: a
+    /// phone should drop its marker the moment the user opens the tab on
+    /// the desktop, not on the next heartbeat.
+    pub fn set_active_session(&self, label: &str, session_id: Option<String>) {
+        let look_here_session = session_id.clone();
+        {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            inner.windows.set_active_session(label, session_id);
+            // A window's active tab is a look at the session: its
+            // "come look" marker dies (and the snapshot's field with it).
+            if let Some(session_id) = &look_here_session {
+                clear_session_look_here(&mut inner, session_id);
+            }
+        }
+        self.broadcast();
     }
 
     pub fn unregister_window(&self, label: &str) {
@@ -2145,6 +2196,7 @@ impl Core {
                     requested_viewport: None,
                     activity: ActivityDetector::new(Instant::now()),
                     taskbar: SessionTaskbar::new(),
+                    look_here: false,
                     control_tail: String::new(),
                     cursor_query_tail: String::new(),
                     pending_cursor_reports: 0,
@@ -2353,6 +2405,7 @@ impl Core {
                     requested_viewport: None,
                     activity: ActivityDetector::new(Instant::now()),
                     taskbar: SessionTaskbar::new(),
+                    look_here: false,
                     control_tail: String::new(),
                     cursor_query_tail: String::new(),
                     pending_cursor_reports: 0,
@@ -2754,15 +2807,23 @@ impl Core {
     ) {
         let key = self.remote_sizing_key(client_id);
         let controller = TerminalController::Remote(key);
-        let epoch = {
+        let (epoch, look_here_cleared) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
             };
-            attach_owner_grid_for(session, &controller, cols, rows, claim)
+            let epoch = attach_owner_grid_for(session, &controller, cols, rows, claim);
+            // The phone just opened this terminal: its "come look" marker
+            // dies, and every client's marker for it (the snapshot's
+            // field is the source they seed from).
+            let look_here_cleared = clear_session_look_here(&mut inner, session_id);
+            (epoch, look_here_cleared)
         };
         if let Some(epoch) = epoch {
             self.broadcast_grid_change(session_id, epoch);
+        }
+        if look_here_cleared {
+            self.broadcast();
         }
     }
 
@@ -2960,18 +3021,20 @@ impl Core {
         }
     }
 
-    /// Broadcasts the session's ConEmu `OSC 9;4` taskbar state to the
-    /// remote clients attached to it and to the desktop windows that
-    /// subscribe to it, like the activity broadcast.
+    /// Broadcasts the session's ConEmu `OSC 9;4` taskbar state to every
+    /// remote client and to the desktop windows that subscribe to it.
+    /// Unlike the activity broadcast this is not gated on attachment: a
+    /// phone's tabs view renders progress for sessions it has not opened,
+    /// and it must see the running-to-clear edge live to raise the
+    /// "come look" marker - a heartbeat snapshot alone only carries the
+    /// state if the whole transition happened to span one.
     fn broadcast_taskbar(&self, session_id: &str, taskbar: TaskbarProgress) {
         let targets = self
             .clients
             .lock()
             .expect("remote clients poisoned")
             .iter()
-            .filter(|(_, client)| {
-                client.device_id.is_some() && client.attached_sessions.contains(session_id)
-            })
+            .filter(|(_, client)| client.device_id.is_some())
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for client_id in &targets {
@@ -3873,6 +3936,7 @@ impl Core {
             activity_change,
             taskbar_change,
             project_id,
+            look_here_changed,
         ) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
             let Some(session) = inner.sessions.get_mut(session_id) else {
@@ -4155,6 +4219,22 @@ impl Core {
             // may not overlap the session's mutable borrow.
             let project_id = session.metadata.project_id.clone();
             let taskbar_change = taskbar_changed.then_some(session.taskbar.effective());
+            // The snapshot's session JSON is built from this metadata - the
+            // taskbar machine itself is never serialized - and a phone in
+            // its tabs view receives no attached-only taskbar events:
+            // keep the two in lockstep so the phone's next snapshot reads
+            // the session's true progress state.
+            if let Some(taskbar) = taskbar_change {
+                session.metadata.taskbar = taskbar;
+            }
+            // The "come look" marker moves with the indicator (see the
+            // helper): the finished edge raises it, a re-armed one drops
+            // it. A move here must reach the snapshot - clients seed
+            // their markers from it - so it reports a change broadcast.
+            let mut look_here_changed = false;
+            if let Some(taskbar) = taskbar_change {
+                look_here_changed = move_look_here(session, taskbar);
+            }
             (
                 reported,
                 title_changed,
@@ -4166,6 +4246,7 @@ impl Core {
                 activity_change,
                 taskbar_change,
                 project_id,
+                look_here_changed,
             )
         };
         let event = TerminalDataEvent {
@@ -4196,7 +4277,12 @@ impl Core {
         }
         if let Some(cwd) = reported_cwd {
             self.handle_session_working_directory(session_id, &cwd);
-        } else if title_changed || activity_change.is_some() {
+        }
+        // A look-here flag move must reach the snapshot: clients seed
+        // their "come look" markers from it. (A cwd handler may have
+        // broadcast already; a duplicate is one extra snapshot push,
+        // while a lost flag move would drop a marker.)
+        if title_changed || activity_change.is_some() || look_here_changed {
             self.broadcast();
         }
     }
@@ -4482,6 +4568,21 @@ fn snapshot_from_inner(inner: &Inner, online_device_ids: &HashSet<String>) -> Ho
                 entry
             })
             .collect(),
+        desktop_active_session_ids: inner.windows.active_session_ids(),
+        // The host-persisted "come look" markers: sessions whose command
+        // just finished and that no client has viewed yet. A client
+        // connecting after the edge reads the field and raises the same
+        // static-dot marker a live client raised from the event stream.
+        look_here_session_ids: {
+            let mut ids: Vec<String> = inner
+                .sessions
+                .values()
+                .filter(|session| session.look_here)
+                .map(|session| session.metadata.id.clone())
+                .collect();
+            ids.sort();
+            ids
+        },
         shells: inner.shells.clone(),
         default_shell_id,
         // Re-normalized on the way out so a settings file edited by hand, or
@@ -4753,9 +4854,45 @@ fn mark_session_exited(inner: &mut Inner, session_id: &str, exit_code: u32) -> b
     session.metadata.activity = session.activity.state();
     session.metadata.activity_since = Some(session.activity.since().to_string());
     // Same for the taskbar: whatever progress the process was showing
-    // belongs to a process that no longer exists.
+    // belongs to a process that no longer exists. Sync it into the
+    // metadata the snapshot is built from, so an exited tab kept for
+    // inspection never resurrects a progress bar in a phone's tabs view.
     session.taskbar.on_exit();
+    session.metadata.taskbar = session.taskbar.effective();
+    // The process is gone, so its "come look" marker dies with it.
+    session.look_here = false;
     true
+}
+
+/// Move a session's "come look" marker with its taskbar indicator and
+/// report whether the flag changed. The flag is raised by the finished
+/// edge (the indicator's only transition INTO the clear state) and
+/// dropped whenever the indicator is re-armed - a new command or an
+/// explicit state, i.e. any non-clear state. Callers invoke it only
+/// after the state machine actually changed state; the flag's other
+/// death is a look at the session ({@link clear_session_look_here}) or
+/// the session's exit ({@link mark_session_exited}).
+fn move_look_here(session: &mut ManagedSession, taskbar: TaskbarProgress) -> bool {
+    let look_here = taskbar == TaskbarProgress::Clear;
+    if session.look_here != look_here {
+        session.look_here = look_here;
+        true
+    } else {
+        false
+    }
+}
+
+/// A look at a session - a desktop window making its tab active, or a
+/// phone opening its terminal - dies the session's "come look" marker.
+/// Returns whether the flag was held (and is now cleared), so the
+/// caller can skip the redundant broadcast.
+fn clear_session_look_here(inner: &mut Inner, session_id: &str) -> bool {
+    let Some(session) = inner.sessions.get_mut(session_id) else {
+        return false;
+    };
+    let cleared = session.look_here;
+    session.look_here = false;
+    cleared
 }
 
 /// How many terminal tabs are open, including a tab kept for inspection
@@ -5669,16 +5806,18 @@ fn registration_status_for_display(
 mod tests {
     use super::{
         ActivityDetector, CdOutcome, CdPlan, ConnectivityAction, ConnectivityTracker,
-        EmbeddedNodeStatus, GridEpoch, Inner, ManagedSession, PENDING_FOCUS_TTL,
+        Core, EmbeddedNodeStatus, GridEpoch, Inner, ManagedSession, PENDING_FOCUS_TTL,
         PRESENCE_WINDOW_MS, PairingGrant, PendingFocus, RetireOutcome, SESSION_DEFAULT_COLS,
         SESSION_DEFAULT_ROWS, SESSION_MAX_COLS, SESSION_MAX_ROWS, SessionActivity, SessionWriter,
         TUI_QUIET_MS, TUI_USER_ATTRIBUTION_MS, TerminalController, VIEWPORT_WATCHDOG_TIMEOUT_MS,
         active_session_count, apply_grid_if_tui, apply_owner_grid, apply_owner_grid_for,
-        apply_session_grid, attach_owner_grid_for, claim_pending_focus, close_session_in_inner,
+        apply_session_grid, attach_owner_grid_for, claim_pending_focus, clear_session_look_here,
+        close_session_in_inner,
         collapse_superseded_repaints, contains_csi_final, drain_journal_front_at,
         ensure_home_project, evict_stale_viewports, folder_name, is_cursor_position_report,
         is_device_attributes_report, is_dropped_node_status, is_system_directory,
-        is_within_project, log_escape, mark_session_exited, newest_running_session_project_id,
+        is_within_project, log_escape, mark_session_exited, move_look_here,
+        newest_running_session_project_id,
         open_session_count, output_is_user_driven, parse_terminal_titles,
         parse_working_directories, preferred_project, presence_alive, project_for_directory,
         project_is_usable, project_name_or_folder, record_cursor_position_requests,
@@ -9038,6 +9177,174 @@ mod tests {
     }
 
     #[test]
+    fn marking_a_session_exited_clears_the_taskbar_in_the_snapshot_metadata() {
+        // The snapshot's session JSON is built from the metadata, not the
+        // taskbar machine: when the shell dies, the machine's cleared state
+        // must be synced into the metadata, so an exited tab kept open for
+        // inspection never resurrects a progress bar in a phone's tabs view.
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "p", r"C:\Work\P", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        inner.sessions.get_mut("s1").unwrap().metadata.taskbar = TaskbarProgress::Value(42);
+        inner.sessions.get_mut("s1").unwrap().look_here = true;
+
+        mark_session_exited(&mut inner, "s1", 1);
+
+        assert_eq!(
+            inner.sessions.get("s1").unwrap().metadata.taskbar,
+            TaskbarProgress::Clear,
+            "the metadata's taskbar must not outlive the process"
+        );
+        assert_eq!(
+            inner.sessions.get("s1").unwrap().look_here, false,
+            "the finished session's marker dies with the process"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn the_activity_sweep_step_syncs_the_cleared_taskbar_into_the_metadata() {
+        // A non-reporting command's implicit spinner is cleared by the
+        // active-to-idle grace transition, which the sweep (not the
+        // stream pass) runs. When the sweep drops the badge it must sync
+        // the cleared taskbar into the snapshot metadata, or every
+        // snapshot after the command finished would resurrect a pulsing
+        // ring on a quiet screen.
+        let mut session = test_session("s1", "p", r"C:\Work\P");
+        session.metadata.tui_mode = TuiMode::Fullscreen;
+        let start = Instant::now();
+        // The program is working: a spontaneous chunk earns the badge,
+        // published once it has held for ACTIVE_MIN_MS.
+        session.tui.mark_spontaneous_output(start);
+        session
+            .activity
+            .observe(&[], TuiMode::Fullscreen, false, false, true, true, start);
+        let settled = start + Duration::from_millis(crate::activity::ACTIVE_MIN_MS + 250);
+        let announced = session
+            .activity
+            .observe(&[], TuiMode::Fullscreen, false, false, false, false, settled)
+            .expect("the held badge is published");
+        // The stream pass synced the running command's spinner the same
+        // way its activity transition does.
+        let (activity, _) = announced;
+        session.taskbar.on_activity(activity);
+        session.metadata.taskbar = session.taskbar.effective();
+        assert_eq!(session.metadata.taskbar, TaskbarProgress::Indeterminate);
+
+        // The screen has now been quiet for longer than TUI_QUIET_MS: the
+        // sweep step drops the badge and moves the spinner to clear.
+        let quiet = start + Duration::from_millis(crate::activity::ACTIVE_MIN_MS + TUI_QUIET_MS + 500);
+        let step = Core::sweep_session_activity_step(&mut session, quiet)
+            .expect("the quiet screen drops its badge");
+        assert_eq!(step.0, SessionActivity::Idle);
+        assert_eq!(step.2, Some(TaskbarProgress::Clear));
+        assert_eq!(session.metadata.activity, SessionActivity::Idle);
+        assert_eq!(
+            session.metadata.taskbar,
+            TaskbarProgress::Clear,
+            "the cleared spinner must reach the snapshots the sweep's broadcast carries"
+        );
+        assert_eq!(
+            session.look_here, true,
+            "the finished edge raises the host's \"come look\" marker"
+        );
+    }
+
+    #[test]
+    fn the_snapshot_reports_the_sessions_still_holding_their_look_here_marker() {
+        // The marker is host-persisted: a client that connects after the
+        // finished edge reads the list from its first snapshot and raises
+        // the same static-dot marker a live client raised from the event
+        // stream.
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "p", r"C:\Work\P", true);
+        inner.sessions.insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        inner.sessions.insert("s2".into(), test_session("s2", "p", r"C:\Work\P"));
+        inner.sessions.get_mut("s1").unwrap().look_here = true;
+
+        let empty: HashSet<String> = HashSet::new();
+        let snapshot = snapshot_from_inner(&inner, &empty);
+        assert_eq!(
+            snapshot.look_here_session_ids,
+            vec!["s1".to_string()],
+            "only the marked session rides the list"
+        );
+
+        inner.sessions.get_mut("s1").unwrap().look_here = false;
+        let cleared = snapshot_from_inner(&inner, &empty);
+        assert!(
+            cleared.look_here_session_ids.is_empty(),
+            "a viewed (or re-armed) session leaves the list at once"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn the_look_here_flag_moves_with_the_taskbar_indicator() {
+        // The finished edge (any transition INTO the clear state) raises
+        // the marker; a re-armed indicator - a new command or an explicit
+        // state, i.e. anything non-clear - drops it. This is the edge a
+        // new command's first report produces, so a second command
+        // running after a marker never keeps the "come look" dot.
+        let mut session = test_session("s1", "p", r"C:\Work\P");
+        assert!(!session.look_here, "a fresh session holds no marker");
+        assert!(
+            !move_look_here(&mut session, TaskbarProgress::Indeterminate),
+            "a new command from an unmarked state stays unmarked"
+        );
+        assert!(
+            move_look_here(&mut session, TaskbarProgress::Clear),
+            "the finished edge raises the marker"
+        );
+        assert!(
+            move_look_here(&mut session, TaskbarProgress::Indeterminate),
+            "a re-armed indicator drops the marker"
+        );
+        assert!(
+            !move_look_here(&mut session, TaskbarProgress::Value(57)),
+            "an explicit report on an unmarked state stays unmarked"
+        );
+        assert!(
+            move_look_here(&mut session, TaskbarProgress::Clear),
+            "a second finished edge raises the marker again"
+        );
+        assert!(
+            move_look_here(&mut session, TaskbarProgress::Value(100)),
+            "the next command's 100% report drops it at once"
+        );
+        assert_eq!(session.look_here, false);
+    }
+
+    #[test]
+    fn viewing_a_session_clears_its_look_here_marker() {
+        // A look from any client - a desktop window making its tab
+        // active, or a phone opening its terminal - dies the marker, and
+        // the snapshot's field with it. The helper reports whether it
+        // held anything, so the callers broadcast only on a real change.
+        let (mut inner, state_path) = inner_with_settings(false, false);
+        test_project(&mut inner, "p", r"C:\Work\P", true);
+        inner.sessions.insert("s1".into(), test_session("s1", "p", r"C:\Work\P"));
+        inner.sessions.get_mut("s1").unwrap().look_here = true;
+
+        assert!(
+            clear_session_look_here(&mut inner, "s1"),
+            "a held marker is reported as cleared"
+        );
+        assert_eq!(inner.sessions.get("s1").unwrap().look_here, false);
+        assert!(
+            !clear_session_look_here(&mut inner, "s1"),
+            "a session that holds no marker reports nothing"
+        );
+        assert!(
+            !clear_session_look_here(&mut inner, "missing"),
+            "an unknown session reports nothing"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
     fn output_user_driven_uses_the_latest_of_input_and_resize() {
         // Keystrokes and resizes each arm the attribution window, and
         // the LATEST of the two governs: a resize while the user was
@@ -9554,6 +9861,7 @@ mod tests {
             requested_viewport: None,
             activity: ActivityDetector::new(Instant::now()),
             taskbar: SessionTaskbar::new(),
+            look_here: false,
             control_tail: String::new(),
             cursor_query_tail: String::new(),
             pending_cursor_reports: 0,

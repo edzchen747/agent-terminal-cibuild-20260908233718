@@ -1490,3 +1490,45 @@ test("closing a find bar that was never opened changes nothing", () => {
   assert.deepEqual(closeFind(CLOSED_FIND), CLOSED_FIND);
   assert.equal(findStatusLabel(CLOSED_FIND), "");
 });
+
+// ---- The snapshot's cross-client marker fields ------------------------------
+
+test("the snapshot's marker fields survive the wire round-trip", () => {
+  // The phone seeds its "come look" markers from lookHereSessionIds (a
+  // connect after the finished edge must still see them) and drops
+  // markers for the desktop's active tabs via desktopActiveSessionIds.
+  // Both must survive the encode/decode the clients run on the
+  // snapshot.
+  const snapshot: HostSnapshot = {
+    host: { id: "h1", name: "Workstation", version: "1.0.0" },
+    projects: [],
+    sessions: [],
+    devices: [],
+    desktopActiveSessionIds: ["a"],
+    lookHereSessionIds: ["b"],
+    shells: [],
+    defaultShellId: "powershell"
+  };
+  const decoded = decodeServerMessage(encodeMessage({ type: "snapshot", snapshot }));
+  assert.equal(decoded.type, "snapshot");
+  const wire = (decoded as { type: "snapshot"; snapshot: HostSnapshot }).snapshot;
+  assert.deepEqual(wire.lookHereSessionIds, ["b"]);
+  assert.deepEqual(wire.desktopActiveSessionIds, ["a"]);
+});
+
+test("a host that predates the marker fields still decodes", () => {
+  // The fields are optional: an older host omits them entirely, and the
+  // decode must not invent markers out of the absence.
+  const snapshot: HostSnapshot = {
+    host: { id: "h1", name: "Workstation", version: "0.9.0" },
+    projects: [],
+    sessions: [],
+    devices: [],
+    shells: [],
+    defaultShellId: "powershell"
+  };
+  const decoded = decodeServerMessage(encodeMessage({ type: "snapshot", snapshot }));
+  const wire = (decoded as { type: "snapshot"; snapshot: HostSnapshot }).snapshot;
+  assert.equal(wire.lookHereSessionIds, undefined);
+  assert.equal(wire.desktopActiveSessionIds, undefined);
+});

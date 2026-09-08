@@ -87,13 +87,16 @@ describe("applying a taskbar event", () => {
     assert.deepEqual(current.get("s1"), taskbar("paused", 10));
   });
 
-  it("drops the held entry on a clear event, leaving the others alone", () => {
+  it("keeps the clear entry on a clear event, leaving the others alone", () => {
+    // The clear must survive in the map: a snapshot in flight was built
+    // before the clear transition and still carries the old state, and
+    // the (newer) event has to win in the merge that follows.
     const next = applyTaskbarEvent(
       map({ s1: taskbar("value", 40), s2: taskbar("indeterminate") }),
       "s1",
       CLEAR_TASKBAR_PROGRESS
     );
-    assert.equal(next.get("s1"), undefined);
+    assert.deepEqual(next.get("s1"), CLEAR_TASKBAR_PROGRESS);
     assert.deepEqual(next.get("s2"), taskbar("indeterminate"));
   });
 
@@ -123,11 +126,21 @@ describe("merging a snapshot", () => {
   it("clears an indicator the session was still holding when its shell exited", () => {
     // An exited tab kept for inspection gets one final clear from the
     // host; the snapshot must not resurrect a spinner the process no
-    // longer owns. A clear state is not stored at all - an absent
-    // entry is the map's clear.
+    // longer owns. Exited sessions take the snapshot's verdict, so the
+    // map's old entry is dropped.
     const current = map({ s1: taskbar("indeterminate") });
     const merged = mergeTaskbar(current, [session("s1", "p1", { status: "exited", exitCode: 1 })]);
     assert.equal(merged.get("s1"), undefined);
+  });
+
+  it("a stale snapshot cannot resurrect a cleared state of a running session", () => {
+    // The snapshot that still reports the spinner was built before the
+    // clear event landed; the clear entry the event left in the map is
+    // newer and must win, or the tab would keep pulsing after the
+    // command finished.
+    const cleared = applyTaskbarEvent(map({ s1: taskbar("indeterminate") }), "s1", CLEAR_TASKBAR_PROGRESS);
+    const merged = mergeTaskbar(cleared, [session("s1", "p1", { taskbar: taskbar("indeterminate") })]);
+    assert.deepEqual(merged.get("s1"), CLEAR_TASKBAR_PROGRESS);
   });
 
   it("drops sessions that are gone", () => {
@@ -292,6 +305,17 @@ describe("model edge cases", () => {
     assert.deepEqual(
       tabProgressModel({ isActive: true, session: finishedIdle, taskbar: CLEAR_TASKBAR_PROGRESS, justCompleted: true }),
       { dot: null, bar: null, fill: null }
+    );
+  });
+
+  it("the marker draws immediately, before the activity's busy badge leaves its grace window", () => {
+    // The host's activity machine lingers "active" for a grace period
+    // after output stops, but the taskbar's running -> clear edge is the
+    // truth of "the command finished": the marker must not flash as a
+    // blinking running command while the activity badge catches up.
+    assert.deepEqual(
+      tabProgressModel({ isActive: false, session: running, taskbar: CLEAR_TASKBAR_PROGRESS, activity: "active", justCompleted: true }),
+      { dot: "completed", bar: "full", fill: null }
     );
   });
 

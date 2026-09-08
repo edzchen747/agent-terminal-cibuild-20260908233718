@@ -997,10 +997,14 @@ export class HostConnection {
   }
 
   /**
-   * The host's taskbar progress for a session. The mobile UI does not
-   * draw it yet, but the held snapshot keeps the state so a future
-   * indicator - or a desktop window that pairs in later - reads the
-   * truth instead of a stale copy.
+   * The host's taskbar progress for a session. Taskbar events reach the
+   * phone for every session (the host broadcasts them to all remote
+   * clients, not just attached ones), so this patch keeps each session's
+   * ring and dot live between heartbeats - short runs that fit between
+   * two heartbeat snapshots still show their running-to-clear edge, and
+   * with it the "come look" marker. Snapshots stay the fallback: the
+   * host syncs the taskbar machine into the session metadata they are
+   * built from, so a replaced snapshot always carries the truth.
    */
   private applyTaskbar(sessionId: string, taskbar: TaskbarProgress): void {
     const snapshot = this.snapshot;

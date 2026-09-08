@@ -334,6 +334,23 @@ export interface HostSnapshot {
   projects: Project[];
   sessions: TerminalSession[];
   devices: AuthorizedDevice[];
+  /**
+   * The sessions desktop windows are actively showing (their active tabs,
+   * unioned across windows), reported by the desktop renderers. Optional
+   * because a host older than this field omits it: a phone reads it to
+   * drop a "come look" marker for a session the user actually opened on
+   * the desktop (a background tab never counts as a look).
+   */
+  desktopActiveSessionIds?: string[];
+  /**
+   * The sessions whose command just finished (progress indicator went
+   * from running to clear) and that no client has viewed yet - the
+   * host-persisted "come look" markers. Optional because a host older
+   * than this field omits it: a client connecting after the edge seeds
+   * its markers from this list, so the static-dot marker survives a
+   * connect that happens after the command finished.
+   */
+  lookHereSessionIds?: string[];
   shells: ShellProfile[];
   defaultShellId: string;
   /**

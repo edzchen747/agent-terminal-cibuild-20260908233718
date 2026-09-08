@@ -89,6 +89,10 @@ export function App() {
   const [taskbarBySession, setTaskbarBySession] = useState<ReadonlyMap<string, TaskbarProgress>>(() => new Map());
   const [completedHold, setCompletedHold] = useState<ReadonlySet<string>>(() => new Set());
   const previousTaskbarRef = useRef(new Map<string, TaskbarProgress>());
+  // The remote devices' viewing sets as the last snapshot said them: a
+  // "come look" marker only dies for a session a client NEWLY opened,
+  // not one that was already open before the command finished.
+  const phoneViewedRef = useRef<Set<string>>(new Set());
   const [projectDrag, setProjectDrag] = useState<ProjectDragState | null>(null);
   const [projectReordering, setProjectReordering] = useState(false);
   const [leavingProjects, setLeavingProjects] = useState<LeavingProject[]>([]);
@@ -201,6 +205,52 @@ export function App() {
       return next;
     });
   }, [activeSessionId]);
+
+  // The host persists the "come look" markers across client connects
+  // (state.lookHereSessionIds): a window (re)loaded after the command
+  // finished still raises the 100% bar. Seed only - the local edge and
+  // view effects own the removals - and skip the tab this window is on:
+  // it is the look itself, not a marker.
+  useEffect(() => {
+    const ids = state?.lookHereSessionIds;
+    if (!ids || ids.length === 0) return;
+    setCompletedHold((current) => {
+      if (ids.every((id) => current.has(id))) return current;
+      const next = new Set(current);
+      for (const id of ids) if (id !== activeSessionId) next.add(id);
+      return next;
+    });
+  }, [state, activeSessionId]);
+
+  // Report the window's active tab to the host: a phone's "come look"
+  // marker for that session resets the moment the terminal is actually
+  // opened here (a background tab never counts as a look), and the host
+  // broadcasts the change to the phones right away.
+  useEffect(() => {
+    void window.agentTerminal.setActiveSession(activeSessionId);
+  }, [activeSessionId]);
+
+  // The marker dies on the desktop too when the user looks at the
+  // session from a phone: the snapshot's per-device viewing sets carry
+  // the sessions a remote device is displaying. Only a NEW entry resets
+  // a marker: a phone that already had the session open when the
+  // command finished is not "looking at the finish", so the marker
+  // survives until a client actually opens the session.
+  useEffect(() => {
+    if (!state) return;
+    const viewed = new Set<string>();
+    for (const device of state.devices) {
+      for (const id of device.viewingSessionIds ?? []) viewed.add(id);
+    }
+    const newly = [...viewed].filter((id) => !phoneViewedRef.current.has(id));
+    phoneViewedRef.current = viewed;
+    if (newly.length === 0) return;
+    setCompletedHold((current) => {
+      const next = new Set(current);
+      for (const id of newly) next.delete(id);
+      return next.size === current.size ? current : next;
+    });
+  }, [state]);
 
   useEffect(() => {
     const sessions = state?.sessions;

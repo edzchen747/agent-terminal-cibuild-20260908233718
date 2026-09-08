@@ -916,3 +916,78 @@ test("restarting the viewport keepalive does not double the tick", async () => {
     else globalThis.document = previousDocument;
   }
 });
+
+// ---- Taskbar events patch every held session --------------------------------
+//
+// The host broadcasts session.taskbar events to every remote client, not
+// just attached ones: a phone in its tabs view sees progress it never
+// attached to, and the running -> clear edge with its "come look" marker.
+// The patch must therefore reach the held snapshot's sessions, not only the
+// open terminal's.
+
+test("a taskbar event patches the held snapshot's sessions, attached or not", async () => {
+  await withFakeWebSocket(async () => {
+    const connection = new HostConnection(host());
+    const snapshots = [];
+    connection.on("snapshot", (snapshot) => snapshots.push(snapshot));
+    const opening = connection["open"]("ws://192.168.1.5:47831", 2_000);
+    const socket = FakeWebSocket.instances.at(-1);
+    socket.setOpen();
+    await opening;
+
+    // Hold a two-session snapshot, like the tabs view does.
+    socket.deliverServerMessage({
+      type: "snapshot",
+      snapshot: {
+        host: { id: "h1", name: "Desktop One", version: "0.3.5" },
+        projects: [],
+        sessions: [{ id: "s1" }, { id: "s2" }],
+        devices: [],
+        shells: [],
+        defaultShellId: ""
+      }
+    });
+
+    // An unattached session's progress must land in the held snapshot,
+    // and the listeners must see the patch.
+    socket.deliverServerMessage({ type: "session.taskbar", sessionId: "s2", taskbar: { state: "value", progress: 40 } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const held = connection["snapshot"];
+    assert.equal(held.sessions.find((session) => session.id === "s2").taskbar.state, "value");
+    assert.equal(held.sessions.find((session) => session.id === "s1").taskbar, undefined, "an untouched session gains no taskbar");
+    assert.equal(snapshots.length, 2, "snapshot listeners see the initial snapshot and the patch");
+    connection.close();
+  });
+});
+
+test("a taskbar event for an unknown session, or before any snapshot, is dropped", async () => {
+  await withFakeWebSocket(async () => {
+    const connection = new HostConnection(host());
+    const opening = connection["open"]("ws://192.168.1.5:47831", 2_000);
+    const socket = FakeWebSocket.instances.at(-1);
+    socket.setOpen();
+    await opening;
+
+    // Before any snapshot is held, the patch has nothing to patch.
+    socket.deliverServerMessage({ type: "session.taskbar", sessionId: "s1", taskbar: { state: "clear" } });
+    assert.equal(connection["snapshot"], undefined);
+
+    // And after a snapshot, a session it does not contain is ignored:
+    // the patch never invents sessions.
+    socket.deliverServerMessage({
+      type: "snapshot",
+      snapshot: {
+        host: { id: "h1", name: "Desktop One", version: "0.3.5" },
+        projects: [],
+        sessions: [{ id: "s1" }],
+        devices: [],
+        shells: [],
+        defaultShellId: ""
+      }
+    });
+    socket.deliverServerMessage({ type: "session.taskbar", sessionId: "gone", taskbar: { state: "value", progress: 7 } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(connection["snapshot"].sessions.length, 1);
+    connection.close();
+  });
+});
