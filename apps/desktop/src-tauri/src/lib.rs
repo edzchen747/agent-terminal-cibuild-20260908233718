@@ -249,6 +249,9 @@ fn set_default_terminal(state: State<'_, Arc<Core>>) -> Result<(), String> {
     // Per-user registry write; the state broadcast below recomputes
     // `is_default_terminal`, so the settings row flips to Undo on success.
     crate::default_terminal::set_as_default_terminal()?;
+    // The snapshot caches the verdict for 5 s - drop it so the broadcast
+    // below carries the fresh value (not the pre-set one).
+    state.invalidate_default_terminal_cache();
     state.broadcast();
     Ok(())
 }
@@ -256,6 +259,9 @@ fn set_default_terminal(state: State<'_, Arc<Core>>) -> Result<(), String> {
 #[tauri::command]
 fn unset_default_terminal(state: State<'_, Arc<Core>>) -> Result<(), String> {
     crate::default_terminal::clear_as_default_terminal()?;
+    // The snapshot caches the verdict for 5 s - drop it so the broadcast
+    // below carries the fresh value (not the pre-clear one).
+    state.invalidate_default_terminal_cache();
     state.broadcast();
     Ok(())
 }

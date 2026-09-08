@@ -542,6 +542,15 @@ pub struct Core {
     /// Last per-device viewing set observed by the viewport watchdog, so a
     /// phone opening or closing a terminal broadcasts once.
     viewing_cache: Mutex<Option<HashMap<String, Vec<String>>>>,
+    /// The desktop's "is the default terminal" verdict (a per-user
+    /// registry read), cached with a 5 s TTL: `state_for_window` runs
+    /// under the state lock for every window of every broadcast, and a
+    /// registry open plus two value reads done there (under the lock,
+    /// per window) stalls the whole app on a machine whose registry
+    /// provider is slow. The cache read (a memory compare) happens under
+    /// the lock; the registry I/O only happens, outside the lock, when
+    /// the TTL has lapsed or a set/unset command invalidated the cache.
+    default_terminal_cache: Mutex<Option<(bool, i64)>>,
     embedded_node: Mutex<Option<Child>>,
     desktop_enrollment_running: AtomicBool,
     /// A saved remote identity re-verification run is in flight. The stored
@@ -717,6 +726,7 @@ impl Core {
             exit_requested: AtomicBool::new(false),
             presence_cache: Mutex::new(None),
             viewing_cache: Mutex::new(None),
+            default_terminal_cache: Mutex::new(None),
             network_online: AtomicBool::new(true),
             pending_focus: Mutex::new(None),
             taskbar_engine: TaskbarEngine::start(),
@@ -1283,6 +1293,59 @@ impl Core {
         });
     }
 
+    /// The desktop's "is the default terminal" verdict with a 5 s TTL
+    /// cache: the value is a per-user registry pair (a key open plus two
+    /// value reads) that only changes when the user (or an admin) edits
+    /// `HKCU\Console\%%Startup`, so a cached read is correct for the UI
+    /// every time except up to 5 s after a set/unset command - and those
+    /// commands invalidate the cache explicitly
+    /// (`invalidate_default_terminal_cache`). The cache read (a memory
+    /// compare) is what `state_for_window` does under the state lock;
+    /// the registry I/O itself happens only when the TTL has lapsed and
+    /// then outside the lock, so a slow registry provider can no longer
+    /// stall every broadcast.
+    pub(crate) const DEFAULT_TERMINAL_CACHE_TTL_MS: i64 = 5_000;
+
+    /// Whether a cached verdict (value + the epoch-ms it was read) is
+    /// still inside its TTL. Extracted as a pure decision so the cache
+    /// discipline is unit-testable without touching the registry.
+    pub(crate) fn default_terminal_cache_fresh(
+        cached: Option<(bool, i64)>,
+        now: i64,
+    ) -> Option<bool> {
+        cached.and_then(|(value, checked_at)| {
+            (now.saturating_sub(checked_at) < Self::DEFAULT_TERMINAL_CACHE_TTL_MS).then_some(value)
+        })
+    }
+
+    fn default_terminal_state(&self) -> bool {
+        let now = Utc::now().timestamp_millis();
+        let cache = self
+            .default_terminal_cache
+            .lock()
+            .expect("default terminal cache poisoned");
+        if let Some(value) = Self::default_terminal_cache_fresh(*cache, now) {
+            return value;
+        }
+        drop(cache);
+        let fresh = crate::default_terminal::is_default_terminal();
+        *self
+            .default_terminal_cache
+            .lock()
+            .expect("default terminal cache poisoned") = Some((fresh, now));
+        fresh
+    }
+
+    /// Set/unset commands (lib.rs) call this so the next broadcast sees
+    /// the new registry value immediately instead of the up-to-5 s
+    /// stale one.
+    pub fn invalidate_default_terminal_cache(&self) {
+        *self
+            .default_terminal_cache
+            .lock()
+            .expect("default terminal cache poisoned") = None;
+    }
+
     pub fn state_for_window(&self, label: &str) -> DesktopState {
         let inner = self.inner.lock().expect("desktop state poisoned");
         let current_project_id = inner
@@ -1312,7 +1375,7 @@ impl Core {
                 status: remote_status,
                 error: network.registration_error.clone(),
             },
-            is_default_terminal: crate::default_terminal::is_default_terminal(),
+            is_default_terminal: self.default_terminal_state(),
         }
     }
 
@@ -3100,17 +3163,29 @@ impl Core {
         let _ = project_id; // keep the argument on every platform
         #[cfg(windows)]
         {
-            let (hwnd, taskbar) = {
+            // Resolve the window label and the taskbar state in two short
+            // state-lock scopes and never hold the state lock across
+            // Tauri's manager lookups (`get_webview_window`, `hwnd`): the
+            // main thread takes the state lock while inside Tauri's window
+            // event handlers, so a worker holding the state lock and
+            // waiting on Tauri's manager lock deadlocks with it (the
+            // 2026-09-08 full-app freeze when switching projects).
+            let label = {
                 let inner = self.inner.lock().expect("desktop state poisoned");
-                let Some(label) = inner.windows.window_for_project(project_id) else {
-                    return;
-                };
-                let Some(window) = self.app.get_webview_window(label) else {
-                    return;
-                };
-                let Ok(hwnd) = window.hwnd() else {
-                    return;
-                };
+                inner.windows.window_for_project(project_id).map(str::to_owned)
+            };
+            let Some(label) = label else {
+                return;
+            };
+            let Some(window) = self.app.get_webview_window(&label) else {
+                return;
+            };
+            let Ok(hwnd) = window.hwnd() else {
+                return;
+            };
+            let hwnd = (hwnd.0) as isize;
+            let taskbar = {
+                let inner = self.inner.lock().expect("desktop state poisoned");
                 let candidates = inner
                     .sessions
                     .values()
@@ -3119,7 +3194,7 @@ impl Core {
                         started_at: session.taskbar.command_started_at(),
                         state: session.taskbar.effective(),
                     });
-                ((hwnd.0) as isize, crate::taskbar::window_state(candidates))
+                crate::taskbar::window_state(candidates)
             };
             if taskbar.is_clear() {
                 // A clear push also forgets the window in the engine's
@@ -10520,5 +10595,212 @@ mod tests {
             "the moved session was the last one in the old project"
         );
         fs::remove_file(state_path).expect("remove test state");
+    }
+
+    // ------------------------------------------------------------------
+    // Lock-discipline regression tests (the 2026-09-08 whole-app freeze)
+    // ------------------------------------------------------------------
+
+    /// Lexical scan of Rust source: brace blocks as (start, end) byte
+    /// offsets, the positions of state-lock acquisitions
+    /// (`self.inner.lock(`), and the positions of Tauri-manager and live
+    /// registry call sites (`self.app.` / `default_terminal::is_default_terminal`).
+    /// String, char, and comment contents are skipped: they may contain
+    /// braces or the scanned patterns without being code.
+    fn scan_state_lock_sites(source: &str) -> (Vec<(usize, usize)>, Vec<usize>, Vec<usize>) {
+        let mut blocks = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
+        let mut locks = Vec::new();
+        let mut calls = Vec::new();
+        let len = source.len();
+        let mut i = 0usize;
+        while i < len {
+            let rest = &source[i..];
+            if rest.starts_with("//") {
+                match rest.find('\n') {
+                    Some(nl) => i += nl,
+                    None => break,
+                }
+                continue;
+            }
+            if rest.starts_with("/*") {
+                let mut depth = 1;
+                i += 2;
+                while i < len && depth > 0 {
+                    if source[i..].starts_with("/*") {
+                        depth += 1;
+                        i += 2;
+                    } else if source[i..].starts_with("*/") {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            if rest.starts_with('"') {
+                i += 1;
+                while i < len {
+                    match source.as_bytes()[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                continue;
+            }
+            if rest.starts_with('r') {
+                // A raw string (r"..." / r#"..."#) ends at " followed by
+                // the same number of #s; anything else falls through.
+                let mut hashes = 0;
+                let mut j = i + 1;
+                while j < len && source.as_bytes()[j] == b'#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j < len && source.as_bytes()[j] == b'"' {
+                    let mut close = String::from("\"");
+                    close.push_str(&"#".repeat(hashes));
+                    i = j + 1;
+                    match source[i..].find(&close) {
+                        Some(end) => i += end + close.len(),
+                        None => i = len,
+                    }
+                    continue;
+                }
+            }
+            if rest.starts_with('\'') {
+                // Char literal ('a', '\\n', '\'\'') or a lifetime ('a):
+                // a char literal closes within a few characters, a
+                // lifetime never does. Only the quote of a lifetime is
+                // skipped.
+                if let Some(close) = rest[1..].find('\'') {
+                    if close <= 4 {
+                        i += close + 2;
+                        continue;
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            if rest.starts_with("self.inner.lock(") {
+                locks.push(i);
+                i += 1;
+                continue;
+            }
+            if rest.starts_with("self.app.") {
+                calls.push(i);
+                i += 1;
+                continue;
+            }
+            if rest.starts_with("default_terminal::is_default_terminal") {
+                calls.push(i);
+                i += 1;
+                continue;
+            }
+            match source.as_bytes()[i] {
+                b'{' => {
+                    stack.push(i);
+                    i += 1;
+                }
+                b'}' => {
+                    let start = stack.pop().unwrap_or(i);
+                    blocks.push((start, i));
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        (blocks, locks, calls)
+    }
+
+    /// The start offset of the innermost brace block enclosing `pos`
+    /// (None when pos is at top level).
+    fn innermost_block_start(blocks: &[(usize, usize)], pos: usize) -> Option<usize> {
+        blocks
+            .iter()
+            .filter(|(start, end)| *start < pos && *end >= pos)
+            .map(|(start, _)| *start)
+            .max()
+    }
+
+    /// Regression for the whole-app freeze: the `open_project` worker held
+    /// the global state lock across Tauri's `get_webview_window` / `hwnd`
+    /// (in `update_window_taskbar`), while the main thread took the state
+    /// lock from Tauri's window-event handlers (focus tracking) while
+    /// Tauri still held its manager lock - a lock-order inversion that
+    /// deadlocked the entire app on every project switch. The fix takes
+    /// the state lock in short scopes and makes the Tauri lookups between
+    /// them, outside the lock.
+    ///
+    /// This scan pins that discipline across all of `core.rs`: a Tauri
+    /// manager call (`self.app.*`) or live registry I/O
+    /// (`default_terminal::is_default_terminal`) must never sit inside a
+    /// block that holds the state lock - exactly the deadlock shape. A
+    /// violation fails the test with the offending line.
+    #[test]
+    fn no_tauri_or_registry_calls_inside_state_lock_scopes() {
+        let source = include_str!("core.rs");
+        let (blocks, locks, calls) = scan_state_lock_sites(source);
+        assert!(!locks.is_empty(), "the scan found no state-lock acquisitions: the scan is blind");
+        assert!(!calls.is_empty(), "the scan found no Tauri/registry call sites: the scan is blind");
+
+        let mut violations = Vec::new();
+        for &call in &calls {
+            for &(start, end) in &blocks {
+                // Only blocks that actually enclose the call: the lock must
+                // still be held at the call site.
+                if !(start < call && end >= call) {
+                    continue;
+                }
+                for &lock in &locks {
+                    // The lock must be a direct statement of this block
+                    // (a lock in a nested block is dropped at that
+                    // nested block's end) and acquired before the call.
+                    if !(start < lock && lock < call) {
+                        continue;
+                    }
+                    if innermost_block_start(&blocks, lock) != Some(start) {
+                        continue;
+                    }
+                    let line_no = source[..call].lines().count();
+                    let start_line = source[..start].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                    let end_line = source[start..].find('\n').map(|p| start + p).unwrap_or(source.len());
+                    violations.push(format!(
+                        "line {line_no}: Tauri/registry call under the state lock acquired at byte {lock}\n    {}",
+                        source[start_line..end_line].trim()
+                    ));
+                    break;
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "Tauri/registry calls under the state lock (the 2026-09-08 whole-app deadlock shape):\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// The default-terminal registry verdict is cached with a 5 s TTL so
+    /// `state_for_window` never does registry I/O under the state lock:
+    /// fresh entries are served from the cache, entries at or past the
+    /// TTL (and clock skew, which saturates to zero age) trigger a
+    /// refresh.
+    #[test]
+    fn default_terminal_cache_ttl_boundaries() {
+        use super::Core;
+        // Fresh: inside the TTL, served without a registry read.
+        assert_eq!(Core::default_terminal_cache_fresh(Some((true, 1_000)), 4_999), Some(true));
+        assert_eq!(Core::default_terminal_cache_fresh(Some((false, 1_000)), 4_999), Some(false));
+        // Exactly the TTL is stale: the next read refreshes.
+        assert_eq!(Core::default_terminal_cache_fresh(Some((true, 1_000)), 6_000), None);
+        // Clock skew (checked_at in the future) saturates to zero age: fresh.
+        assert_eq!(Core::default_terminal_cache_fresh(Some((true, 9_000)), 1_000), Some(true));
+        // No entry: refresh.
+        assert_eq!(Core::default_terminal_cache_fresh(None, 1_000), None);
     }
 }
