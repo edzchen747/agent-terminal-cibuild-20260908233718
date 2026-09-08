@@ -17,7 +17,7 @@
     "test:provisioning": "node --test server/provisioning/server.test.mjs",
     "android:sync": "npm run android:sync -w @agentterminal/mobile",
     "android:open": "npm run android:open -w @agentterminal/mobile",
-    "desktop:portable": "npm run package:win -w @agentterminal/desktop"
+    "desktop:portable": "npm run build -w @agentterminal/protocol && npm run package:win -w @agentterminal/desktop"
   },
   "engines": {
     "node": ">=22"
