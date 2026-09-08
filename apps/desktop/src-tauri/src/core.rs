@@ -49,7 +49,7 @@ use crate::{
     taskbar::SessionTaskbar,
     taskbar_engine::TaskbarEngine,
     tui::{ShellMarker, TuiClassifier},
-    window_clients::WindowClients,
+    window_clients::{ProjectOrigin, WindowClients},
 };
 
 /// The PTY is spawned at this grid, then tracks the current OWNER's
@@ -155,12 +155,111 @@ fn journal_dump_path(session_id: &str) -> PathBuf {
 
 pub(crate) fn sync_log_line(scope: &str, message: fmt::Arguments<'_>) {
     let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
-    let line = format!("{timestamp} [{scope}] {message}\n");
+    let line = format!("{timestamp} [{scope}] (t={}) {message}\n", thread_tag());
     let _ = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(sync_log_path())
         .and_then(|mut file| file.write_all(line.as_bytes()));
+}
+
+// Human-readable per-thread tag, written once at each thread's spawn (see
+// `with_thread_tag` / `set_thread_tag`) and carried on every sync-log line,
+// so a frozen run can attribute each line to its thread. Threads that never
+// set one fall back to the numeric thread id.
+thread_local! {
+    static THREAD_TAG: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn set_thread_tag(name: impl Into<String>) {
+    THREAD_TAG.with(|tag| *tag.borrow_mut() = Some(name.into()));
+}
+
+// Spawn a named thread: the tag is set before `target` runs, so the
+// thread's first log line already carries it.
+pub(crate) fn with_thread_tag(name: String, target: impl FnOnce() + Send + 'static) {
+    std::thread::spawn(move || {
+        set_thread_tag(name);
+        target();
+    });
+}
+
+fn thread_tag() -> String {
+    THREAD_TAG.with(|tag| {
+        tag.borrow()
+            .clone()
+            .unwrap_or_else(|| format!("tid{:?}", std::thread::current().id()))
+    })
+}
+
+/// Which threads are currently inside an `inner` state-lock scope (debug
+/// only). A thread cannot nest the non-reentrant mutex, so the record is
+/// per-thread, not a stack. The lock watchdog dumps it whenever the state
+/// lock is stuck - in a frozen run that names the thread holding the lock
+/// and the scope it entered. `InnerScopeGuard` must be created right after
+/// the lock is acquired and live until the scope ends (RAII drop removes
+/// the record).
+static OPEN_INNER_SCOPES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (String, i64)>>,
+> = std::sync::LazyLock::new(std::sync::Mutex::default);
+
+pub(crate) struct InnerScopeGuard {
+    tag: String,
+    active: bool,
+}
+
+impl InnerScopeGuard {
+    pub fn enter(scope: &str, session: Option<&str>) -> Self {
+        if !sync_debug_enabled() {
+            return Self { tag: String::new(), active: false };
+        }
+        let tag = thread_tag();
+        let detail = match session {
+            Some(session) => format!("{scope}({session})"),
+            None => scope.to_owned(),
+        };
+        OPEN_INNER_SCOPES
+            .lock()
+            .expect("inner scope trace poisoned")
+            .insert(tag.clone(), (detail, Utc::now().timestamp_millis()));        Self { tag, active: true }
+    }
+}
+
+impl Drop for InnerScopeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            OPEN_INNER_SCOPES
+                .lock()
+                .expect("inner scope trace poisoned")
+                .remove(&self.tag);
+        }
+    }
+}
+
+/// One-line report of every still-open inner-lock scope ("tag in scope
+/// since <epoch-ms>"; empty when no thread is inside one). Empty in
+/// production: the map is only written while sync debug is enabled.
+pub(crate) fn open_inner_scope_report() -> String {
+    if !sync_debug_enabled() {
+        return String::new();
+    }
+    let trace = OPEN_INNER_SCOPES.lock().expect("inner scope trace poisoned");
+    format_open_inner_scopes(&trace)
+}
+
+/// The pure formatter behind `open_inner_scope_report` (kept separate so
+/// the report format the lock watchdog logs is unit-testable without the
+/// env-var gate): one "tag in scope since <ms>" entry per open scope,
+/// comma-joined, empty when none.
+pub(crate) fn format_open_inner_scopes(
+    trace: &std::collections::HashMap<String, (String, i64)>,
+) -> String {
+    trace
+        .iter()
+        .map(|(tag, (scope, at_ms))| format!("{tag} in {scope} since {at_ms}ms"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 macro_rules! sync_log {
@@ -542,14 +641,11 @@ pub struct Core {
     /// Last per-device viewing set observed by the viewport watchdog, so a
     /// phone opening or closing a terminal broadcasts once.
     viewing_cache: Mutex<Option<HashMap<String, Vec<String>>>>,
-    /// The desktop's "is the default terminal" verdict (a per-user
-    /// registry read), cached with a 5 s TTL: `state_for_window` runs
-    /// under the state lock for every window of every broadcast, and a
-    /// registry open plus two value reads done there (under the lock,
-    /// per window) stalls the whole app on a machine whose registry
-    /// provider is slow. The cache read (a memory compare) happens under
-    /// the lock; the registry I/O only happens, outside the lock, when
-    /// the TTL has lapsed or a set/unset command invalidated the cache.
+    /// The desktop's "is the default terminal" verdict (a per-user registry
+    /// read), cached with a 5 s TTL: `state_for_window` runs under the state
+    /// lock for every window of every broadcast, and a registry open plus
+    /// two value reads done there (under the lock, per window) stalls the
+    /// whole app on a machine whose registry provider is slow.
     default_terminal_cache: Mutex<Option<(bool, i64)>>,
     embedded_node: Mutex<Option<Child>>,
     desktop_enrollment_running: AtomicBool,
@@ -734,7 +830,76 @@ impl Core {
         core.spawn_presence_refresh();
         core.spawn_viewport_watchdog();
         core.spawn_activity_watchdog();
+        // A sync-debug-only probe: it reveals a stuck or poisoned state
+        // lock while the app is hung (see spawn_lock_watchdog).
+        if sync_debug_enabled() {
+            core.spawn_lock_watchdog();
+            core.spawn_main_thread_ping();
+        }
         core
+    }
+
+    /// Diagnostic heartbeat (sync-debug only): post a no-op task onto the
+    /// main thread every 500 ms. The posted task logs when the MAIN thread
+    /// runs it, so a run of "main tick" lines proves the event loop is
+    /// pumping - when they stop, the main thread itself is stuck (and the
+    /// lock-watchdog / open-scope lines say where).
+    fn spawn_main_thread_ping(self: &Arc<Self>) {
+        let app = self.app.clone();
+        with_thread_tag("main-ping".into(), move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = app.run_on_main_thread(|| {
+                sync_log!("main", "main tick");
+            });
+        });
+    }
+
+    /// Diagnostic probe (only when AGENT_TERMINAL_SYNC_DEBUG=1): the state
+    /// lock's turns are microseconds, so a holder keeping it for two
+    /// seconds means the app is about to hang. Log that - with the
+    /// poisoned state explicitly, since a panic in any bare thread that
+    /// held the lock (a PTY merge thread, a child-wait thread) poisons it
+    /// and the main thread's next window-focus handler then panics on
+    /// `lock().expect(…)` and the whole UI dies. The log line, plus the
+    /// last `openwin`/`focused` line before it, names the stuck point.
+    fn spawn_lock_watchdog(self: &Arc<Self>) {
+        let core = Arc::clone(self);
+        with_thread_tag("lock-watch".into(), move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    match core.inner.try_lock() {
+                        Ok(guard) => {
+                            drop(guard);
+                            break;
+                        }
+                        Err(std::sync::TryLockError::WouldBlock)
+                            if std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            sync_log!(
+                                "watchdog",
+                                "state lock held for over 2s (a thread is stuck holding it); open inner scopes: [{}]",
+                                open_inner_scope_report()
+                            );
+                            break;
+                        }
+                        Err(std::sync::TryLockError::Poisoned(guard)) => {
+                            sync_log!(
+                                "watchdog",
+                                "state lock POISONED - a thread panicked while holding it; open inner scopes: [{}]",
+                                open_inner_scope_report()
+                            );
+                            drop(guard);
+                            break;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Boots on the first saved project in the user's order, falling back to
@@ -746,7 +911,12 @@ impl Core {
             inner.store.ensure_network_identity()?;
             startup_project(&mut inner)?
         };
-        let _ = self.ensure_project_window_with_focus(&project.id, true, None)?;
+        let _ = self.ensure_project_window_with_focus(
+            &project.id,
+            true,
+            None,
+            ProjectOrigin::User,
+        )?;
         Ok(())
     }
 
@@ -810,7 +980,7 @@ impl Core {
     /// with the control server.
     pub fn start_connectivity_monitor(self: &Arc<Self>) {
         let core = Arc::clone(self);
-        std::thread::spawn(move || {
+        with_thread_tag("connectivity".into(), move || {
             let mut tracker = ConnectivityTracker::default();
             loop {
                 match tracker.record(network::internet_connected()) {
@@ -1272,7 +1442,7 @@ impl Core {
                             "Agent Terminal embedded network node did not resume: {error:#}; retrying once"
                         );
                         let retry_core = Arc::clone(&core);
-                        std::thread::spawn(move || {
+                        with_thread_tag("verify-retry".into(), move || {
                             std::thread::sleep(std::time::Duration::from_secs(4));
                             retry_core.verify_remote_node(true, false);
                         });
@@ -1293,22 +1463,20 @@ impl Core {
         });
     }
 
-    /// The desktop's "is the default terminal" verdict with a 5 s TTL
-    /// cache: the value is a per-user registry pair (a key open plus two
-    /// value reads) that only changes when the user (or an admin) edits
+    /// The desktop's "is the default terminal" verdict with a 5 s TTL cache:
+    /// the value is a per-user registry pair (a key open plus two value
+    /// reads) that only changes when the user (or an admin) edits
     /// `HKCU\Console\%%Startup`, so a cached read is correct for the UI
     /// every time except up to 5 s after a set/unset command - and those
-    /// commands invalidate the cache explicitly
-    /// (`invalidate_default_terminal_cache`). The cache read (a memory
-    /// compare) is what `state_for_window` does under the state lock;
-    /// the registry I/O itself happens only when the TTL has lapsed and
-    /// then outside the lock, so a slow registry provider can no longer
-    /// stall every broadcast.
+    /// commands invalidate the cache explicitly. The cache read (a memory
+    /// compare) is what `state_for_window` does under the state lock; the
+    /// registry I/O itself happens only when the TTL has lapsed and then
+    /// outside the lock.
     pub(crate) const DEFAULT_TERMINAL_CACHE_TTL_MS: i64 = 5_000;
 
-    /// Whether a cached verdict (value + the epoch-ms it was read) is
-    /// still inside its TTL. Extracted as a pure decision so the cache
-    /// discipline is unit-testable without touching the registry.
+    /// Whether a cached verdict (value + the epoch-ms it was read) is still
+    /// inside its TTL. Extracted as a pure decision so the cache discipline
+    /// is unit-testable without touching the registry.
     pub(crate) fn default_terminal_cache_fresh(
         cached: Option<(bool, i64)>,
         now: i64,
@@ -1336,9 +1504,8 @@ impl Core {
         fresh
     }
 
-    /// Set/unset commands (lib.rs) call this so the next broadcast sees
-    /// the new registry value immediately instead of the up-to-5 s
-    /// stale one.
+    /// Set/unset commands (lib.rs) call this so the next broadcast sees the
+    /// new registry value immediately instead of the up-to-5 s stale one.
     pub fn invalidate_default_terminal_cache(&self) {
         *self
             .default_terminal_cache
@@ -1348,11 +1515,16 @@ impl Core {
 
     pub fn state_for_window(&self, label: &str) -> DesktopState {
         let inner = self.inner.lock().expect("desktop state poisoned");
+        let _scope = InnerScopeGuard::enter("state_for_window", Some(label));
+        let entered_at = std::time::Instant::now();
         let current_project_id = inner
             .windows
             .project_for_window(label)
             .map(str::to_owned)
             .unwrap_or_default();
+        // The renderer reads this to keep a host-placed project's
+        // auto-selected tab from claiming the PTY grid (see ProjectOrigin).
+        let current_project_origin = inner.windows.project_origin(label).as_str().to_owned();
         let online_device_ids = self.online_device_ids();
         let network = inner.store.network();
         // With no authorized device there is nobody the overlay route could
@@ -1365,9 +1537,10 @@ impl Core {
             self.remote_verification_running.load(Ordering::Acquire)
                 || self.desktop_enrollment_running.load(Ordering::Acquire),
         );
-        DesktopState {
+        let state = DesktopState {
             snapshot: snapshot_from_inner(&inner, &online_device_ids),
             current_project_id,
+            current_project_origin,
             open_projects_in_new_windows: inner.store.settings().open_projects_in_new_windows,
             confirm_external_links: inner.store.settings().confirm_external_links,
             follow_working_directory: inner.store.settings().follow_working_directory,
@@ -1376,11 +1549,23 @@ impl Core {
                 error: network.registration_error.clone(),
             },
             is_default_terminal: self.default_terminal_state(),
+        };
+        // The state lock's turns are microseconds; a slow construction is
+        // the kind of thing that starves every other thread (and is a
+        // likely culprit in a whole-app freeze).
+        if entered_at.elapsed() > std::time::Duration::from_millis(50) {
+            sync_log!(
+                "lock",
+                "state_for_window SLOW label={label} held={}ms",
+                entered_at.elapsed().as_millis()
+            );
         }
+        state
     }
 
     pub fn snapshot(&self) -> HostSnapshot {
         let inner = self.inner.lock().expect("desktop state poisoned");
+        let _scope = InnerScopeGuard::enter("snapshot", None);
         let online_device_ids = self.online_device_ids();
         snapshot_from_inner(&inner, &online_device_ids)
     }
@@ -1399,7 +1584,7 @@ impl Core {
 
     fn spawn_presence_refresh(self: &Arc<Self>) {
         let core = Arc::clone(self);
-        std::thread::spawn(move || {
+        with_thread_tag("presence".into(), move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(
                     PRESENCE_REFRESH_INTERVAL_MS,
@@ -1427,7 +1612,7 @@ impl Core {
     /// concern, the green connectivity dot a 2-minute one.
     fn spawn_viewport_watchdog(self: &Arc<Self>) {
         let core = Arc::clone(self);
-        std::thread::spawn(move || {
+        with_thread_tag("vp-watch".into(), move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(VIEWPORT_WATCHDOG_TICK_MS));
                 core.sweep_stale_viewports();
@@ -1437,7 +1622,7 @@ impl Core {
 
     fn spawn_activity_watchdog(self: &Arc<Self>) {
         let core = Arc::clone(self);
-        std::thread::spawn(move || {
+        with_thread_tag("act-watch".into(), move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(ACTIVITY_WATCHDOG_TICK_MS));
                 core.sweep_session_activity();
@@ -1499,6 +1684,7 @@ impl Core {
     fn sweep_session_activity(self: &Arc<Self>) {
         let changed = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("activity-sweep", None);
             let now = Instant::now();
             // The "come look" marker is not raised for a session a
             // client is actively viewing (see `viewed_session_ids`):
@@ -1548,6 +1734,7 @@ impl Core {
         let mut changed = Vec::new();
         let viewing = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("viewport-sweep", None);
             let now = Instant::now();
             for session in inner.sessions.values_mut() {
                 let evicted = evict_stale_viewports(
@@ -1594,6 +1781,8 @@ impl Core {
     }
 
     pub fn broadcast(&self) {
+        let entered_at = std::time::Instant::now();
+        sync_log!("lock", "broadcast enter");
         for label in self.app.webview_windows().into_keys() {
             let registered = self
                 .inner
@@ -1626,11 +1815,30 @@ impl Core {
                 },
             );
         }
+        sync_log!(
+            "lock",
+            "broadcast exit ({}ms)",
+            entered_at.elapsed().as_millis()
+        );
     }
 
     pub fn mark_window_focused(&self, label: &str) {
+        sync_log!("openwin", "window {label} focused (gained OS focus)");
         let mut inner = self.inner.lock().expect("desktop state poisoned");
+        let _scope = InnerScopeGuard::enter("mark_focused", Some(label));
         inner.windows.mark_focused(label);
+        sync_log!("openwin", "window {label} focused: recorded");
+    }
+
+    /// The window lost OS focus: it stops counting as the desktop being
+    /// engaged, which decides whether a shell `cd` drags it along
+    /// (see `desktop_follows_cd`).
+    pub fn mark_window_blurred(&self, label: &str) {
+        sync_log!("openwin", "window {label} blurred (lost OS focus)");
+        let mut inner = self.inner.lock().expect("desktop state poisoned");
+        let _scope = InnerScopeGuard::enter("mark_blurred", Some(label));
+        inner.windows.mark_blurred(label);
+        sync_log!("openwin", "window {label} blurred: recorded");
     }
 
     /// Records the session the window is actively showing (its active tab),
@@ -1655,6 +1863,7 @@ impl Core {
     }
 
     pub fn unregister_window(&self, label: &str) {
+        sync_log!("lock", "unregister_window enter label={label}");
         let project_id = self
             .inner
             .lock()
@@ -1667,6 +1876,7 @@ impl Core {
         let mut changed = Vec::new();
         {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("unregister_viewports", Some(label));
             let controller = TerminalController::Desktop(label.to_string());
             for session in inner.sessions.values_mut() {
                 let removed = session.viewports.remove(&controller);
@@ -1682,13 +1892,15 @@ impl Core {
             self.broadcast_grid_change(&session_id, epoch);
         }
         if let Some(project_id) = project_id {
-            self.cleanup_empty_temporary_project(&project_id);
+            self.cleanup_empty_temporary_project(&project_id, true);
         }
+        sync_log!("lock", "unregister_window exit label={label}");
     }
 
     pub fn show_terminal_window(self: &Arc<Self>) {
         let (label, fallback_project) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("show_window", None);
             let fallback_project = preferred_project(&mut inner).map(|project| project.id);
             (inner.windows.last_or_any(), fallback_project)
         };
@@ -1706,11 +1918,11 @@ impl Core {
     }
 
     pub fn ensure_project_window(self: &Arc<Self>, project_id: &str) -> Result<String> {
-        self.ensure_project_window_with_focus(project_id, true, None)
+        self.ensure_project_window_with_focus(project_id, true, None, ProjectOrigin::User)
     }
 
     fn ensure_project_window_in_background(self: &Arc<Self>, project_id: &str) -> Result<String> {
-        self.ensure_project_window_with_focus(project_id, false, None)
+        self.ensure_project_window_with_focus(project_id, false, None, ProjectOrigin::Host)
     }
 
     /// Ensures the project owns a window so its sessions have a place to
@@ -1723,6 +1935,7 @@ impl Core {
     fn ensure_project_window_quietly(self: &Arc<Self>, project_id: &str) -> Result<()> {
         let (open_new_windows, existing) = {
             let inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("ensure_quiet_lookup", Some(project_id));
             (
                 inner.store.settings().open_projects_in_new_windows,
                 inner
@@ -1742,7 +1955,11 @@ impl Core {
         let label = format!("terminal-{}", Uuid::new_v4());
         {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("ensure_quiet_assign", Some(project_id));
             inner.windows.assign(&label, &project.id);
+            // The host opened this window (a session was created on a
+            // phone); the auto-selected tab must not claim the PTY grid.
+            inner.windows.set_project_origin(&label, ProjectOrigin::Host);
         }
         let built =
             WebviewWindowBuilder::new(&self.app, &label, WebviewUrl::App("index.html".into()))
@@ -1815,14 +2032,28 @@ impl Core {
     /// multi-window mode reuses the project's own window when it has one
     /// and opens a new window otherwise. Returns the label of the window
     /// that ends up showing the project.
+    ///
+    /// `origin` records WHY the window shows the project: a user-opened
+    /// project's auto-selected tab claims the PTY grid, a host-placed one
+    /// (a cd moved a session into it) must not - the client that ran the
+    /// cd is still the one interacting (see `ProjectOrigin`).
     fn ensure_project_window_with_focus(
         self: &Arc<Self>,
         project_id: &str,
         focus: bool,
         preferred_window: Option<&str>,
+        origin: ProjectOrigin,
     ) -> Result<String> {
+        // Breadcrumbs for the open-project path: if a freeze stalls one of
+        // the main-thread window calls below, the last openwin line in the
+        // sync log is the exact stuck point.
+        sync_log!(
+            "openwin",
+            "ensure_project_window start project={project_id} focus={focus} origin={origin:?}"
+        );
         let reusable = {
             let inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("ensure_window_reusable", Some(project_id));
             (!inner.store.settings().open_projects_in_new_windows)
                 .then(|| {
                     preferred_window
@@ -1833,6 +2064,7 @@ impl Core {
                 .flatten()
         };
         if let Some(label) = reusable {
+            sync_log!("openwin", "reusable branch window={label}");
             let (project, displaced) = {
                 let project = self.project_by_id(project_id)?;
                 let displaced = self
@@ -1844,6 +2076,12 @@ impl Core {
                     .displaced_window;
                 (project, displaced)
             };
+            {
+                let mut inner = self.inner.lock().expect("desktop state poisoned");
+                let _scope = InnerScopeGuard::enter("ensure_window_origin", Some(&label));
+                inner.windows.set_project_origin(&label, origin);
+            }
+            sync_log!("openwin", "reusable: destroy/set_title/unminimize/show");
             if let Some(displaced) = displaced
                 && let Some(window) = self.app.get_webview_window(&displaced)
             {
@@ -1860,8 +2098,10 @@ impl Core {
                 // A reassigned or newly surfaced window inherits the
                 // project's live taskbar state (a running or failed
                 // command's indicator must not die with the old window).
+                sync_log!("openwin", "reusable: show/focus done, taskbar+broadcast");
                 self.update_window_taskbar(&project.id);
                 self.broadcast();
+                sync_log!("openwin", "reusable: done");
                 return Ok(label);
             }
         }
@@ -1875,6 +2115,23 @@ impl Core {
         if let Some(label) = existing
             && let Some(window) = self.app.get_webview_window(&label)
         {
+            // A surfaced window is placed by whoever asked for it. The
+            // renderer reads the window's origin to decide whether its
+            // auto-selected tab claims the PTY grid, so this branch must
+            // re-record it: a quiet window (created hidden by
+            // `ensure_project_window_quietly` for a session opened outside
+            // the desktop) carries the Host origin, and surfacing it for an
+            // explicit open (open_project, the tray, a console handoff -
+            // all `ProjectOrigin::User`) without the flip would leave its
+            // auto-selected tab claim-suppressed, so a brand-new session's
+            // grid stays stuck at the PTY default and the terminal looks
+            // frozen.
+            sync_log!("openwin", "existing branch window={label} (origin flip + surface)");
+            {
+                let mut inner = self.inner.lock().expect("desktop state poisoned");
+                let _scope = InnerScopeGuard::enter("ensure_window_existing", Some(&label));
+                inner.windows.set_project_origin(&label, origin);
+            }
             let _ = window.unminimize();
             window.show()?;
             if focus {
@@ -1882,8 +2139,12 @@ impl Core {
                 self.mark_window_focused(&label);
             }
             // The window's taskbar button inherits the project's live
-            // state (it may have been rebuilt after a destroy).
+            // state (it may have been rebuilt after a destroy). Windows
+            // already booted learn the origin flip through the snapshot.
+            sync_log!("openwin", "existing: unminimize/show");
             self.update_window_taskbar(project_id);
+            self.broadcast();
+            sync_log!("openwin", "existing: done");
             return Ok(label);
         }
 
@@ -1891,11 +2152,14 @@ impl Core {
         let label = format!("terminal-{}", Uuid::new_v4());
         {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("ensure_window_fresh", Some(project_id));
             inner.windows.assign(&label, &project.id);
+            inner.windows.set_project_origin(&label, origin);
             if focus {
                 inner.windows.mark_focused(&label);
             }
         }
+        sync_log!("openwin", "fresh branch: building window {label} (blocks until the main thread)");
         let built =
             WebviewWindowBuilder::new(&self.app, &label, WebviewUrl::App("index.html".into()))
                 .title(format!("{} — Agent Terminal", project.name))
@@ -1906,6 +2170,7 @@ impl Core {
                 .decorations(false)
                 .visible(focus)
                 .build();
+        sync_log!("openwin", "fresh branch: window {label} built");
         let window = match built {
             Ok(window) => window,
             Err(error) => {
@@ -1922,14 +2187,17 @@ impl Core {
         // main thread, where the window's messages are dispatched.
         install_edge_resize(&self.app, &label);
         if !focus {
+            sync_log!("openwin", "fresh: showing window {label}");
             window.show()?;
         }
         if focus {
+            sync_log!("openwin", "fresh: focusing window {label}");
             window.set_focus()?;
         }
         // A fresh window's taskbar button inherits the project's live
         // state (a running or failed command's indicator).
         self.update_window_taskbar(&project.id);
+        sync_log!("openwin", "fresh: done window={label}");
         Ok(label)
     }
 
@@ -1938,19 +2206,26 @@ impl Core {
         project_id: &str,
         preferred_window: Option<&str>,
     ) -> Result<()> {
-        let has_running = self
-            .inner
-            .lock()
-            .expect("desktop state poisoned")
-            .sessions
-            .values()
-            .any(|session| {
-                session.metadata.project_id == project_id && session.metadata.status == "running"
-            });
+        sync_log!("openwin", "open_project invoked project={project_id} preferred={preferred_window:?}");
+        let has_running = {
+            let inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("open_project", None);
+            inner
+                .sessions
+                .values()
+                .any(|session| {
+                    session.metadata.project_id == project_id && session.metadata.status == "running"
+                })
+        };
         if !has_running {
             self.create_session(project_id, None)?;
         }
-        let _ = self.ensure_project_window_with_focus(project_id, true, preferred_window)?;
+        let _ = self.ensure_project_window_with_focus(
+            project_id,
+            true,
+            preferred_window,
+            ProjectOrigin::User,
+        )?;
         Ok(())
     }
 
@@ -2252,6 +2527,7 @@ impl Core {
         };
         {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("create_session", None);
             inner.sessions.insert(
                 id.clone(),
                 ManagedSession {
@@ -2296,7 +2572,7 @@ impl Core {
         self.spawn_session_reader(&id, reader);
         let waiter_core = Arc::clone(self);
         let waiter_id = id.clone();
-        thread::spawn(move || {
+        with_thread_tag(format!("waiter-{id}"), move || {
             if let Ok(status) = child.wait() {
                 waiter_core.on_terminal_exit(&waiter_id, status.exit_code());
             }
@@ -2328,7 +2604,8 @@ impl Core {
         // back on the PTY exactly as it did when the reader appended inline,
         // instead of growing a queue.
         let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
-        thread::spawn(move || {
+        let pty_id = session_id.to_owned();
+        with_thread_tag(format!("ptyreader-{pty_id}"), move || {
             let mut bytes = vec![0_u8; 16_384];
             loop {
                 match reader.read(&mut bytes) {
@@ -2343,7 +2620,7 @@ impl Core {
         });
         let reader_core = Arc::clone(self);
         let reader_id = session_id.to_owned();
-        thread::spawn(move || {
+        with_thread_tag(format!("merge-{reader_id}"), move || {
             let mut compactor = StreamCompactor::new();
             let mut buffered: Vec<u8> = Vec::new();
             while let Ok(chunk) = raw_rx.recv() {
@@ -2504,7 +2781,7 @@ impl Core {
         let waiter_core = Arc::clone(self);
         let waiter_id = id.clone();
         let client_wait = handoff.client_wait as isize;
-        thread::spawn(move || {
+        with_thread_tag(format!("handoff-waiter-{id}"), move || {
             let status = crate::default_terminal::wait_client_exit(client_wait);
             waiter_core.on_terminal_exit(&waiter_id, status);
         });
@@ -2531,7 +2808,7 @@ impl Core {
         let window_core = Arc::clone(self);
         let window_project = project.id.clone();
         let window_session = id.clone();
-        std::thread::spawn(move || {
+        with_thread_tag("console-show".into(), move || {
             // A console the user launched has to end up on screen. A
             // window that is open gets raised; when none is open - they
             // were all closed and the app keeps running from the tray -
@@ -2621,6 +2898,7 @@ impl Core {
     pub fn close_session(self: &Arc<Self>, session_id: &str) {
         let project_id = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("close_session", Some(session_id));
             match close_session_in_inner(&mut inner, session_id, true) {
                 Some(project_id) => project_id,
                 // The tab was already closed; no state change, no retire,
@@ -2628,7 +2906,7 @@ impl Core {
                 None => return,
             }
         };
-        self.cleanup_empty_temporary_project(&project_id);
+        self.cleanup_empty_temporary_project(&project_id, true);
         // The closed session's taskbar state is gone with it, so re-push
         // the window's combined state for whatever is left.
         self.update_window_taskbar(&project_id);
@@ -2890,6 +3168,7 @@ impl Core {
         let controller = TerminalController::Remote(key);
         let (epoch, look_here_cleared) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("attach_remote", Some(session_id));
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
             };
@@ -2937,6 +3216,7 @@ impl Core {
         claim: bool,
     ) -> Result<SessionSnapshot> {
         let mut inner = self.inner.lock().expect("desktop state poisoned");
+        let _scope = InnerScopeGuard::enter("attach_window", Some(label));
         let window_project_id = inner
             .windows
             .project_for_window(label)
@@ -2984,14 +3264,15 @@ impl Core {
     }
 
     pub fn detach_window_session(&self, label: &str, session_id: &str) {
-        self.inner
-            .lock()
-            .expect("desktop state poisoned")
-            .windows
-            .detach(label, session_id);
+        {
+            let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("detach_window", Some(label));
+            inner.windows.detach(label, session_id);
+        }
         let controller = TerminalController::Desktop(label.to_string());
         let epoch = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("detach_viewport", Some(label));
             let Some(session) = inner.sessions.get_mut(session_id) else {
                 return;
             };
@@ -3163,16 +3444,19 @@ impl Core {
         let _ = project_id; // keep the argument on every platform
         #[cfg(windows)]
         {
-            // Resolve the window label and the taskbar state in two short
-            // state-lock scopes and never hold the state lock across
-            // Tauri's manager lookups (`get_webview_window`, `hwnd`): the
-            // main thread takes the state lock while inside Tauri's window
-            // event handlers, so a worker holding the state lock and
-            // waiting on Tauri's manager lock deadlocks with it (the
-            // 2026-09-08 full-app freeze when switching projects).
+            // Resolve the label under the state lock, but make the Tauri
+            // window lookup and hwnd acquisition OUTSIDE it: the main
+            // thread's window-event handlers (focus tracking) take the
+            // state lock while Tauri still holds its manager state, so a
+            // worker that holds the state lock across a Tauri manager
+            // call deadlocks against that path (lock-order inversion).
             let label = {
                 let inner = self.inner.lock().expect("desktop state poisoned");
-                inner.windows.window_for_project(project_id).map(str::to_owned)
+                let _scope = InnerScopeGuard::enter("taskbar", Some(project_id));
+                inner
+                    .windows
+                    .window_for_project(project_id)
+                    .map(str::to_owned)
             };
             let Some(label) = label else {
                 return;
@@ -3186,6 +3470,7 @@ impl Core {
             let hwnd = (hwnd.0) as isize;
             let taskbar = {
                 let inner = self.inner.lock().expect("desktop state poisoned");
+                let _scope = InnerScopeGuard::enter("taskbar", Some(project_id));
                 let candidates = inner
                     .sessions
                     .values()
@@ -4024,6 +4309,7 @@ impl Core {
     }
 
     fn on_terminal_data(self: &Arc<Self>, session_id: &str, data: String) {
+        let terminal_data_entered_at = std::time::Instant::now();
         let (
             reported_cwd,
             title_changed,
@@ -4038,6 +4324,7 @@ impl Core {
             look_here_changed,
         ) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("terminal-data", Some(session_id));
             // The "come look" marker is not raised for a session a
             // client is actively viewing (see `viewed_session_ids`):
             // the client looking at it is the look itself, so a command
@@ -4361,6 +4648,13 @@ impl Core {
             data: payload.clone(),
             offset,
         };
+        if terminal_data_entered_at.elapsed() > std::time::Duration::from_millis(100) {
+            sync_log!(
+                "lock",
+                "terminal-data SLOW session={session_id} scope held {}ms",
+                terminal_data_entered_at.elapsed().as_millis()
+            );
+        }
         for label in window_clients {
             let _ = self.app.emit_to(
                 EventTarget::webview_window(label),
@@ -4395,8 +4689,10 @@ impl Core {
     }
 
     fn on_terminal_exit(self: &Arc<Self>, session_id: &str, exit_code: u32) {
+        sync_log!("lock", "terminal-exit enter session={session_id} code={exit_code}");
         let (closed_project, exited_project, taskbar_clear) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("terminal-exit", Some(session_id));
             // The taskbar state the process was showing, for the
             // kept-open exited tab: its indicator has to be dropped
             // explicitly, since no stream is left to clear it.
@@ -4431,7 +4727,7 @@ impl Core {
             }
         };
         if let Some(project_id) = &closed_project {
-            self.cleanup_empty_temporary_project(project_id);
+            self.cleanup_empty_temporary_project(project_id, true);
             // The closed session's state is gone with it, so re-push the
             // window's taskbar in case the surviving sessions' priority
             // changed.
@@ -4463,9 +4759,25 @@ impl Core {
         let Ok(cwd) = canonical_directory(&cleaned) else {
             return;
         };
+        // Which client ran the cd decides whether the DESKTOP window follows
+        // it. The host only sees the PTY output, so it uses the one signal
+        // that separates the clients: the window showing the session still
+        // holds OS focus when the desktop user typed the cd there. With no
+        // desktop window focused, a remote client (a phone) ran it and the
+        // desktop must not be dragged along.
+        let follow_window = {
+            let inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("cd-follow-check", Some(session_id));
+            inner.sessions
+                .get(session_id)
+                .map(|session| session.metadata.project_id.clone())
+                .as_deref()
+                .is_some_and(|project_id| desktop_follows_cd(&inner, project_id))
+        };
         let outcome = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
-            resolve_working_directory(&mut inner, session_id, &cwd)
+            let _scope = InnerScopeGuard::enter("cd-resolve", Some(session_id));
+            resolve_working_directory(&mut inner, session_id, &cwd, follow_window)
         };
         let plan = match outcome {
             CdOutcome::Missing => return,
@@ -4479,32 +4791,43 @@ impl Core {
             CdOutcome::Reassigned(plan) => plan,
         };
         if plan.project_changed {
-            if let Some(label) = plan.displaced_window
-                && let Some(window) = self.app.get_webview_window(&label)
-            {
-                let _ = window.destroy();
-            }
-
-            if let Some(label) = plan.active_window {
-                if let Some(window) = self.app.get_webview_window(&label) {
-                    let _ = window.set_title(&format!("{} — Agent Terminal", plan.project.name));
-                    if plan.old_has_sessions && plan.open_projects_in_new_windows {
-                        let _ = self.ensure_project_window_in_background(&plan.previous_project_id);
-                    } else {
-                        self.cleanup_empty_temporary_project(&plan.previous_project_id);
+            if follow_window {
+                // The desktop ran the cd: its window follows the session
+                // into the new project, shown and focused, as before. (A
+                // following cd always has a window to follow: the focus
+                // check that set `follow_window` is the old project's
+                // window holding OS focus.)
+                sync_log!("cd", "cd-follow session={session_id} project={} previous={}", plan.project.id, plan.previous_project_id);
+                if let Some(label) = plan.displaced_window
+                    && let Some(window) = self.app.get_webview_window(&label)
+                {
+                    sync_log!("cd", "cd-follow: destroying displaced window {label}");
+                    let _ = window.destroy();
+                }
+                if let Some(label) = plan.active_window {
+                    if let Some(window) = self.app.get_webview_window(&label) {
+                        sync_log!("cd", "cd-follow: surfacing active window {label}");
+                        let _ = window.set_title(&format!("{} — Agent Terminal", plan.project.name));
+                        if plan.old_has_sessions && plan.open_projects_in_new_windows {
+                            let _ = self.ensure_project_window_in_background(&plan.previous_project_id);
+                        } else {
+                            self.cleanup_empty_temporary_project(&plan.previous_project_id, true);
+                        }
+                        let _ = window.unminimize();
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        self.mark_window_focused(&label);
+                        sync_log!("cd", "cd-follow: window {label} surfaced");
                     }
-                    let _ = window.unminimize();
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                    self.mark_window_focused(&label);
                 }
-            } else {
-                let _ = self.ensure_project_window(&plan.project.id);
-                if plan.old_has_sessions {
-                    let _ = self.ensure_project_window_in_background(&plan.previous_project_id);
-                } else {
-                    self.cleanup_empty_temporary_project(&plan.previous_project_id);
-                }
+            } else if !plan.old_has_sessions {
+                // A remote client (a phone) ran the cd: no desktop window is
+                // retargeted, opened, shown, or focused. The old project
+                // keeps its window (with whatever sessions remain there);
+                // only an empty temporary old project is retired, and
+                // quietly - the window reattaches to its replacement
+                // without a show or a focus.
+                self.cleanup_empty_temporary_project(&plan.previous_project_id, false);
             }
             // The moved session's taskbar state now belongs to the other
             // project; make sure both projects' windows carry the states
@@ -4515,9 +4838,11 @@ impl Core {
         self.broadcast();
     }
 
-    fn cleanup_empty_temporary_project(&self, project_id: &str) {
+    fn cleanup_empty_temporary_project(&self, project_id: &str, focus: bool) {
+        sync_log!("lock", "cleanup enter project={project_id} focus={focus}");
         let (window_label, replacement) = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("cleanup_retire", Some(project_id));
             match retire_empty_temporary_project(&mut inner, project_id) {
                 RetireOutcome::NotEligible => return,
                 RetireOutcome::Removed {
@@ -4540,7 +4865,11 @@ impl Core {
         };
         let displaced = {
             let mut inner = self.inner.lock().expect("desktop state poisoned");
+            let _scope = InnerScopeGuard::enter("cleanup_reassign", Some(project_id));
             inner.windows.clear_attachments(&window_label);
+            // The host reattached this window to the replacement project;
+            // its auto-selected tab must not claim the PTY grid.
+            inner.windows.set_project_origin(&window_label, ProjectOrigin::Host);
             inner
                 .windows
                 .assign(&window_label, &replacement.id)
@@ -4553,10 +4882,15 @@ impl Core {
         }
         if let Some(window) = self.app.get_webview_window(&window_label) {
             let _ = window.set_title(&format!("{} — Agent Terminal", replacement.name));
-            let _ = window.unminimize();
-            let _ = window.show();
-            let _ = window.set_focus();
-            self.mark_window_focused(&window_label);
+            // A retire triggered by a remote client's cd (a phone) must not
+            // pop the window: the reattachment is quiet, so the phone keeps
+            // being the client the desktop is not interrupting.
+            if focus {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+                self.mark_window_focused(&window_label);
+            }
         }
     }
 
@@ -5124,12 +5458,37 @@ fn should_open_quiet_window(open_projects_in_new_windows: bool, project_has_wind
     open_projects_in_new_windows && !project_has_window
 }
 
+/// A shell `cd` drags the desktop window along only when the desktop is
+/// the client that ran it. The host sees only the PTY output and cannot
+/// tell the clients apart, so it uses the one signal that does: the window
+/// showing the session still holds OS focus when the desktop user typed
+/// the cd there. With no desktop window focused, a remote client (a phone)
+/// ran the cd, and the desktop must not follow it.
+fn desktop_follows_cd(inner: &Inner, project_id: &str) -> bool {
+    inner.windows
+        .window_for_project(project_id)
+        .is_some_and(|label| inner.windows.is_focused(label))
+}
+
 /// Resolve which project a session's new working directory belongs to and
 /// update the session's stored cwd. With follow-working-directory on the
 /// session is moved to the matching project (creating a temporary one when
 /// none matches) and a window plan is returned; with it off the cwd is
 /// recorded but the session is left in its project.
-fn resolve_working_directory(inner: &mut Inner, session_id: &str, cwd: &Path) -> CdOutcome {
+///
+/// `follow_window` decides whether the DESKTOP WINDOW follows the session
+/// into the new project. It is set by the caller only when the desktop is
+/// the client that ran the cd (its window still holds OS focus - see
+/// `desktop_follows_cd`): the window is retargeted and the host shows it.
+/// When the cd came from a remote client (a phone) it stays `false` and
+/// the window is left exactly where it is - not retargeted, not opened,
+/// shown, or focused - while the session still moves in state.
+fn resolve_working_directory(
+    inner: &mut Inner,
+    session_id: &str,
+    cwd: &Path,
+    follow_window: bool,
+) -> CdOutcome {
     let Some(current) = inner
         .sessions
         .get(session_id)
@@ -5188,10 +5547,31 @@ fn resolve_working_directory(inner: &mut Inner, session_id: &str, cwd: &Path) ->
                 .map(str::to_owned)
         })
         .flatten();
-    let displaced_window = active_window.as_ref().and_then(|label| {
-        inner.windows.retain_attachment(label, session_id);
-        inner.windows.assign(label, &project.id).displaced_window
-    });
+    let displaced_window = match active_window.as_deref() {
+        // The desktop ran the cd: the window follows the session into the
+        // new project. It keeps rendering the moved session's pane: the
+        // moved session's attachment is retained (every other attached
+        // session is not in the window's project anymore) and the pane is
+        // re-attached to the window when it renders.
+        Some(label) if follow_window => {
+            inner.windows.retain_attachment(label, session_id);
+            // The desktop user ran the cd, so the followed window's
+            // auto-selected tab claims the PTY grid as usual (it is a
+            // user-placed window, not a host-placed one).
+            inner.windows.set_project_origin(label, ProjectOrigin::User);
+            inner.windows.assign(label, &project.id).displaced_window
+        }
+        // The cd ran on a remote client (a phone): the window stays on
+        // the session's old project and the new project gets no window,
+        // so nothing is displaced. The session's attachment leaves the
+        // window with it - the window shows the old project, whose
+        // remaining sessions are the only ones it should keep rendering.
+        Some(label) => {
+            inner.windows.detach(label, session_id);
+            None
+        }
+        None => None,
+    };
     let old_has_sessions = project_changed
         && inner
             .sessions
@@ -5950,7 +6330,8 @@ mod tests {
         apply_session_grid, attach_owner_grid_for, claim_pending_focus, clear_session_look_here,
         close_session_in_inner,
         collapse_superseded_repaints, contains_csi_final, drain_journal_front_at,
-        ensure_home_project, evict_stale_viewports, folder_name, is_cursor_position_report,
+        desktop_follows_cd, ensure_home_project, evict_stale_viewports, folder_name,
+        is_cursor_position_report,
         is_device_attributes_report, is_dropped_node_status, is_system_directory,
         is_within_project, log_escape, mark_session_exited, move_look_here,
         newest_running_session_project_id,
@@ -5966,6 +6347,7 @@ mod tests {
     };
     use crate::models::TaskbarProgress;
     use crate::taskbar::SessionTaskbar;
+    use crate::window_clients::ProjectOrigin;
     use crate::{
         models::{AuthorizedDevice, Project, SessionSegment, TerminalSession, TuiMode},
         store::DesktopStore,
@@ -10282,7 +10664,7 @@ mod tests {
         inner.windows.assign("window-a", "a");
         inner.windows.attach("window-a", "s1");
 
-        let outcome = resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\B"));
+        let outcome = resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\B"), false);
         assert!(
             matches!(outcome, CdOutcome::Recorded),
             "with follow off the cwd is recorded, not reassigned"
@@ -10316,7 +10698,7 @@ mod tests {
         inner.windows.assign("window-a", "a");
 
         // A folder that matches no saved or temporary project.
-        let outcome = resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Somewhere\Else"));
+        let outcome = resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Somewhere\Else"), false);
         assert!(matches!(outcome, CdOutcome::Recorded));
         assert_eq!(inner.sessions["s1"].metadata.project_id, "a");
         assert!(
@@ -10337,7 +10719,7 @@ mod tests {
         inner.windows.assign("window-t", "temp-a");
         inner.windows.attach("window-t", "s1");
 
-        let outcome = resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\TempA\sub"));
+        let outcome = resolve_working_directory(&mut inner, "s1", Path::new(r"C:\Work\TempA\sub"), false);
         assert!(matches!(outcome, CdOutcome::Recorded));
         assert_eq!(inner.sessions["s1"].metadata.project_id, "temp-a");
         assert_eq!(
@@ -10352,7 +10734,7 @@ mod tests {
     fn resolve_missing_session_reports_missing_regardless_of_follow() {
         let (mut inner, state_path) = inner_with_settings(false, false);
         assert!(matches!(
-            resolve_working_directory(&mut inner, "ghost", Path::new(r"C:\Work\A")),
+            resolve_working_directory(&mut inner, "ghost", Path::new(r"C:\Work\A"), false),
             CdOutcome::Missing
         ));
         inner
@@ -10360,7 +10742,7 @@ mod tests {
             .set_follow_working_directory(true)
             .expect("turn follow on");
         assert!(matches!(
-            resolve_working_directory(&mut inner, "ghost", Path::new(r"C:\Work\A")),
+            resolve_working_directory(&mut inner, "ghost", Path::new(r"C:\Work\A"), false),
             CdOutcome::Missing
         ));
         assert!(inner.sessions.is_empty());
@@ -10381,7 +10763,7 @@ mod tests {
         let plan = expect_reassigned(resolve_working_directory(
             &mut inner,
             "s1",
-            Path::new(r"C:\Work\B\deep"),
+            Path::new(r"C:\Work\B\deep"), true
         ));
         assert_eq!(inner.sessions["s1"].metadata.project_id, "b");
         assert_eq!(plan.previous_project_id, "a");
@@ -10405,7 +10787,7 @@ mod tests {
         let plan = expect_reassigned(resolve_working_directory(
             &mut inner,
             "s1",
-            Path::new(r"C:\Work\Deep\x"),
+            Path::new(r"C:\Work\Deep\x"), true
         ));
         assert_eq!(plan.project.id, "inner", "the more specific project wins");
         assert_eq!(inner.sessions["s1"].metadata.project_id, "inner");
@@ -10425,7 +10807,7 @@ mod tests {
         let plan = expect_reassigned(resolve_working_directory(
             &mut inner,
             "s1",
-            Path::new(r"C:\Work\C"),
+            Path::new(r"C:\Work\C"), true
         ));
         assert_eq!(
             plan.project.id, temp.id,
@@ -10452,7 +10834,7 @@ mod tests {
         let plan = expect_reassigned(resolve_working_directory(
             &mut inner,
             "s1",
-            Path::new(r"C:\Fresh\Folder"),
+            Path::new(r"C:\Fresh\Folder"), true
         ));
         assert!(
             !plan.project.persistent,
@@ -10478,7 +10860,7 @@ mod tests {
         let plan = expect_reassigned(resolve_working_directory(
             &mut inner,
             "s1",
-            Path::new(r"C:\Work\A\sub"),
+            Path::new(r"C:\Work\A\sub"), true
         ));
         assert!(
             !plan.project_changed,
@@ -10530,7 +10912,7 @@ mod tests {
         let plan = expect_reassigned(resolve_working_directory(
             &mut inner,
             "s1",
-            Path::new(r"C:\Work\B"),
+            Path::new(r"C:\Work\B"), true
         ));
         assert!(plan.project_changed);
         assert_eq!(plan.active_window.as_deref(), Some("window-a"));
@@ -10561,7 +10943,7 @@ mod tests {
         let plan = expect_reassigned(resolve_working_directory(
             &mut inner,
             "s1",
-            Path::new(r"C:\Work\B"),
+            Path::new(r"C:\Work\B"), true
         ));
         assert!(
             plan.old_has_sessions,
@@ -10588,12 +10970,342 @@ mod tests {
         let plan = expect_reassigned(resolve_working_directory(
             &mut inner,
             "s1",
-            Path::new(r"C:\Work\B"),
+            Path::new(r"C:\Work\B"), true
         ));
         assert!(
             !plan.old_has_sessions,
             "the moved session was the last one in the old project"
         );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn quiet_cd_keeps_the_window_on_the_old_project_and_touches_no_focus() {
+        // A cd from a remote client (the phone), with no desktop window
+        // focused: the session moves to the new project in state, but the
+        // window is left exactly where it is - not retargeted, not opened,
+        // shown, or focused - and the new project gets no window.
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        test_project(&mut inner, "b", r"C:\Work\B", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner.windows.assign("window-a", "a");
+        inner.windows.attach("window-a", "s1");
+
+        let plan = expect_reassigned(resolve_working_directory(
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Work\B"),
+            false,
+        ));
+        assert!(plan.project_changed);
+        assert_eq!(plan.project.id, "b");
+        assert_eq!(
+            inner.sessions["s1"].metadata.project_id, "b",
+            "the session still follows the working directory in state"
+        );
+        assert_eq!(plan.active_window.as_deref(), Some("window-a"));
+        assert_eq!(
+            plan.displaced_window, None,
+            "the window is not retargeted, so nothing is displaced"
+        );
+        assert_eq!(
+            inner.windows.window_for_project("a"),
+            Some("window-a"),
+            "the window stays on the old project"
+        );
+        assert_eq!(
+            inner.windows.window_for_project("b"),
+            None,
+            "the new project gets no window"
+        );
+        assert!(
+            inner.windows.subscribers("s1").is_empty(),
+            "the moved session's attachment leaves the old window"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn a_focused_window_follows_the_cd_as_a_user_placement() {
+        // The same cd, but the window showing the session holds OS focus:
+        // the desktop user ran it, so the window follows into the new
+        // project and stays a user placement (its auto-selected tab
+        // claims the PTY grid as usual).
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        test_project(&mut inner, "b", r"C:\Work\B", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner.windows.assign("window-a", "a");
+        inner.windows.mark_focused("window-a");
+
+        assert!(
+            desktop_follows_cd(&inner, "a"),
+            "the focused window's project follows"
+        );
+        let plan = expect_reassigned(resolve_working_directory(
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Work\B"),
+            true,
+        ));
+        assert!(
+            plan.project_changed,
+            "the cd moved the session across projects"
+        );
+        assert_eq!(
+            inner.windows.window_for_project("b"),
+            Some("window-a"),
+            "the window follows the session into the new project"
+        );
+        assert_eq!(
+            inner.windows.project_origin("window-a"),
+            ProjectOrigin::User,
+            "a followed window is a user placement"
+        );
+        assert_eq!(
+            inner.windows.subscribers("s1"),
+            vec!["window-a"],
+            "the moved session's attachment follows the window"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn desktop_follows_cd_requires_the_projects_window_to_hold_focus() {
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        inner.windows.assign("window-a", "a");
+
+        assert!(!desktop_follows_cd(&inner, "a"), "an unfocused window does not follow");
+        inner.windows.mark_focused("window-a");
+        assert!(desktop_follows_cd(&inner, "a"));
+        inner.windows.mark_blurred("window-a");
+        assert!(
+            !desktop_follows_cd(&inner, "a"),
+            "focus lost (the user is on the phone): the desktop stays put"
+        );
+        assert!(
+            !desktop_follows_cd(&inner, "unknown-project"),
+            "a project with no window cannot be followed"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn a_surfaced_quiet_window_for_a_windowless_project_becomes_a_user_placement() {
+        // The state sequence behind the "new window freezes" repro: with
+        // `open_projects_in_new_windows` on, a desktop cd moves the saved
+        // project's window into a temporary project (the saved project is
+        // left WINDOWLESS). Clicking the saved project's 0 tabs then
+        // creates a session, whose quiet-window path opens a HIDDEN
+        // Host-origin window for it - and the explicit open surfaces that
+        // very window. That surface must flip it to a User placement
+        // (core.rs `ensure_project_window_with_focus` existing-window
+        // branch, plus the broadcast): a booting renderer on a Host origin
+        // marks the auto-selected tab auto-activated, its pane never
+        // claims the PTY grid, and a brand-new session sits at the PTY
+        // default - the terminal looks frozen.
+        let (mut inner, state_path) = inner_with_settings(true, true);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner.windows.assign("window-a", "a");
+        inner.windows.attach("window-a", "s1");
+        inner.windows.mark_focused("window-a");
+
+        assert!(
+            desktop_follows_cd(&inner, "a"),
+            "the focused window's project follows the cd"
+        );
+        let plan = expect_reassigned(resolve_working_directory(
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Temp\build"),
+            true,
+        ));
+        assert!(plan.project_changed);
+        let temp_id = plan.project.id.clone();
+        assert_ne!(temp_id, "a");
+        assert_eq!(
+            inner.windows.window_for_project(&temp_id),
+            Some("window-a"),
+            "the focused window follows the cd into the temporary project"
+        );
+        assert_eq!(
+            inner.windows.window_for_project("a"),
+            None,
+            "the saved project is left windowless, which forces the quiet-window path"
+        );
+
+        // The 0-tab click: create_session's quiet window (hidden, host
+        // placement - the path cannot know a user is about to surface it).
+        inner.windows.assign("window-quiet", "a");
+        inner.windows.set_project_origin("window-quiet", ProjectOrigin::Host);
+
+        // The explicit open surfaces it: a user placement from then on.
+        inner.windows.set_project_origin("window-quiet", ProjectOrigin::User);
+        assert_eq!(
+            inner.windows.project_origin("window-quiet"),
+            ProjectOrigin::User,
+            "the surfaced window must be a user placement, or its auto-selected tab's claim stays suppressed"
+        );
+        assert_eq!(
+            inner.windows.window_for_project("a"),
+            Some("window-quiet"),
+            "the surfaced window is the saved project's window"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn a_cd_follows_only_when_the_sessions_own_project_window_is_focused() {
+        // The multi-window edge: the user is looking at window-b (project
+        // b) while a phone is attached to s1 (project a) and runs a cd
+        // there. window-a EXISTS but does not hold OS focus, so project a's
+        // cd must stay quiet - only the focused window's own project
+        // follows. An "any window is focused" check would drag window-a
+        // along and steal the phone's view.
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        test_project(&mut inner, "b", r"C:\Work\B", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner.windows.assign("window-a", "a");
+        inner.windows.attach("window-a", "s1");
+        inner.windows.assign("window-b", "b");
+        inner.windows.mark_focused("window-b");
+
+        assert!(
+            !desktop_follows_cd(&inner, "a"),
+            "another project's focused window must not drag this one along"
+        );
+        assert!(
+            desktop_follows_cd(&inner, "b"),
+            "the focused window's own project does follow"
+        );
+
+        let plan = expect_reassigned(resolve_working_directory(
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Temp\build"),
+            false,
+        ));
+        assert!(plan.project_changed);
+        let temp_id = plan.project.id.clone();
+        assert_ne!(temp_id, "a");
+        assert_eq!(plan.active_window.as_deref(), Some("window-a"));
+        assert_eq!(plan.displaced_window, None);
+        assert_eq!(inner.windows.window_for_project("a"), Some("window-a"));
+        assert_eq!(
+            inner.windows.window_for_project(&temp_id),
+            None,
+            "the quiet cd gives the new project no window"
+        );
+        assert!(
+            inner.windows.subscribers("s1").is_empty(),
+            "the moved session's attachment leaves the window it no longer belongs to"
+        );
+        assert_eq!(
+            inner.windows.project_origin("window-a"),
+            ProjectOrigin::User,
+            "the quiet cd never re-placed the window, so its origin is untouched"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn a_destroyed_window_stops_following_cds() {
+        // A window closed while focused stops counting as engaged: the
+        // desktop is running from the tray, so the next cd (typically from
+        // the phone) must stay quiet even if the session it moves was the
+        // one that window showed.
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner.windows.assign("window-a", "a");
+        inner.windows.mark_focused("window-a");
+
+        assert!(desktop_follows_cd(&inner, "a"), "the focused window follows while it is alive");
+        inner.windows.remove_window("window-a");
+        assert!(
+            !desktop_follows_cd(&inner, "a"),
+            "a closed window cannot hold focus, so its project's cds are quiet"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn a_followed_cd_flips_a_host_placement_back_to_user() {
+        // The flip the renderer's origin-changed clear depends on: a
+        // window that a quiet path placed as a Host origin (a retire
+        // reattachment) becomes a USER placement the moment the user runs
+        // a cd in it (the window holds focus, so the cd followed). Without
+        // the flip the window's auto-selected tab would stay
+        // claim-suppressed forever and a new session's grid would sit at
+        // the PTY default - the terminal looks frozen.
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        test_project(&mut inner, "b", r"C:\Work\B", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+        inner.windows.assign("window-a", "a");
+        inner.windows.set_project_origin("window-a", ProjectOrigin::Host);
+        inner.windows.mark_focused("window-a");
+
+        let plan = expect_reassigned(resolve_working_directory(
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Work\B"),
+            true,
+        ));
+        assert!(plan.project_changed);
+        assert_eq!(inner.windows.window_for_project("b"), Some("window-a"));
+        assert_eq!(
+            inner.windows.project_origin("window-a"),
+            ProjectOrigin::User,
+            "the user's cd re-places the window as a user placement"
+        );
+        fs::remove_file(state_path).expect("remove test state");
+    }
+
+    #[test]
+    fn a_followed_cd_without_a_window_only_moves_the_session() {
+        // No window shows either project (all closed, the app runs from
+        // the tray): the cd still moves the session in state, but there is
+        // nothing to retarget, displace, or re-place - the follow flag
+        // must be a no-op for the window side, not an error.
+        let (mut inner, state_path) = inner_with_settings(true, false);
+        test_project(&mut inner, "a", r"C:\Work\A", true);
+        test_project(&mut inner, "b", r"C:\Work\B", true);
+        inner
+            .sessions
+            .insert("s1".into(), test_session("s1", "a", r"C:\Work\A"));
+
+        let plan = expect_reassigned(resolve_working_directory(
+            &mut inner,
+            "s1",
+            Path::new(r"C:\Work\B"),
+            true,
+        ));
+        assert!(plan.project_changed);
+        assert_eq!(
+            plan.active_window,
+            None,
+            "no window shows the old project, so nothing is affected"
+        );
+        assert_eq!(plan.displaced_window, None);
+        assert_eq!(inner.sessions["s1"].metadata.project_id, "b");
+        assert_eq!(inner.windows.window_for_project("b"), None);
         fs::remove_file(state_path).expect("remove test state");
     }
 
@@ -10802,5 +11514,63 @@ mod tests {
         assert_eq!(Core::default_terminal_cache_fresh(Some((true, 9_000)), 1_000), Some(true));
         // No entry: refresh.
         assert_eq!(Core::default_terminal_cache_fresh(None, 1_000), None);
+    }
+
+    /// The lock watchdog's report (logged when the state lock is stuck) must
+    /// name every thread still inside an `inner` scope - the string that
+    /// turned the 2026-09-08 freeze diagnosis from guesswork into a one-line
+    /// answer.
+    #[test]
+    fn the_inner_scope_report_names_every_open_scope() {
+        use super::format_open_inner_scopes;
+        let mut trace = std::collections::HashMap::new();
+        assert_eq!(format_open_inner_scopes(&trace), "");
+        trace.insert("open-project".into(), ("taskbar(7a39b849)".into(), 1_788_886_786_089));
+        trace.insert("merge-464713f1".into(), ("terminal-data".into(), 1_788_886_786_500));
+        let report = format_open_inner_scopes(&trace);
+        assert!(report.contains("open-project in taskbar(7a39b849) since 1788886786089ms"));
+        assert!(report.contains("merge-464713f1 in terminal-data since 1788886786500ms"));
+    }
+
+    /// A sync-debug-gated-off `InnerScopeGuard` is a strict no-op (zero
+    /// production cost): it neither records nor removes a trace entry,
+    /// so the open-scope report stays empty in a production run.
+    #[test]
+    fn a_gated_off_inner_scope_guard_leaves_the_trace_untouched() {
+        use super::{InnerScopeGuard, OPEN_INNER_SCOPES, sync_debug_enabled};
+        if sync_debug_enabled() {
+            // The gate is on for this process (e.g. cargo test run with the
+            // env var set): the no-op contract is not observable here.
+            return;
+        }
+        let before = OPEN_INNER_SCOPES
+            .lock()
+            .expect("inner scope trace poisoned")
+            .clone();
+        let guard = InnerScopeGuard::enter("noop-scope", Some("s1"));
+        drop(guard);
+        let after = OPEN_INNER_SCOPES.lock().expect("inner scope trace poisoned");
+        assert_eq!(
+            &*after, &before,
+            "a gated-off guard must not touch the open-scope trace"
+        );
+    }
+
+    /// The thread tag travels WITH the thread it was set on: the spawned
+    /// worker sees its own tag, and the spawner's tag is untouched (a
+    /// worker test thread has no tag of its own, so it falls back to the
+    /// numeric thread id - never another thread's name).
+    #[test]
+    fn a_thread_tag_follows_the_thread_that_was_given_it() {
+        use super::{thread_tag, with_thread_tag};
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        with_thread_tag("tagged-worker".into(), move || {
+            tx.send(thread_tag()).expect("send the thread's tag");
+        });
+        assert_eq!(rx.recv().expect("receive the tag"), "tagged-worker");
+        assert!(
+            thread_tag().starts_with("tid"),
+            "the spawner keeps the numeric-id fallback; tags never leak across threads"
+        );
     }
 }

@@ -2,6 +2,16 @@ import type { HostSnapshot, PairingPayload, Project, SessionActivity, SessionSeg
 
 export interface DesktopState extends HostSnapshot {
   currentProjectId: string;
+  /**
+   * How the window came to show its current project: the user opened it
+   * ("user"), or the host placed it there - a shell cd moved a session
+   * into the project, or an empty temporary project was retired ("host").
+   * The renderer uses this to keep a host-placed project's auto-selected
+   * tab from claiming the PTY grid: the client that ran the cd (a phone)
+   * is the one actually interacting, and a claim would steal the grid -
+   * reflowing the phone's view - from under it.
+   */
+  currentProjectOrigin: "user" | "host";
   openProjectsInNewWindows: boolean;
   confirmExternalLinks: boolean;
   followWorkingDirectory: boolean;

@@ -11,6 +11,17 @@ interface Props {
   sessionId: string;
   visible: boolean;
   active: boolean;
+  /**
+   * Whether this pane's ACTIVATION claims the PTY grid. App.tsx passes
+   * false for the tab the host auto-selected when a cd moved the session
+   * into the project: that activation is the host following the session,
+   * not a user opening the terminal, so it must not steal the grid from
+   * the client that ran the cd (a phone). Real interactions (a tab click,
+   * a click in the pane, typing) claim through their own paths, and a tab
+   * click also clears the mark, so the pane's later activations claim
+   * again.
+   */
+  claimOnActivate: boolean;
   confirmExternalLinks: boolean;
   scheme: TerminalScheme;
   /** The app's keyboard-ownership policy (App.tsx): register this pane's keyboard handle. */
@@ -44,11 +55,12 @@ const dbg = (message: string) => {
   window.agentTerminal.logDebug(`[ATSync] ${message}`);
 };
 
-export function TerminalPane({ sessionId, visible, active, confirmExternalLinks, scheme, registerKeyboard }: Props) {
+export function TerminalPane({ sessionId, visible, active, claimOnActivate, confirmExternalLinks, scheme, registerKeyboard }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const activeRef = useRef(active);
   const visibleRef = useRef(visible);
+  const claimOnActivateRef = useRef(claimOnActivate);
   const replayingRef = useRef(false);
   const resizeRef = useRef<(claim?: boolean) => void>(() => undefined);
   // The in-flight attach, so the join/leave effect below can sequence a
@@ -72,6 +84,7 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
   const findInputRef = useRef<HTMLInputElement>(null);
   activeRef.current = active;
   visibleRef.current = visible;
+  claimOnActivateRef.current = claimOnActivate;
   confirmExternalLinksRef.current = confirmExternalLinks;
   schemeRef.current = scheme;
   replayingRef.current = replaying;
@@ -637,8 +650,10 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       // predated the first paint (or was absent), and this is the pane's
       // real post-replay size. A same-size claim is a no-op at the host
       // (no second PTY resize, no extra reflow), so a well-measured
-      // attach costs nothing.
-      resizeRef.current(activeRef.current);
+      // attach costs nothing. A host auto-selected tab (claimOnActivate
+      // false) resyncs unclaimed instead: the user never opened it, and
+      // claiming would steal the grid from the client that did.
+      resizeRef.current(activeRef.current && claimOnActivateRef.current);
     };
     const replayPending = () => {
       if (disposed) return;
@@ -775,10 +790,35 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
     // Selecting this tab is an explicit open of THIS terminal, so the
     // announce claims the PTY grid: the phone may have owned it, and the
     // pane the user just brought to the front is the one that should size
-    // the session now.
-    resizeRef.current(true);
+    // the session now. ONE activation must not claim: a tab the host
+    // auto-selected when a cd moved the session into a new project
+    // (claimOnActivate false) - the user did not open this terminal, so
+    // claiming would steal the grid from the client that did (the phone
+    // that ran the cd). Its unclaimed announce still joins set S, keeping
+    // the pane a successor candidate, and the next real interaction (a
+    // tab click, a click in the pane, typing) claims as usual.
+    resizeRef.current(claimOnActivateRef.current);
     terminalRef.current?.focus();
   }, [active]);
+
+  // The window was re-placed as a user placement AFTER this pane had
+  // mounted with a suppressed claim (a quiet window surfaced by an
+  // explicit project open - core.rs `ensure_project_window_with_focus`
+  // flips the window's origin host -> user, App.tsx clears the stale
+  // auto-activation mark, and this prop follows). The user's open is an
+  // interaction, so claim now: without this the shared grid would stay
+  // at the PTY default until a click or keystroke, and a fresh session's
+  // terminal looks frozen. A pane still draining its replay needs no
+  // extra claim - finishAttachment claims the post-replay size itself -
+  // and a pane that is not the active (or visible) tab claims on its
+  // activation or visibility transition instead.
+  const previousClaimOnActivateRef = useRef(claimOnActivate);
+  useEffect(() => {
+    const gained = claimOnActivate && !previousClaimOnActivateRef.current;
+    previousClaimOnActivateRef.current = claimOnActivate;
+    if (!gained || !activeRef.current || !visibleRef.current || replayingRef.current) return;
+    resizeRef.current(true);
+  }, [claimOnActivate]);
 
   // The app's keyboard-ownership policy (App.tsx): hand this pane's
   // terminal to it so the active, settled pane can take or give up the
@@ -827,9 +867,10 @@ export function TerminalPane({ sessionId, visible, active, confirmExternalLinks,
       return;
     }
     // Becoming visible re-joins set S, claiming only if this is also the
-    // active tab (a visible-but-inactive split pane joins unclaimed - see
-    // the resize() comment above).
-    const frame = window.requestAnimationFrame(() => resizeRef.current(activeRef.current));
+    // active tab AND the activation was user-driven (a visible-but-
+    // inactive split pane joins unclaimed - see the resize() comment
+    // above; a host auto-selected tab never claims, see claimOnActivate).
+    const frame = window.requestAnimationFrame(() => resizeRef.current(activeRef.current && claimOnActivateRef.current));
     return () => window.cancelAnimationFrame(frame);
   }, [visible, sessionId]);
 

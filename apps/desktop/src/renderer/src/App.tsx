@@ -75,6 +75,20 @@ export function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const currentProjectRef = useRef<string | null>(null);
+  // The session the window's auto-selected tab came from a HOST-placed
+  // project switch: a shell cd moved the session into the project the
+  // window shows (or an empty temporary project was retired into it), so
+  // the host - not the user - opened it. That tab's activation must not
+  // claim the PTY grid (it would reflow the client that is actually
+  // interacting, typically the phone that ran the cd); its unclaimed
+  // announce still joins the session's viewport set, so the pane stays a
+  // successor candidate. The set is cleared on the next project switch
+  // and an entry is dropped the moment the user clicks the tab or a
+  // session disappears, so a user-driven activation of that same tab
+  // claims as usual.
+  const autoActivatedSessionsRef = useRef<Set<string>>(new Set());
+  const previousProjectIdRef = useRef<string | null>(null);
+  const previousProjectOriginRef = useRef<string | null>(null);
   const [modal, setModal] = useState<Modal>(null);
   const [qr, setQr] = useState("");
   const [pairError, setPairError] = useState("");
@@ -600,6 +614,53 @@ export function App() {
       projectSessionIds: projectSessions.map((session) => session.id),
       rememberedByProject: remembered
     });
+    // A project the HOST placed this window on (currentProjectOrigin:
+    // "host" - a cd moved the session into it, or an empty temporary
+    // project was retired into it) auto-selects a tab the user did not
+    // open: mark that selection so its pane activates WITHOUT claiming the
+    // PTY grid. Claiming would steal the grid from the client that ran the
+    // cd (a phone), reflowing the view the phone is actually in; the
+    // unclaimed announce still joins the viewport set, so the pane stays
+    // a successor candidate when that client departs.
+    const projectChanged = previousProjectIdRef.current !== state.currentProjectId;
+    previousProjectIdRef.current = state.currentProjectId;
+    const originChanged = previousProjectOriginRef.current !== state.currentProjectOrigin;
+    previousProjectOriginRef.current = state.currentProjectOrigin;
+    const autoActivated = autoActivatedSessionsRef.current;
+    if (projectChanged) {
+      autoActivated.clear();
+      if (state.currentProjectOrigin === "host" && next !== null) autoActivated.add(next);
+    } else {
+      // Drop entries for sessions that closed (a closed session's pane is
+      // gone, and its entry would otherwise survive until the next
+      // project switch).
+      const available = new Set(state.sessions.map((session) => session.id));
+      for (const id of autoActivated) {
+        if (!available.has(id)) autoActivated.delete(id);
+      }
+      // The window's project is UNCHANGED, but the tab it was showing left
+      // it: a shell cd moved the session into another project (typically
+      // from the phone) and the host just auto-selected its replacement.
+      // That activation is host-driven, so it must not claim the PTY grid
+      // (it would steal it from the client that ran the cd). A tab the
+      // user closed is the user's own action, so its successor still
+      // claims.
+      const departed = activeSessionId ? state.sessions.find((session) => session.id === activeSessionId) : undefined;
+      if (next !== null && next !== activeSessionId && departed && departed.projectId !== state.currentProjectId) {
+        autoActivated.add(next);
+      }
+      // The host re-placed this window as a USER placement while its
+      // project stayed the same (the user explicitly opened this project
+      // in this window - a quiet window surfaced by the open-project
+      // flow flips its origin host -> user, core.rs
+      // `ensure_project_window_with_focus`). Any host marks are now
+      // stale: the auto-selected tab is a user placement, claims from
+      // here on, and the pane's claim-gain transition re-claims (see
+      // TerminalPane.tsx).
+      if (originChanged && state.currentProjectOrigin === "user") {
+        autoActivated.clear();
+      }
+    }
     if (next !== null) rememberProjectActiveSession(remembered, state.currentProjectId, next);
     currentProjectRef.current = state.currentProjectId;
     if (next !== activeSessionId) setActiveSessionId(next);
@@ -1156,7 +1217,8 @@ export function App() {
                   activity: activityBySession.get(session.id),
                   justCompleted: completedHold.has(session.id)
                 });
-                return <button key={session.id} ref={(element) => { if (element) tabElementsRef.current.set(session.id, element); else tabElementsRef.current.delete(session.id); }} role="tab" aria-selected={session.id === activeSessionId} className={`terminal-tab ${session.id === activeSessionId ? "active" : ""} ${selectedSplit ? "is-split-selected" : ""} ${sessionSplit ? "is-split" : ""} ${splitIndex === 0 ? "split-first" : splitIndex === 1 ? "split-second" : ""} ${isDragging ? "is-dragging" : ""} ${closingSessionIds.has(session.id) ? "is-closing" : ""}`} style={{ transform: tabDragTransform(session.id, index) }} onClick={() => { if (!suppressTabClickRef.current) setActiveSessionId(session.id); }} onContextMenu={(event) => { event.preventDefault(); setSplitMenu({ kind: "tab", sessionId: session.id, x: event.clientX, y: event.clientY }); }} onPointerDown={(event) => beginTabDrag(event, session.id, index)} onPointerMove={moveTabDrag} onPointerUp={(event) => finishTabDrag(event, true)} onPointerCancel={(event) => finishTabDrag(event, false)}>
+                return <button key={session.id} ref={(element) => { if (element) tabElementsRef.current.set(session.id, element); else tabElementsRef.current.delete(session.id); }} role="tab" aria-selected={session.id === activeSessionId} className={`terminal-tab ${session.id === activeSessionId ? "active" : ""} ${selectedSplit ? "is-split-selected" : ""} ${sessionSplit ? "is-split" : ""} ${splitIndex === 0 ? "split-first" : splitIndex === 1 ? "split-second" : ""} ${isDragging ? "is-dragging" : ""} ${closingSessionIds.has(session.id) ? "is-closing" : ""}`} style={{ transform: tabDragTransform(session.id, index) }} onClick={() => { if (!suppressTabClickRef.current) { // A user click opens the tab for real, so its activations claim from here on. autoActivatedSessionsRef.current.delete(session.id);
+      setActiveSessionId(session.id); } }} onContextMenu={(event) => { event.preventDefault(); setSplitMenu({ kind: "tab", sessionId: session.id, x: event.clientX, y: event.clientY }); }} onPointerDown={(event) => beginTabDrag(event, session.id, index)} onPointerMove={moveTabDrag} onPointerUp={(event) => finishTabDrag(event, true)} onPointerCancel={(event) => finishTabDrag(event, false)}>
                   <TerminalIcon /><span className="terminal-tab-label display-name" title={session.title}>{session.title}</span>{progressModel.dot === "running" && <i className="tab-status-dot is-running" title="Running" />}{progressModel.dot === "completed" && <i className="tab-status-dot is-completed" title="Just finished" />}{progressModel.dot === "idle" && <i className="tab-status-dot is-idle" title="Idle" />}{progressModel.dot === "error" && <i className="tab-status-dot is-error" title={`Exited (${session.exitCode ?? "unknown"})`} />}{progressModel.bar !== null && <i className={`tab-progress${progressModel.bar === "pulse" ? " is-pulse" : ""}`} style={progressModel.fill !== null ? ({ "--tab-fill": `${progressModel.fill}%` } as CSSProperties) : undefined} aria-hidden="true" />}
                   <span className="tab-close" role="button" aria-label={`Close ${session.title}`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); void closeTab(session.id); }}><CloseIcon /></span>
                 </button>;
@@ -1187,7 +1249,7 @@ export function App() {
                 }
               }
               return <div key={session.id} className={`terminal-surface ${visible ? "is-visible" : ""} ${paneActive ? "is-active" : "is-inactive"} ${activeSplit ? `is-split ${activeSplit.layout}` : ""}`} style={surfaceStyle} onPointerDown={() => { if (visible && !paneActive) setActiveSessionId(session.id); }}>
-                <TerminalPane sessionId={session.id} visible={visible} active={paneActive} confirmExternalLinks={state.confirmExternalLinks} scheme={terminalScheme} registerKeyboard={registerTerminalKeyboard} />
+                <TerminalPane sessionId={session.id} visible={visible} active={paneActive} claimOnActivate={!autoActivatedSessionsRef.current.has(session.id)} confirmExternalLinks={state.confirmExternalLinks} scheme={terminalScheme} registerKeyboard={registerTerminalKeyboard} />
                 {visible && activeSplit && !paneActive && <div className="split-mini-toolbar" onPointerDown={(event) => event.stopPropagation()}>
                   <TerminalIcon /><span className="display-name" title={session.title}>{session.title}</span>
                   <button title="Manage split view" aria-label="Manage split view" onClick={(event) => { const bounds = event.currentTarget.getBoundingClientRect(); setSplitMenu({ kind: "manage", groupId: activeSplit.id, x: bounds.right, y: bounds.top }); }}><MoreIcon /></button>

@@ -257,6 +257,13 @@ pub struct DesktopState {
     #[serde(flatten)]
     pub snapshot: HostSnapshot,
     pub current_project_id: String,
+    /// How the window came to show its current project: the user opened it
+    /// (`"user"`), or the host placed it there (a shell `cd` moved a
+    /// session into it, or an empty temporary project was retired).
+    /// The renderer uses this to keep a host-placed project's auto-selected
+    /// tab from claiming the PTY grid - the client that ran the `cd`
+    /// (a phone) is the one actually interacting with the session.
+    pub current_project_origin: String,
     pub open_projects_in_new_windows: bool,
     pub confirm_external_links: bool,
     pub follow_working_directory: bool,

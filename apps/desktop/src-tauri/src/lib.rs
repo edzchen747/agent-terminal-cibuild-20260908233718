@@ -250,7 +250,7 @@ fn set_default_terminal(state: State<'_, Arc<Core>>) -> Result<(), String> {
     // `is_default_terminal`, so the settings row flips to Undo on success.
     crate::default_terminal::set_as_default_terminal()?;
     // The snapshot caches the verdict for 5 s - drop it so the broadcast
-    // below carries the fresh value (not the pre-set one).
+    // carries the fresh value (not the pre-set one).
     state.invalidate_default_terminal_cache();
     state.broadcast();
     Ok(())
@@ -259,8 +259,6 @@ fn set_default_terminal(state: State<'_, Arc<Core>>) -> Result<(), String> {
 #[tauri::command]
 fn unset_default_terminal(state: State<'_, Arc<Core>>) -> Result<(), String> {
     crate::default_terminal::clear_as_default_terminal()?;
-    // The snapshot caches the verdict for 5 s - drop it so the broadcast
-    // below carries the fresh value (not the pre-clear one).
     state.invalidate_default_terminal_cache();
     state.broadcast();
     Ok(())
@@ -334,6 +332,9 @@ fn set_active_session(window: WebviewWindow, state: State<'_, Arc<Core>>, sessio
 }
 
 pub fn run() {
+    // The Tauri event loop (and every main-thread window call) runs on this
+    // thread; tag it so sync-log lines from the main thread read "main".
+    crate::core::set_thread_tag("main");
     // COM starts us with `-Embedding` to serve a console handoff. That
     // instance has to keep running and register the handoff class itself,
     // so it must not hand its command line to an existing instance and
@@ -369,6 +370,14 @@ pub fn run() {
                 window
                     .state::<Arc<Core>>()
                     .mark_window_focused(window.label());
+            }
+            tauri::WindowEvent::Focused(false) => {
+                // The user looked away (another app, or the phone): the
+                // desktop is no longer the engaged client, so a remote cd
+                // must not drag this window along.
+                window
+                    .state::<Arc<Core>>()
+                    .mark_window_blurred(window.label());
             }
             tauri::WindowEvent::Destroyed => {
                 window
@@ -480,7 +489,7 @@ const TRAY_SESSION_COUNT_TICK_MS: u64 = 500;
 
 fn spawn_tray_session_count_refresher(core: Arc<Core>, label: MenuItem<Wry>) {
     let mut last = session_count_label(core.session_counts());
-    std::thread::spawn(move || {
+    crate::core::with_thread_tag("tray-count".into(), move || {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(TRAY_SESSION_COUNT_TICK_MS));
             let text = session_count_label(core.session_counts());
@@ -512,7 +521,7 @@ fn session_count_label((active, open): (usize, usize)) -> String {
 // WebView2 can deadlock when a second webview is constructed directly inside a
 // Windows event handler. Keep tray and single-instance callbacks off that thread.
 fn show_terminal_window_from_worker(core: Arc<Core>) {
-    let _ = std::thread::spawn(move || core.show_terminal_window());
+    let _ = crate::core::with_thread_tag("show-window".into(), move || core.show_terminal_window());
 }
 
 fn tray_icon() -> Image<'static> {
