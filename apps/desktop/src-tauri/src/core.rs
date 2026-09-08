@@ -1931,9 +1931,15 @@ impl Core {
     /// outside of the desktop's explicit open-project flow (the phone's
     /// `New terminal`, or the desktop's add-tab button): the tab must exist,
     /// but it must not pull the desktop app to the front or tear the user
-    /// out of the project they are looking at.
+    /// out of the project they are looking at. The one exception: with no
+    /// window open at all (the app runs from the tray) a phone-opened
+    /// session opens NOTHING - a window appearing on the desktop would be a
+    /// visual change the phone's action must not cause. The session lives
+    /// in state, and restoring the app surfaces it: `preferred_project`
+    /// falls back to the newest running session's project (see
+    /// `should_open_quiet_window`).
     fn ensure_project_window_quietly(self: &Arc<Self>, project_id: &str) -> Result<()> {
-        let (open_new_windows, existing) = {
+        let (open_new_windows, existing, any_window_open) = {
             let inner = self.inner.lock().expect("desktop state poisoned");
             let _scope = InnerScopeGuard::enter("ensure_quiet_lookup", Some(project_id));
             (
@@ -1942,13 +1948,16 @@ impl Core {
                     .windows
                     .window_for_project(project_id)
                     .map(str::to_owned),
+                !inner.windows.labels().is_empty(),
             )
         };
-        if !should_open_quiet_window(open_new_windows, existing.is_some()) {
+        if !should_open_quiet_window(open_new_windows, existing.is_some(), any_window_open) {
             // The project already owns a window (or the desktop is in
             // single-window mode, where switching a window to the project is
-            // how the desktop changes its selected project): leave every
-            // window alone. Opening the project from the desktop focuses it.
+            // how the desktop changes its selected project), or every
+            // window is closed and the app runs from the tray - a phone
+            // action must not bring a window onto the screen. Opening the
+            // project from the desktop focuses it.
             return Ok(());
         }
         let project = self.project_by_id(project_id)?;
@@ -5447,15 +5456,22 @@ struct CdPlan {
     open_projects_in_new_windows: bool,
 }
 
-/// Whether a session created outside of the desktop's explicit open-project
-/// flow (the phone's `New terminal`, or the desktop's add-tab button) needs a
-/// fresh background window: only when the project does not already own one
-/// and the desktop is in per-project-window mode. A project that already has
-/// a window is left alone (no focus, no hoisting), and in single-window mode
-/// nothing is created because switching a window to the project is exactly
-/// how the desktop changes its selected project.
-fn should_open_quiet_window(open_projects_in_new_windows: bool, project_has_window: bool) -> bool {
-    open_projects_in_new_windows && !project_has_window
+/// Whether a session opened outside the explicit open-project flow (the
+/// phone's `New terminal`, the add-tab button) gets its own quiet window:
+/// multi-window mode only (in single-window mode the desktop's window IS
+/// the project switcher, so a new window would steal the user's project),
+/// the project must not already own a window - and at least one window
+/// must already be open: with every window closed the app runs from the
+/// tray, and a phone action must not bring a window onto the screen at
+/// all (the session lives in state, and restoring the app surfaces it -
+/// `preferred_project` falls back to the newest running session's
+/// project).
+fn should_open_quiet_window(
+    open_projects_in_new_windows: bool,
+    project_has_window: bool,
+    any_window_open: bool,
+) -> bool {
+    open_projects_in_new_windows && !project_has_window && any_window_open
 }
 
 /// A shell `cd` drags the desktop window along only when the desktop is
@@ -10877,23 +10893,30 @@ mod tests {
     #[test]
     fn quiet_window_is_created_only_for_unowned_projects_in_multi_window_mode() {
         // The contract behind a session opened by the phone or the add-tab
-        // button: a project that already owns a window is never touched, and
-        // single-window mode stays on the desktop's current project.
+        // button: a project that already owns a window is never touched,
+        // single-window mode stays on the desktop's current project, and
+        // with no window open at all (the tray-only state) a phone action
+        // brings nothing onto the screen - the session lives in state and
+        // restoring the app surfaces it.
         assert!(
-            should_open_quiet_window(true, false),
-            "multi-window mode with no window for the project opens a background one"
+            should_open_quiet_window(true, false, true),
+            "multi-window mode with a window open and none for the project opens a background one"
         );
         assert!(
-            !should_open_quiet_window(true, true),
+            !should_open_quiet_window(true, true, true),
             "a project that already owns a window is not hoisted or refocused"
         );
         assert!(
-            !should_open_quiet_window(false, false),
+            !should_open_quiet_window(false, false, true),
             "in single-window mode creating a window would switch the desktop's project"
         );
         assert!(
-            !should_open_quiet_window(false, true),
+            !should_open_quiet_window(false, true, true),
             "single-window mode never touches an existing window either"
+        );
+        assert!(
+            !should_open_quiet_window(true, false, false),
+            "the tray-only state (no window open) must stay untouched by a phone action"
         );
     }
 
