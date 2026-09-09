@@ -865,13 +865,18 @@ export class HostConnection {
   private async reportBridgeFailures(): Promise<void> {
     const reported = await this.embeddedEngine.bridgeStatus();
     const statuses: PortBridgeStatus[] = reported
-      .filter((entry) => entry.state === "failed")
+      .filter((entry) => entry.state === "failed" || entry.state === "unreachable")
       .map((entry) => ({
         bridgeId: entry.id,
         state: "failed" as const,
-        detail: entry.error
-          ? `This phone could not open its side of the bridge (${entry.error}).`
-          : "This phone could not open its side of the bridge."
+        // "unreachable" means the listener is up but forwarding failed, and
+        // which side is at fault depends on the direction: a listen-tsnet
+        // bridge dials this phone's own service, a listen-local one dials the
+        // desktop across the overlay. Naming the wrong one sends the user
+        // looking in the wrong place.
+        detail: entry.state === "unreachable"
+          ? unreachableDetail(this.publishedBridges.find((spec) => spec.id === entry.id), entry.error)
+          : `This phone could not open its side of the bridge${entry.error ? ` (${entry.error})` : ""}.`
       }));
     const signature = JSON.stringify(statuses);
     if (signature === this.reportedBridgeFailures) return;
@@ -1224,6 +1229,18 @@ function raceDeadline<T>(promise: Promise<T>, deadlineAt: number): Promise<T> {
       (error) => { clearTimeout(timer); reject(error); }
     );
   });
+}
+
+/**
+ * Why a bridge that is listening on this phone could not forward a
+ * connection, phrased for whichever side actually failed to answer.
+ */
+function unreachableDetail(spec: NodeBridgeSpec | undefined, error?: string): string {
+  const reason = error ? ` (${error})` : "";
+  if (spec?.mode === "listen-tsnet") {
+    return `Nothing answered on ${spec.target ?? "this phone"}${reason}. Start the service on that port on this phone.`;
+  }
+  return `The desktop did not answer on ${spec?.target ?? "this port"}${reason}.`;
 }
 
 function defaultRemoteEndpoint(hostId: string): string {

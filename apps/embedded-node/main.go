@@ -40,7 +40,12 @@ func main() {
 	targetPort := flag.String("target-port", "47831", "local Agent Terminal WebSocket port")
 	remoteAddress := flag.String("remote-address", "", "tailnet address of a remote Agent Terminal host")
 	proxyListen := flag.String("proxy-listen", "", "localhost listen address for mobile mode")
+	exitWithParent := flag.Bool("exit-with-parent", false, "exit when the launcher's stdin pipe closes")
 	flag.Parse()
+
+	if *exitWithParent {
+		go exitWhenParentCloses()
+	}
 
 	if *stateDir == "" {
 		log.Fatal("--state-dir is required")
@@ -117,6 +122,26 @@ func main() {
 	writeStatus(*stateDir, result)
 	go serve(listener, func() (net.Conn, error) { return net.DialTimeout("tcp", "127.0.0.1:"+*targetPort, 2*time.Second) })
 	runBridgeReconciler(node, *stateDir)
+}
+
+// Exit once the launcher goes away.
+//
+// The node outlives its launcher otherwise: it is a detached child process, so
+// a crash, a kill, or a development restart of the app leaves it running - and
+// the next launch starts another one against the same state directory and the
+// same node identity, so several processes end up contending for one node.
+// Rather than have the launcher hunt for strays by pid (which races with pid
+// reuse), it hands the child an inherited stdin pipe and never writes to it:
+// the read below blocks for as long as the launcher lives and returns EOF the
+// moment the OS tears its end down, whatever killed it.
+func exitWhenParentCloses() {
+	buffer := make([]byte, 1)
+	for {
+		if _, err := os.Stdin.Read(buffer); err != nil {
+			// EOF, or a broken pipe. Either way the launcher is gone.
+			os.Exit(0)
+		}
+	}
 }
 
 // Start returns once the tsnet backend has been initialized, which is not the

@@ -71,6 +71,11 @@ type bridgeStatusFile struct {
 const (
 	bridgeStateListening = "listening"
 	bridgeStateFailed    = "failed"
+	// The listener is open but the far side of the bridge refused or never
+	// answered. A filtered port is otherwise indistinguishable from a hang:
+	// the only symptom is a client that waits for the dial timeout and then
+	// gets nothing, with no trace anywhere.
+	bridgeStateUnreachable = "unreachable"
 
 	bridgeModeTsnet = "listen-tsnet"
 	bridgeModeLocal = "listen-local"
@@ -90,6 +95,27 @@ type runningBridge struct {
 	mu     sync.Mutex
 	conns  map[net.Conn]struct{}
 	closed bool
+	// Why the most recent connection could not be forwarded, cleared by the
+	// next one that succeeds. Reported so a bridge that is listening but
+	// leads nowhere can say so instead of silently timing out.
+	dialError string
+}
+
+// Record the outcome of forwarding one accepted connection.
+func (bridge *runningBridge) noteDial(err error) {
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	if err == nil {
+		bridge.dialError = ""
+		return
+	}
+	bridge.dialError = safeErrorDetail(err)
+}
+
+func (bridge *runningBridge) lastDialError() string {
+	bridge.mu.Lock()
+	defer bridge.mu.Unlock()
+	return bridge.dialError
 }
 
 func (bridge *runningBridge) track(conn net.Conn) bool {
@@ -201,8 +227,8 @@ func reconcileBridges(node *tsnet.Server, running map[string]*runningBridge, des
 
 	statuses := make([]bridgeStatus, 0, len(desired))
 	for _, spec := range desired {
-		if _, alive := running[spec.ID]; alive {
-			statuses = append(statuses, bridgeStatus{ID: spec.ID, State: bridgeStateListening})
+		if bridge, alive := running[spec.ID]; alive {
+			statuses = append(statuses, listeningStatus(spec.ID, bridge.lastDialError()))
 			continue
 		}
 		bridge, err := startBridge(node, spec)
@@ -211,9 +237,19 @@ func reconcileBridges(node *tsnet.Server, running map[string]*runningBridge, des
 			continue
 		}
 		running[spec.ID] = bridge
-		statuses = append(statuses, bridgeStatus{ID: spec.ID, State: bridgeStateListening})
+		statuses = append(statuses, listeningStatus(spec.ID, bridge.lastDialError()))
 	}
 	return statuses
+}
+
+// A listening bridge that could not forward its last connection is reported
+// as unreachable rather than as working, so the far side's refusal - or a
+// packet filter dropping the port outright - reaches the user.
+func listeningStatus(id, dialError string) bridgeStatus {
+	if dialError == "" {
+		return bridgeStatus{ID: id, State: bridgeStateListening}
+	}
+	return bridgeStatus{ID: id, State: bridgeStateUnreachable, Error: dialError}
 }
 
 // The ids of the bridges that must give up their listener: the ones the
@@ -313,6 +349,7 @@ func serveBridge(bridge *runningBridge, dial func() (net.Conn, error)) {
 			defer bridge.untrack(in)
 			setKeepAlive(in)
 			outgoing, err := dial()
+			bridge.noteDial(err)
 			if err != nil {
 				return
 			}

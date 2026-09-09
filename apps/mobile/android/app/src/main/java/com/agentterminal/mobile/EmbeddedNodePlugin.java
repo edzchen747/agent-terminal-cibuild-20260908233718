@@ -135,7 +135,13 @@ public class EmbeddedNodePlugin extends Plugin {
                 "--control-url", controlUrl == null ? "" : controlUrl,
                 "--node-id", nodeId == null ? "" : nodeId,
                 "--remote-address", remoteHost + ":" + remotePort,
-                "--proxy-listen", "127.0.0.1:0"
+                "--proxy-listen", "127.0.0.1:0",
+                // ProcessBuilder gives the child an inherited stdin pipe that
+                // we never write to. The node exits when it reaches EOF, so a
+                // node cannot outlive the app process that started it - which
+                // would otherwise leave it contending for the same node
+                // identity as the next launch's process.
+                "--exit-with-parent"
             );
             builder.environment().put("AGENT_TERMINAL_NODE_PRIVATE_KEY", privateKey == null ? "" : privateKey);
             // Android app processes have no writable HOME/TMPDIR, which makes

@@ -76,6 +76,12 @@ pub struct NodeBridgeStatus {
 pub const MODE_LISTEN_TSNET: &str = "listen-tsnet";
 pub const MODE_LISTEN_LOCAL: &str = "listen-local";
 
+/// States the node reports back in `bridges-status.json`.
+const NODE_STATE_FAILED: &str = "failed";
+/// Listening, but the far side refused or never answered - which is what a
+/// filtered port looks like, and is otherwise invisible.
+const NODE_STATE_UNREACHABLE: &str = "unreachable";
+
 pub struct BridgePlan {
     pub entries: Vec<BridgeEntry>,
     pub statuses: BTreeMap<String, Vec<PortBridgeStatus>>,
@@ -230,7 +236,7 @@ pub fn merge_node_statuses(
     node: &NodeBridgeStatusFile,
 ) {
     for reported in &node.bridges {
-        if reported.state != "failed" {
+        if reported.state != NODE_STATE_FAILED && reported.state != NODE_STATE_UNREACHABLE {
             continue;
         }
         let Some((device_id, bridge_id)) = split_entry_id(&reported.id) else {
@@ -247,16 +253,17 @@ pub fn merge_node_statuses(
         }
         let entry = entries.iter().find(|item| item.id == reported.id);
         status.state = PortBridgeState::Failed;
-        status.detail = Some(node_failure_detail(entry, &reported.error));
+        status.detail = Some(if reported.state == NODE_STATE_UNREACHABLE {
+            node_unreachable_detail(entry, &reported.error)
+        } else {
+            node_failure_detail(entry, &reported.error)
+        });
     }
 }
 
+/// The node could not open its listener at all.
 fn node_failure_detail(entry: Option<&BridgeEntry>, error: &str) -> String {
-    let reason = if error.trim().is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", error.trim())
-    };
+    let reason = reason_suffix(error);
     match entry {
         Some(entry) if entry.mode == MODE_LISTEN_LOCAL => format!(
             "{} could not be opened on this PC; another program is probably already using it{reason}.",
@@ -267,6 +274,35 @@ fn node_failure_detail(entry: Option<&BridgeEntry>, error: &str) -> String {
             entry.port.unwrap_or_default()
         ),
         None => format!("The bridge could not be opened on this PC{reason}."),
+    }
+}
+
+/// The listener is open, but forwarding a connection through it failed.
+///
+/// Which side is at fault depends on the direction, and getting this wrong
+/// sends the user looking in the wrong place: a `listen-tsnet` bridge dials
+/// this PC's own service, while a `listen-local` one dials the device across
+/// the overlay.
+fn node_unreachable_detail(entry: Option<&BridgeEntry>, error: &str) -> String {
+    let reason = reason_suffix(error);
+    match entry {
+        Some(entry) if entry.mode == MODE_LISTEN_LOCAL => format!(
+            "The device did not answer on {}{reason}. Check that the service is running on it, and that the overlay allows this port.",
+            entry.target
+        ),
+        Some(entry) => format!(
+            "Nothing answered on {} on this PC{reason}. Start the service on that port.",
+            entry.target
+        ),
+        None => format!("The bridge is listening but its target did not answer{reason}."),
+    }
+}
+
+fn reason_suffix(error: &str) -> String {
+    if error.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", error.trim())
     }
 }
 
@@ -546,5 +582,95 @@ mod tests {
             Some("Port 8080 is in use on this phone.")
         );
         assert_eq!(state_of(&plan, "late", "b"), PortBridgeState::Conflict);
+    }
+
+    #[test]
+    fn a_listening_bridge_whose_target_never_answers_becomes_a_warning() {
+        // The failure this exists for: the listener opens on both sides, so
+        // everything looks healthy, and every connection through it hangs
+        // until the dial times out with nothing recorded anywhere.
+        let candidates = vec![candidate(
+            "device",
+            "Pixel",
+            1,
+            vec![
+                bridge("served-here", 8000, PortBridgeServer::Host),
+                bridge("served-there", 5000, PortBridgeServer::Client),
+            ],
+        )];
+        let mut plan = plan_port_bridges(&candidates, true);
+        let entries = plan.entries.clone();
+        merge_node_statuses(
+            &mut plan,
+            &entries,
+            &NodeBridgeStatusFile {
+                bridges: vec![
+                    NodeBridgeStatus {
+                        id: entry_id("device", "served-here"),
+                        state: "unreachable".into(),
+                        error: "connection refused".into(),
+                    },
+                    NodeBridgeStatus {
+                        id: entry_id("device", "served-there"),
+                        state: "unreachable".into(),
+                        error: "i/o timeout".into(),
+                    },
+                ],
+            },
+        );
+
+        assert_eq!(
+            state_of(&plan, "device", "served-here"),
+            PortBridgeState::Failed
+        );
+        assert_eq!(
+            state_of(&plan, "device", "served-there"),
+            PortBridgeState::Failed
+        );
+
+        // The host serves 8000, so the missing service is on this PC.
+        let here = plan.statuses["device"]
+            .iter()
+            .find(|status| status.bridge_id == "served-here")
+            .and_then(|status| status.detail.clone())
+            .expect("a reason");
+        assert!(here.contains("127.0.0.1:8000"), "{here}");
+        assert!(here.contains("on this PC"), "{here}");
+
+        // The device serves 5000, so the user must be sent to the device -
+        // pointing at this PC would send them looking in the wrong place.
+        let there = plan.statuses["device"]
+            .iter()
+            .find(|status| status.bridge_id == "served-there")
+            .and_then(|status| status.detail.clone())
+            .expect("a reason");
+        assert!(there.contains("100.64.0.1:5000"), "{there}");
+        assert!(there.contains("device did not answer"), "{there}");
+        assert!(there.contains("i/o timeout"), "{there}");
+    }
+
+    #[test]
+    fn a_bridge_the_node_reports_as_listening_stays_active() {
+        let candidates = vec![candidate(
+            "device",
+            "Pixel",
+            1,
+            vec![bridge("a", 8000, PortBridgeServer::Host)],
+        )];
+        let mut plan = plan_port_bridges(&candidates, true);
+        let entries = plan.entries.clone();
+        merge_node_statuses(
+            &mut plan,
+            &entries,
+            &NodeBridgeStatusFile {
+                bridges: vec![NodeBridgeStatus {
+                    id: entry_id("device", "a"),
+                    state: "listening".into(),
+                    error: String::new(),
+                }],
+            },
+        );
+        assert_eq!(state_of(&plan, "device", "a"), PortBridgeState::Active);
+        assert_eq!(plan.statuses["device"][0].detail, None);
     }
 }

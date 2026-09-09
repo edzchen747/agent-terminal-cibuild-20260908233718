@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -116,6 +117,40 @@ func TestAllowedBridgePeer(t *testing.T) {
 	}
 	if allowedBridgePeer(awarded, stubConn{remote: "100.64.0.4:41000"}) {
 		t.Fatal("a device that was not awarded the port must be rejected")
+	}
+}
+
+
+func TestListeningStatusReportsAFailedDial(t *testing.T) {
+	// A bridge whose listener is open but whose target refuses is the case
+	// that is otherwise invisible: without this it reports as listening and
+	// every connection through it just hangs.
+	if got := listeningStatus("a", ""); got != (bridgeStatus{ID: "a", State: bridgeStateListening}) {
+		t.Fatalf("a bridge that forwarded fine must read as listening, got %+v", got)
+	}
+	got := listeningStatus("a", "connection refused")
+	want := bridgeStatus{ID: "a", State: bridgeStateUnreachable, Error: "connection refused"}
+	if got != want {
+		t.Fatalf("listeningStatus = %+v, want %+v", got, want)
+	}
+}
+
+func TestNoteDialRemembersTheLastOutcome(t *testing.T) {
+	bridge := &runningBridge{conns: map[net.Conn]struct{}{}}
+	if bridge.lastDialError() != "" {
+		t.Fatal("a bridge that has forwarded nothing yet has no error")
+	}
+
+	bridge.noteDial(errors.New("connection refused"))
+	if bridge.lastDialError() != "connection refused" {
+		t.Fatalf("a failed dial must be remembered, got %q", bridge.lastDialError())
+	}
+
+	// A later success means the far side came back, so the warning has to
+	// clear on its own rather than needing the bridge to be rebuilt.
+	bridge.noteDial(nil)
+	if bridge.lastDialError() != "" {
+		t.Fatalf("a successful dial must clear the error, got %q", bridge.lastDialError())
 	}
 }
 

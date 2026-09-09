@@ -1131,11 +1131,20 @@ impl Core {
             // process remains the only listener for the terminal WebSocket.
             .arg("--target-port")
             .arg(self.configured_port().to_string())
+            // The node is a detached child, so a crash or a hard kill of this
+            // process would otherwise strand it - and the next launch would
+            // start another against the same state directory and node
+            // identity. It exits when the inherited stdin pipe below closes,
+            // which the OS does however this process dies.
+            .arg("--exit-with-parent")
             .env(
                 "AGENT_TERMINAL_NODE_PRIVATE_KEY",
                 network_state.private_key.unwrap_or_default(),
             )
-            .stdin(Stdio::null())
+            // Deliberately a pipe rather than null: it is never written to,
+            // and the node treats its EOF as "the launcher is gone" (see
+            // --exit-with-parent). Keeping the Child alive keeps it open.
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         #[cfg(windows)]
