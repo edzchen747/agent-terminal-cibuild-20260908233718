@@ -41,6 +41,10 @@ jobs:
         working-directory: apps/embedded-node
         run: go mod tidy
 
+      - name: Vet
+        working-directory: apps/embedded-node
+        run: go vet ./...
+
       - name: Build embedded-node.exe
         shell: pwsh
         run: ./scripts/build-embedded-node.ps1
@@ -50,4 +54,40 @@ jobs:
         with:
           name: embedded-node-windows-${{ github.sha }}
           path: apps/desktop/src-tauri/resources/embedded-node/embedded-node.exe
+          if-no-files-found: error
+
+  # The Android node ships inside the APK, but it is also wanted on its own:
+  # dropping a rebuilt .so into jniLibs is the whole update when nothing else
+  # about the app changed. Building it here rather than in the Android workflow
+  # keeps it reachable without the release signing secrets an APK build needs.
+  #
+  # Runs on Windows because the build script resolves its output path with
+  # backslashes, which a Linux runner would take as part of the file name.
+  build-android:
+    name: Android libembedded-node.so
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/embedded-node/go.mod
+          cache: true
+          cache-dependency-path: apps/embedded-node/go.mod
+
+      - name: Resolve Go dependencies
+        working-directory: apps/embedded-node
+        run: go mod tidy
+
+      - name: Build libembedded-node.so
+        shell: pwsh
+        run: ./scripts/build-embedded-node-android.ps1
+
+      - name: Upload libembedded-node.so
+        uses: actions/upload-artifact@v4
+        with:
+          name: embedded-node-android-${{ github.sha }}
+          path: apps/mobile/android/app/src/main/jniLibs/arm64-v8a/libembedded-node.so
           if-no-files-found: error
