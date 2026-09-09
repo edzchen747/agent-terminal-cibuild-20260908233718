@@ -99,6 +99,10 @@ pub struct PortBridge {
     pub id: String,
     pub port: u16,
     pub server: PortBridgeServer,
+    /// What the user calls this bridge. Config-page only: it never reaches
+    /// the node, so renaming one cannot disturb a live bridge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

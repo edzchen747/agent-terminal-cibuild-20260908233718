@@ -5,7 +5,8 @@ import { encodePairingPayload, MAX_PROJECT_NAME_LENGTH, normalizeTerminalThemeSe
 import type { PortBridge, Project, SessionActivity, TaskbarProgress, TerminalSession } from "@agentterminal/protocol";
 import type { DesktopState, FocusSessionEvent } from "../../shared/api";
 import { BookmarkIcon, ClockIcon, CloseIcon, EditIcon, FolderIcon, MenuIcon, MoreIcon, PhoneIcon, PlusIcon, PortBridgeIcon, SeparateIcon, SettingsIcon, SideBySideIcon, SplitViewIcon, StackedIcon, SwapIcon, TerminalIcon, TrashIcon, WifiIcon } from "./icons";
-import { deviceHasBridgeWarning, PortBridgeDevicePage, PortBridgeListPage } from "./PortBridgePages";
+import { PortBridgeDevicePage, PortBridgeListPage } from "./PortBridgePages";
+import { deviceHasBridgeWarning } from "./port-bridges";
 import { projectPersistenceAction, projectRowOpensOnKey } from "./persistence";
 import { projectDragTransform, reorderBlock, shouldCommitProjectReorder } from "./project-drag";
 import { departedProjects, PROJECT_LEAVE_MS, projectListEntries, type LeavingProject } from "./project-leave";
@@ -1392,8 +1393,8 @@ export function App() {
 
       {modal === "bridgeDevice" && bridgeDevice && <PortBridgeDevicePage
         device={bridgeDevice}
+        statuses={state.portBridgeStatuses}
         onBack={() => setModal("bridges")}
-        onClose={() => setModal(null)}
         onSave={savePortBridging}
       />}
 

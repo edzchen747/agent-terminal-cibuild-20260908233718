@@ -474,40 +474,60 @@ button { color: inherit; }
 .danger-icon:hover { color: var(--danger-hover); background: var(--danger-surface); }
 .danger-icon svg { width: 15px; }
 .empty-devices { padding: 24px; text-align: center; color: var(--text-muted); font-size: 11px; }
-/* Port bridges: one card per device on the list page, then a plain config
-   list on the per-device page. The warning marker exists only on the list
-   page - it is about a port another device took, which the per-device page
-   deliberately says nothing about. */
-.bridges-modal { width: 560px; }
-.modal-back { margin: 0 0 4px; padding: 0; border: 0; background: transparent; color: var(--accent-ink); font-size: 11px; font-weight: 600; cursor: pointer; }
-.modal-back:hover { text-decoration: underline; }
+/* Port bridges. The list page is a card per device; the per-device page uses
+   the same row cards as the phone, so the two read as one feature. */
+.bridges-modal { width: 580px; }
 .bridge-devices { margin-top: 18px; display: flex; flex-direction: column; gap: 12px; }
 .bridge-device { border: 1px solid var(--border-strong); border-radius: 12px; background: var(--surface-raised); overflow: hidden; }
-.bridge-device > header { padding: 12px; display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 4px; }
-.bridge-device > header > span:nth-child(2) { display: flex; flex-direction: column; gap: 3px; }
+.bridge-device > header { padding: 12px; display: flex; align-items: center; gap: 10px; }
+.bridge-device-copy { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .bridge-device strong { color: var(--text-dim); font-size: 12px; }
 .bridge-device small { color: var(--text-muted); font-size: 10px; }
+/* The switch is its own flex container: the knob is an inline <i>, and width
+   and height do not apply to an inline box, so a non-flex parent collapses it
+   to a sliver. */
+.bridge-switch { flex: none; display: flex; align-items: center; cursor: pointer; }
+.bridge-switch input { position: absolute; opacity: 0; pointer-events: none; }
+.bridge-switch > i { display: block; width: 38px; height: 21px; position: relative; flex: none; border: 1px solid var(--border-input); border-radius: 999px; background: var(--surface-hover); transition: background .15s ease, border-color .15s ease; }
+.bridge-switch > i::after { content: ""; width: 15px; height: 15px; position: absolute; left: 2px; top: 2px; border-radius: 50%; background: var(--text-muted); transition: transform .15s ease, background .15s ease; }
+.bridge-switch input:checked + i { border-color: var(--accent-line-strong); background: var(--accent-tint-strong); }
+.bridge-switch input:checked + i::after { transform: translateX(17px); background: var(--accent); }
+.bridge-switch-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
 .bridge-rows { border-top: 1px solid var(--border-strong); }
-.bridge-row { padding: 8px 12px; display: grid; grid-template-columns: 58px 1fr auto 20px; align-items: center; gap: 8px; border-bottom: 1px solid var(--border-strong); }
-.bridge-row strong { color: var(--text-strong); font-size: 12px; font-variant-numeric: tabular-nums; }
-.bridge-row small { color: var(--text-muted); font-size: 10px; }
-.bridge-state { padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 700; color: var(--text-muted); background: var(--surface-hover); }
+.bridge-row { padding: 8px 12px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--border-strong); }
+.bridge-row strong { min-width: 58px; color: var(--text-strong); font-size: 12px; font-variant-numeric: tabular-nums; }
+.bridge-row small { flex: 1; min-width: 0; color: var(--text-muted); font-size: 10px; }
+.bridge-state { flex: none; padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 700; color: var(--text-muted); background: var(--surface-hover); }
 .bridge-state.is-active { color: var(--ok); background: var(--accent-tint); }
 .bridge-state.is-conflict, .bridge-state.is-failed { color: var(--warn); background: var(--warn-track); }
-.bridge-warning { width: 20px; display: grid; place-items: center; color: var(--warn); cursor: help; }
-.bridge-warning svg { width: 15px; }
-.bridge-warning.is-empty { cursor: default; }
 .bridge-empty { padding: 14px 12px; color: var(--text-muted); font-size: 10.5px; }
 .bridge-configure { width: 100%; padding: 10px 12px; display: flex; align-items: center; justify-content: center; gap: 6px; border: 0; border-top: 1px solid var(--border-strong); background: transparent; color: var(--accent-ink); font-size: 11px; font-weight: 600; cursor: pointer; }
 .bridge-configure:hover { background: var(--surface-hover); }
 .bridge-configure svg { width: 14px; }
-.bridge-config-list { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
-.bridge-config-row { display: grid; grid-template-columns: 1fr 1fr 32px; align-items: end; gap: 10px; }
-.bridge-config-row label { display: flex; flex-direction: column; gap: 5px; color: var(--text-muted); font-size: 10px; }
-.bridge-config-row input, .bridge-config-row select { border: 1px solid var(--border-input); border-radius: 7px; background: var(--surface-input); color: var(--text-dim); padding: 7px 9px; font-size: 11px; }
-.bridge-config-row.is-invalid input { border-color: var(--danger-border); }
-.bridge-config-row.is-draft { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border-strong); }
-.bridge-config-row .icon-button:disabled { opacity: .4; cursor: default; }
+
+/* The warning marker carries its own tooltip rather than a title attribute:
+   the native one needs an uninterrupted hover over a 15px target and gives up
+   constantly, which left the explanation for an unbridged port unreachable. */
+.bridge-warning { flex: none; position: relative; display: grid; place-items: center; color: var(--warn); cursor: help; }
+.bridge-warning svg { width: 15px; }
+.bridge-tip { position: absolute; right: 0; bottom: calc(100% + 7px); z-index: 5; width: max-content; max-width: 270px; padding: 7px 9px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface-raised); box-shadow: 0 10px 30px var(--shadow-deep); color: var(--text-dim); font-size: 10.5px; font-weight: 500; line-height: 1.5; text-align: left; opacity: 0; visibility: hidden; transition: opacity .12s ease; pointer-events: none; }
+.bridge-warning:hover .bridge-tip, .bridge-warning:focus-visible .bridge-tip { opacity: 1; visibility: visible; }
+
+/* Config rows, styled like the phone's ports page. */
+.bridge-config-list { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
+.bridge-config-row { padding: 12px; display: grid; grid-template-columns: 96px 1fr 1fr 32px; align-items: end; gap: 10px; border: 1px solid var(--border-strong); border-radius: 12px; background: var(--surface-raised); }
+.bridge-config-row.is-draft { border-style: dashed; }
+.bridge-config-row.is-invalid { border-color: var(--danger-border); }
+.bridge-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; color: var(--text-muted); font-size: 10px; }
+.bridge-field input, .bridge-field select { width: 100%; border: 1px solid var(--border-input); border-radius: 7px; background: var(--surface-input); color: var(--text-dim); padding: 7px 9px; font-size: 11px; }
+.bridge-config-row .danger-icon { margin-bottom: 1px; }
+.bridge-config-meta { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; }
+.bridge-config-meta small { flex: 1; color: var(--text-muted); font-size: 10px; }
+.bridge-config-warning { grid-column: 1 / -1; margin: 0; display: flex; align-items: flex-start; gap: 7px; color: var(--warn); font-size: 10px; line-height: 1.5; }
+.bridge-config-warning svg { width: 14px; flex: none; margin-top: 1px; }
+.bridges-modal .primary.wide { margin-top: 16px; display: flex; align-items: center; justify-content: center; gap: 7px; }
+.bridges-modal .primary.wide svg { width: 15px; }
+.bridges-modal .primary.wide:disabled { opacity: .45; cursor: default; }
 /* A port that could not be bridged is only visible on the Port Bridge page,
    so the title-bar button says so from wherever the user happens to be. */
 .icon-button.has-warning { color: var(--warn); }

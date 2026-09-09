@@ -776,6 +776,7 @@ mod tests {
                 id: "b1".into(),
                 port: 5173,
                 server: PortBridgeServer::Host,
+                label: Some("dev server".into()),
             }],
         };
         assert!(

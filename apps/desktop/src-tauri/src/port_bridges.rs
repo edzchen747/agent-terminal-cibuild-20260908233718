@@ -348,6 +348,7 @@ mod tests {
             id: id.into(),
             port,
             server,
+            label: None,
         }
     }
 

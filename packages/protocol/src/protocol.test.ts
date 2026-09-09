@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, TERMINAL_SESSION_ACTIVITIES, isSessionActive, sessionActivityLabel, sessionActivityOf, sessionActivitySummary, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, combineTaskbarProgress, CLEAR_TASKBAR_PROGRESS, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, MAX_ZOOM_FONT_SIZE, MIN_ZOOM_FONT_SIZE, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TASKBAR_PROGRESS_STATES, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, findDecorationsFor, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, BASELINE_TERMINAL_ZOOM, MAX_TERMINAL_ZOOM, MIN_TERMINAL_ZOOM, TERMINAL_ZOOM_STEPS, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, terminalZoomFontSize, CLOSED_FIND, applyFindResults, closeFind, findCommandForKey, findStatusLabel, openFind, setFindQuery, addBridge, removeBridge, sortedBridges, updateBridge, bridgeDirectionLabel, bridgeStateLabel, bridgeWarningDetail, canAddBridgePort, duplicatePortIds, isPortBridgeWarning, isValidBridgePort, normalizePortBridging, portBridgeStatusOf, type ClientMessage, type HostSnapshot, type SessionActivity, type TerminalSession, type TaskbarProgress } from "./index.js";
+import { DEFAULT_DARK_TERMINAL_SCHEME_ID, DEFAULT_LIGHT_TERMINAL_SCHEME_ID, DEFAULT_TERMINAL_THEME_SETTINGS, LAN_CONNECT_TIMEOUT_MS, MOBILE_HEARTBEAT_INTERVAL_MS, OVERLAY_CONTROL_URL, OVERLAY_TAILNET_DOMAIN, PROTOCOL_VERSION, TERMINAL_SCROLLBACK_LINES, TERMINAL_SESSION_ACTIVITIES, isSessionActive, sessionActivityLabel, sessionActivityOf, sessionActivitySummary, VIEWPORT_KEEPALIVE_INTERVAL_MS, VIEWPORT_WATCHDOG_TIMEOUT_MS, applyTerminalModifiers, combineTaskbarProgress, CLEAR_TASKBAR_PROGRESS, decodeClientMessage, decodeServerMessage, encodeMessage, encodePairingPayload, findHttpLinks, gridForContent, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, MAX_ZOOM_FONT_SIZE, MIN_ZOOM_FONT_SIZE, parsePairingPayload, parseTerminalWorkingDirectories, streamByteLength, TASKBAR_PROGRESS_STATES, TERMINAL_ANSI_THEME, TERMINAL_SCHEMES, normalizeTerminalThemeSettings, resolveTerminalScheme, findDecorationsFor, terminalSchemeById, terminalSchemesFor, xtermThemeFor, squishScaleToFill, ConsoleFrame, consoleContentRows, scrollIntoScrollback, viewportContentRows, writeHostChunk, zoomedFontSize, BASELINE_TERMINAL_ZOOM, MAX_TERMINAL_ZOOM, MIN_TERMINAL_ZOOM, TERMINAL_ZOOM_STEPS, extrapolatedCell, nearestTerminalZoom, steppedTerminalZoom, terminalZoomFontSize, CLOSED_FIND, applyFindResults, closeFind, findCommandForKey, findStatusLabel, openFind, setFindQuery, addBridge, bridgeDisplayName, MAX_BRIDGE_LABEL_LENGTH, normalizeBridgeLabel, removeBridge, sortedBridges, updateBridge, bridgeDirectionLabel, bridgeStateLabel, bridgeWarningDetail, canAddBridgePort, duplicatePortIds, isPortBridgeWarning, isValidBridgePort, normalizePortBridging, portBridgeStatusOf, type ClientMessage, type HostSnapshot, type SessionActivity, type TerminalSession, type TaskbarProgress } from "./index.js";
 
 test("pairing payloads round-trip", () => {
   const payload = {
@@ -1629,4 +1629,29 @@ test("bridges render in port order regardless of when they were added", () => {
   assert.deepEqual(sortedBridges(bridges).map((bridge) => bridge.port), [5173, 9000]);
   // Sorting must not mutate the caller's list.
   assert.deepEqual(bridges.map((bridge) => bridge.port), [9000, 5173]);
+});
+
+test("a bridge label is optional, trimmed, and clearable", () => {
+  assert.equal(normalizeBridgeLabel(undefined), undefined);
+  assert.equal(normalizeBridgeLabel("   "), undefined);
+  assert.equal(normalizeBridgeLabel("  dev server  "), "dev server");
+  assert.equal(normalizeBridgeLabel("x".repeat(80))?.length, MAX_BRIDGE_LABEL_LENGTH);
+
+  const named = addBridge([], 5173, "host", "  dev server ");
+  assert.deepEqual(named.map((bridge) => bridge.label), ["dev server"]);
+  // A blank label is absent rather than an empty string.
+  assert.deepEqual(addBridge([], 8080, "host", "  ").map((bridge) => "label" in bridge), [false]);
+
+  const id = named.map((bridge) => bridge.id)[0] ?? "";
+  // Clearing a label must remove the key, not leave it as undefined, so the
+  // row falls back to showing its port.
+  assert.deepEqual(updateBridge(named, id, { label: "" }).map((bridge) => "label" in bridge), [false]);
+  assert.deepEqual(updateBridge(named, id, { label: "api" }).map((bridge) => bridge.label), ["api"]);
+  // An edit that does not mention the label leaves it alone.
+  assert.deepEqual(updateBridge(named, id, { port: 9000 }).map((bridge) => bridge.label), ["dev server"]);
+});
+
+test("a bridge row is named by its label, falling back to its port", () => {
+  assert.equal(bridgeDisplayName({ port: 5173 }), "5173");
+  assert.equal(bridgeDisplayName({ port: 5173, label: "dev server" }), "dev server");
 });

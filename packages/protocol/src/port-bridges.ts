@@ -23,6 +23,12 @@ export interface PortBridge {
   port: number;
   /** The side that already listens on `127.0.0.1:port`. */
   server: PortBridgeServer;
+  /**
+   * What the user calls this bridge ("dev server", "ollama"). Optional and
+   * purely for the config pages: it never reaches the node, so renaming one
+   * cannot disturb a live bridge.
+   */
+  label?: string;
 }
 
 export interface DevicePortBridging {
@@ -52,6 +58,13 @@ export interface PortBridgeStatus {
 
 export const MIN_BRIDGE_PORT = 1 as const;
 export const MAX_BRIDGE_PORT = 65_535 as const;
+export const MAX_BRIDGE_LABEL_LENGTH = 40 as const;
+
+/** Trim a label and drop it entirely when nothing is left. */
+export function normalizeBridgeLabel(label: string | undefined): string | undefined {
+  const trimmed = (label ?? "").trim().slice(0, MAX_BRIDGE_LABEL_LENGTH);
+  return trimmed === "" ? undefined : trimmed;
+}
 
 export function emptyPortBridging(): DevicePortBridging {
   return { enabled: false, bridges: [] };
@@ -133,13 +146,19 @@ export function portBridgeStatusOf(
  * UI because the desktop page and the phone page offer the same operations on
  * the same list, and the two would otherwise drift.
  */
-export function createBridge(port: number, server: PortBridgeServer): PortBridge {
-  return { id: globalThis.crypto.randomUUID(), port, server };
+export function createBridge(port: number, server: PortBridgeServer, label?: string): PortBridge {
+  const named = normalizeBridgeLabel(label);
+  return { id: globalThis.crypto.randomUUID(), port, server, ...(named ? { label: named } : {}) };
 }
 
-export function addBridge(bridges: readonly PortBridge[], port: number, server: PortBridgeServer): PortBridge[] {
+export function addBridge(
+  bridges: readonly PortBridge[],
+  port: number,
+  server: PortBridgeServer,
+  label?: string
+): PortBridge[] {
   if (!canAddBridgePort(bridges, port)) return [...bridges];
-  return [...bridges, createBridge(port, server)];
+  return [...bridges, createBridge(port, server, label)];
 }
 
 /**
@@ -151,22 +170,35 @@ export function addBridge(bridges: readonly PortBridge[], port: number, server: 
 export function updateBridge(
   bridges: readonly PortBridge[],
   id: string,
-  patch: Partial<Pick<PortBridge, "port" | "server">>
+  patch: Partial<Pick<PortBridge, "port" | "server" | "label">>
 ): PortBridge[] {
   return bridges.map((bridge) => {
     if (bridge.id !== id) return bridge;
     const port = patch.port ?? bridge.port;
     const taken = bridges.some((other) => other.id !== id && other.port === port);
-    return {
+    const label = "label" in patch ? normalizeBridgeLabel(patch.label) : bridge.label;
+    const next: PortBridge = {
       ...bridge,
       port: isValidBridgePort(port) && !taken ? port : bridge.port,
       server: patch.server ?? bridge.server
     };
+    // Assigning undefined would leave the key present; clearing a label has
+    // to actually remove it so the row falls back to showing its port.
+    if (label) next.label = label; else delete next.label;
+    return next;
   });
 }
 
 export function removeBridge(bridges: readonly PortBridge[], id: string): PortBridge[] {
   return bridges.filter((bridge) => bridge.id !== id);
+}
+
+/**
+ * What a bridge row is called: the user's label when they gave one, and the
+ * port itself otherwise, so a row is never nameless.
+ */
+export function bridgeDisplayName(bridge: Pick<PortBridge, "port" | "label">): string {
+  return bridge.label ?? String(bridge.port);
 }
 
 /** Bridges shown in a stable order, so a saved edit never reshuffles the page. */

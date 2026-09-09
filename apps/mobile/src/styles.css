@@ -557,6 +557,8 @@ button { color: inherit; }
 .ports-toggle input:checked + i::after { transform: translateX(17px); background: var(--accent); }
 .ports-list { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
 .ports-row { padding: 12px; display: grid; grid-template-columns: 1fr 1fr 40px; align-items: end; gap: 10px; border: 1px solid var(--border-strong); border-radius: 12px; background: var(--surface-raised); }
+.ports-row.is-draft { border-style: dashed; }
+.ports-field.is-label { grid-column: 1 / -1; }
 .ports-row.is-invalid { border-color: var(--danger-border); }
 .ports-row.is-draft { margin-top: 12px; border-style: dashed; }
 .ports-field { display: flex; flex-direction: column; gap: 5px; color: var(--text-muted); font-size: 10px; }
@@ -572,7 +574,11 @@ button { color: inherit; }
 .ports-state.is-conflict, .ports-state.is-failed { color: var(--warn-ink); background: var(--warn-tint); }
 .ports-warning { display: grid; place-items: center; color: var(--warn-ink); }
 .ports-warning svg { width: 16px; }
-.ports-warning-text { grid-column: 1 / -1; margin: 0; color: var(--warn-ink); font-size: 10px; line-height: 1.5; }
+.ports-warning-text { grid-column: 1 / -1; margin: 0; display: flex; align-items: flex-start; gap: 7px; color: var(--warn-ink); font-size: 10px; line-height: 1.5; }
+.ports-warning-text svg { width: 14px; flex: none; margin-top: 1px; }
+.ports-add-row { margin-top: 14px; display: flex; align-items: center; justify-content: center; gap: 7px; }
+.ports-add-row svg { width: 16px; }
+.ports-add-row:disabled { opacity: .45; }
 .ports-empty { padding: 30px; border: 1px dashed var(--border-strong); border-radius: 12px; color: var(--text-muted); text-align: center; font-size: 11px; line-height: 1.6; }
 .ports-error { margin-top: 12px; padding: 10px 12px; border: 1px solid var(--danger-border); border-radius: 10px; background: var(--danger-surface); color: var(--danger-ink); font-size: 10.5px; }
 /* Back swipe (hosts page, pairing screen): the view slides right over the

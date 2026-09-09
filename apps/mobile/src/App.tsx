@@ -11,7 +11,7 @@ import {
   CapacitorBarcodeScannerTypeHint
 } from "@capacitor/barcode-scanner";
 import type { DirectoryListing, HostSnapshot, PairingPayload, PortBridge, PortBridgeServer, Platform, Project, TaskbarProgress, TerminalSession } from "@agentterminal/protocol";
-import { addBridge, bridgeDirectionLabel, bridgeStateLabel, bridgeWarningDetail, canAddBridgePort, createRequestId, duplicatePortIds, isSessionActive, isValidBridgePort, MAX_BRIDGE_PORT, MAX_PROJECT_NAME_LENGTH, MIN_BRIDGE_PORT, normalizePortBridging, normalizeTerminalThemeSettings, parsePairingPayload, portBridgeStatusOf, removeBridge, resolveTerminalScheme, sessionActivitySummary, sortedBridges, terminalSchemesFor, updateBridge } from "@agentterminal/protocol";
+import { addBridge, bridgeDirectionLabel, bridgeStateLabel, bridgeWarningDetail, canAddBridgePort, createRequestId, duplicatePortIds, isSessionActive, isValidBridgePort, MAX_BRIDGE_LABEL_LENGTH, MAX_BRIDGE_PORT, MAX_PROJECT_NAME_LENGTH, MIN_BRIDGE_PORT, normalizePortBridging, normalizeTerminalThemeSettings, parsePairingPayload, portBridgeStatusOf, removeBridge, resolveTerminalScheme, sessionActivitySummary, sortedBridges, terminalSchemesFor, updateBridge } from "@agentterminal/protocol";
 import { HostConnection, type RemoteRegistrationState, type SavedHost, type SavedHostRecord } from "./connection";
 import { ConnectionNotification } from "./connection-notification";
 import { notificationStateFor, type ConnectionNotificationState } from "./connectionPolicy";
@@ -2021,13 +2021,34 @@ function PortField({ port, disabled, onCommit }: { port: number; disabled: boole
   />;
 }
 
+/** The label field, committed on blur for the same reason as the port. */
+function LabelField({ label, disabled, onCommit }: { label: string; disabled: boolean; onCommit: (label: string) => void }) {
+  const [draft, setDraft] = useState(label);
+  const [editing, setEditing] = useState(false);
+  const value = editing ? draft : label;
+
+  return <input
+    maxLength={MAX_BRIDGE_LABEL_LENGTH}
+    placeholder="optional"
+    value={value}
+    disabled={disabled}
+    onFocus={() => { setDraft(label); setEditing(true); }}
+    onChange={(event) => setDraft(event.target.value)}
+    onBlur={() => { setEditing(false); if (draft.trim() !== label) onCommit(draft); }}
+    onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }}
+  />;
+}
+
+/** A row the user is still filling in; not saved until its port is usable. */
+interface DraftBridge { port: string; server: PortBridgeServer; label: string }
+
 /**
  * This phone's port bridges, as configured on the desktop that owns them.
  *
- * The same operations as the desktop's per-device page: switch bridging on or
- * off, add a port, choose which side runs the service, remove a port. Unlike
- * the desktop's overview it lists only this phone, so a port another device
- * holds shows up here as an ordinary status rather than a comparison.
+ * The same operations as the desktop's per-device page, and the same warning
+ * text: a port can be perfectly configured here and still not bridged because
+ * another device claimed the number first, and this is the page the user would
+ * come to in order to change it.
  */
 function PortsPage({ snapshot, deviceId, saving, error, onBack, onSave, preview }: {
   snapshot: HostSnapshot;
@@ -2041,21 +2062,21 @@ function PortsPage({ snapshot, deviceId, saving, error, onBack, onSave, preview 
   const bridging = normalizePortBridging(snapshot.devices.find((device) => device.id === deviceId)?.portBridging);
   const bridges = sortedBridges(bridging.bridges);
   const duplicates = new Set(duplicatePortIds(bridges));
-  const [draftPort, setDraftPort] = useState("");
-  const [draftServer, setDraftServer] = useState<PortBridgeServer>("host");
+  const [draft, setDraft] = useState<DraftBridge | null>(null);
 
-  const port = Number(draftPort);
-  const canAdd = !saving && draftPort.trim() !== "" && canAddBridgePort(bridges, port);
-  const addError = draftPort.trim() === "" || canAddBridgePort(bridges, port)
+  const draftPort = Number(draft?.port);
+  const draftValid = draft !== null && draft.port.trim() !== "" && canAddBridgePort(bridges, draftPort);
+  const draftError = !draft || draft.port.trim() === "" || draftValid
     ? ""
-    : bridges.some((bridge) => bridge.port === port)
-      ? `Port ${draftPort} is already bridged on this phone.`
+    : bridges.some((bridge) => bridge.port === draftPort)
+      ? `Port ${draft.port} is already bridged on this phone.`
       : `Enter a port between ${MIN_BRIDGE_PORT} and ${MAX_BRIDGE_PORT}.`;
 
-  function add() {
-    if (!canAdd) return;
-    onSave(bridging.enabled, addBridge(bridges, port, draftServer));
-    setDraftPort("");
+  /** Promote the draft into a real bridge once its port is usable. */
+  function commitDraft() {
+    if (!draft || !draftValid) return;
+    onSave(bridging.enabled, addBridge(bridges, draftPort, draft.server, draft.label));
+    setDraft(null);
   }
 
   return <BackSwipeZone onBack={onBack} preview={preview}><div className="mobile-app ports-page">
@@ -2068,17 +2089,17 @@ function PortsPage({ snapshot, deviceId, saving, error, onBack, onSave, preview 
       </label>
 
       <div className="ports-list">
-        {bridges.length ? bridges.map((bridge) => {
+        {bridges.map((bridge) => {
           const status = portBridgeStatusOf(snapshot.portBridgeStatuses, deviceId, bridge.id);
           const state = bridging.enabled ? status?.state ?? "pending" : "disabled";
           const warning = bridging.enabled ? bridgeWarningDetail(bridge, status) : "";
           return <div className={`ports-row${duplicates.has(bridge.id) ? " is-invalid" : ""}`} key={bridge.id}>
-            <label className="ports-field">Port<PortField
+            <label className="ports-field is-port">Port<PortField
               port={bridge.port}
               disabled={saving}
               onCommit={(port) => onSave(bridging.enabled, updateBridge(bridges, bridge.id, { port }))}
             /></label>
-            <label className="ports-field">Server<select
+            <label className="ports-field">Served by<select
               value={bridge.server}
               disabled={saving}
               onChange={(event) => onSave(bridging.enabled, updateBridge(bridges, bridge.id, { server: event.target.value as PortBridgeServer }))}
@@ -2087,34 +2108,58 @@ function PortsPage({ snapshot, deviceId, saving, error, onBack, onSave, preview 
               <option value="client">This phone</option>
             </select></label>
             <button className="ports-remove" disabled={saving} onClick={() => onSave(bridging.enabled, removeBridge(bridges, bridge.id))} aria-label={`Remove port ${bridge.port}`}><TrashIcon /></button>
+            <label className="ports-field is-label">Label<LabelField
+              label={bridge.label ?? ""}
+              disabled={saving}
+              onCommit={(label) => onSave(bridging.enabled, updateBridge(bridges, bridge.id, { label }))}
+            /></label>
             <div className="ports-meta">
               <small>{bridgeDirectionLabel(bridge, "mobile")}</small>
               <span className={`ports-state is-${state}`}>{bridgeStateLabel(state)}</span>
-              {warning && <span className="ports-warning" role="img" aria-label={warning} title={warning}><WarningIcon /></span>}
             </div>
-            {warning && <p className="ports-warning-text">{warning}</p>}
+            {warning && <p className="ports-warning-text"><WarningIcon /><span>{warning}</span></p>}
           </div>;
-        }) : <div className="ports-empty">No ports yet. Add one below to reach a service on the desktop from this phone, or the other way around.</div>}
+        })}
+
+        {draft && <div className={`ports-row is-draft${draftError ? " is-invalid" : ""}`}>
+          <label className="ports-field is-port">Port<input
+            type="number"
+            inputMode="numeric"
+            autoFocus
+            min={MIN_BRIDGE_PORT}
+            max={MAX_BRIDGE_PORT}
+            placeholder="5173"
+            value={draft.port}
+            disabled={saving}
+            onChange={(event) => setDraft({ ...draft, port: event.target.value })}
+            onBlur={commitDraft}
+            onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }}
+          /></label>
+          <label className="ports-field">Served by<select value={draft.server} disabled={saving} onChange={(event) => setDraft({ ...draft, server: event.target.value as PortBridgeServer })}>
+            <option value="host">The desktop</option>
+            <option value="client">This phone</option>
+          </select></label>
+          <button className="ports-remove" onClick={() => setDraft(null)} aria-label="Discard this port"><TrashIcon /></button>
+          <label className="ports-field is-label">Label<input
+            maxLength={MAX_BRIDGE_LABEL_LENGTH}
+            placeholder="optional"
+            value={draft.label}
+            disabled={saving}
+            onChange={(event) => setDraft({ ...draft, label: event.target.value })}
+            onBlur={commitDraft}
+          /></label>
+          {draftError && <p className="ports-warning-text"><WarningIcon /><span>{draftError}</span></p>}
+        </div>}
+
+        {!bridges.length && !draft && <div className="ports-empty">No ports yet. Add one below to reach a service on the desktop from this phone, or the other way around.</div>}
       </div>
 
-      <div className="ports-row is-draft">
-        <label className="ports-field">Port<input
-          type="number"
-          inputMode="numeric"
-          min={MIN_BRIDGE_PORT}
-          max={MAX_BRIDGE_PORT}
-          placeholder="5173"
-          value={draftPort}
-          disabled={saving}
-          onChange={(event) => setDraftPort(event.target.value)}
-        /></label>
-        <label className="ports-field">Server<select value={draftServer} disabled={saving} onChange={(event) => setDraftServer(event.target.value as PortBridgeServer)}>
-          <option value="host">The desktop</option>
-          <option value="client">This phone</option>
-        </select></label>
-        <button className="ports-add" disabled={!canAdd} onClick={add} aria-label="Add port"><PlusIcon /></button>
-      </div>
-      {(addError || error) && <div className="ports-error">{addError || error}</div>}
+      {/* One unfinished row at a time: a second empty template before the
+          first has a port would give two rows that cannot be told apart. */}
+      <button className="mobile-primary full ports-add-row" disabled={saving || draft !== null} onClick={() => setDraft({ port: "", server: "host", label: "" })}>
+        <PlusIcon /> New port bridge
+      </button>
+      {error && <div className="ports-error">{error}</div>}
     </section>
   </div></BackSwipeZone>;
 }
