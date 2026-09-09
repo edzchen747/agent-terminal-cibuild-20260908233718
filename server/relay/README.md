@@ -27,8 +27,12 @@ the maintenance container.
 
 The provisioner derives one Headscale user from each host ID. Both devices in
 that pairing group enroll as that user. `headscale/policy.hujson` is
-deny-by-default and allows application TCP traffic only to `autogroup:self`,
-so one public registration cannot reach unrelated pairings. Provisioning roles
+deny-by-default and allows traffic only to `autogroup:self`, so one public
+registration cannot reach unrelated pairings. Ports are not restricted within
+a pairing group: Port Bridge forwards user-chosen TCP ports between that
+group's own two nodes, and which ports carry traffic is decided by the desktop
+(it arbitrates every bridge, and the embedded node opens a tailnet listener
+only for a configured port, restricted to the one peer awarded it). Provisioning roles
 remain fixed, audited server policy metadata rather than Headscale ACL tags:
 Headscale 0.29 makes tags and user ownership mutually exclusive, and global
 desktop/mobile tags would remove the same-user isolation boundary.

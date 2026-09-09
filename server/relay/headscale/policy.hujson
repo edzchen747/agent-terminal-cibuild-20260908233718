@@ -1,12 +1,21 @@
 {
   // Headscale defaults to allow-all when no policy is configured. Keep the
   // overlay deny-by-default and permit Agent Terminal traffic only between
-  // nodes owned by the same per-pair user on the application's TCP port.
+  // nodes owned by the same per-pair user.
+  //
+  // The port list is open because Port Bridge forwards user-chosen TCP ports
+  // between a pairing group's own two nodes, and the port is not known until
+  // the user picks it. The isolation this policy exists for is unchanged:
+  // autogroup:self is one pairing group's own nodes, so a public registration
+  // still cannot reach an unrelated pairing on any port. Which ports actually
+  // carry traffic is decided above this layer - the desktop arbitrates every
+  // bridge and the embedded node opens a tailnet listener only for a port the
+  // user configured, restricted to the single peer that was awarded it.
   "grants": [
     {
       "src": ["autogroup:member"],
       "dst": ["autogroup:self"],
-      "ip": ["47831"]
+      "ip": ["*"]
     }
   ]
 }
